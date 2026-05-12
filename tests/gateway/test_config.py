@@ -454,6 +454,36 @@ class TestLoadGatewayConfig:
             "789": "Creative writing",
         }
 
+    def test_bridges_telegram_auto_skill_routes_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  auto_skill_routes:\n"
+            "    - skill: tg\n"
+            "      chats:\n"
+            '        - "-1001234567"\n'
+            "      match:\n"
+            "        urls: true\n"
+            "        media:\n"
+            "          - photo\n"
+            "          - video\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["auto_skill_routes"] == [
+            {
+                "skill": "tg",
+                "chats": ["-1001234567"],
+                "match": {"urls": True, "media": ["photo", "video"]},
+            }
+        ]
+
     def test_bridges_slack_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
