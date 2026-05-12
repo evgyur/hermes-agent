@@ -786,6 +786,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if plat == Platform.TELEGRAM and "auto_skill_routes" in platform_cfg:
+                    bridged["auto_skill_routes"] = platform_cfg["auto_skill_routes"]
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

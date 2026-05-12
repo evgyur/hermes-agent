@@ -312,6 +312,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
+        # Auto skill routes: declarative per-chat skill modes (e.g. route URLs/media to /tg).
+        self._auto_skill_routes: List[Dict[str, Any]] = self._load_auto_skill_routes()
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
@@ -3424,6 +3426,63 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    def _load_auto_skill_routes(self) -> List[Dict[str, Any]]:
+        """Load declarative auto-skill routes from Telegram config.
+
+        Example:
+            telegram:
+              auto_skill_routes:
+                - skill: tg
+                  chats: [-1003437858232]
+                  match:
+                    urls: true
+                    media: [photo, video]
+        """
+        raw_routes = self.config.extra.get("auto_skill_routes", [])
+        if not isinstance(raw_routes, list):
+            return []
+
+        routes: List[Dict[str, Any]] = []
+        for raw in raw_routes:
+            if not isinstance(raw, dict):
+                continue
+            skill = str(raw.get("skill") or "").strip().lstrip("/")
+            chats = raw.get("chats") or []
+            match = raw.get("match") or {}
+            if not skill or not isinstance(chats, list) or not isinstance(match, dict):
+                continue
+            routes.append({
+                "skill": skill,
+                "chats": {str(chat_id) for chat_id in chats},
+                "match_urls": bool(match.get("urls", False)),
+                "match_media": {str(kind).lower() for kind in (match.get("media") or [])},
+            })
+        return routes
+
+    def _auto_skill_prefix_for_text(self, chat_id: str, text: str) -> Optional[str]:
+        """Return a slash-command prefix when text matches an auto-skill route."""
+        if not chat_id or not text or text.lstrip().startswith("/"):
+            return None
+        has_url = bool(re.search(r"https?://\S+|t\.co/\S+", text))
+        for route in self._auto_skill_routes:
+            if chat_id not in route["chats"]:
+                continue
+            if has_url and route.get("match_urls"):
+                return f"/{route['skill']} "
+        return None
+
+    def _auto_skill_prefix_for_media(self, chat_id: str, msg_type: MessageType) -> Optional[str]:
+        """Return a slash-command prefix when media matches an auto-skill route."""
+        if not chat_id:
+            return None
+        media_kind = msg_type.value.lower()
+        for route in self._auto_skill_routes:
+            if chat_id not in route["chats"]:
+                continue
+            if media_kind in route.get("match_media", set()):
+                return f"/{route['skill']} "
+        return None
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -3438,6 +3497,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+
+        # Auto skill route: e.g. a chat can route URL-like source messages to /tg.
+        chat_id = str(getattr(update.message.chat, "id", ""))
+        skill_prefix = self._auto_skill_prefix_for_text(chat_id, event.text)
+        if skill_prefix:
+            event.text = skill_prefix + event.text
+
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3639,6 +3705,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
+
+        # Auto skill route early, before photo/video batching can return.
+        chat_id = str(getattr(msg.chat, "id", ""))
+        skill_prefix = self._auto_skill_prefix_for_media(chat_id, msg_type)
+        if skill_prefix:
+            if event.text:
+                event.text = skill_prefix + event.text
+            else:
+                event.text = skill_prefix
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
