@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import html as _html
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -2208,6 +2209,393 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _handle_gptprof_callback(self, query, data: str) -> None:
+        """Handle Chip's /gptprof inline keyboard callbacks."""
+        auth_path = "/home/hermes/.hermes/auth.json"
+        config_path = "/home/hermes/.hermes/config.yaml"
+        hcp_dir = "/home/hermes/.hermes/skills/chip/hcp"
+        send_script = "/home/hermes/.hermes/skills/chip/gptprof/send_buttons.py"
+        python_bin = "/opt/hermes-agent/venv/bin/python3"
+
+        def _load_json(path: str, default: Any) -> Any:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return default
+
+        def _write_json(path: str, value: Any) -> None:
+            directory = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".json", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(value, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                atomic_replace(tmp, path)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+
+        def _write_yaml(path: str, value: Any) -> None:
+            import yaml as _yaml
+            directory = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".yaml", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _yaml.safe_dump(value, f, allow_unicode=True, sort_keys=False)
+                atomic_replace(tmp, path)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+
+        async def _send_fresh_card(answer: str) -> None:
+            await query.answer(text=answer)
+            try:
+                subprocess.Popen(
+                    [python_bin, send_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                logger.error("gptprof refresh failed: %s", exc, exc_info=True)
+
+        def _usage_score(slug: str) -> tuple[int, int]:
+            cache = _load_json("/tmp/gptprof_usage_cache.json", {})
+            payload = cache.get(slug, {}) if isinstance(cache, dict) else {}
+            rl = (payload.get("rate_limit") or {}) if isinstance(payload, dict) else {}
+            primary = rl.get("primary_window") or {}
+            secondary = rl.get("secondary_window") or {}
+            def left(window: dict) -> int:
+                used = window.get("used_percent") if isinstance(window, dict) else None
+                return max(0, 100 - int(used)) if isinstance(used, (int, float)) else -1
+            return (left(secondary), left(primary))
+
+        def _active_slug() -> str:
+            auth = _load_json(auth_path, {})
+            if isinstance(auth, dict):
+                codex = auth.get("codex")
+                if isinstance(codex, dict) and codex.get("profile"):
+                    return str(codex["profile"])
+            return "gptinvest23"
+
+        def _model_for_slug(slug: str) -> str:
+            return {
+                "gptinvest23": "gpt-5.5",
+                "markov495": "gpt-5.4",
+                "mintsage": "gpt-5.4-mini",
+                "omnifocusme": "gpt-5.4-mini",
+            }.get(slug, "gpt-5.5")
+
+        def _persist_new_auth(slug: str, access_token: str, refresh_token: str) -> None:
+            profile_path = os.path.join(hcp_dir, f"{slug}.json")
+            profile = _load_json(profile_path, {})
+            if not isinstance(profile, dict):
+                profile = {}
+            profile.setdefault("profile", slug)
+            profile.setdefault("email", f"{slug}@gmail.com")
+            profile.setdefault("plan", "Codex")
+            profile["access_token"] = access_token
+            profile["refresh_token"] = refresh_token
+            _write_json(profile_path, profile)
+
+            auth = _load_json(auth_path, {})
+            if not isinstance(auth, dict):
+                auth = {}
+            auth["codex"] = {
+                "profile": slug,
+                "plan": profile.get("plan"),
+                "email": profile.get("email"),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            }
+            pool_root = auth.setdefault("credential_pool", {})
+            if isinstance(pool_root, dict):
+                pool = pool_root.get("openai-codex")
+                if not isinstance(pool, list):
+                    pool = []
+                selected_source = f"gptprof:{slug}"
+                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
+                selected = {
+                    "id": f"gptprof-{slug}",
+                    "label": profile.get("email") or slug,
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": selected_source,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                    "request_count": 0,
+                }
+                for idx, item in enumerate(existing, start=1):
+                    if isinstance(item, dict):
+                        item["priority"] = idx
+                pool_root["openai-codex"] = [selected, *existing]
+            _write_json(auth_path, auth)
+
+            try:
+                import yaml as _yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model")
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                model_cfg["provider"] = "openai-codex"
+                model_cfg["default"] = _model_for_slug(slug)
+                model_cfg.setdefault("base_url", "https://chatgpt.com/backend-api/codex")
+                cfg["model"] = model_cfg
+                _write_yaml(config_path, cfg)
+            except Exception as exc:
+                logger.error("gptprof new auth config update failed: %s", exc, exc_info=True)
+
+        async def _start_new_auth() -> None:
+            slug = _active_slug()
+            issuer = "https://auth.openai.com"
+            client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+            token_url = "https://auth.openai.com/oauth/token"
+            message = getattr(query, "message", None)
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    resp = await client.post(
+                        f"{issuer}/api/accounts/deviceauth/usercode",
+                        json={"client_id": client_id},
+                        headers={"Content-Type": "application/json"},
+                    )
+                if resp.status_code != 200:
+                    await query.answer(text=f"New auth failed: {resp.status_code}")
+                    return
+                device_data = resp.json()
+                user_code = str(device_data.get("user_code") or "")
+                device_auth_id = str(device_data.get("device_auth_id") or "")
+                poll_interval = max(3, int(device_data.get("interval") or 5))
+                if not user_code or not device_auth_id:
+                    await query.answer(text="New auth failed: empty device code.")
+                    return
+            except Exception as exc:
+                logger.error("gptprof new auth start failed: %s", exc, exc_info=True)
+                await query.answer(text="New auth failed to start.")
+                return
+
+            await query.answer(text="New auth started.")
+            if message is not None:
+                try:
+                    await message.reply_text(
+                        "🔑 New Codex auth\n\n"
+                        f"Profile: {slug}\n"
+                        f"Open: {issuer}/codex/device\n"
+                        f"Code: {user_code}\n\n"
+                        "After sign-in I’ll save it into this profile and refresh gptprof.",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
+            async def _poll_and_save() -> None:
+                try:
+                    import httpx
+                    deadline = time.monotonic() + 15 * 60
+                    code_resp = None
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                        while time.monotonic() < deadline:
+                            await asyncio.sleep(poll_interval)
+                            poll_resp = await client.post(
+                                f"{issuer}/api/accounts/deviceauth/token",
+                                json={"device_auth_id": device_auth_id, "user_code": user_code},
+                                headers={"Content-Type": "application/json"},
+                            )
+                            if poll_resp.status_code == 200:
+                                code_resp = poll_resp.json()
+                                break
+                            if poll_resp.status_code in (403, 404):
+                                continue
+                            raise RuntimeError(f"device polling status {poll_resp.status_code}")
+                    if code_resp is None:
+                        raise TimeoutError("device auth timed out")
+
+                    authorization_code = str(code_resp.get("authorization_code") or "")
+                    code_verifier = str(code_resp.get("code_verifier") or "")
+                    if not authorization_code or not code_verifier:
+                        raise RuntimeError("device auth returned incomplete exchange data")
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                        token_resp = await client.post(
+                            token_url,
+                            data={
+                                "grant_type": "authorization_code",
+                                "code": authorization_code,
+                                "redirect_uri": f"{issuer}/deviceauth/callback",
+                                "client_id": client_id,
+                                "code_verifier": code_verifier,
+                            },
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        )
+                    if token_resp.status_code != 200:
+                        raise RuntimeError(f"token exchange status {token_resp.status_code}")
+                    tokens = token_resp.json()
+                    access_token = str(tokens.get("access_token") or "")
+                    refresh_token = str(tokens.get("refresh_token") or "")
+                    if not access_token or not refresh_token:
+                        raise RuntimeError("token exchange returned incomplete tokens")
+
+                    _persist_new_auth(slug, access_token, refresh_token)
+                    try:
+                        cache = _load_json("/tmp/gptprof_usage_cache.json", {})
+                        if isinstance(cache, dict):
+                            cache.pop(slug, None)
+                            _write_json("/tmp/gptprof_usage_cache.json", cache)
+                    except Exception:
+                        pass
+                    if message is not None:
+                        await message.reply_text(f"✅ New auth saved for {slug}. Refreshing usage…")
+                    try:
+                        subprocess.Popen(
+                            [python_bin, send_script],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.error("gptprof new auth failed: %s", exc, exc_info=True)
+                    if message is not None:
+                        try:
+                            await message.reply_text(f"⚠️ New auth failed for {slug}: {exc}")
+                        except Exception:
+                            pass
+
+            asyncio.create_task(_poll_and_save())
+
+        async def _switch(slug: str, model: str, *, autoswitch: bool = False) -> None:
+            safe_slugs = {"gptinvest23", "markov495", "mintsage", "omnifocusme"}
+            if slug not in safe_slugs:
+                await query.answer(text="Unknown profile.")
+                return
+            profile_path = os.path.join(hcp_dir, f"{slug}.json")
+            profile = _load_json(profile_path, {})
+            if not isinstance(profile, dict) or not profile.get("access_token"):
+                await query.answer(text="Profile token not found.")
+                return
+
+            auth = _load_json(auth_path, {})
+            if not isinstance(auth, dict):
+                auth = {}
+            codex_entry = {
+                "profile": slug,
+                "plan": profile.get("plan"),
+                "email": profile.get("email"),
+                "access_token": profile.get("access_token"),
+                "refresh_token": profile.get("refresh_token"),
+            }
+            auth["codex"] = codex_entry
+
+            pool_root = auth.setdefault("credential_pool", {})
+            if isinstance(pool_root, dict):
+                pool = pool_root.get("openai-codex")
+                if not isinstance(pool, list):
+                    pool = []
+                # Put the selected profile first so Codex inference uses it immediately.
+                selected_source = f"gptprof:{slug}"
+                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
+                selected = {
+                    "id": f"gptprof-{slug}",
+                    "label": profile.get("email") or slug,
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": selected_source,
+                    "access_token": profile.get("access_token"),
+                    "refresh_token": profile.get("refresh_token"),
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                    "request_count": 0,
+                }
+                for idx, item in enumerate(existing, start=1):
+                    if isinstance(item, dict):
+                        item["priority"] = idx
+                pool_root["openai-codex"] = [selected, *existing]
+
+            _write_json(auth_path, auth)
+
+            try:
+                import yaml as _yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model")
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {"default": model}
+                model_cfg["provider"] = "openai-codex"
+                model_cfg["default"] = model
+                model_cfg.setdefault("base_url", "https://chatgpt.com/backend-api/codex")
+                cfg["model"] = model_cfg
+                _write_yaml(config_path, cfg)
+            except Exception as exc:
+                logger.error("gptprof config update failed: %s", exc, exc_info=True)
+                await query.answer(text="Profile switched, config update failed.")
+                return
+
+            label = "Autoswitched" if autoswitch else "Switched"
+            await query.answer(text=f"{label}: {slug}")
+            try:
+                await query.edit_message_text(
+                    text=f"✅ {label} to {slug}\n🧠 Model: openai/{model}\n\nUse /new for a fresh session.",
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+            except Exception:
+                pass
+            try:
+                subprocess.Popen(
+                    [python_bin, send_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception:
+                pass
+
+        if data == "gptprof:close":
+            await query.answer(text="Closed.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        if data in {"gptprof:add", "gptprof:new_auth"}:
+            await _start_new_auth()
+            return
+        if data == "gptprof:pi_route":
+            await query.answer(text="Pi route stays available as fallback.")
+            return
+        if data in {"gptprof:refresh", "gptprof:check_auth"}:
+            await _send_fresh_card("Usage refreshed.")
+            return
+        if data == "gptprof:autoswitch":
+            model_by_slug = {
+                "gptinvest23": "gpt-5.5",
+                "markov495": "gpt-5.4",
+                "mintsage": "gpt-5.4-mini",
+                "omnifocusme": "gpt-5.4-mini",
+            }
+            slug = max(model_by_slug, key=_usage_score)
+            await _switch(slug, model_by_slug[slug], autoswitch=True)
+            return
+
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid gptprof action.")
+            return
+        _, slug, model = parts
+        await _switch(slug, model)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -2222,6 +2610,21 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- GPT profile callbacks ---
+        if data.startswith("gptprof:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to switch GPT profiles.")
+                return
+            await self._handle_gptprof_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
