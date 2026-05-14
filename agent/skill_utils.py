@@ -35,6 +35,22 @@ EXCLUDED_SKILL_DIRS = frozenset(
         "vendor",
     )
 )
+EXCLUDED_SKILL_DIR_SUFFIXES = (
+    ".bak",
+    ".backup",
+    ".local-backup",
+)
+
+
+def is_excluded_skill_dir(dirname: str) -> bool:
+    """Return True for operational/non-catalog skill directory names.
+
+    Backup snapshots such as ``tg.bak`` and ``postcraft.local-backup`` must not
+    enter skill indexes or slash-command routing. Otherwise duplicate
+    frontmatter names can make a backup skill shadow the canonical one.
+    """
+    normalized = str(dirname or "").strip().lower()
+    return normalized in EXCLUDED_SKILL_DIRS or normalized.endswith(EXCLUDED_SKILL_DIR_SUFFIXES)
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
 
@@ -489,11 +505,12 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
     Excludes operational/non-catalog directories such as ``.git``, ``.hub``,
-    ``.archive``, ``.sync-backups``, ``node_modules``, and vendored trees.
+    ``.archive``, ``.sync-backups``, ``node_modules``, vendored trees, and
+    backup skill trees such as ``*.bak`` or ``*.local-backup``.
     """
     matches = []
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+        dirs[:] = [d for d in dirs if not is_excluded_skill_dir(d)]
         if filename in files:
             matches.append(Path(root) / filename)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):

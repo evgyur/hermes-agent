@@ -62,10 +62,12 @@ def test_iter_skill_index_files_excludes_backups_vendor_and_node_modules(tmp_pat
     """Only active catalog skills should appear in prompt/tool skill indexes."""
     active = tmp_path / "active-skill"
     backup = tmp_path / ".sync-backups" / "snapshot" / "backup-skill"
+    suffix_backup = tmp_path / "tg.bak"
+    local_backup = tmp_path / "postcraft.local-backup"
     vendored = tmp_path / "some-project" / "vendor" / "vendored-skill"
     node = tmp_path / "node_modules" / "pkg" / "node-skill"
 
-    for skill_dir in (active, backup, vendored, node):
+    for skill_dir in (active, backup, suffix_backup, local_backup, vendored, node):
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: x\ndescription: test\n---\nbody\n", encoding="utf-8"
