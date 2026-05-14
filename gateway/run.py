@@ -933,6 +933,29 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _config_list_contains_chat(config: dict, platform_key: str, setting: str, chat_id: str) -> bool:
+    """Return True when ``<platform>.<setting>`` contains the current chat id.
+
+    This is intentionally chat-scoped instead of using ``display.platforms``:
+    display settings are platform-wide, while some noisy public Telegram groups
+    need quieter progress without changing DMs or other group chats.
+    """
+    platform_cfg = config.get(platform_key) if isinstance(config, dict) else None
+    if not isinstance(platform_cfg, dict):
+        return False
+    raw = platform_cfg.get(setting)
+    if raw is None:
+        return False
+    chat_id_str = str(chat_id or "").strip()
+    if not chat_id_str:
+        return False
+    if isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = str(raw).split(",")
+    return chat_id_str in {str(value).strip() for value in values if str(value).strip()}
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -6747,7 +6770,7 @@ class GatewayRunner:
                         except Exception:
                             pass
 
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+        if event.media_urls:
             import mimetypes as _mimetypes
             from tools.credential_files import to_agent_visible_cache_path
 
@@ -6777,13 +6800,13 @@ class GatewayRunner:
 
                 if mtype.startswith("text/"):
                     context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
+                        f"[The user sent or referenced a text document: '{display_name}'. "
                         f"Its content has been included below. "
                         f"The file is also saved at: {agent_path}]"
                     )
                 else:
                     context_note = (
-                        f"[The user sent a document: '{display_name}'. "
+                        f"[The user sent or referenced a document: '{display_name}'. "
                         f"The file is saved at: {agent_path}. "
                         f"Ask the user what they'd like you to do with it.]"
                     )
@@ -14132,7 +14155,17 @@ class GatewayRunner:
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        suppress_tool_progress_for_chat = _config_list_contains_chat(
+            user_config,
+            platform_key,
+            "suppress_tool_progress_chats",
+            source.chat_id,
+        )
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and not suppress_tool_progress_for_chat
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.

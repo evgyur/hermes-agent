@@ -7,6 +7,7 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 def _make_adapter(
     require_mention=None,
+    require_mention_chats=None,
     free_response_chats=None,
     mention_patterns=None,
     ignored_threads=None,
@@ -20,6 +21,8 @@ def _make_adapter(
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
+    if require_mention_chats is not None:
+        extra["require_mention_chats"] = require_mention_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if mention_patterns is not None:
@@ -156,6 +159,22 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():
+    adapter = _make_adapter(require_mention=False, require_mention_chats=["-200"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("replying", chat_id=-200, reply_to_bot=True)) is True
+    assert adapter._should_process_message(_group_message("/status", chat_id=-200), is_command=True) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
+
+
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
     adapter = _make_adapter(
         require_mention=True,
@@ -235,6 +254,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  guest_mode: true\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
+        "  require_mention_chats:\n"
+        "    - \"-456\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n",
         encoding="utf-8",
@@ -244,6 +265,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("TELEGRAM_MENTION_PATTERNS", raising=False)
     monkeypatch.delenv("TELEGRAM_GUEST_MODE", raising=False)
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
 
     config = load_gateway_config()
@@ -252,10 +274,12 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION"] == "true"
     assert __import__("os").environ["TELEGRAM_GUEST_MODE"] == "true"
     assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
+    assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION_CHATS"] == "-456"
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
     tg_cfg = config.platforms.get(Platform.TELEGRAM)
     assert tg_cfg is not None
     assert tg_cfg.extra.get("guest_mode") is True
+    assert tg_cfg.extra.get("require_mention_chats") == ["-456"]
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
