@@ -50,6 +50,8 @@ _HERMES_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Governed shared memory through mem0g
+    "mem0g",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
