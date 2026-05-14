@@ -1,6 +1,6 @@
-"""Tests for agent/skill_utils.py — extract_skill_conditions metadata handling."""
+"""Tests for agent/skill_utils.py."""
 
-from agent.skill_utils import extract_skill_conditions
+from agent.skill_utils import extract_skill_conditions, iter_skill_index_files
 
 
 def test_metadata_as_dict_with_hermes():
@@ -56,3 +56,21 @@ def test_metadata_missing_entirely():
         "fallback_for_tools": [],
         "requires_tools": [],
     }
+
+
+def test_iter_skill_index_files_excludes_backups_vendor_and_node_modules(tmp_path):
+    """Only active catalog skills should appear in prompt/tool skill indexes."""
+    active = tmp_path / "active-skill"
+    backup = tmp_path / ".sync-backups" / "snapshot" / "backup-skill"
+    vendored = tmp_path / "some-project" / "vendor" / "vendored-skill"
+    node = tmp_path / "node_modules" / "pkg" / "node-skill"
+
+    for skill_dir in (active, backup, vendored, node):
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: x\ndescription: test\n---\nbody\n", encoding="utf-8"
+        )
+
+    found = [p.relative_to(tmp_path) for p in iter_skill_index_files(tmp_path, "SKILL.md")]
+
+    assert found == [active.relative_to(tmp_path) / "SKILL.md"]

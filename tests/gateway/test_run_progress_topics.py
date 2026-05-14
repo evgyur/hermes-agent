@@ -737,36 +737,42 @@ async def _run_with_agent(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch, tmp_path):
-    """Tool progress should start a second editable bubble before Telegram's limit.
-
-    Regression: once the first progress bubble grew past the platform limit,
-    the gateway kept trying to edit that same oversized full transcript.  The
-    Telegram adapter then split-and-sent a fresh continuation on every update,
-    causing a noisy trail of one-line messages instead of a new editable bubble.
-    """
+async def test_run_agent_suppresses_tool_progress_for_configured_telegram_chat(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
-        ManyProgressLinesAgent,
-        session_id="sess-progress-overflow-rollover",
+        FakeAgent,
+        session_id="sess-quiet-chat",
+        chat_id="-1003770669948",
         config_data={
-            "display": {
-                "tool_progress": "all",
-                "interim_assistant_messages": False,
-                "tool_preview_length": 60,
-            }
+            "display": {"tool_progress": "all"},
+            "telegram": {"suppress_tool_progress_chats": [-1003770669948]},
         },
-        adapter_cls=SmallLimitProgressAdapter,
     )
 
     assert result["final_response"] == "done"
-    assert isinstance(adapter, SmallLimitProgressAdapter)
-    assert len(adapter.sent) >= 2, "expected a fresh progress bubble after the first filled"
-    assert adapter.oversized_sends == []
-    assert adapter.oversized_edits == []
-    all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
-    assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.typing == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_tool_progress_for_other_telegram_chats(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-normal-chat",
+        chat_id="-1001",
+        config_data={
+            "display": {"tool_progress": "all"},
+            "telegram": {"suppress_tool_progress_chats": [-1003770669948]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == '💻 terminal: "pwd"'
 
 
 @pytest.mark.asyncio

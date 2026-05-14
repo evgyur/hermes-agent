@@ -108,6 +108,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.from_user.id = 1
     msg.from_user.full_name = "Test User"
     msg.message_thread_id = None
+    msg.reply_to_message = None
     return msg
 
 
@@ -894,3 +895,59 @@ class TestSendVideo:
 
         call_kwargs = connected_adapter._bot.send_video.call_args[1]
         assert call_kwargs["message_thread_id"] == 789
+
+
+class TestRepliedToMedia:
+    @pytest.mark.asyncio
+    async def test_command_reply_to_text_document_caches_file_and_preserves_command(self, adapter):
+        content = b"Transcript body"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="transcript.txt",
+            mime_type="text/plain",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        replied = _make_message(document=doc)
+        replied.message_id = 66
+
+        msg = _make_message()
+        msg.text = "/summ"
+        msg.reply_to_message = replied
+        update = _make_update(msg)
+
+        await adapter._handle_command(update, MagicMock())
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.startswith("/summ")
+        assert "[Content of replied-to transcript.txt]" in event.text
+        assert "Transcript body" in event.text
+        assert event.reply_to_message_id == "66"
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        assert event.media_types == ["text/plain"]
+
+    @pytest.mark.asyncio
+    async def test_text_reply_to_pdf_document_caches_replied_media(self, adapter):
+        pdf_bytes = b"%PDF-1.4 replied"
+        file_obj = _make_file_obj(pdf_bytes)
+        doc = _make_document(file_name="deck.pdf", file_size=len(pdf_bytes), file_obj=file_obj)
+        replied = _make_message(document=doc)
+        replied.message_id = 77
+
+        msg = _make_message()
+        msg.text = "summarize this"
+        msg.reply_to_message = replied
+        update = _make_update(msg)
+
+        await adapter._handle_text_message(update, MagicMock())
+
+        key, event = next(iter(adapter._pending_text_batches.items()))
+        assert key
+        assert event.text == "summarize this"
+        assert event.reply_to_message_id == "77"
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        assert event.media_types == ["application/pdf"]

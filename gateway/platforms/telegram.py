@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import html as _html
 import re
@@ -189,6 +190,54 @@ def _strip_mdv2(text: str) -> str:
     # Remove MarkdownV2 spoiler markers (||text|| → text)
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
     return cleaned
+
+
+_INLINE_TG_PREVIEW_BLOCKER = (
+    "превью заблокировано: Hermes-бот попытался отправить TG-пост inline. "
+    "Нужный путь — telegram-chip / ChipCR с exact-message verify-gate."
+)
+_CHIP_TG_PREVIEW_GUARD_CHAT_IDS = {"-1003437858232", "-1003712304136"}
+_INLINE_TG_OPERATOR_PREFIX_RE = re.compile(
+    r"(?i)^\s*(готово|сделал|отправил|принял|да|нет|ок|ошибка|блокер|превью\s+не|smoke|proof)\b"
+)
+
+
+def _looks_like_inline_tg_preview(text: str) -> bool:
+    """Return True for finished Telegram-post drafts that must not be bot-sent.
+
+    In Chip's `/tg` chats, any finished TG preview or edited post must be
+    delivered by the human account (ChipCR via telegram-chip), not by the
+    Hermes bot. This detector intentionally catches both HTML captions and
+    plain edited TG drafts while avoiding compact operator reports.
+    """
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+    if _INLINE_TG_OPERATOR_PREFIX_RE.search(stripped):
+        return False
+    if "➊" in stripped or "┈" in stripped:
+        return False
+
+    first_line = stripped.splitlines()[0].strip()
+    has_html_heading = first_line.startswith("<b>") and "</b>" in first_line
+    has_tg_block_separator = "⠀" in stripped  # U+2800 braille blank used by tg posts
+    has_source_label = bool(re.search(r"(?im)^\s*(источник|source)\s*:", stripped))
+    has_markdown_source = bool(re.search(r"(?im)^\s*(источник|source)\s*:\s*\[[^\]]+\]\(https?://", stripped))
+    has_post_body = len([ln for ln in stripped.splitlines() if ln.strip()]) >= 4
+    if has_html_heading and has_post_body and (has_tg_block_separator or has_source_label):
+        return True
+
+    # Follow-up edits often produce a plain Telegram draft, not raw HTML:
+    #   Title
+    #   ⠀
+    #   body...
+    #   ⠀
+    #   Источник: [name](url)
+    # Those are still finished `/tg` artifacts and must be routed through
+    # ChipCR, never emitted by the Hermes bot as a final response.
+    short_title = 3 <= len(first_line) <= 120 and not first_line.startswith(("/", "#"))
+    has_multiple_tg_blocks = has_tg_block_separator and has_post_body
+    return bool(short_title and has_multiple_tg_blocks and (has_source_label or has_markdown_source))
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +498,10 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         # Auto skill routes: declarative per-chat skill modes (e.g. route URLs/media to /tg).
         self._auto_skill_routes: List[Dict[str, Any]] = self._load_auto_skill_routes()
+        # Inline preview guard: fail closed when a configured chat would receive
+        # a finished `/tg` preview from the Hermes bot instead of the required
+        # human-account sender path.
+        self._inline_preview_guard: Dict[str, Any] = self._load_inline_preview_guard()
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
@@ -1685,6 +1738,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            guard_result = await self._inline_preview_guard_send_result(chat_id, content, metadata)
+            if guard_result is not None:
+                return guard_result
+            guard_replacement = self._inline_preview_guard_replacement(chat_id, content, metadata)
+            if guard_replacement:
+                content = guard_replacement
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(
@@ -4206,6 +4266,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return group chat IDs that require an explicit bot trigger.
+
+        This is the per-chat counterpart to the global ``require_mention``
+        switch. It lets one noisy group/topic behave as mention/reply-only
+        without changing the default free-response behavior in other chats.
+        """
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -4474,6 +4548,9 @@ class TelegramAdapter(BasePlatformAdapter):
         DMs remain unrestricted. Group/supergroup messages are accepted when:
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
+        - the chat is explicitly listed in ``require_mention_chats`` and the
+          message replies to the bot, @mentions the bot, or matches a configured
+          regex wake-word pattern
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message replies to the bot
@@ -4534,6 +4611,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
+        if chat_id_str in self._telegram_require_mention_chats():
+            if self._is_reply_to_bot(message):
+                return True
+            if self._message_mentions_bot(message):
+                return True
+            return self._message_matches_mention_patterns(message)
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
@@ -4614,6 +4697,177 @@ class TelegramAdapter(BasePlatformAdapter):
             })
         return routes
 
+    def _load_inline_preview_guard(self) -> Dict[str, Any]:
+        """Load per-chat guard against Hermes-bot `/tg` previews.
+
+        Chip's TG chats are fail-closed by default in this install: finished
+        post previews must be routed through telegram-chip/ChipCR even when the
+        config entry is missing or incomplete. Config can still add chats or
+        override script/timeout, but not silently disable the hardcoded Chip
+        guard unless HERMES_DISABLE_CHIP_TG_PREVIEW_GUARD=1 is set for tests.
+        """
+        raw = self.config.extra.get("inline_preview_guard", {})
+        if raw is True:
+            raw = {"enabled": True}
+        if not isinstance(raw, dict):
+            raw = {}
+        chats = raw.get("chats") or []
+        if isinstance(chats, (str, int)):
+            chats = [chats]
+        chat_set = {str(chat_id) for chat_id in chats}
+        if os.getenv("HERMES_DISABLE_CHIP_TG_PREVIEW_GUARD", "0") != "1":
+            chat_set |= set(_CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
+        enabled = bool(raw.get("enabled", False)) or bool(chat_set & _CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
+        return {
+            "enabled": enabled,
+            "chats": chat_set,
+            "blocker": str(raw.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER),
+            "action": str(raw.get("action") or "chipcr_preview"),
+            "script": str(raw.get("script") or "/home/hermes/.hermes/skills/tg/scripts/send-reworked-preview.sh"),
+            "timeout": float(raw.get("timeout", 120)),
+        }
+
+    def _inline_preview_guard_applies(
+        self,
+        chat_id: str,
+        content: str,
+    ) -> bool:
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        if not guard.get("enabled"):
+            return False
+        chats = guard.get("chats") or set()
+        if chats and str(chat_id) not in chats:
+            return False
+        return _looks_like_inline_tg_preview(content)
+
+    @staticmethod
+    def _extract_tg_preview_state_message_id(state_path: str = "/tmp/tg_preview_state.json") -> Optional[str]:
+        try:
+            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not (data.get("ok") and data.get("verified")):
+            return None
+        mid = data.get("message_id") or (data.get("message_ids") or [None])[0]
+        return str(mid) if mid else None
+
+    def _send_inline_preview_via_chipcr_sync(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        script = str(guard.get("script") or "")
+        timeout = float(guard.get("timeout") or 120)
+        if not script or not os.path.exists(script):
+            return SendResult(success=False, error=f"inline preview guard script missing: {script}")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".html",
+            prefix="hermes-inline-tg-preview-",
+            delete=False,
+        ) as tmp:
+            tmp.write(content.strip() + "\n")
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                [script, "--chat-id", str(chat_id), "--file", tmp_path, "--no-media"],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode != 0:
+                detail = stderr or stdout or f"exit {proc.returncode}"
+                return SendResult(success=False, error=f"ChipCR preview send failed: {detail[:500]}")
+            message_id = self._extract_tg_preview_state_message_id()
+            if not message_id:
+                return SendResult(
+                    success=False,
+                    error="ChipCR preview send did not leave verified /tmp/tg_preview_state.json",
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response={
+                    "inline_preview_guard": "chipcr_preview",
+                    "stdout": stdout[-1000:],
+                },
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=f"ChipCR preview guard exception: {exc}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    async def _inline_preview_guard_send_result(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Route configured inline `/tg` previews through ChipCR instead of bot-send."""
+        if not self._inline_preview_guard_applies(chat_id, content):
+            return None
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        action = str(guard.get("action") or "blocker").strip().lower()
+        if action not in {"chipcr_preview", "chipcr", "send_chipcr"}:
+            return None
+        result = await asyncio.to_thread(
+            self._send_inline_preview_via_chipcr_sync,
+            chat_id,
+            content,
+            metadata,
+        )
+        if result.success:
+            logger.info(
+                "[%s] Routed inline TG preview through ChipCR guard (chat=%s message_id=%s)",
+                self.name,
+                chat_id,
+                result.message_id,
+            )
+            return result
+        self._last_inline_preview_guard_error = result.error
+        logger.error(
+            "[%s] ChipCR inline TG preview guard failed (chat=%s): %s",
+            self.name,
+            chat_id,
+            result.error,
+        )
+        return None
+
+    def _inline_preview_guard_replacement(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return blocker text when a configured chat would get inline preview."""
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        if not self._inline_preview_guard_applies(chat_id, content):
+            return None
+        thread_id = self._metadata_thread_id(metadata)
+        error = getattr(self, "_last_inline_preview_guard_error", "") or ""
+        logger.error(
+            "[%s] Blocked inline TG preview from Hermes bot (chat=%s thread=%s len=%d error=%s)",
+            self.name,
+            chat_id,
+            thread_id,
+            len(content or ""),
+            error,
+        )
+        blocker = str(guard.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER)
+        if error:
+            blocker = f"превью не отправлено/не подтверждено: {error[:700]}"
+            self._last_inline_preview_guard_error = ""
+        return blocker
+
     def _auto_skill_prefix_for_text(self, chat_id: str, text: str) -> Optional[str]:
         """Return a slash-command prefix when text matches an auto-skill route."""
         if not chat_id or not text or text.lstrip().startswith("/"):
@@ -4654,6 +4908,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._attach_replied_media_to_event(update.message, event)
 
         # Auto skill route: e.g. a chat can route URL-like source messages to /tg.
         chat_id = str(getattr(update.message.chat, "id", ""))
@@ -4670,9 +4925,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg, is_command=True):
             return
-        await self._ensure_forum_commands(msg)
-
-        event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        
+        event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
+        await self._attach_replied_media_to_event(update.message, event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4875,6 +5130,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        await self._attach_replied_media_to_event(msg, event)
         
         # Add caption as text
         if msg.caption:
@@ -5108,6 +5364,169 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
+
+    async def _attach_replied_media_to_event(self, msg: Message, event: MessageEvent) -> None:
+        """Attach media from the Telegram message being replied to.
+
+        Telegram reply updates include ``reply_to_message`` metadata. Hermes
+        already injects replied-to text/captions into context, but file-only
+        messages have empty text and were previously invisible to the agent.
+        This downloads supported replied-to media into the same local caches as
+        first-class incoming media so commands like ``/summ`` can operate on a
+        file referenced via Telegram's native Reply UI.
+        """
+        replied = getattr(msg, "reply_to_message", None)
+        if not replied:
+            return
+
+        def merge_replied_context(note: str) -> None:
+            if event.text and event.text.startswith("/"):
+                event.text = f"{event.text}\n\n{note}"
+            else:
+                event.text = f"{note}\n\n{event.text}" if event.text else note
+
+        try:
+            if getattr(replied, "photo", None):
+                photo = replied.photo[-1]
+                file_obj = await photo.get_file()
+                image_bytes = await file_obj.download_as_bytearray()
+                ext = ".jpg"
+                if getattr(file_obj, "file_path", None):
+                    for candidate in [".png", ".webp", ".gif", ".jpeg", ".jpg"]:
+                        if file_obj.file_path.lower().endswith(candidate):
+                            ext = candidate
+                            break
+                cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+                event.media_urls.append(cached_path)
+                event.media_types.append(f"image/{ext.lstrip('.')}")
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.PHOTO
+                logger.info("[Telegram] Cached replied-to photo at %s", cached_path)
+                return
+
+            if getattr(replied, "voice", None):
+                file_obj = await replied.voice.get_file()
+                audio_bytes = await file_obj.download_as_bytearray()
+                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
+                event.media_urls.append(cached_path)
+                event.media_types.append("audio/ogg")
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.VOICE
+                logger.info("[Telegram] Cached replied-to voice at %s", cached_path)
+                return
+
+            if getattr(replied, "audio", None):
+                file_obj = await replied.audio.get_file()
+                audio_bytes = await file_obj.download_as_bytearray()
+                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
+                event.media_urls.append(cached_path)
+                event.media_types.append("audio/mp3")
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.AUDIO
+                logger.info("[Telegram] Cached replied-to audio at %s", cached_path)
+                return
+
+            if getattr(replied, "video", None):
+                file_obj = await replied.video.get_file()
+                video_bytes = await file_obj.download_as_bytearray()
+                ext = ".mp4"
+                if getattr(file_obj, "file_path", None):
+                    for candidate in SUPPORTED_VIDEO_TYPES:
+                        if file_obj.file_path.lower().endswith(candidate):
+                            ext = candidate
+                            break
+                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                event.media_urls.append(cached_path)
+                event.media_types.append(SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4"))
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.VIDEO
+                logger.info("[Telegram] Cached replied-to video at %s", cached_path)
+                return
+
+            doc = getattr(replied, "document", None)
+            if not doc:
+                return
+
+            original_filename = doc.file_name or ""
+            _, ext = os.path.splitext(original_filename)
+            ext = ext.lower()
+            doc_mime = (doc.mime_type or "").lower()
+            if not ext and doc_mime:
+                ext = _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, "")
+                if not ext:
+                    mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+                    ext = mime_to_ext.get(doc_mime, "")
+                if not ext:
+                    video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
+                    ext = video_mime_to_ext.get(doc_mime, "")
+
+            MAX_DOC_BYTES = 20 * 1024 * 1024
+            if not doc.file_size or doc.file_size > MAX_DOC_BYTES:
+                note = (
+                    "[The message you replied to contains a document that is too large "
+                    "or whose size could not be verified. Maximum: 20 MB.]"
+                )
+                merge_replied_context(note)
+                logger.info("[Telegram] Replied-to document too large: %s bytes", doc.file_size)
+                return
+
+            if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
+                file_obj = await doc.get_file()
+                image_bytes = await file_obj.download_as_bytearray()
+                image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
+                cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
+                event.media_urls.append(cached_path)
+                event.media_types.append(doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg"))
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.PHOTO
+                logger.info("[Telegram] Cached replied-to image-document at %s", cached_path)
+                return
+
+            if ext in SUPPORTED_VIDEO_TYPES:
+                file_obj = await doc.get_file()
+                video_bytes = await file_obj.download_as_bytearray()
+                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                event.media_urls.append(cached_path)
+                event.media_types.append(SUPPORTED_VIDEO_TYPES[ext])
+                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                    event.message_type = MessageType.VIDEO
+                logger.info("[Telegram] Cached replied-to video document at %s", cached_path)
+                return
+
+            if ext not in SUPPORTED_DOCUMENT_TYPES:
+                note = (
+                    f"[The message you replied to contains an unsupported document type "
+                    f"'{ext or 'unknown'}'. Supported types: {', '.join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))}.]"
+                )
+                merge_replied_context(note)
+                logger.info("[Telegram] Unsupported replied-to document type: %s", ext or "unknown")
+                return
+
+            file_obj = await doc.get_file()
+            doc_bytes = await file_obj.download_as_bytearray()
+            raw_bytes = bytes(doc_bytes)
+            cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
+            event.media_urls.append(cached_path)
+            event.media_types.append(SUPPORTED_DOCUMENT_TYPES[ext])
+            if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
+                event.message_type = MessageType.DOCUMENT
+            logger.info("[Telegram] Cached replied-to document at %s", cached_path)
+
+            MAX_TEXT_INJECT_BYTES = 100 * 1024
+            if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                try:
+                    text_content = raw_bytes.decode("utf-8")
+                    display_name = original_filename or f"document{ext}"
+                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                    injection = f"[Content of replied-to {display_name}]:\n{text_content}"
+                    merge_replied_context(injection)
+                except UnicodeDecodeError:
+                    logger.warning(
+                        "[Telegram] Could not decode replied-to text file as UTF-8, skipping content injection",
+                        exc_info=True,
+                    )
+        except Exception as e:
+            logger.warning("[Telegram] Failed to cache replied-to media: %s", e, exc_info=True)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.

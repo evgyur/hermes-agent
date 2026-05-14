@@ -38,9 +38,11 @@ _ensure_telegram_mock()
 from gateway.platforms.telegram import (  # noqa: E402
     TelegramAdapter,
     _escape_mdv2,
+    _looks_like_inline_tg_preview,
     _strip_mdv2,
     _wrap_markdown_tables,
 )
+from gateway.platforms.base import SendResult  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -946,3 +948,60 @@ class TestTelegramGuestMentionGating:
         message.caption_entities = [_guest_mention_entity(text)]
 
         assert adapter._should_process_message(message) is True
+
+
+class TestInlinePreviewGuard:
+    def test_detects_finished_html_tg_post(self):
+        post = "<b>GPT-5.5 впервые закрыл задачу</b>\n⠀\nТекст поста.\n\nИсточник: ProgramBench"
+        assert _looks_like_inline_tg_preview(post) is True
+
+    def test_detects_plain_reworked_tg_post(self):
+        post = (
+            "GPT-5.5 впервые закрыла задачу в ProgramBench\n"
+            "⠀\n"
+            "ProgramBench наконец обновили результаты. GPT-5.5 прогнали в режимах high/xhigh.\n\n"
+            "И тут Claude явно отстаёт.\n"
+            "⠀\n"
+            "Источник: [ProgramBench](https://programbench.com/blog/gpt-5-5-first-solve/)"
+        )
+        assert _looks_like_inline_tg_preview(post) is True
+
+    def test_does_not_flag_operator_report(self):
+        report = "готово.\n\n➊ проверка\n┈ smoke ok\n┈ message_id: 123"
+        assert _looks_like_inline_tg_preview(report) is False
+
+    def test_chip_tg_guard_is_hardcoded_by_default(self):
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        assert adapter._inline_preview_guard["enabled"] is True
+        assert "-1003712304136" in adapter._inline_preview_guard["chats"]
+        assert adapter._inline_preview_guard["action"] == "chipcr_preview"
+
+    @pytest.mark.asyncio
+    async def test_chipcr_action_suppresses_bot_send(self, monkeypatch):
+        config = PlatformConfig(
+            enabled=True,
+            token="fake-token",
+            extra={
+                "inline_preview_guard": {
+                    "enabled": True,
+                    "action": "chipcr_preview",
+                    "chats": ["-1003712304136"],
+                }
+            },
+        )
+        adapter = TelegramAdapter(config)
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        post = "<b>GPT-5.5 впервые закрыл задачу</b>\n⠀\nТекст поста.\n\nИсточник: ProgramBench"
+
+        def fake_chipcr_send(chat_id, content, metadata=None):
+            assert chat_id == "-1003712304136"
+            assert content == post
+            return SendResult(success=True, message_id="777")
+
+        monkeypatch.setattr(adapter, "_send_inline_preview_via_chipcr_sync", fake_chipcr_send)
+
+        result = await adapter.send("-1003712304136", post)
+
+        assert result.success is True
+        assert result.message_id == "777"
+        adapter._bot.send_message.assert_not_called()
