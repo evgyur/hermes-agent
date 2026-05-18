@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ import subprocess
 import tempfile
 import html as _html
 import re
+import time
+from collections import deque
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,8 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        BusinessConnectionHandler,
+        BusinessMessagesDeletedHandler,
         ContextTypes,
         filters,
     )
@@ -48,6 +53,8 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    BusinessConnectionHandler = None
+    BusinessMessagesDeletedHandler = None
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -77,6 +84,7 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
+    TEXT_DOCUMENT_EXTENSIONS,
     utf16_len,
     _prefix_within_utf16_limit,
 )
@@ -144,6 +152,9 @@ _INLINE_TG_PREVIEW_BLOCKER = (
     "Нужный путь — telegram-chip / ChipCR с exact-message verify-gate."
 )
 _CHIP_TG_PREVIEW_GUARD_CHAT_IDS = {"-1003437858232", "-1003712304136"}
+_TG_PREVIEW_PENDING_ECHO_FILE = "/tmp/tg_preview_echo_pending.jsonl"
+_HUMAN20_CTA_TEXT = "перейти в @human20"
+_HUMAN20_CTA_URL = "https://t.me/human20"
 _INLINE_TG_OPERATOR_PREFIX_RE = re.compile(
     r"(?i)^\s*(готово|сделал|отправил|принял|да|нет|ок|ошибка|блокер|превью\s+не|smoke|proof)\b"
 )
@@ -185,6 +196,24 @@ def _looks_like_inline_tg_preview(text: str) -> bool:
     short_title = 3 <= len(first_line) <= 120 and not first_line.startswith(("/", "#"))
     has_multiple_tg_blocks = has_tg_block_separator and has_post_body
     return bool(short_title and has_multiple_tg_blocks and (has_source_label or has_markdown_source))
+
+
+def _tg_preview_visible_text(text: str) -> str:
+    """Normalize a TG preview caption/body for echo fingerprinting.
+
+    `send-preview.sh` writes HTML, but Telegram delivers the same ChipCR
+    message back to the bot as visible plain text plus entities. Hash the
+    visible form so the pre-send pending marker and incoming update match.
+    """
+    if not text:
+        return ""
+    visible = re.sub(r"<[^>]+>", "", text)
+    visible = _html.unescape(visible)
+    return visible.strip()
+
+
+def _tg_preview_echo_fingerprint(text: str) -> str:
+    return hashlib.sha256(_tg_preview_visible_text(text).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +412,89 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
+        # Cache of observed Telegram chat types so outbound replies can add
+        # DM-only affordances without extra Bot API lookups on every send.
+        self._chat_type_cache: Dict[str, str] = {}
+        # Ephemeral, in-memory cache of recent user-visible Telegram messages
+        # keyed by chat/topic lane. Telegram Bot API cannot fetch arbitrary
+        # history, so we keep the updates the gateway has actually observed and
+        # inject a compact per-turn snapshot before the model asks avoidable
+        # clarifying questions. This is never persisted to memory/transcripts.
+        self._recent_visible_messages: Dict[str, deque[dict[str, str]]] = {}
+        self._recent_visible_limit: int = int(os.getenv("HERMES_TELEGRAM_RECENT_CONTEXT_LIMIT", "20"))
+        self._recent_visible_store_limit: int = max(20, self._recent_visible_limit * 2)
+
+    def _recent_context_key_for_source(self, source) -> str:
+        """Return an isolation key for recent visible Telegram context."""
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = getattr(source, "thread_id", None)
+        if thread_id is not None:
+            return f"{chat_id}:thread:{thread_id}"
+        return chat_id
+
+    @staticmethod
+    def _recent_context_snippet(text: str, *, limit: int = 240) -> str:
+        snippet = " ".join(str(text or "").split())
+        if len(snippet) <= limit:
+            return snippet
+        return snippet[: limit - 1].rstrip() + "…"
+
+    def _format_recent_visible_context(self, event: MessageEvent) -> Optional[str]:
+        """Format recent same-chat/topic Telegram messages for prompt injection."""
+        key = self._recent_context_key_for_source(event.source)
+        recent = list(self._recent_visible_messages.get(key) or [])
+        if not recent:
+            return None
+        limit = max(1, self._recent_visible_limit)
+        lines = [
+            "## Recent visible Telegram context",
+            "",
+            "Same chat/topic, newest last. Ephemeral: do not save this to memory. Use it before asking clarifying questions.",
+        ]
+        for item in recent[-limit:]:
+            msg_id = item.get("message_id") or "?"
+            sender = item.get("sender") or "Telegram user"
+            text = item.get("text") or ""
+            if not text:
+                continue
+            lines.append(f"- ID {msg_id} | {sender}: {text}")
+        return "\n".join(lines) if len(lines) > 3 else None
+
+    def _attach_recent_visible_context(self, event: MessageEvent) -> None:
+        event.recent_context = self._format_recent_visible_context(event)
+
+    def _record_recent_visible_message(self, event: MessageEvent) -> None:
+        """Record the incoming Telegram message for later same-lane context."""
+        key = self._recent_context_key_for_source(event.source)
+        if not key:
+            return
+        raw = getattr(event, "raw_message", None)
+        visible_text = (
+            getattr(raw, "text", None)
+            or getattr(raw, "caption", None)
+            or event.text
+            or ""
+        )
+        if not visible_text:
+            return
+        source = event.source
+        sender = getattr(source, "user_name", None) or getattr(source, "user_id", None) or "Telegram user"
+        entry = {
+            "message_id": str(getattr(event, "message_id", "") or "?"),
+            "sender": str(sender),
+            "text": self._recent_context_snippet(visible_text),
+        }
+        bucket = self._recent_visible_messages.get(key)
+        if bucket is None:
+            bucket = deque(maxlen=self._recent_visible_store_limit)
+            self._recent_visible_messages[key] = bucket
+        bucket.append(entry)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Attach same-chat/topic recent context before normal dispatch."""
+        self._attach_recent_visible_context(event)
+        self._record_recent_visible_message(event)
+        await super().handle_message(event)
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -453,6 +565,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
+
+    @classmethod
+    def _business_connection_id_from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not metadata:
+            return None
+        value = metadata.get("business_connection_id") or metadata.get("telegram_business_connection_id")
+        return str(value) if value else None
+
+    @classmethod
+    def _business_kwargs(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        business_connection_id = cls._business_connection_id_from_metadata(metadata)
+        return {"business_connection_id": business_connection_id} if business_connection_id else {}
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1211,6 +1335,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            if getattr(filters.UpdateType, "BUSINESS_MESSAGE", None) is not None:
+                self._app.add_handler(TelegramMessageHandler(
+                    filters.UpdateType.BUSINESS_MESSAGE,
+                    self._handle_business_message,
+                ))
+            if BusinessConnectionHandler is not None:
+                self._app.add_handler(BusinessConnectionHandler(self._handle_business_connection))
+            if BusinessMessagesDeletedHandler is not None:
+                self._app.add_handler(BusinessMessagesDeletedHandler(self._handle_business_messages_deleted))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -1498,6 +1631,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     should_thread = self._should_thread_reply(reply_to_source, i)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+                human20_reply_markup = self._human20_inline_markup(chat_id, metadata) if i == len(chunks) - 1 else None
                 thread_kwargs = self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -1517,7 +1651,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
+                                **self._business_kwargs(metadata),
                                 **self._link_preview_kwargs(),
+                                reply_markup=human20_reply_markup,
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
@@ -1531,7 +1667,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
+                                    **self._business_kwargs(metadata),
                                     **self._link_preview_kwargs(),
+                                    reply_markup=human20_reply_markup,
                                     **self._notification_kwargs(metadata),
                                 )
                             else:
@@ -2208,6 +2346,440 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _handle_gptprof_callback(self, query, data: str) -> None:
+        """Handle Chip's /gptprof inline keyboard callbacks."""
+        auth_path = "/home/hermes/.hermes/auth.json"
+        config_path = "/home/hermes/.hermes/config.yaml"
+        hcp_dir = "/home/hermes/.hermes/skills/chip/hcp"
+        send_script = "/home/hermes/.hermes/skills/chip/gptprof/send_buttons.py"
+        python_bin = "/opt/hermes-agent/venv/bin/python3"
+        pending_auth_path = "/tmp/gptprof_pending_auth.json"
+
+        def _load_json(path: str, default: Any) -> Any:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return default
+
+        def _write_json(path: str, value: Any) -> None:
+            directory = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".json", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(value, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                atomic_replace(tmp, path)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+
+        def _write_yaml(path: str, value: Any) -> None:
+            import yaml as _yaml
+            directory = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".yaml", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _yaml.safe_dump(value, f, allow_unicode=True, sort_keys=False)
+                atomic_replace(tmp, path)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+
+        async def _send_fresh_card(answer: str, *, clear_cache: bool = False) -> None:
+            await query.answer(text=answer)
+            if clear_cache:
+                try:
+                    _write_json("/tmp/gptprof_usage_cache.json", {})
+                except Exception:
+                    pass
+            try:
+                subprocess.Popen(
+                    [python_bin, send_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                logger.error("gptprof refresh failed: %s", exc, exc_info=True)
+
+        def _usage_score(slug: str) -> tuple[int, int]:
+            cache = _load_json("/tmp/gptprof_usage_cache.json", {})
+            payload = cache.get(slug, {}) if isinstance(cache, dict) else {}
+            rl = (payload.get("rate_limit") or {}) if isinstance(payload, dict) else {}
+            primary = rl.get("primary_window") or {}
+            secondary = rl.get("secondary_window") or {}
+            def left(window: dict) -> int:
+                used = window.get("used_percent") if isinstance(window, dict) else None
+                return max(0, 100 - int(used)) if isinstance(used, (int, float)) else -1
+            return (left(secondary), left(primary))
+
+        def _active_slug() -> str:
+            auth = _load_json(auth_path, {})
+            if isinstance(auth, dict):
+                codex = auth.get("codex")
+                if isinstance(codex, dict) and codex.get("profile"):
+                    return str(codex["profile"])
+            return "gptinvest23"
+
+        def _model_for_slug(slug: str) -> str:
+            return {
+                "gptinvest23": "gpt-5.5",
+                "markov495": "gpt-5.4",
+                "mintsage": "gpt-5.4-mini",
+                "omnifocusme": "gpt-5.4-mini",
+            }.get(slug, "gpt-5.5")
+
+        def _persist_new_auth(slug: str, access_token: str, refresh_token: str) -> None:
+            profile_path = os.path.join(hcp_dir, f"{slug}.json")
+            profile = _load_json(profile_path, {})
+            if not isinstance(profile, dict):
+                profile = {}
+            profile.setdefault("profile", slug)
+            profile.setdefault("email", f"{slug}@gmail.com")
+            profile.setdefault("plan", "Codex")
+            profile["access_token"] = access_token
+            profile["refresh_token"] = refresh_token
+            _write_json(profile_path, profile)
+
+            auth = _load_json(auth_path, {})
+            if not isinstance(auth, dict):
+                auth = {}
+            auth["codex"] = {
+                "profile": slug,
+                "plan": profile.get("plan"),
+                "email": profile.get("email"),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            }
+            pool_root = auth.setdefault("credential_pool", {})
+            if isinstance(pool_root, dict):
+                pool = pool_root.get("openai-codex")
+                if not isinstance(pool, list):
+                    pool = []
+                selected_source = f"gptprof:{slug}"
+                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
+                selected = {
+                    "id": f"gptprof-{slug}",
+                    "label": profile.get("email") or slug,
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": selected_source,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                    "request_count": 0,
+                }
+                for idx, item in enumerate(existing, start=1):
+                    if isinstance(item, dict):
+                        item["priority"] = idx
+                pool_root["openai-codex"] = [selected, *existing]
+            _write_json(auth_path, auth)
+
+            try:
+                import yaml as _yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model")
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                model_cfg["provider"] = "openai-codex"
+                model_cfg["default"] = _model_for_slug(slug)
+                model_cfg["base_url"] = "https://chatgpt.com/backend-api/codex"
+                model_cfg["api_mode"] = "codex_responses"
+                cfg["model"] = model_cfg
+                _write_yaml(config_path, cfg)
+            except Exception as exc:
+                logger.error("gptprof new auth config update failed: %s", exc, exc_info=True)
+
+        async def _start_new_auth() -> None:
+            slug = _active_slug()
+            issuer = "https://auth.openai.com"
+            client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+            token_url = "https://auth.openai.com/oauth/token"
+            message = getattr(query, "message", None)
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    resp = await client.post(
+                        f"{issuer}/api/accounts/deviceauth/usercode",
+                        json={"client_id": client_id},
+                        headers={"Content-Type": "application/json"},
+                    )
+                if resp.status_code != 200:
+                    await query.answer(text=f"New auth failed: {resp.status_code}")
+                    return
+                device_data = resp.json()
+                user_code = str(device_data.get("user_code") or "")
+                device_auth_id = str(device_data.get("device_auth_id") or "")
+                poll_interval = max(3, int(device_data.get("interval") or 5))
+                if not user_code or not device_auth_id:
+                    await query.answer(text="New auth failed: empty device code.")
+                    return
+            except Exception as exc:
+                logger.error("gptprof new auth start failed: %s", exc, exc_info=True)
+                await query.answer(text="New auth failed to start.")
+                return
+
+            _write_json(pending_auth_path, {
+                "slug": slug,
+                "issuer": issuer,
+                "client_id": client_id,
+                "token_url": token_url,
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+                "poll_interval": poll_interval,
+                "created_at": time.time(),
+                "expires_at": time.time() + 15 * 60,
+            })
+
+            await query.answer(text="New auth started.")
+            if message is not None:
+                try:
+                    await message.reply_text(
+                        "🔑 New Codex auth\n\n"
+                        f"Profile: {slug}\n"
+                        f"Open: {issuer}/codex/device\n"
+                        f"Code: {user_code}\n\n"
+                        "After sign-in, press Check auth.",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Check auth", callback_data="gptprof:check_auth"),
+                        ]]),
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
+
+        async def _check_pending_auth() -> None:
+            pending = _load_json(pending_auth_path, {})
+            if not isinstance(pending, dict) or not pending.get("device_auth_id"):
+                await query.answer(text="No pending auth. Press New auth first.")
+                return
+            if time.time() > float(pending.get("expires_at") or 0):
+                try:
+                    os.unlink(pending_auth_path)
+                except OSError:
+                    pass
+                await query.answer(text="Auth code expired. Press New auth again.")
+                return
+
+            slug = str(pending.get("slug") or _active_slug())
+            issuer = str(pending.get("issuer") or "https://auth.openai.com")
+            client_id = str(pending.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann")
+            token_url = str(pending.get("token_url") or "https://auth.openai.com/oauth/token")
+            device_auth_id = str(pending.get("device_auth_id") or "")
+            user_code = str(pending.get("user_code") or "")
+            message = getattr(query, "message", None)
+
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    poll_resp = await client.post(
+                        f"{issuer}/api/accounts/deviceauth/token",
+                        json={"device_auth_id": device_auth_id, "user_code": user_code},
+                        headers={"Content-Type": "application/json"},
+                    )
+                if poll_resp.status_code in (403, 404):
+                    await query.answer(text="Auth is not completed yet.")
+                    return
+                if poll_resp.status_code != 200:
+                    await query.answer(text=f"Auth check failed: {poll_resp.status_code}")
+                    return
+                code_resp = poll_resp.json()
+                authorization_code = str(code_resp.get("authorization_code") or "")
+                code_verifier = str(code_resp.get("code_verifier") or "")
+                if not authorization_code or not code_verifier:
+                    await query.answer(text="Auth check returned incomplete data.")
+                    return
+
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    token_resp = await client.post(
+                        token_url,
+                        data={
+                            "grant_type": "authorization_code",
+                            "code": authorization_code,
+                            "redirect_uri": f"{issuer}/deviceauth/callback",
+                            "client_id": client_id,
+                            "code_verifier": code_verifier,
+                        },
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    )
+                if token_resp.status_code != 200:
+                    await query.answer(text=f"Token exchange failed: {token_resp.status_code}")
+                    return
+                tokens = token_resp.json()
+                access_token = str(tokens.get("access_token") or "")
+                refresh_token = str(tokens.get("refresh_token") or "")
+                if not access_token or not refresh_token:
+                    await query.answer(text="Token exchange returned incomplete tokens.")
+                    return
+
+                _persist_new_auth(slug, access_token, refresh_token)
+                try:
+                    os.unlink(pending_auth_path)
+                except OSError:
+                    pass
+                try:
+                    cache = _load_json("/tmp/gptprof_usage_cache.json", {})
+                    if isinstance(cache, dict):
+                        cache.pop(slug, None)
+                        _write_json("/tmp/gptprof_usage_cache.json", cache)
+                except Exception:
+                    pass
+                await query.answer(text=f"Auth saved: {slug}")
+                if message is not None:
+                    try:
+                        await message.reply_text(f"✅ New auth saved for {slug}. Refreshing usage…")
+                    except Exception:
+                        pass
+                try:
+                    subprocess.Popen(
+                        [python_bin, send_script],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.error("gptprof auth check failed: %s", exc, exc_info=True)
+                await query.answer(text="Auth check failed.")
+
+        async def _switch(slug: str, model: str, *, autoswitch: bool = False) -> None:
+            safe_slugs = {"gptinvest23", "markov495", "mintsage", "omnifocusme"}
+            if slug not in safe_slugs:
+                await query.answer(text="Unknown profile.")
+                return
+            profile_path = os.path.join(hcp_dir, f"{slug}.json")
+            profile = _load_json(profile_path, {})
+            if not isinstance(profile, dict) or not profile.get("access_token"):
+                await query.answer(text="Profile token not found.")
+                return
+
+            auth = _load_json(auth_path, {})
+            if not isinstance(auth, dict):
+                auth = {}
+            codex_entry = {
+                "profile": slug,
+                "plan": profile.get("plan"),
+                "email": profile.get("email"),
+                "access_token": profile.get("access_token"),
+                "refresh_token": profile.get("refresh_token"),
+            }
+            auth["codex"] = codex_entry
+
+            pool_root = auth.setdefault("credential_pool", {})
+            if isinstance(pool_root, dict):
+                pool = pool_root.get("openai-codex")
+                if not isinstance(pool, list):
+                    pool = []
+                # Put the selected profile first so Codex inference uses it immediately.
+                selected_source = f"gptprof:{slug}"
+                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
+                selected = {
+                    "id": f"gptprof-{slug}",
+                    "label": profile.get("email") or slug,
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": selected_source,
+                    "access_token": profile.get("access_token"),
+                    "refresh_token": profile.get("refresh_token"),
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                    "request_count": 0,
+                }
+                for idx, item in enumerate(existing, start=1):
+                    if isinstance(item, dict):
+                        item["priority"] = idx
+                pool_root["openai-codex"] = [selected, *existing]
+
+            _write_json(auth_path, auth)
+
+            try:
+                import yaml as _yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model")
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {"default": model}
+                model_cfg["provider"] = "openai-codex"
+                model_cfg["default"] = model
+                model_cfg["base_url"] = "https://chatgpt.com/backend-api/codex"
+                model_cfg["api_mode"] = "codex_responses"
+                cfg["model"] = model_cfg
+                _write_yaml(config_path, cfg)
+            except Exception as exc:
+                logger.error("gptprof config update failed: %s", exc, exc_info=True)
+                await query.answer(text="Profile switched, config update failed.")
+                return
+
+            label = "Autoswitched" if autoswitch else "Switched"
+            await query.answer(text=f"{label}: {slug}")
+            try:
+                await query.edit_message_text(
+                    text=f"✅ {label} to {slug}\n🧠 Model: openai-codex/{model}\n\nUse /new for a fresh session.",
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+            except Exception:
+                pass
+            try:
+                subprocess.Popen(
+                    [python_bin, send_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception:
+                pass
+
+        if data == "gptprof:close":
+            await query.answer(text="Closed.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        if data in {"gptprof:add", "gptprof:new_auth"}:
+            await _start_new_auth()
+            return
+        if data == "gptprof:pi_route":
+            await query.answer(text="Pi route stays available as fallback.")
+            return
+        if data == "gptprof:refresh":
+            await _send_fresh_card("Usage refreshed.", clear_cache=True)
+            return
+        if data == "gptprof:check_auth":
+            await _check_pending_auth()
+            return
+        if data == "gptprof:autoswitch":
+            model_by_slug = {
+                "gptinvest23": "gpt-5.5",
+                "markov495": "gpt-5.4",
+                "mintsage": "gpt-5.4-mini",
+                "omnifocusme": "gpt-5.4-mini",
+            }
+            slug = max(model_by_slug, key=_usage_score)
+            await _switch(slug, model_by_slug[slug], autoswitch=True)
+            return
+
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid gptprof action.")
+            return
+        _, slug, model = parts
+        await _switch(slug, model)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -2222,6 +2794,21 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- GPT profile callbacks ---
+        if data.startswith("gptprof:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to switch GPT profiles.")
+                return
+            await self._handle_gptprof_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
@@ -2479,6 +3066,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "voice": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
+                            "reply_markup": self._human20_inline_markup(chat_id, metadata),
                             **voice_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -2504,6 +3092,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "audio": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
+                            "reply_markup": self._human20_inline_markup(chat_id, metadata),
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -2795,6 +3384,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "filename": display_name,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
+                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -2841,6 +3431,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "video": f,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
+                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -2892,6 +3483,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo": image_url,
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
+                    "reply_markup": self._human20_inline_markup(chat_id, metadata),
                     **photo_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -2928,6 +3520,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "photo": image_data,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
+                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **upload_thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -2974,6 +3567,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "animation": animation_url,
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
+                    "reply_markup": self._human20_inline_markup(chat_id, metadata),
                     **animation_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -3015,6 +3609,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     action="typing",
                     message_thread_id=message_thread_id,
+                    **self._business_kwargs(metadata),
                 )
             except Exception as e:
                 # Typing failures are non-fatal; log at debug level only.
@@ -3425,6 +4020,54 @@ class TelegramAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    @staticmethod
+    def _message_matches_sigurd_trigger(message: Message) -> bool:
+        for candidate in (getattr(message, "text", None), getattr(message, "caption", None)):
+            if candidate and re.search(r"(?i)\bsigurd\b", candidate):
+                return True
+        return False
+
+    def _cache_observed_chat_type(self, chat_id: str, chat_type: str) -> None:
+        chat_type = str(chat_type or "").strip().lower()
+        if not chat_type:
+            return
+        cache = getattr(self, "_chat_type_cache", None)
+        if cache is None:
+            cache = {}
+            self._chat_type_cache = cache
+        cache[str(chat_id)] = chat_type
+
+    def _outbound_chat_type(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+            return "dm"
+        cache = getattr(self, "_chat_type_cache", None) or {}
+        return cache.get(str(chat_id))
+
+    def _human20_inline_markup(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_markup: Optional[Any] = None,
+    ) -> Optional[Any]:
+        metadata = metadata or {}
+        if self._outbound_chat_type(chat_id, metadata) != "dm":
+            return reply_markup
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        except Exception:
+            return reply_markup
+
+        button = InlineKeyboardButton(_HUMAN20_CTA_TEXT, url=_HUMAN20_CTA_URL)
+        if reply_markup is None:
+            return InlineKeyboardMarkup([[button]])
+
+        try:
+            rows = [list(row) for row in getattr(reply_markup, "inline_keyboard", [])]
+        except Exception:
+            rows = []
+        rows.append([button])
+        return InlineKeyboardMarkup(rows)
+
     def _is_guest_mention(self, message: Message) -> bool:
         """Return True for the narrow guest-mode bypass: explicit bot mention.
 
@@ -3443,7 +4086,8 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
-        DMs remain unrestricted. Group/supergroup messages are accepted when:
+        DMs require a direct trigger: reply, explicit @mention, or the
+        configured Sigurd wake word. Group/supergroup messages are accepted when:
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
         - the chat is explicitly listed in ``require_mention_chats`` and the
@@ -3466,7 +4110,17 @@ class TelegramAdapter(BasePlatformAdapter):
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
         if not self._is_group_chat(message):
-            return True
+            sender = getattr(message, "from_user", None)
+            sender_id = str(getattr(sender, "id", "") or "").strip()
+            allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+            allowed_ids = {part.strip() for part in allowed_csv.split(",") if part.strip()}
+            if sender_id and ("*" in allowed_ids or sender_id in allowed_ids):
+                return True
+            return (
+                bool(getattr(message, "reply_to_message", None))
+                or self._message_mentions_bot(message)
+                or self._message_matches_sigurd_trigger(message)
+            )
 
         thread_id = getattr(message, "message_thread_id", None)
         if thread_id is not None:
@@ -3713,9 +4367,112 @@ class TelegramAdapter(BasePlatformAdapter):
             self._last_inline_preview_guard_error = ""
         return blocker
 
+    @staticmethod
+    def _recent_chipcr_preview_message_ids() -> set[str]:
+        """Return exact message ids sent by the ChipCR `/tg` preview path.
+
+        `telegram-chip` sends previews from Chip's human account, so Telegram
+        delivers those messages back to this bot as normal user messages. If we
+        process that echo, the auto `/tg` route can recursively preview the
+        preview. The canonical sender writes verified ids to these local state
+        files; treat only exact ids as self-generated preview echoes.
+        """
+        ids: set[str] = set()
+        state_path = os.getenv("TG_PREVIEW_STATE_FILE", "/tmp/tg_preview_state.json")
+        message_id_path = os.getenv("TG_PREVIEW_MESSAGE_ID_FILE", "/tmp/tg_preview_message_id.txt")
+
+        try:
+            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
+            if data.get("ok") and data.get("verified"):
+                for value in data.get("message_ids") or []:
+                    if value is not None:
+                        ids.add(str(value))
+                if data.get("message_id") is not None:
+                    ids.add(str(data.get("message_id")))
+        except Exception:
+            pass
+
+        try:
+            for line in _Path(message_id_path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    ids.add(line)
+        except Exception:
+            pass
+
+        return ids
+
+    @staticmethod
+    def _pending_chipcr_preview_echo_fingerprints(chat_id: str) -> set[str]:
+        """Return still-valid pre-send preview fingerprints for this chat.
+
+        The exact-id guard is not enough: Telegram can deliver the ChipCR echo
+        while `send-preview.sh` is still verifying and before it has written the
+        final state file (or when callers use a custom state path). The sender
+        therefore writes a short-lived content fingerprint before sending.
+        """
+        path = os.getenv("TG_PREVIEW_PENDING_ECHO_FILE", _TG_PREVIEW_PENDING_ECHO_FILE)
+        now = time.time()
+        fingerprints: set[str] = set()
+        try:
+            lines = _Path(path).read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return fingerprints
+        for line in lines[-200:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            if str(data.get("chat_id") or "") != str(chat_id):
+                continue
+            try:
+                expires_at = float(data.get("expires_at") or 0)
+            except (TypeError, ValueError):
+                expires_at = 0
+            if expires_at and expires_at < now:
+                continue
+            value = str(data.get("sha256") or "").strip()
+            if value:
+                fingerprints.add(value)
+        return fingerprints
+
+    def _is_chipcr_tg_preview_echo(self, message: Message) -> bool:
+        """Return True for ChipCR preview messages that must be ignored.
+
+        `telegram-chip` posts from Chip's human account, so Bot API receives the
+        preview as a normal user message. Exact ids are preferred; pending
+        fingerprints cover the race before exact state is visible.
+        """
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        guarded_chats = guard.get("chats") or set(_CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
+        if guarded_chats and chat_id not in guarded_chats:
+            return False
+
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        username = str(getattr(user, "username", "") or "").lstrip("@").lower()
+        if user_id and user_id != "617744661" and username != "chipcr":
+            return False
+
+        message_id = str(getattr(message, "message_id", "") or "")
+        if message_id and message_id in self._recent_chipcr_preview_message_ids():
+            return True
+
+        visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        if not _looks_like_inline_tg_preview(visible_text):
+            return False
+        pending = self._pending_chipcr_preview_echo_fingerprints(chat_id)
+        return bool(pending and _tg_preview_echo_fingerprint(visible_text) in pending)
+
     def _auto_skill_prefix_for_text(self, chat_id: str, text: str) -> Optional[str]:
         """Return a slash-command prefix when text matches an auto-skill route."""
         if not chat_id or not text or text.lstrip().startswith("/"):
+            return None
+        if _looks_like_inline_tg_preview(text):
             return None
         has_url = bool(re.search(r"https?://\S+|t\.co/\S+", text))
         for route in self._auto_skill_routes:
@@ -3737,6 +4494,160 @@ class TelegramAdapter(BasePlatformAdapter):
                 return f"/{route['skill']} "
         return None
 
+    def _telegram_business_config(self) -> Dict[str, Any]:
+        cfg = self.config.extra.get("business") or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _telegram_business_enabled(self) -> bool:
+        value = self._telegram_business_config().get("enabled", False)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _telegram_business_allowed_chats(self) -> set[str]:
+        raw = self._telegram_business_config().get("allowed_chats") or []
+        if isinstance(raw, (str, int)):
+            raw = [raw]
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def _telegram_business_trigger_words(self) -> List[str]:
+        raw = self._telegram_business_config().get("trigger_words") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        words = [str(item).strip() for item in raw if str(item).strip()]
+        if not words:
+            words = ["Sigurd", "Сигурд"]
+        return words
+
+    def _telegram_business_allow_reply_trigger(self) -> bool:
+        """Return whether replying to a prior bot message wakes Business mode.
+
+        Telegram Business delegated chats are often used as ambient operator
+        inboxes. A plain reply to a previous bot message can be accidental noise
+        (especially around inline-keyboard/status messages), so Business mode is
+        wake-word/mention-only by default. Installations that explicitly want
+        reply-to-bot follow-ups can opt in with
+        ``telegram.business.allow_reply_trigger: true``.
+        """
+        value = self._telegram_business_config().get("allow_reply_trigger", False)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _message_matches_business_trigger(self, message: Message) -> bool:
+        if self._telegram_business_allow_reply_trigger() and self._is_reply_to_bot(message):
+            return True
+        if self._message_mentions_bot(message):
+            return True
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+        if not text:
+            return False
+        for word in self._telegram_business_trigger_words():
+            if re.match(rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])", text):
+                return True
+        return False
+
+    def _strip_business_trigger_text(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        cleaned = self._clean_bot_trigger_text(text)
+        for word in self._telegram_business_trigger_words():
+            stripped = re.sub(rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])*\s*", "", cleaned, count=1).strip()
+            stripped = stripped.lstrip(" ,.:;!?-").strip()
+            if stripped != cleaned:
+                return stripped or cleaned
+        return cleaned
+
+    def _is_business_trusted_actor(self, message: Message) -> bool:
+        sender = getattr(message, "from_user", None)
+        sender_id = str(getattr(sender, "id", "") or "").strip()
+        if not sender_id:
+            return False
+        explicit_ids: set[str] = set()
+        for env_name in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+            for part in os.getenv(env_name, "").split(","):
+                part = part.strip()
+                if part and part != "*":
+                    explicit_ids.add(part)
+        if sender_id in explicit_ids:
+            return True
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        pairing_store = getattr(runner, "pairing_store", None)
+        is_approved = getattr(pairing_store, "is_approved", None)
+        if callable(is_approved):
+            try:
+                return bool(is_approved("telegram", sender_id))
+            except Exception:
+                logger.debug("[Telegram] Business pairing-store trust check failed", exc_info=True)
+        return False
+
+    async def _handle_business_connection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        conn = getattr(update, "business_connection", None)
+        logger.info(
+            "Received Telegram Business connection update id=%s user_id=%s can_reply=%s",
+            getattr(conn, "id", None),
+            getattr(getattr(conn, "user", None), "id", None),
+            getattr(conn, "can_reply", None),
+        )
+
+    async def _handle_business_messages_deleted(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        deleted = getattr(update, "deleted_business_messages", None)
+        logger.info(
+            "Received Telegram Business messages deleted update business_connection_id=%s chat_id=%s",
+            getattr(deleted, "business_connection_id", None),
+            getattr(getattr(deleted, "chat", None), "id", None),
+        )
+
+    async def _handle_business_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = getattr(update, "business_message", None)
+        if not msg:
+            return
+        chat = getattr(msg, "chat", None)
+        sender = getattr(msg, "from_user", None)
+        business_connection_id = getattr(msg, "business_connection_id", None)
+        has_text = bool(getattr(msg, "text", None) or getattr(msg, "caption", None))
+        logger.info(
+            "Received Telegram Business message update chat_id=%s user_id=%s has_text=%s business_connection_id=%s",
+            getattr(chat, "id", None),
+            getattr(sender, "id", None),
+            has_text,
+            bool(business_connection_id),
+        )
+        if not self._telegram_business_enabled():
+            logger.info("Ignored Telegram Business message chat_id=%s reason=business_disabled", getattr(chat, "id", None))
+            return
+        if not business_connection_id:
+            logger.warning("Ignored Telegram Business message chat_id=%s reason=missing_business_connection_id", getattr(chat, "id", None))
+            return
+        if not has_text:
+            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_text", getattr(chat, "id", None))
+            return
+        if sender and getattr(sender, "is_bot", False):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=bot_sender", getattr(chat, "id", None))
+            return
+        if self._bot and sender and getattr(sender, "id", None) == getattr(self._bot, "id", None):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=self_sender", getattr(chat, "id", None))
+            return
+        chat_id = str(getattr(chat, "id", "") or "")
+        allowed_chats = self._telegram_business_allowed_chats()
+        if allowed_chats and chat_id not in allowed_chats:
+            logger.info("Ignored Telegram Business message chat_id=%s reason=chat_not_allowed", chat_id)
+            return
+        if not self._message_matches_business_trigger(msg):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_trigger", chat_id)
+            return
+
+        trusted = self._is_business_trusted_actor(msg)
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = self._strip_business_trigger_text(getattr(msg, "text", None) or getattr(msg, "caption", None) or event.text) or event.text
+        event.source.business_connection_id = str(business_connection_id)
+        event.source.external_safe_mode = not trusted
+        event.source.chat_type = "dm"
+        await self._attach_replied_media_to_event(msg, event)
+        logger.info(
+            "Accepted Telegram Business message chat_id=%s user_id=%s business_connection_id=True external_safe_mode=%s",
+            chat_id,
+            getattr(sender, "id", None),
+            event.source.external_safe_mode,
+        )
+        self._enqueue_text_event(event)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -3745,6 +4656,13 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         if not update.message or not update.message.text:
+            return
+        if self._is_chipcr_tg_preview_echo(update.message):
+            logger.info(
+                "[Telegram] Ignoring ChipCR /tg preview echo chat=%s message_id=%s",
+                getattr(getattr(update.message, "chat", None), "id", None),
+                getattr(update.message, "message_id", None),
+            )
             return
         if not self._should_process_message(update.message):
             return
@@ -3934,6 +4852,13 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if self._is_chipcr_tg_preview_echo(update.message):
+            logger.info(
+                "[Telegram] Ignoring ChipCR /tg preview media echo chat=%s message_id=%s",
+                getattr(getattr(update.message, "chat", None), "id", None),
+                getattr(update.message, "message_id", None),
+            )
             return
         if not self._should_process_message(update.message):
             return
@@ -4152,7 +5077,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                if ext in TEXT_DOCUMENT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
                         display_name = original_filename or f"document{ext}"
@@ -4326,7 +5251,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[Telegram] Cached replied-to document at %s", cached_path)
 
             MAX_TEXT_INJECT_BYTES = 100 * 1024
-            if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+            if ext in TEXT_DOCUMENT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                 try:
                     text_content = raw_bytes.decode("utf-8")
                     display_name = original_filename or f"document{ext}"
@@ -4597,13 +5522,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Build source
         source = self.build_source(
             chat_id=str(chat.id),
-            chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
+            chat_name=getattr(chat, "title", None) or getattr(chat, "full_name", None),
             chat_type=chat_type,
             user_id=str(user.id) if user else (str(chat.id) if chat_type == "dm" else None),
-            user_name=user.full_name if user else (chat.full_name if hasattr(chat, "full_name") and chat_type == "dm" else None),
+            user_name=getattr(user, "full_name", None) if user else (getattr(chat, "full_name", None) if chat_type == "dm" else None),
             thread_id=thread_id_str,
             chat_topic=chat_topic,
         )
+        self._cache_observed_chat_type(str(chat.id), chat_type)
         
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)

@@ -76,16 +76,19 @@ def _group_message(
     )
 
 
-def _dm_message(text="hello", *, from_user_id=111):
+def _dm_message(text="hello", *, from_user_id=111, reply_to_bot=False, entities=None, caption=None, caption_entities=None):
+    reply_to_message = None
+    if reply_to_bot:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999))
     return SimpleNamespace(
         text=text,
-        caption=None,
-        entities=[],
-        caption_entities=[],
+        caption=caption,
+        entities=entities or [],
+        caption_entities=caption_entities or [],
         message_thread_id=None,
         chat=SimpleNamespace(id=from_user_id, type="private"),
         from_user=SimpleNamespace(id=from_user_id),
-        reply_to_message=None,
+        reply_to_message=reply_to_message,
     )
 
 
@@ -150,6 +153,39 @@ def test_group_messages_can_require_direct_trigger_via_config():
     # And commands still pass unconditionally when require_mention is disabled
     adapter_no_mention = _make_adapter(require_mention=False)
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
+
+
+def test_private_dms_require_direct_trigger_or_sigurd():
+    adapter = _make_adapter(require_mention=False)
+
+    assert adapter._should_process_message(_dm_message("hello there")) is False
+    assert adapter._should_process_message(
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+    assert adapter._should_process_message(_dm_message("replying", reply_to_bot=True)) is True
+    assert adapter._should_process_message(_dm_message("Sigurd, status")) is True
+
+
+def test_business_messages_are_wake_word_or_mention_only_by_default():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is False
+    assert adapter._message_matches_business_trigger(_dm_message("Sigurd, check this")) is True
+    assert adapter._message_matches_business_trigger(
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_business_reply_trigger_requires_explicit_opt_in():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is True
 
 
 def test_free_response_chats_bypass_mention_requirement():
@@ -334,8 +370,8 @@ def test_config_env_overrides_telegram_user_allowlists(monkeypatch, tmp_path):
 def test_dm_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
     adapter = _make_adapter(allow_from=["111", "222"])
 
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is True
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is True
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is False
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is False
 
 
 def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
