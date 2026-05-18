@@ -9388,7 +9388,20 @@ class GatewayRunner:
         if mgr is None:
             return t("gateway.goal.unavailable")
 
-        if not args or lower == "status":
+        # UX shortcut for Telegram/Discord/etc.: reply to a plan/message with
+        # bare `/goal` and use the replied-to text as the standing goal.  Keep
+        # `/goal` without a reply as status for backwards compatibility, and
+        # keep explicit subcommands (`/goal status`, `/goal pause`, …) as
+        # controls even when they are sent as replies.
+        if not args:
+            replied_text = (getattr(event, "reply_to_text", None) or "").strip()
+            if replied_text:
+                args = replied_text
+                lower = args.lower()
+            else:
+                return mgr.status_line()
+
+        if lower == "status":
             return mgr.status_line()
 
         if lower == "pause":
