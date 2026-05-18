@@ -1296,43 +1296,12 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
 def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     """Resolve a fresh xAI OAuth (api_key, base_url) for auxiliary clients.
 
-    Prefer the credential pool, matching the main runtime/provider status
-    path.  Some xAI OAuth logins live only as pool entries; falling straight
-    to the singleton auth-store resolver would make auxiliary tasks such as
-    compression report "no provider configured" even though ``hermes auth
-    status`` shows xAI OAuth as logged in.
-
-    Falls back to ``hermes_cli.auth``'s singleton runtime resolver for older
-    auth-store-only logins. Returns ``None`` if the user is not authenticated
-    with xAI Grok OAuth.
+    Routes through ``hermes_cli.auth``'s runtime resolver so the auto-refresh
+    path is shared with the main agent, instead of relying on whatever raw
+    tokens happen to be sitting in auth.json or the credential pool.  Returns
+    ``None`` if the user is not authenticated with xAI Grok OAuth (so
+    ``_resolve_auto`` Step 1 falls through to the next provider in the chain).
     """
-    try:
-        from hermes_cli.auth import (
-            DEFAULT_XAI_OAUTH_BASE_URL,
-            _xai_validate_inference_base_url,
-        )
-
-        pool = load_pool("xai-oauth")
-        if pool and pool.has_credentials():
-            entry = pool.select()
-            if entry is not None:
-                api_key = str(
-                    getattr(entry, "runtime_api_key", None)
-                    or getattr(entry, "access_token", "")
-                    or ""
-                ).strip()
-                base_url = _xai_validate_inference_base_url(
-                    os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-                    or os.getenv("XAI_BASE_URL", "").strip().rstrip("/")
-                    or str(getattr(entry, "runtime_base_url", None) or "").strip().rstrip("/")
-                    or str(getattr(entry, "base_url", None) or "").strip().rstrip("/"),
-                    fallback=DEFAULT_XAI_OAUTH_BASE_URL,
-                )
-                if api_key and base_url:
-                    return api_key, base_url
-    except Exception as exc:
-        logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
-
     try:
         from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
@@ -3857,19 +3826,6 @@ def resolve_vision_provider_client(
                         main_provider, default_model or resolved_model or main_model,
                     )
                     return _finalize(main_provider, sync_client, default_model)
-            elif main_provider in _PROVIDERS_WITHOUT_VISION:
-                # Kimi Coding Plan's /coding endpoint (Anthropic Messages wire)
-                # does not accept image input — Kimi's own docs say "Current
-                # model does not support image input, switch to a model with
-                # image_in capability" and vision lives on the separate Kimi
-                # Platform (api.moonshot.ai). Skip the main provider and fall
-                # through to the aggregator chain instead of returning a
-                # client that will 404 on every vision request (#17076).
-                logger.debug(
-                    "Vision auto-detect: skipping main provider %s (no "
-                    "vision support) — falling through to aggregator chain",
-                    main_provider,
-                )
             else:
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,

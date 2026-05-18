@@ -96,10 +96,7 @@ class ResponsesApiTransport(ProviderTransport):
         kwargs = {
             "model": model,
             "instructions": instructions,
-            "input": _chat_messages_to_responses_input(
-                payload_messages,
-                is_xai_responses=is_xai_responses,
-            ),
+            "input": _chat_messages_to_responses_input(payload_messages),
             "tools": response_tools,
             "store": False,
         }
@@ -108,8 +105,11 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
-        # xAI Responses takes prompt_cache_key in extra_body (set further
-        # down); GitHub Models opts out of cache-key routing entirely.
+        # xAI's Responses API uses `prompt_cache_key` (body-level) as the
+        # cache-routing key, not a top-level kwarg — the body-field
+        # injection below survives openai SDK builds whose
+        # Responses.stream() signature drops the kwarg. Everything else
+        # that ISN'T github/xAI keeps using the typed kwarg.
         if not is_github_responses and not is_xai_responses and session_id:
             kwargs["prompt_cache_key"] = session_id
 
@@ -182,10 +182,15 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_headers["x-grok-conv-id"] = session_id
             kwargs["extra_headers"] = merged_extra_headers
 
-            # xAI Responses cache-routing — body-level field per
-            # https://docs.x.ai/developers/advanced-api-usage/prompt-caching/maximizing-cache-hits.
-            # Sent via extra_body (not the typed kwarg) so it survives openai
-            # SDK builds whose Responses.stream() signature has dropped the field.
+            # xAI Responses cache-routing field. Lives in the request body
+            # (per https://docs.x.ai/.../prompt-caching/maximizing-cache-hits),
+            # so we ship it via extra_body — the openai SDK serializes
+            # extra_body fields into the JSON body without per-field type
+            # validation, sidestepping the TypeError that fires on
+            # Responses.stream() builds whose `prompt_cache_key` kwarg has
+            # been dropped. Setdefault preserves a caller-supplied value
+            # (e.g. request_overrides.extra_body.prompt_cache_key) over
+            # the auto-derived session_id.
             existing_extra_body = kwargs.get("extra_body")
             merged_extra_body: Dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):

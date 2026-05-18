@@ -51,10 +51,16 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
     thread_id = getattr(source, "thread_id", None)
-    if thread_id is None:
-        return None
-    metadata = {"thread_id": thread_id}
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    metadata = {}
+    business_connection_id = getattr(source, "business_connection_id", None)
+    if business_connection_id:
+        metadata["business_connection_id"] = str(business_connection_id)
+    if getattr(source, "external_safe_mode", False):
+        metadata["external_safe_mode"] = True
+        metadata["telegram_business_external_contact"] = True
+    if thread_id is not None:
+        metadata["thread_id"] = thread_id
+    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm" and thread_id is not None:
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
@@ -62,7 +68,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
-    return metadata
+    return metadata or None
 
 
 def _reply_anchor_for_event(event) -> str | None:
@@ -816,6 +822,8 @@ DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
+    ".html": "text/html",
+    ".htm": "text/html",
     ".md": "text/markdown",
     ".txt": "text/plain",
     ".csv": "text/csv",
@@ -855,6 +863,22 @@ SUPPORTED_IMAGE_DOCUMENT_TYPES = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+TEXT_DOCUMENT_EXTENSIONS = frozenset({
+    ".cfg",
+    ".csv",
+    ".htm",
+    ".html",
+    ".ini",
+    ".json",
+    ".log",
+    ".md",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+})
 
 
 def get_document_cache_dir() -> Path:
@@ -972,6 +996,11 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+
+    # Ephemeral recent visible chat context, populated by adapters that can
+    # observe nearby platform messages. The gateway injects this into the
+    # per-turn system prompt, not the persisted transcript.
+    recent_context: Optional[str] = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.

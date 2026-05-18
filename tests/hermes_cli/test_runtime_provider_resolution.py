@@ -95,6 +95,61 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
     assert resolved.get("credential_pool") is None
 
 
+def test_resolve_runtime_provider_minimax_forces_anthropic_messages_with_stale_codex_config(monkeypatch):
+    """MiniMax must never inherit OpenAI/Codex Responses transport from config.
+
+    Regression for cron jobs pinned to provider=minimax while the global model
+    config still belongs to openai-codex.  The stale codex_responses mode made
+    MiniMax calls hit /anthropic/responses, which MiniMax returns as 404.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {
+            "api_key": "minimax-key",
+            "base_url": "https://api.minimax.io/anthropic",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="minimax")
+
+    assert resolved["provider"] == "minimax"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+
+
+def test_minimax_pool_entry_forces_anthropic_messages_even_if_config_mode_is_stale():
+    class _Entry:
+        access_token = "pool-minimax-key"
+        source = "manual"
+        base_url = "https://api.minimax.io/anthropic"
+
+    resolved = rp._resolve_runtime_from_pool_entry(
+        provider="minimax",
+        entry=_Entry(),
+        requested_provider="minimax",
+        model_cfg={
+            "provider": "minimax",
+            "default": "MiniMax-M2.7-highspeed",
+            "api_mode": "codex_responses",
+        },
+    )
+
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+
+
 def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     class _Pool:
         def has_credentials(self):

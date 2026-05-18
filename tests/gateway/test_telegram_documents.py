@@ -87,7 +87,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     """Build a mock Telegram Message with the given document/photo."""
     msg = MagicMock()
     msg.message_id = 42
-    msg.text = caption or ""
+    msg.text = ""
     msg.caption = caption
     msg.date = None
     # Media flags — all None except explicit payload
@@ -108,7 +108,12 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.from_user.id = 1
     msg.from_user.full_name = "Test User"
     msg.message_thread_id = None
-    msg.reply_to_message = None
+    msg.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        text=None,
+        caption=None,
+        message_id=None,
+    )
     return msg
 
 
@@ -234,6 +239,25 @@ class TestDocumentDownloadBlock:
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
         assert "# Title" in event.text
+
+    @pytest.mark.asyncio
+    async def test_supported_html_injects_content(self, adapter):
+        content = b"<html><body><h1>Memory plan</h1></body></html>"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="memory-plan.html",
+            mime_type="text/html",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_types == ["text/html"]
+        assert "[Content of memory-plan.html]" in event.text
+        assert "<h1>Memory plan</h1>" in event.text
 
     @pytest.mark.asyncio
     async def test_caption_preserved_with_injection(self, adapter):
@@ -951,3 +975,31 @@ class TestRepliedToMedia:
         assert len(event.media_urls) == 1
         assert os.path.exists(event.media_urls[0])
         assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_command_reply_to_html_document_injects_content(self, adapter):
+        content = b"<section>Second brain memory plan</section>"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="plan.html",
+            mime_type="text/html",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        replied = _make_message(document=doc)
+        replied.message_id = 88
+
+        msg = _make_message()
+        msg.text = "/summ"
+        msg.reply_to_message = replied
+        update = _make_update(msg)
+
+        await adapter._handle_command(update, MagicMock())
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.startswith("/summ")
+        assert "[Content of replied-to plan.html]" in event.text
+        assert "Second brain memory plan" in event.text
+        assert event.reply_to_message_id == "88"
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_types == ["text/html"]

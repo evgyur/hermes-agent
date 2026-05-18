@@ -518,7 +518,6 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
             else:
                 subprocess.run(shlex.split(command), check=True, capture_output=True, text=True)
-            
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
@@ -726,6 +725,7 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
     xai_config = stt_config.get("xai", {})
     base_url = str(
         xai_config.get("base_url")
+        or creds.get("base_url")
         or get_env_value("XAI_STT_BASE_URL")
         or creds.get("base_url")
         or XAI_STT_BASE_URL

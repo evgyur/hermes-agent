@@ -2080,7 +2080,7 @@ def select_provider_and_model(args=None):
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "xai-oauth":
-        _model_flow_xai_oauth(config, current_model, args=args)
+        _model_flow_xai_oauth(config, current_model)
     elif selected_provider == "qwen-oauth":
         _model_flow_qwen_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
@@ -2961,7 +2961,7 @@ def _model_flow_openai_codex(config, current_model=""):
         print("No change.")
 
 
-def _model_flow_xai_oauth(_config, current_model="", *, args=None):
+def _model_flow_xai_oauth(_config, current_model=""):
     """xAI Grok OAuth (SuperGrok Subscription) provider: ensure logged in, then pick model."""
     from hermes_cli.auth import (
         get_xai_oauth_auth_status,
@@ -2992,15 +2992,7 @@ def _model_flow_xai_oauth(_config, current_model="", *, args=None):
             print("Starting a fresh xAI OAuth login...")
             print()
             try:
-                # Forward CLI flags from ``hermes model --manual-paste``
-                # / ``--no-browser`` / ``--timeout`` into the loopback
-                # login. Without this, browser-only remotes (#26923)
-                # can't reach the manual-paste path via ``hermes model``.
-                mock_args = argparse.Namespace(
-                    manual_paste=bool(getattr(args, "manual_paste", False)),
-                    no_browser=bool(getattr(args, "no_browser", False)),
-                    timeout=getattr(args, "timeout", None),
-                )
+                mock_args = argparse.Namespace()
                 _login_xai_oauth(
                     mock_args,
                     PROVIDER_REGISTRY["xai-oauth"],
@@ -3018,11 +3010,7 @@ def _model_flow_xai_oauth(_config, current_model="", *, args=None):
         print("Not logged into xAI Grok OAuth (SuperGrok Subscription). Starting login...")
         print()
         try:
-            mock_args = argparse.Namespace(
-                manual_paste=bool(getattr(args, "manual_paste", False)),
-                no_browser=bool(getattr(args, "no_browser", False)),
-                timeout=getattr(args, "timeout", None),
-            )
+            mock_args = argparse.Namespace()
             _login_xai_oauth(mock_args, PROVIDER_REGISTRY["xai-oauth"])
         except SystemExit:
             print("Login cancelled or failed.")
@@ -3045,7 +3033,7 @@ def _model_flow_xai_oauth(_config, current_model="", *, args=None):
         pass
 
     models = list(_PROVIDER_MODELS.get("xai-oauth") or _PROVIDER_MODELS.get("xai") or [])
-    selected = _prompt_model_selection(models, current_model=current_model or (models[0] if models else "grok-4.3"))
+    selected = _prompt_model_selection(models, current_model=current_model or (models[0] if models else "grok-code-fast-1"))
     if selected:
         _save_model_choice(selected)
         _update_config_for_provider("xai-oauth", base_url)

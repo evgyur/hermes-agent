@@ -253,6 +253,45 @@ async def test_send_omits_general_topic_thread_id():
 
 
 @pytest.mark.asyncio
+async def test_send_adds_human20_button_for_private_dms():
+    from gateway.platforms import telegram as telegram_mod
+
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=43)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    dm_message = SimpleNamespace(
+        text="Sigurd, hello",
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        chat=SimpleNamespace(id=111, type=telegram_mod.ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=111, full_name="Alice"),
+        reply_to_message=None,
+        message_id=99,
+        date=None,
+    )
+    event = adapter._build_message_event(dm_message, msg_type=SimpleNamespace(value="text"))
+    assert event.source.chat_type == "dm"
+
+    result = await adapter.send("111", "hello from dm")
+
+    assert result.success is True
+    assert len(call_log) == 1
+    markup = call_log[0]["reply_markup"]
+    assert markup is not None
+    button = markup.inline_keyboard[-1][0]
+    assert button.text == "перейти в @human20"
+    assert button.kwargs["url"] == "https://t.me/human20"
+
+
+@pytest.mark.asyncio
 async def test_send_typing_preserves_general_topic_thread_id():
     """Typing for forum General must send message_thread_id=1, not None.
 

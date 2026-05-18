@@ -180,18 +180,8 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {
-    "chat_completions",
-    "codex_responses",
-    "anthropic_messages",
-    "bedrock_converse",
-    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
-    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
-    # instead of Hermes' tool dispatch. Gated behind config key
-    # `model.openai_runtime == "codex_app_server"` AND provider in
-    # {"openai", "openai-codex"}. Default is unchanged.
-    "codex_app_server",
-}
+_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+_MINIMAX_ANTHROPIC_PROVIDERS = {"minimax", "minimax-cn", "minimax-oauth"}
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -332,7 +322,11 @@ def _resolve_runtime_from_pool_entry(
             # Refs #16878.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
-        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+        elif (
+            configured_mode
+            and _provider_supports_explicit_api_mode(provider, configured_provider)
+            and not (provider in _MINIMAX_ANTHROPIC_PROVIDERS and configured_mode == "codex_responses")
+        ):
             api_mode = configured_mode
         else:
             # Auto-detect Anthropic-compatible endpoints (/anthropic suffix,
@@ -1060,8 +1054,13 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
+            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if (
+                configured_mode
+                and _provider_supports_explicit_api_mode(provider, configured_provider)
+                and not (provider in _MINIMAX_ANTHROPIC_PROVIDERS and configured_mode == "codex_responses")
+            ):
                 api_mode = configured_mode
             else:
                 # Auto-detect from URL (Anthropic /anthropic suffix,

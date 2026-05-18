@@ -98,16 +98,19 @@ def _group_message(
     )
 
 
-def _dm_message(text="hello", *, from_user_id=111):
+def _dm_message(text="hello", *, from_user_id=111, reply_to_bot=False, entities=None, caption=None, caption_entities=None):
+    reply_to_message = None
+    if reply_to_bot:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999))
     return SimpleNamespace(
         text=text,
-        caption=None,
-        entities=[],
-        caption_entities=[],
+        caption=caption,
+        entities=entities or [],
+        caption_entities=caption_entities or [],
         message_thread_id=None,
         chat=SimpleNamespace(id=from_user_id, type="private"),
         from_user=SimpleNamespace(id=from_user_id),
-        reply_to_message=None,
+        reply_to_message=reply_to_message,
     )
 
 
@@ -178,70 +181,37 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
-def test_explicit_multi_bot_mentions_route_only_to_named_bots():
-    text = "@research_bot @ops_bot hi"
-    entities = _mention_entities(text, ["@research_bot", "@ops_bot"])
+def test_private_dms_require_direct_trigger_or_sigurd():
+    adapter = _make_adapter(require_mention=False)
 
-    default_bot = _make_adapter(require_mention=True, bot_username="default_bot")
-    research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
-    ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
-
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True, entities=entities)) is False
-    assert research_bot._should_process_message(_group_message(text, entities=entities)) is True
-    assert ops_bot._should_process_message(_group_message(text, entities=entities)) is True
-
-
-def test_entityless_multi_bot_mentions_still_route_exclusively():
-    text = "@research_bot @ops_bot hi"
-
-    default_bot = _make_adapter(require_mention=True, bot_username="default_bot")
-    research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
-    ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
-
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
-    assert research_bot._should_process_message(_group_message(text)) is True
-    assert ops_bot._should_process_message(_group_message(text)) is True
-
-
-def test_intern_bots_ignore_messages_addressed_to_other_intern_bot():
-    text = "@Interntestnumber1bot you're not supposed to do the blog"
-
-    test2_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber2bot")
-    test1_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber1bot")
-
-    assert test2_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
-    assert test1_bot._should_process_message(_group_message(text)) is True
-
-
-def test_bot_command_addressed_to_other_bot_is_exclusive_even_when_mentions_not_required():
-    text = "/stop@Interntestnumber1bot"
-    entity = _bot_command_entity(text, text)
-
-    test2_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber2bot")
-    test1_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber1bot")
-
-    assert test2_bot._should_process_message(_group_message(text, entities=[entity]), is_command=True) is False
-    assert test1_bot._should_process_message(_group_message(text, entities=[entity]), is_command=True) is True
-
-
-def test_raw_bot_mention_fallback_does_not_match_email_or_substring():
-    adapter = _make_adapter(require_mention=True, bot_username="hermes_bot")
-
-    assert adapter._should_process_message(_group_message("email ops@hermes_bot.example")) is False
-    assert adapter._should_process_message(_group_message("prefix@hermes_bot hi")) is False
-    assert adapter._should_process_message(_group_message("hi @hermes_bot")) is True
-
-
-def test_exclusive_bot_mentions_can_be_disabled_for_legacy_groups():
-    adapter = _make_adapter(
-        require_mention=True,
-        exclusive_bot_mentions=False,
-        bot_username="default_bot",
-    )
-
+    assert adapter._should_process_message(_dm_message("hello there")) is False
     assert adapter._should_process_message(
-        _group_message("@research_bot hi", reply_to_bot=True)
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
     ) is True
+    assert adapter._should_process_message(_dm_message("replying", reply_to_bot=True)) is True
+    assert adapter._should_process_message(_dm_message("Sigurd, status")) is True
+
+
+def test_business_messages_are_wake_word_or_mention_only_by_default():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is False
+    assert adapter._message_matches_business_trigger(_dm_message("Sigurd, check this")) is True
+    assert adapter._message_matches_business_trigger(
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_business_reply_trigger_requires_explicit_opt_in():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is True
 
 
 def test_free_response_chats_bypass_mention_requirement():
@@ -460,8 +430,8 @@ def test_config_env_overrides_telegram_user_allowlists(monkeypatch, tmp_path):
 def test_dm_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
     adapter = _make_adapter(allow_from=["111", "222"])
 
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is True
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is True
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is False
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is False
 
 
 def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
