@@ -4050,6 +4050,11 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_markup: Optional[Any] = None,
     ) -> Optional[Any]:
         metadata = metadata or {}
+        # This CTA is only for Telegram Business delegated inbox replies —
+        # i.e. when Chip invokes Sigurd in personal chats with other people.
+        # Do not attach it to Chip's direct bot DM or ordinary Telegram chats.
+        if not self._business_connection_id_from_metadata(metadata):
+            return reply_markup
         if self._outbound_chat_type(chat_id, metadata) != "dm":
             return reply_markup
         try:
