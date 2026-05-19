@@ -3173,12 +3173,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return "gptinvest23"
 
         def _model_for_slug(slug: str) -> str:
-            return {
-                "gptinvest23": "gpt-5.5",
-                "markov495": "gpt-5.4",
-                "mintsage": "gpt-5.4-mini",
-                "omnifocusme": "gpt-5.4-mini",
-            }.get(slug, "gpt-5.5")
+            # gptprof switches the Codex OAuth profile/token only. The inference
+            # route stays pinned to GPT-5.5 so a profile button cannot silently
+            # downgrade Hermes to 5.4/5.4-mini.
+            return "gpt-5.5"
 
         def _persist_new_auth(slug: str, access_token: str, refresh_token: str) -> None:
             profile_path = os.path.join(hcp_dir, f"{slug}.json")
@@ -3403,6 +3401,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if slug not in safe_slugs:
                 await query.answer(text="Unknown profile.")
                 return
+            # Ignore the model embedded in legacy callback_data. Profile choice
+            # selects credentials; model selection is pinned globally here.
+            model = "gpt-5.5"
             profile_path = os.path.join(hcp_dir, f"{slug}.json")
             profile = _load_json(profile_path, {})
             if not isinstance(profile, dict) or not profile.get("access_token"):
@@ -3509,9 +3510,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if data == "gptprof:autoswitch":
             model_by_slug = {
                 "gptinvest23": "gpt-5.5",
-                "markov495": "gpt-5.4",
-                "mintsage": "gpt-5.4-mini",
-                "omnifocusme": "gpt-5.4-mini",
+                "markov495": "gpt-5.5",
+                "mintsage": "gpt-5.5",
+                "omnifocusme": "gpt-5.5",
             }
             slug = max(model_by_slug, key=_usage_score)
             await _switch(slug, model_by_slug[slug], autoswitch=True)
