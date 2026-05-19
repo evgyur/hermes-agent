@@ -2771,9 +2771,11 @@ class TestGoogleChatStandaloneSend:
         fake_creds.token = "the-token"
         fake_creds.refresh = MagicMock(return_value=None)
 
-        original = _gc_mod.service_account.Credentials.from_service_account_info
-        _gc_mod.service_account.Credentials.from_service_account_info = MagicMock(
-            return_value=fake_creds
+        original = _gc_mod.service_account
+        _gc_mod.service_account = types.SimpleNamespace(
+            Credentials=types.SimpleNamespace(
+                from_service_account_info=MagicMock(return_value=fake_creds)
+            )
         )
         try:
             _install_fake_google_auth_transport(monkeypatch)
@@ -2787,7 +2789,7 @@ class TestGoogleChatStandaloneSend:
                 "hello cron",
             )
         finally:
-            _gc_mod.service_account.Credentials.from_service_account_info = original
+            _gc_mod.service_account = original
 
         assert result == {
             "success": True,
@@ -2826,9 +2828,11 @@ class TestGoogleChatStandaloneSend:
         fake_creds.token = "the-token"
         fake_creds.refresh = MagicMock(return_value=None)
 
-        original = _gc_mod.service_account.Credentials.from_service_account_info
-        _gc_mod.service_account.Credentials.from_service_account_info = MagicMock(
-            return_value=fake_creds
+        original = _gc_mod.service_account
+        _gc_mod.service_account = types.SimpleNamespace(
+            Credentials=types.SimpleNamespace(
+                from_service_account_info=MagicMock(return_value=fake_creds)
+            )
         )
         try:
             _install_fake_google_auth_transport(monkeypatch)
@@ -2846,7 +2850,7 @@ class TestGoogleChatStandaloneSend:
                 "hi",
             )
         finally:
-            _gc_mod.service_account.Credentials.from_service_account_info = original
+            _gc_mod.service_account = original
 
         assert "error" in result
         assert "403" in result["error"]

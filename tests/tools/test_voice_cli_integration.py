@@ -490,6 +490,22 @@ class TestVprintForceParameter:
         assert unforced_error_count == 0, \
             f"Found {unforced_error_count} critical error _vprint calls without force=True"
 
+        forced_status_count = sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_vprint"
+            and any(
+                kw.arg == "force"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+        )
+        assert forced_status_count > 0, \
+            "Expected at least one _vprint with force=True for status/error messages"
+
 
 # ============================================================================
 # Bug fix regression tests

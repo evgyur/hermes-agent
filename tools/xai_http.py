@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 from typing import Dict
 
+
 def get_env_value(name: str, default=None):
     """Read ``name`` from ``~/.hermes/.env`` first, then ``os.environ``.
 
-    Wraps :func:`hermes_cli.config.get_env_value` so tests can patch
-    ``tools.xai_http.get_env_value`` to inject dotenv-only secrets into the
-    xAI credential resolver.
+    Resolve ``hermes_cli.config.get_env_value`` at call time so tests or
+    earlier imports cannot freeze a temporary monkeypatch into this module.
+    Tests may still patch ``tools.xai_http.get_env_value`` directly to inject
+    dotenv-only secrets into the xAI credential resolver.
     """
     try:
         from hermes_cli.config import get_env_value as _hermes_get_env_value

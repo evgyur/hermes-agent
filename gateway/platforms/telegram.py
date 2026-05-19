@@ -32,6 +32,11 @@ try:
         ContextTypes,
         filters,
     )
+    try:
+        from telegram.ext import BusinessConnectionHandler, BusinessMessagesDeletedHandler
+    except ImportError:
+        BusinessConnectionHandler = None
+        BusinessMessagesDeletedHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -47,6 +52,8 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    BusinessConnectionHandler = None
+    BusinessMessagesDeletedHandler = None
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -540,6 +547,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
+
+    @classmethod
+    def _business_connection_id_from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not metadata:
+            return None
+        value = metadata.get("business_connection_id") or metadata.get("telegram_business_connection_id")
+        return str(value) if value else None
+
+    @classmethod
+    def _business_kwargs(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        business_connection_id = cls._business_connection_id_from_metadata(metadata)
+        return {"business_connection_id": business_connection_id} if business_connection_id else {}
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1428,6 +1447,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            business_message_filter = getattr(getattr(filters, "UpdateType", None), "BUSINESS_MESSAGE", None)
+            if business_message_filter is not None:
+                self._app.add_handler(TelegramMessageHandler(
+                    business_message_filter,
+                    self._handle_business_message,
+                ))
+            if BusinessConnectionHandler is not None:
+                self._app.add_handler(BusinessConnectionHandler(self._handle_business_connection))
+            if BusinessMessagesDeletedHandler is not None:
+                self._app.add_handler(BusinessMessagesDeletedHandler(self._handle_business_messages_deleted))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -1755,6 +1784,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
+                                **self._business_kwargs(metadata),
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
@@ -1769,6 +1799,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
+                                    **self._business_kwargs(metadata),
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
@@ -2370,6 +2401,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                     reply_to_mode=self._reply_to_mode
                 ),
+                **self._business_kwargs(metadata),
                 **self._link_preview_kwargs(),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -2438,6 +2470,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_mode=self._reply_to_mode
                 )
             )
+            kwargs.update(self._business_kwargs(metadata))
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
@@ -2489,6 +2522,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_mode=self._reply_to_mode
                 )
             )
+            kwargs.update(self._business_kwargs(metadata))
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
@@ -2571,6 +2605,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                 )
             )
+            kwargs.update(self._business_kwargs(metadata))
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._clarify_state[clarify_id] = session_key
@@ -3406,6 +3441,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
                             **voice_thread_kwargs,
+                            **self._business_kwargs(metadata),
                             **self._notification_kwargs(metadata),
                         },
                         metadata,
@@ -3432,6 +3468,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
                             **audio_thread_kwargs,
+                            **self._business_kwargs(metadata),
                             **self._notification_kwargs(metadata),
                         },
                         metadata,
@@ -3570,6 +3607,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "media": media,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -3629,6 +3667,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -3726,6 +3765,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -3773,6 +3813,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -3825,6 +3866,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
                     **photo_thread_kwargs,
+                    **self._business_kwargs(metadata),
                     **self._notification_kwargs(metadata),
                 },
                 metadata,
@@ -3862,6 +3904,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **upload_thread_kwargs,
+                        **self._business_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -3939,6 +3982,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     action="typing",
                     message_thread_id=message_thread_id,
+                    **self._business_kwargs(metadata),
                 )
             except Exception as e:
                 # For DM topic lanes, Telegram may reject message_thread_id.
@@ -4465,6 +4509,84 @@ class TelegramAdapter(BasePlatformAdapter):
         username = re.escape(self._bot.username)
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
+
+    def _telegram_business_config(self) -> Dict[str, Any]:
+        cfg = self.config.extra.get("business") or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _telegram_business_enabled(self) -> bool:
+        value = self._telegram_business_config().get("enabled", False)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _telegram_business_allowed_chats(self) -> set[str]:
+        raw = self._telegram_business_config().get("allowed_chats") or []
+        if isinstance(raw, (str, int)):
+            raw = [raw]
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def _telegram_business_trigger_words(self) -> List[str]:
+        raw = self._telegram_business_config().get("trigger_words") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    def _message_matches_business_trigger(self, message: Message) -> bool:
+        if self._is_reply_to_bot(message) or self._message_mentions_bot(message):
+            return True
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+        if not text:
+            return False
+        for word in self._telegram_business_trigger_words():
+            if re.match(rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])", text):
+                return True
+        return False
+
+    def _strip_business_trigger_text(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        cleaned = self._clean_bot_trigger_text(text)
+        for word in self._telegram_business_trigger_words():
+            stripped = re.sub(
+                rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])*\s*",
+                "",
+                cleaned,
+                count=1,
+            ).strip()
+            stripped = stripped.lstrip(" ,.:;!?-").strip()
+            if stripped != cleaned:
+                return stripped or cleaned
+        return cleaned
+
+    def _is_business_trusted_actor(self, message: Message) -> bool:
+        """Return True only for explicitly trusted Telegram Business operators.
+
+        Wildcard allow-all settings intentionally do not make a Business sender
+        trusted; otherwise an external delegated-inbox contact could receive
+        the full local tool layer.
+        """
+        sender = getattr(message, "from_user", None)
+        sender_id = str(getattr(sender, "id", "") or "").strip()
+        if not sender_id:
+            return False
+
+        explicit_ids: set[str] = set()
+        for env_name in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+            for part in os.getenv(env_name, "").split(","):
+                part = part.strip()
+                if part and part != "*":
+                    explicit_ids.add(part)
+        if sender_id in explicit_ids:
+            return True
+
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        pairing_store = getattr(runner, "pairing_store", None)
+        is_approved = getattr(pairing_store, "is_approved", None)
+        if callable(is_approved):
+            try:
+                return bool(is_approved("telegram", sender_id))
+            except Exception:
+                logger.debug("[Telegram] Business pairing-store trust check failed", exc_info=True)
+        return False
 
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
@@ -5034,6 +5156,90 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self.handle_message(event)
 
+    async def _handle_business_connection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        conn = getattr(update, "business_connection", None)
+        logger.info(
+            "Received Telegram Business connection update id=%s user_id=%s can_reply=%s",
+            getattr(conn, "id", None),
+            getattr(getattr(conn, "user", None), "id", None),
+            getattr(conn, "can_reply", None),
+        )
+
+    async def _handle_business_messages_deleted(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        deleted = getattr(update, "deleted_business_messages", None)
+        logger.info(
+            "Received Telegram Business messages deleted update business_connection_id=%s chat_id=%s",
+            getattr(deleted, "business_connection_id", None),
+            getattr(getattr(deleted, "chat", None), "id", None),
+        )
+
+    async def _handle_business_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Telegram Business delegated inbox messages.
+
+        Business messages are not delivered as ``update.message``.  They must
+        preserve ``business_connection_id`` so outbound replies use Telegram's
+        delegated Business route instead of an ordinary bot DM.
+        """
+        msg = getattr(update, "business_message", None)
+        if not msg:
+            return
+
+        chat = getattr(msg, "chat", None)
+        sender = getattr(msg, "from_user", None)
+        chat_id = str(getattr(chat, "id", "") or "")
+        business_connection_id = getattr(msg, "business_connection_id", None)
+        has_text = bool(getattr(msg, "text", None) or getattr(msg, "caption", None))
+        logger.info(
+            "Received Telegram Business message update chat_id=%s user_id=%s has_text=%s business_connection_id=%s",
+            getattr(chat, "id", None),
+            getattr(sender, "id", None),
+            has_text,
+            bool(business_connection_id),
+        )
+
+        if not self._telegram_business_enabled():
+            logger.info("Ignored Telegram Business message chat_id=%s reason=business_disabled", chat_id)
+            return
+        if not business_connection_id:
+            logger.warning("Ignored Telegram Business message chat_id=%s reason=missing_business_connection_id", chat_id)
+            return
+        if not has_text:
+            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_text", chat_id)
+            return
+        if sender and getattr(sender, "is_bot", False):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=bot_sender", chat_id)
+            return
+        if self._bot and sender and getattr(sender, "id", None) == getattr(self._bot, "id", None):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=self_sender", chat_id)
+            return
+
+        allowed_chats = self._telegram_business_allowed_chats()
+        if allowed_chats and chat_id not in allowed_chats:
+            logger.info("Ignored Telegram Business message chat_id=%s reason=chat_not_allowed", chat_id)
+            return
+        if not self._message_matches_business_trigger(msg):
+            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_trigger", chat_id)
+            return
+
+        trusted = self._is_business_trusted_actor(msg)
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = (
+            self._strip_business_trigger_text(
+                getattr(msg, "text", None) or getattr(msg, "caption", None) or event.text
+            )
+            or event.text
+        )
+        event.source.business_connection_id = str(business_connection_id)
+        event.source.external_safe_mode = not trusted
+        event.source.chat_type = "dm"
+        logger.info(
+            "Accepted Telegram Business message chat_id=%s user_id=%s business_connection_id=True external_safe_mode=%s",
+            chat_id,
+            getattr(sender, "id", None),
+            event.source.external_safe_mode,
+        )
+        await self.handle_message(event)
+
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
 
@@ -5261,6 +5467,12 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_type = "group"
         elif telegram_chat_type == "channel":
             chat_type = "channel"
+        elif str(getattr(chat, "id", "")).startswith("-"):
+            # If python-telegram-bot is unavailable or a previous test reload
+            # leaves ChatType as a loose mock/typing object, group-like chats
+            # can otherwise collapse to the DM default.  Negative Telegram ids
+            # are never private chats, so keep them out of DM session lanes.
+            chat_type = "group"
 
         # Resolve Telegram topic name and skill binding.
         # Only preserve message_thread_id when Telegram marks the message as

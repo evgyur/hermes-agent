@@ -154,6 +154,7 @@ class Platform(Enum):
             pseudo._name_ = value.upper().replace("-", "_").replace(" ", "_")
             cls._value2member_map_[value] = pseudo
             cls._member_map_[pseudo._name_] = pseudo
+            type.__setattr__(cls, pseudo._name_, pseudo)
             return pseudo
 
         # Runtime-registered plugins (e.g. user-installed, discovered after
@@ -864,6 +865,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if plat == Platform.TELEGRAM and "business" in platform_cfg:
+                    bridged["business"] = platform_cfg["business"]
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

@@ -91,6 +91,8 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    business_connection_id: Optional[str] = None  # Telegram Business delegated inbox route
+    external_safe_mode: bool = False  # True for untrusted external Business contacts
     
     @property
     def description(self) -> str:
@@ -134,6 +136,10 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.business_connection_id:
+            d["business_connection_id"] = self.business_connection_id
+        if self.external_safe_mode:
+            d["external_safe_mode"] = True
         return d
 
     @classmethod
@@ -152,6 +158,8 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            business_connection_id=data.get("business_connection_id"),
+            external_safe_mode=bool(data.get("external_safe_mode", False)),
         )
     
 
@@ -630,6 +638,14 @@ def build_session_key(
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
+
+        business_connection_id = getattr(source, "business_connection_id", None)
+        if source.platform == Platform.TELEGRAM and business_connection_id and dm_chat_id:
+            actor_id = source.user_id or "unknown"
+            mode = "external" if getattr(source, "external_safe_mode", False) else "trusted"
+            if source.thread_id:
+                return f"agent:main:{platform}:business:{dm_chat_id}:{source.thread_id}:{actor_id}:{mode}"
+            return f"agent:main:{platform}:business:{dm_chat_id}:{actor_id}:{mode}"
 
         if dm_chat_id:
             if source.thread_id:
