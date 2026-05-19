@@ -32,12 +32,28 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_IMAGE_CAPTION_LIMIT = 1024
 
 
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
+
+
+def _caption_text_for_images(text_content: str, native_image_count: int) -> str | None:
+    """Return text as an image caption when it fits native caption limits.
+
+    Telegram photos carry only 1024 caption chars. If the text does not fit,
+    keep it as a normal text message instead of silently truncating it.
+    """
+    text = (text_content or "").strip()
+    if not text or native_image_count <= 0:
+        return None
+    if len(text) > _IMAGE_CAPTION_LIMIT:
+        return None
+    return text
 
 
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
@@ -3210,6 +3226,30 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+
+                # If the response has a short text body plus a native image,
+                # deliver the text as the image caption instead of sending a
+                # separate text message followed by a bare photo. This is the
+                # expected UX for quick chart commands like /hype.
+                _native_image_count = len(images)
+                if not force_document_attachments:
+                    _native_image_count += sum(
+                        1
+                        for media_path, is_voice in media_files
+                        if Path(media_path).suffix.lower() in _IMAGE_EXTS and not is_voice
+                    )
+                    _native_image_count += sum(
+                        1
+                        for file_path in local_files
+                        if Path(file_path).suffix.lower() in _IMAGE_EXTS
+                    )
+                _image_caption_text = _caption_text_for_images(text_content, _native_image_count)
+                if _image_caption_text:
+                    if images:
+                        first_url, _first_alt = images[0]
+                        images[0] = (first_url, _image_caption_text)
+                        _image_caption_text = None
+                    text_content = ""
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -3319,7 +3359,6 @@ class BasePlatformAdapter(ABC):
 
                 # Send extracted media files — route by file type
                 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
                 # Partition images out of media_files + local_files so they
                 # can be sent as a single batch (Signal RPC). When
@@ -3348,7 +3387,13 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        _batch = [
+                            (
+                                f"file://{_quote(p)}",
+                                _image_caption_text if idx == 0 and _image_caption_text else "",
+                            )
+                            for idx, p in enumerate(_image_paths)
+                        ]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
