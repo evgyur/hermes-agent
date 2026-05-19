@@ -6544,16 +6544,42 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        env = os.environ.copy()
+                        env["HERMES_COMMAND_NAME"] = command
+                        env["HERMES_COMMAND_ARGS"] = user_args
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
+                                env=env,
+                                start_new_session=True,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            communicate_task = asyncio.create_task(proc.communicate())
+                            stdout, stderr = await asyncio.wait_for(communicate_task, timeout=30)
                             output = (stdout or stderr).decode().strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
+                            if proc.returncode is None:
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                except Exception:
+                                    try:
+                                        proc.kill()
+                                    except ProcessLookupError:
+                                        pass
+                            try:
+                                await communicate_task
+                            except Exception:
+                                pass
                             return "Quick command timed out (30s)."
                         except Exception as e:
                             return f"Quick command error: {e}"

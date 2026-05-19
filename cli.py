@@ -7237,13 +7237,24 @@ class HermesCLI:
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
+                    import os
+                    import shlex
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        env = os.environ.copy()
+                        env["HERMES_COMMAND_NAME"] = base_cmd.lstrip("/")
+                        env["HERMES_COMMAND_ARGS"] = user_args
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30
+                                text=True, timeout=30, env=env
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:

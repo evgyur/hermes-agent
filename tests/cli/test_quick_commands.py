@@ -38,6 +38,14 @@ class TestCLIQuickCommands:
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "daily-note"
 
+    def test_exec_command_can_append_user_args(self):
+        cli = self._make_cli({"chart": {"type": "exec", "command": "printf '%s'", "append_args": True}})
+        result = cli.process_command("/chart 2h")
+        assert result is True
+        cli.console.print.assert_called_once()
+        printed = self._printed_plain(cli.console.print.call_args[0][0])
+        assert printed == "2h"
+
     def test_exec_command_uses_chat_console_when_tui_is_live(self):
         cli = self._make_cli({"dn": {"type": "exec", "command": "echo daily-note"}})
         cli._app = object()
@@ -158,6 +166,19 @@ class TestGatewayQuickCommands:
         event = self._make_event("limits")
         result = await runner._handle_message(event)
         assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_can_append_user_args(self):
+        from gateway.run import GatewayRunner
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"chart": {"type": "exec", "command": "printf '%s'", "append_args": True}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("chart", "2h")
+        result = await runner._handle_message(event)
+        assert result == "2h"
 
     @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
