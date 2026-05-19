@@ -1748,6 +1748,12 @@ def cmd_whatsapp(args):
 
 def cmd_setup(args):
     """Interactive setup wizard."""
+    if getattr(args, "section", None) == "power":
+        from hermes_cli.power import run_power_setup
+
+        run_power_setup(args)
+        return
+
     from hermes_cli.setup import run_setup_wizard
 
     run_setup_wizard(args)
@@ -10746,12 +10752,12 @@ def main():
         "setup",
         help="Interactive setup wizard",
         description="Configure Hermes Agent with an interactive wizard. "
-        "Run a specific section: hermes setup model|tts|terminal|gateway|tools|agent",
+        "Run a specific section: hermes setup model|tts|terminal|gateway|tools|agent|power",
     )
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "tts", "terminal", "gateway", "tools", "agent"],
+        choices=["model", "tts", "terminal", "gateway", "tools", "agent", "power"],
         default=None,
         help="Run a specific setup section instead of the full wizard",
     )
@@ -10775,6 +10781,11 @@ def main():
         action="store_true",
         help="On existing installs: only prompt for items that are missing "
         "or unset, instead of running the full reconfigure wizard.",
+    )
+    setup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="For `hermes setup power`: show the Power Setup preset without writing config.",
     )
     setup_parser.set_defaults(func=cmd_setup)
 
@@ -11325,6 +11336,13 @@ def main():
     )
 
     hooks_parser.set_defaults(func=cmd_hooks)
+
+    # =========================================================================
+    # power command — multimodal public-safe setup foundation
+    # =========================================================================
+    from hermes_cli.power import add_power_parser
+
+    add_power_parser(subparsers)
 
     # =========================================================================
     # doctor command

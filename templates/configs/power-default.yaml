@@ -1,0 +1,103 @@
+# Hermes Power Setup default preset (public-safe)
+# Copy into config.yaml manually, or run: hermes power install
+# No secrets, session files, private chat ids, tg, or postcraft are included.
+
+stt:
+  enabled: true
+  provider: local
+  local:
+    model: base
+    language: ""
+
+tts:
+  provider: edge
+  edge:
+    voice: en-US-AriaNeural
+
+voice:
+  auto_tts: false
+  max_recording_seconds: 120
+
+agent:
+  image_input_mode: auto
+
+auxiliary:
+  vision:
+    provider: auto
+    model: ""
+    timeout: 120
+    download_timeout: 30
+
+video_generation:
+  provider: piapi
+  piapi:
+    api_key_env: PIAPI_API_KEY
+    default_model: seedance-2-fast-preview
+    workflow: generate-remove-watermark-download
+
+toolsets:
+  - hermes-cli
+  - terminal
+  - file
+  - web
+  - browser
+  - vision
+  - image_gen
+  - video
+  - tts
+  - skills
+  - memory
+  - session_search
+  - cronjob
+  - delegation
+
+quick_commands:
+  gptprof:
+    type: exec
+    command: python3 -m hermes_cli.power_quick gptprof
+    append_args: true
+  mmfast:
+    type: alias
+    target: /model MiniMax-M2.7 --provider minimax --global
+  gptt:
+    type: alias
+    target: /model gpt-5.5 --provider openai-codex --global
+  say:
+    type: exec
+    command: python3 -m hermes_cli.power_quick say
+    append_args: true
+  img:
+    type: exec
+    command: python3 -m hermes_cli.power_quick img
+    append_args: true
+  video:
+    type: exec
+    command: python3 -m hermes_cli.power_quick video
+    append_args: true
+
+power:
+  enabled: true
+  preset: default
+  modules:
+    - voice-studio
+    - vision-doc-intake
+    - image-studio
+    - piapi-video-generation
+    - model-profile-switcher
+    - power-compat-commands
+    - telegram-user-bridge
+    - browser-relay
+    - media-intake
+    - ops-doctor
+    - memory-skill-hygiene
+    - mcp-webhook-starter
+  private_overlay_required: false
+  bundled_skills:
+    - piapi-video-toolkit
+  smoke_surfaces:
+    # Public smoke inventory only; real provider keys stay in .env, never in templates.
+    - stt
+    - tts
+    - auxiliary_vision
+    - image_generation
+    - video_generation

@@ -1,0 +1,34 @@
+# Voice + vision preset for Hermes Power Setup.
+# This file is public-safe: no API keys or private ids.
+
+stt:
+  enabled: true
+  # local = free faster-whisper; use groq/openai/mistral only after setting the matching env key.
+  provider: local
+  local:
+    model: base
+    language: ""
+
+tts:
+  # edge = free default. Premium alternatives: elevenlabs, openai, minimax, mistral.
+  provider: edge
+  edge:
+    voice: en-US-AriaNeural
+
+voice:
+  auto_tts: false
+  max_recording_seconds: 120
+
+agent:
+  # auto attaches pixels natively when the active model supports vision; otherwise uses auxiliary vision.
+  image_input_mode: auto
+
+auxiliary:
+  vision:
+    provider: auto
+    model: ""
+    timeout: 120
+    download_timeout: 30
+
+# Image and video generation surfaces are enabled by the Power default preset
+# through the image_gen/video toolsets. Provider credentials belong in .env.
