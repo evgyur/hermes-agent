@@ -885,11 +885,12 @@ auxiliary:
   # Kanban triage specifier — `hermes kanban specify <id>` (or the
   # dashboard's ✨ Specify button on Triage-column cards) uses this
   # slot to expand a one-liner into a concrete spec and promote the
-  # task to `todo`. Cheap fast models work well here; spec expansion
-  # is short and doesn't need reasoning depth.
+  # task to `todo`. Cheap fast models work well here; MiniMax is a
+  # good default and the task is short enough that reasoning depth is
+  # usually wasted.
   triage_specifier:
-    provider: "auto"
-    model: ""
+    provider: "minimax"
+    model: "MiniMax-M2.7"
     base_url: ""
     api_key: ""
     timeout: 120
@@ -915,8 +916,8 @@ Example:
 ```yaml
 auxiliary:
   session_search:
-    provider: "main"
-    model: "glm-4.5-air"
+    provider: minimax
+    model: MiniMax-M2.7
     timeout: 60
     max_concurrency: 2
     extra_body:
