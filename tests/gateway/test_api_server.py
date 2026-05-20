@@ -357,6 +357,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/v1/skills", adapter._handle_skills)
+    app.router.add_get("/v1/skills/{name}", adapter._handle_get_skill)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -593,8 +595,12 @@ class TestCapabilitiesEndpoint:
             assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
+            assert data["features"]["skills_api"] is True
+            assert data["features"]["skills_api_requires_auth"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["endpoints"]["skills"]["path"] == "/v1/skills"
+            assert data["endpoints"]["skill"]["path"] == "/v1/skills/{name}"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
 
     @pytest.mark.asyncio
@@ -611,6 +617,104 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+# ---------------------------------------------------------------------------
+# /v1/skills endpoint
+# ---------------------------------------------------------------------------
+
+
+def _write_api_test_skill(root, name, *, description, tags, category="chip", body="Body"):
+    skill_dir = root / category / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    tag_list = ", ".join(tags)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\nmetadata:\n  hermes:\n    tags: [{tag_list}]\n---\n\n# {name}\n\n{body}\n",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
+class TestSkillsEndpoint:
+    @pytest.mark.asyncio
+    async def test_skills_requires_configured_api_key(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/skills")
+            assert resp.status == 403
+            data = await resp.json()
+            assert "API key" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_skills_requires_bearer_token_when_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/skills")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_skills_searches_installed_metadata_by_query_and_tag(self, auth_adapter, tmp_path, monkeypatch):
+        import tools.skills_tool as skills_tool
+
+        _write_api_test_skill(
+            tmp_path,
+            "human20-emoji-packs",
+            description="Create Human20 Telegram emoji packs",
+            tags=["chip", "human20", "design"],
+            category="chip",
+            body="Emoji pack workflow",
+        )
+        _write_api_test_skill(
+            tmp_path,
+            "human20-ops",
+            description="Operate Human20 backend",
+            tags=["chip", "human20", "devops"],
+            category="chip",
+        )
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/skills?query=human20&tag=design",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["object"] == "list"
+        assert data["count"] == 1
+        assert data["data"][0]["name"] == "human20-emoji-packs"
+        assert data["data"][0]["category"] == "chip"
+        assert data["data"][0]["tags"] == ["chip", "human20", "design"]
+
+    @pytest.mark.asyncio
+    async def test_get_skill_returns_full_skill_payload(self, auth_adapter, tmp_path, monkeypatch):
+        import tools.skills_tool as skills_tool
+
+        _write_api_test_skill(
+            tmp_path,
+            "human20-emoji-packs",
+            description="Create Human20 Telegram emoji packs",
+            tags=["chip", "human20", "design"],
+            category="chip",
+            body="Full private instructions",
+        )
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/skills/human20-emoji-packs",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["object"] == "skill"
+        assert data["name"] == "human20-emoji-packs"
+        assert data["tags"] == ["chip", "human20", "design"]
+        assert "Full private instructions" in data["content"]
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_install, do_list, do_search, do_update, handle_skills_slash
 
 
 class _DummyLockFile:
@@ -65,7 +65,7 @@ def three_source_env(monkeypatch, hub_env):
 def _capture(source_filter: str = "all") -> str:
     """Run do_list into a string buffer and return the output."""
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_list(source_filter=source_filter, console=console)
     return sink.getvalue()
 
@@ -74,7 +74,7 @@ def _capture_check(monkeypatch, results, name=None) -> str:
     import tools.skills_hub as hub
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: results)
     do_check(name=name, console=console)
     return sink.getvalue()
@@ -85,7 +85,7 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     import hermes_cli.skills_hub as cli_hub
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     installs = []
 
     monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: results)
@@ -192,7 +192,7 @@ def test_do_list_enabled_only_hides_disabled(three_source_env, monkeypatch):
         lambda platform=None: {"hub-skill"},
     )
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_list(enabled_only=True, console=console)
     output = sink.getvalue()
 
@@ -220,6 +220,40 @@ def test_do_list_platform_env_is_ignored(three_source_env, monkeypatch):
     _capture()
 
     assert seen["platform"] is None
+
+
+def test_do_search_installed_matches_tags(monkeypatch):
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(
+        skills_tool,
+        "_find_all_skills",
+        lambda **_kwargs: [
+            {
+                "name": "visual-builder",
+                "category": "creative",
+                "description": "Build polished UI prototypes",
+                "tags": ["design", "ui"],
+                "related_skills": ["sketch"],
+            },
+            {
+                "name": "ops-helper",
+                "category": "devops",
+                "description": "Operate servers",
+                "tags": ["devops"],
+                "related_skills": [],
+            },
+        ],
+    )
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
+    do_search("design", source="installed", console=console)
+    output = sink.getvalue()
+
+    assert "visual-builder" in output
+    assert "design" in output
+    assert "ops-helper" not in output
 
 
 def test_do_check_reports_available_updates(monkeypatch):
@@ -311,7 +345,7 @@ def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_en
     monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
 
     do_install("skils-sh/anthropics/skills/frontend-design", console=console, skip_confirm=True)
 
@@ -389,7 +423,7 @@ def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, 
     installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/SKILL.md",
         console=console, skip_confirm=True,
@@ -403,7 +437,7 @@ def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_en
     installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/SKILL.md",
         console=console, skip_confirm=True,
@@ -418,7 +452,7 @@ def test_url_install_actionable_error_on_non_interactive_with_no_name(monkeypatc
     installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/SKILL.md",
         console=console, skip_confirm=True,
@@ -439,7 +473,7 @@ def test_url_install_prompts_interactively_when_tty(monkeypatch, tmp_path, hub_e
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/SKILL.md",
         console=console, skip_confirm=False,  # interactive
@@ -465,7 +499,7 @@ def test_url_install_prompts_category_and_uses_typed_value(monkeypatch, tmp_path
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/sharethis-chat/SKILL.md",
         console=console, skip_confirm=False, force=True,
@@ -482,7 +516,7 @@ def test_url_install_cancel_name_prompt_aborts(monkeypatch, tmp_path, hub_env):
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
     do_install(
         "https://example.com/SKILL.md",
         console=console, skip_confirm=False, force=True,

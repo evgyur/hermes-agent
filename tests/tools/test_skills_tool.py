@@ -12,6 +12,7 @@ from tools.skills_tool import (
     _get_required_environment_variables,
     _parse_frontmatter,
     _parse_tags,
+    _skill_matches_query,
     _get_category_from_path,
     _find_all_skills,
     skill_matches_platform,
@@ -281,6 +282,25 @@ class TestFindAllSkills:
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
 
+    def test_extracts_hermes_tags_and_related_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "visual-builder",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    tags: [design, ui]\n"
+                    "    related_skills: [sketch]\n"
+                ),
+            )
+            skills = _find_all_skills()
+
+        assert skills[0]["tags"] == ["design", "ui"]
+        assert skills[0]["related_skills"] == ["sketch"]
+        assert _skill_matches_query(skills[0], query="design") is True
+        assert _skill_matches_query(skills[0], tag="design") is True
+
 
 # ---------------------------------------------------------------------------
 # skills_list
@@ -330,6 +350,23 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
+
+    def test_query_and_tag_filters_search_local_metadata(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "visual-builder",
+                frontmatter_extra="metadata:\n  hermes:\n    tags: [design, ui]\n",
+                body="Build polished interfaces.",
+            )
+            _make_skill(tmp_path, "ops-helper", frontmatter_extra="tags: [devops]\n")
+
+            by_query = json.loads(skills_list(query="design"))
+            by_tag = json.loads(skills_list(tag="design"))
+
+        assert [s["name"] for s in by_query["skills"]] == ["visual-builder"]
+        assert [s["name"] for s in by_tag["skills"]] == ["visual-builder"]
+        assert by_tag["skills"][0]["tags"] == ["design", "ui"]
 
 
 # ---------------------------------------------------------------------------

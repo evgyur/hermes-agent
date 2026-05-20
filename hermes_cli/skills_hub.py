@@ -106,6 +106,66 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _installed_skill_results(query: str, limit: int = 10):
+    """Search locally installed skills by name, description, category, tags, and related skills."""
+    from tools.skills_hub import SkillMeta
+    from tools.skills_tool import _find_all_skills, _skill_matches_query
+
+    q = query.strip().lower()
+    matches = []
+    for skill in _find_all_skills():
+        if not _skill_matches_query(skill, query=query):
+            continue
+        tags = [str(t) for t in skill.get("tags", [])]
+        tags_lower = [t.lower() for t in tags]
+        name_lower = str(skill.get("name", "")).lower()
+        category_lower = str(skill.get("category", "")).lower()
+        description_lower = str(skill.get("description", "")).lower()
+        if q in tags_lower:
+            rank = 0
+        elif q and q in name_lower:
+            rank = 1
+        elif q and q in category_lower:
+            rank = 2
+        elif q and q in description_lower:
+            rank = 3
+        else:
+            rank = 4
+        matches.append(
+            (
+                rank,
+                name_lower,
+                SkillMeta(
+                    name=skill.get("name", ""),
+                    description=skill.get("description", ""),
+                    source="installed",
+                    identifier=skill.get("name", ""),
+                    trust_level="community",
+                    path=skill.get("category"),
+                    tags=tags,
+                    extra={"related_skills": skill.get("related_skills", [])},
+                ),
+            )
+        )
+    matches.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in matches[:limit]]
+
+
+def _merge_skill_results(preferred, rest, limit: int):
+    """Merge search results by name, preserving preferred source hits first."""
+    seen = set()
+    merged = []
+    for result in list(preferred) + list(rest):
+        key = result.name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(result)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 def _resolve_source_meta_and_bundle(identifier: str, sources):
     """Resolve metadata and bundle for a specific identifier."""
     meta = None
@@ -247,10 +307,22 @@ def do_search(query: str, source: str = "all", limit: int = 10,
     c = console or _console
     c.print(f"\n[bold]Searching for:[/] {query}")
 
-    auth = GitHubAuth()
-    sources = create_source_router(auth)
-    with c.status("[bold]Searching registries..."):
-        results = unified_search(query, sources, source_filter=source, limit=limit)
+    installed_results = []
+    if source in {"all", "installed", "local"}:
+        installed_results = _installed_skill_results(query, limit=limit)
+
+    if source in {"installed", "local"}:
+        results = installed_results
+    else:
+        auth = GitHubAuth()
+        sources = create_source_router(auth)
+        with c.status("[bold]Searching registries..."):
+            registry_results = unified_search(query, sources, source_filter=source, limit=limit)
+        results = (
+            _merge_skill_results(installed_results, registry_results, limit)
+            if source == "all"
+            else registry_results
+        )
 
     if not results:
         c.print("[dim]No skills found matching your query.[/]\n")
@@ -259,6 +331,7 @@ def do_search(query: str, source: str = "all", limit: int = 10,
     table = Table(title=f"Skills Hub — {len(results)} result(s)")
     table.add_column("Name", style="bold cyan")
     table.add_column("Description", max_width=60)
+    table.add_column("Tags", style="dim", max_width=28)
     table.add_column("Source", style="dim")
     table.add_column("Trust", style="dim")
     table.add_column("Identifier", style="dim")
@@ -269,6 +342,7 @@ def do_search(query: str, source: str = "all", limit: int = 10,
         table.add_row(
             r.name,
             r.description[:60] + ("..." if len(r.description) > 60 else ""),
+            ", ".join(getattr(r, "tags", [])[:4]) if getattr(r, "tags", None) else "",
             r.source,
             f"[{trust_style}]{trust_label}[/]",
             r.identifier,
@@ -794,6 +868,8 @@ def do_list(source_filter: str = "all",
     table = Table(title=title)
     table.add_column("Name", style="bold cyan")
     table.add_column("Category", style="dim")
+    table.add_column("Description", max_width=48)
+    table.add_column("Tags", style="dim", max_width=28)
     table.add_column("Source", style="dim")
     table.add_column("Trust", style="dim")
     table.add_column("Status", style="dim")
@@ -845,7 +921,11 @@ def do_list(source_filter: str = "all",
 
         trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow", "local": "dim"}.get(trust, "dim")
         trust_label = "official" if source_display == "official" else trust
-        table.add_row(name, category, source_display, f"[{trust_style}]{trust_label}[/]", status_cell)
+        desc = skill.get("description", "")
+        if len(desc) > 48:
+            desc = desc[:45] + "..."
+        tags = ", ".join(skill.get("tags", [])[:4])
+        table.add_row(name, category, desc, tags, source_display, f"[{trust_style}]{trust_label}[/]", status_cell)
 
     c.print(table)
     summary = f"[dim]{hub_count} hub-installed, {builtin_count} builtin, {local_count} local"
@@ -1435,7 +1515,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "search":
         if not args:
-            c.print("[bold red]Usage:[/] /skills search <query> [--source skills-sh|well-known|github|official] [--limit N]\n")
+            c.print("[bold red]Usage:[/] /skills search <query> [--source installed|skills-sh|well-known|github|official] [--limit N]\n")
             return
         source = "all"
         limit = 10
@@ -1577,7 +1657,7 @@ def _print_skills_help(console: Console) -> None:
     console.print(Panel(
         "[bold]Skills Hub Commands:[/]\n\n"
         "  [cyan]browse[/] [--source official]   Browse all available skills (paginated)\n"
-        "  [cyan]search[/] <query>              Search registries for skills\n"
+        "  [cyan]search[/] <query> [--source installed]  Search installed skills + registries\n"
         "  [cyan]install[/] <identifier>        Install a skill (with security scan)\n"
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
