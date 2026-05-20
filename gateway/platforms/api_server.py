@@ -761,6 +761,25 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_required_auth(self, request: "web.Request", *, feature: str) -> Optional["web.Response"]:
+        """Validate Bearer auth for endpoints that must never run unauthenticated."""
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    f"{feature} requires API key authentication. Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+        return self._check_auth(request)
+
+    @staticmethod
+    def _coerce_positive_int(value: Any, default: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(1, min(parsed, maximum))
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -995,6 +1014,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
+                "skills_api": True,
+                "skills_api_requires_auth": True,
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
@@ -1010,6 +1031,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "skills": {"method": "GET", "path": "/v1/skills"},
+                "skill": {"method": "GET", "path": "/v1/skills/{name}"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -1019,6 +1042,97 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
+
+    def _skill_summary_payload(self, skill: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(skill.get("name") or "")
+        return {
+            "id": name,
+            "object": "skill",
+            "name": name,
+            "description": str(skill.get("description") or ""),
+            "category": skill.get("category"),
+            "tags": [str(t) for t in skill.get("tags", [])],
+            "related_skills": [str(s) for s in skill.get("related_skills", [])],
+        }
+
+    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills — authenticated installed-skill search/list endpoint."""
+        auth_err = self._check_required_auth(request, feature="Skills API")
+        if auth_err:
+            return auth_err
+
+        from tools.skills_tool import _find_all_skills, _skill_matches_query
+
+        params = request.rel_url.query
+        query = (params.get("query") or params.get("q") or "").strip()
+        tag = (params.get("tag") or "").strip()
+        category = (params.get("category") or "").strip()
+        limit = self._coerce_positive_int(params.get("limit"), default=100, maximum=500)
+
+        skills = _find_all_skills()
+        if category:
+            skills = [s for s in skills if s.get("category") == category]
+        if query or tag:
+            skills = [s for s in skills if _skill_matches_query(s, query=query, tag=tag)]
+
+        def _rank(skill: Dict[str, Any]) -> tuple[int, str]:
+            q = query.lower()
+            tags = [str(t).lower() for t in skill.get("tags", [])]
+            name = str(skill.get("name", "")).lower()
+            cat = str(skill.get("category", "")).lower()
+            desc = str(skill.get("description", "")).lower()
+            if tag and tag.lower() in tags:
+                return (0, name)
+            if q in tags:
+                return (1, name)
+            if q and q in name:
+                return (2, name)
+            if q and q in cat:
+                return (3, name)
+            if q and q in desc:
+                return (4, name)
+            return (5, name)
+
+        skills = sorted(skills, key=_rank)[:limit]
+        return web.json_response({
+            "object": "list",
+            "data": [self._skill_summary_payload(skill) for skill in skills],
+            "count": len(skills),
+            "filters": {
+                "query": query or None,
+                "tag": tag or None,
+                "category": category or None,
+                "source": "installed",
+            },
+        })
+
+    async def _handle_get_skill(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills/{name} — authenticated full skill fetch endpoint."""
+        auth_err = self._check_required_auth(request, feature="Skills API")
+        if auth_err:
+            return auth_err
+
+        name = request.match_info.get("name", "").strip()
+        if not name:
+            return web.json_response(_openai_error("Missing skill name"), status=400)
+
+        from tools.skills_tool import skill_view
+
+        try:
+            payload = json.loads(skill_view(name))
+        except Exception as exc:
+            logger.debug("Failed to load skill %s via API: %s", name, exc, exc_info=True)
+            return web.json_response(_openai_error("Failed to load skill"), status=500)
+
+        if not payload.get("success"):
+            return web.json_response(
+                _openai_error(str(payload.get("error") or f"Skill '{name}' not found"), code="skill_not_found"),
+                status=404,
+            )
+
+        payload["object"] = "skill"
+        payload["id"] = payload.get("name") or name
+        return web.json_response(payload)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3402,6 +3516,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/skills", self._handle_skills)
+            self._app.router.add_get("/v1/skills/{name}", self._handle_get_skill)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

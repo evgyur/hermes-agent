@@ -11609,6 +11609,8 @@ Examples:
         default="all",
         choices=[
             "all",
+            "installed",
+            "local",
             "official",
             "skills-sh",
             "well-known",

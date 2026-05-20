@@ -557,6 +557,56 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+def _extract_skill_tags(frontmatter: Dict[str, Any]) -> List[str]:
+    """Return normalized searchable tags from skill frontmatter."""
+    metadata = frontmatter.get("metadata")
+    if isinstance(metadata, dict):
+        hermes_meta = metadata.get("hermes")
+        if isinstance(hermes_meta, dict):
+            tags = _parse_tags(hermes_meta.get("tags"))
+            if tags:
+                return tags
+    return _parse_tags(frontmatter.get("tags"))
+
+
+def _extract_related_skills(frontmatter: Dict[str, Any]) -> List[str]:
+    """Return normalized searchable related-skill names from frontmatter."""
+    metadata = frontmatter.get("metadata")
+    if isinstance(metadata, dict):
+        hermes_meta = metadata.get("hermes")
+        if isinstance(hermes_meta, dict):
+            related = _parse_tags(hermes_meta.get("related_skills"))
+            if related:
+                return related
+    return _parse_tags(frontmatter.get("related_skills"))
+
+
+def _skill_matches_query(skill: Dict[str, Any], query: str | None = None, tag: str | None = None) -> bool:
+    """Match local skill metadata by name, description, category, tags, or related skills."""
+    if tag:
+        wanted = tag.strip().lower()
+        tags = [str(t).lower() for t in skill.get("tags", [])]
+        if wanted not in tags:
+            return False
+
+    if query:
+        q = query.strip().lower()
+        if q:
+            searchable = " ".join(
+                [
+                    str(skill.get("name", "")),
+                    str(skill.get("description", "")),
+                    str(skill.get("category", "")),
+                    " ".join(str(t) for t in skill.get("tags", [])),
+                    " ".join(str(s) for s in skill.get("related_skills", [])),
+                ]
+            ).lower()
+            if q not in searchable:
+                return False
+
+    return True
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -614,12 +664,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
                 category = _get_category_from_path(skill_md)
+                tags = _extract_skill_tags(frontmatter)
+                related_skills = _extract_related_skills(frontmatter)
 
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "tags": tags,
+                    "related_skills": related_skills,
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -682,7 +736,7 @@ def _load_category_description(category_dir: Path) -> Optional[str]:
         return None
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(category: str = None, query: str = None, tag: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -691,6 +745,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
     Args:
         category: Optional category filter (e.g., "mlops")
+        query: Optional substring search across name, description, category, tags, and related skills
+        tag: Optional exact tag filter (e.g., "design")
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
@@ -726,6 +782,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+        if query or tag:
+            all_skills = [s for s in all_skills if _skill_matches_query(s, query=query, tag=tag)]
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
@@ -741,7 +799,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "hint": "Use skill_view(name) to see full content and linked files. Use query/tag filters to search local skill metadata.",
             },
             ensure_ascii=False,
         )
@@ -1507,7 +1565,15 @@ SKILLS_LIST_SCHEMA = {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional local metadata search across skill name, description, category, tags, and related skills",
+            },
+            "tag": {
+                "type": "string",
+                "description": "Optional exact tag filter, e.g. 'design'",
+            },
         },
         "required": [],
     },
@@ -1537,7 +1603,10 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        query=args.get("query"),
+        tag=args.get("tag"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
