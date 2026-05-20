@@ -970,10 +970,10 @@ class TestInlinePreviewGuard:
         report = "готово.\n\n➊ проверка\n┈ smoke ok\n┈ message_id: 123"
         assert _looks_like_inline_tg_preview(report) is False
 
-    def test_chip_tg_guard_is_hardcoded_by_default(self):
+    def test_inline_preview_guard_is_disabled_by_default(self):
         adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
-        assert adapter._inline_preview_guard["enabled"] is True
-        assert "-1009876543210" in adapter._inline_preview_guard["chats"]
+        assert adapter._inline_preview_guard["enabled"] is False
+        assert adapter._inline_preview_guard["chats"] == set()
         assert adapter._inline_preview_guard["action"] == "external_preview"
 
     @pytest.mark.asyncio

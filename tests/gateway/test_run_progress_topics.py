@@ -743,10 +743,10 @@ async def test_run_agent_suppresses_tool_progress_for_configured_telegram_chat(m
         tmp_path,
         FakeAgent,
         session_id="sess-quiet-chat",
-        chat_id="-1003770669948",
+        chat_id="-1001234567890",
         config_data={
             "display": {"tool_progress": "all"},
-            "telegram": {"suppress_tool_progress_chats": [-1003770669948]},
+            "telegram": {"suppress_tool_progress_chats": [-1001234567890]},
         },
     )
 
@@ -766,7 +766,7 @@ async def test_run_agent_keeps_tool_progress_for_other_telegram_chats(monkeypatc
         chat_id="-1001",
         config_data={
             "display": {"tool_progress": "all"},
-            "telegram": {"suppress_tool_progress_chats": [-1003770669948]},
+            "telegram": {"suppress_tool_progress_chats": [-1001234567890]},
         },
     )
 

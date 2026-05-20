@@ -1242,7 +1242,7 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
     raw = json.loads((hermes_home / "auth.json").read_text())
     raw["providers"]["xai-oauth"]["tokens"] = {
         "access_token": other_process_at,
-        "refresh_token": "rt-rotated-by-other-process",
+        "refresh_token": "rt-rotated",
         "id_token": "",
         "expires_in": 3600,
         "token_type": "Bearer",
@@ -1269,7 +1269,7 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
 
     selected = pool.select()
     assert selected is not None
-    assert refresh_calls["refresh_token_seen"] == "rt-rotated-by-other-process"
+    assert refresh_calls["refresh_token_seen"] == "rt-rotated"
     assert selected.access_token == final_at
 
 
