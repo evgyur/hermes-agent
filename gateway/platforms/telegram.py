@@ -201,9 +201,9 @@ def _strip_mdv2(text: str) -> str:
 
 _INLINE_TG_PREVIEW_BLOCKER = (
     "превью заблокировано: Hermes-бот попытался отправить TG-пост inline. "
-    "Нужный путь — telegram-chip / ChipCR с exact-message verify-gate."
+    "Нужный путь — external preview bridge with exact-message verify-gate."
 )
-_CHIP_TG_PREVIEW_GUARD_CHAT_IDS = {"-1003437858232", "-1003712304136"}
+_TG_PREVIEW_GUARD_CHAT_IDS: set[str] = set()
 _TG_PREVIEW_PENDING_ECHO_FILE = "/tmp/tg_preview_echo_pending.jsonl"
 _HUMAN20_CTA_TEXT = "перейти в @human20"
 _HUMAN20_CTA_URL = "https://t.me/human20"
@@ -215,8 +215,8 @@ _INLINE_TG_OPERATOR_PREFIX_RE = re.compile(
 def _looks_like_inline_tg_preview(text: str) -> bool:
     """Return True for finished Telegram-post drafts that must not be bot-sent.
 
-    In Chip's `/tg` chats, any finished TG preview or edited post must be
-    delivered by the human account (ChipCR via telegram-chip), not by the
+    In Configured `/tg` chats, any finished TG preview or edited post must be
+    delivered by the human account (the configured external preview bridge), not by the
     Hermes bot. This detector intentionally catches both HTML captions and
     plain edited TG drafts while avoiding compact operator reports.
     """
@@ -244,7 +244,7 @@ def _looks_like_inline_tg_preview(text: str) -> bool:
     #   ⠀
     #   Источник: [name](url)
     # Those are still finished `/tg` artifacts and must be routed through
-    # ChipCR, never emitted by the Hermes bot as a final response.
+    # the preview bridge, never emitted by the Hermes bot as a final response.
     short_title = 3 <= len(first_line) <= 120 and not first_line.startswith(("/", "#"))
     has_multiple_tg_blocks = has_tg_block_separator and has_post_body
     return bool(short_title and has_multiple_tg_blocks and (has_source_label or has_markdown_source))
@@ -253,7 +253,7 @@ def _looks_like_inline_tg_preview(text: str) -> bool:
 def _tg_preview_visible_text(text: str) -> str:
     """Normalize a TG preview caption/body for echo fingerprinting.
 
-    `send-preview.sh` writes HTML, but Telegram delivers the same ChipCR
+    `send-preview.sh` writes HTML, but Telegram delivers the same external-preview
     message back to the bot as visible plain text plus entities. Hash the
     visible form so the pre-send pending marker and incoming update match.
     """
@@ -3091,439 +3091,14 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer()
 
     async def _handle_gptprof_callback(self, query, data: str) -> None:
-        """Handle Chip's /gptprof inline keyboard callbacks."""
-        auth_path = "/home/hermes/.hermes/auth.json"
-        config_path = "/home/hermes/.hermes/config.yaml"
-        hcp_dir = "/home/hermes/.hermes/skills/chip/hcp"
-        send_script = "/home/hermes/.hermes/skills/chip/gptprof/send_buttons.py"
-        python_bin = "/opt/hermes-agent/venv/bin/python3"
-        pending_auth_path = "/tmp/gptprof_pending_auth.json"
+        """Handle optional profile-switcher callbacks.
 
-        def _load_json(path: str, default: Any) -> Any:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return default
+        The public fork does not bundle private OAuth profile files or operator
+        overlays. Install a private profile-switcher pack to enable these
+        callback payloads.
+        """
+        await query.answer(text="Profile switcher callbacks are not bundled in the public distro.")
 
-        def _write_json(path: str, value: Any) -> None:
-            directory = os.path.dirname(path) or "."
-            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".json", dir=directory)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(value, f, indent=2, ensure_ascii=False)
-                    f.write("\n")
-                atomic_replace(tmp, path)
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-                except OSError:
-                    pass
-
-        def _write_yaml(path: str, value: Any) -> None:
-            import yaml as _yaml
-            directory = os.path.dirname(path) or "."
-            fd, tmp = tempfile.mkstemp(prefix=".gptprof-", suffix=".yaml", dir=directory)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    _yaml.safe_dump(value, f, allow_unicode=True, sort_keys=False)
-                atomic_replace(tmp, path)
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-                except OSError:
-                    pass
-
-        async def _send_fresh_card(answer: str, *, clear_cache: bool = False) -> None:
-            await query.answer(text=answer)
-            if clear_cache:
-                try:
-                    _write_json("/tmp/gptprof_usage_cache.json", {})
-                except Exception:
-                    pass
-            try:
-                subprocess.Popen(
-                    [python_bin, send_script],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception as exc:
-                logger.error("gptprof refresh failed: %s", exc, exc_info=True)
-
-        def _usage_score(slug: str) -> tuple[int, int]:
-            cache = _load_json("/tmp/gptprof_usage_cache.json", {})
-            payload = cache.get(slug, {}) if isinstance(cache, dict) else {}
-            rl = (payload.get("rate_limit") or {}) if isinstance(payload, dict) else {}
-            primary = rl.get("primary_window") or {}
-            secondary = rl.get("secondary_window") or {}
-            def left(window: dict) -> int:
-                used = window.get("used_percent") if isinstance(window, dict) else None
-                return max(0, 100 - int(used)) if isinstance(used, (int, float)) else -1
-            return (left(secondary), left(primary))
-
-        def _active_slug() -> str:
-            auth = _load_json(auth_path, {})
-            if isinstance(auth, dict):
-                codex = auth.get("codex")
-                if isinstance(codex, dict) and codex.get("profile"):
-                    return str(codex["profile"])
-            return "gptinvest23"
-
-        def _model_for_slug(slug: str) -> str:
-            # gptprof switches the Codex OAuth profile/token only. The inference
-            # route stays pinned to GPT-5.5 so a profile button cannot silently
-            # downgrade Hermes to 5.4/5.4-mini.
-            return "gpt-5.5"
-
-        def _persist_new_auth(slug: str, access_token: str, refresh_token: str) -> None:
-            profile_path = os.path.join(hcp_dir, f"{slug}.json")
-            profile = _load_json(profile_path, {})
-            if not isinstance(profile, dict):
-                profile = {}
-            profile.setdefault("profile", slug)
-            profile.setdefault("email", f"{slug}@gmail.com")
-            profile.setdefault("plan", "Codex")
-            profile["access_token"] = access_token
-            profile["refresh_token"] = refresh_token
-            _write_json(profile_path, profile)
-
-            auth = _load_json(auth_path, {})
-            if not isinstance(auth, dict):
-                auth = {}
-            auth["codex"] = {
-                "profile": slug,
-                "plan": profile.get("plan"),
-                "email": profile.get("email"),
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            }
-            pool_root = auth.setdefault("credential_pool", {})
-            if isinstance(pool_root, dict):
-                pool = pool_root.get("openai-codex")
-                if not isinstance(pool, list):
-                    pool = []
-                selected_source = f"gptprof:{slug}"
-                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
-                selected = {
-                    "id": f"gptprof-{slug}",
-                    "label": profile.get("email") or slug,
-                    "auth_type": "oauth",
-                    "priority": 0,
-                    "source": selected_source,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "base_url": "https://chatgpt.com/backend-api/codex",
-                    "last_status": "ok",
-                    "last_status_at": time.time(),
-                    "request_count": 0,
-                }
-                for idx, item in enumerate(existing, start=1):
-                    if isinstance(item, dict):
-                        item["priority"] = idx
-                pool_root["openai-codex"] = [selected, *existing]
-            _write_json(auth_path, auth)
-
-            try:
-                import yaml as _yaml
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = _yaml.safe_load(f) or {}
-                model_cfg = cfg.get("model")
-                if not isinstance(model_cfg, dict):
-                    model_cfg = {}
-                model_cfg["provider"] = "openai-codex"
-                model_cfg["default"] = _model_for_slug(slug)
-                model_cfg["base_url"] = "https://chatgpt.com/backend-api/codex"
-                model_cfg["api_mode"] = "codex_responses"
-                cfg["model"] = model_cfg
-                _write_yaml(config_path, cfg)
-            except Exception as exc:
-                logger.error("gptprof new auth config update failed: %s", exc, exc_info=True)
-
-        async def _start_new_auth() -> None:
-            slug = _active_slug()
-            issuer = "https://auth.openai.com"
-            client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-            token_url = "https://auth.openai.com/oauth/token"
-            message = getattr(query, "message", None)
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                    resp = await client.post(
-                        f"{issuer}/api/accounts/deviceauth/usercode",
-                        json={"client_id": client_id},
-                        headers={"Content-Type": "application/json"},
-                    )
-                if resp.status_code != 200:
-                    await query.answer(text=f"New auth failed: {resp.status_code}")
-                    return
-                device_data = resp.json()
-                user_code = str(device_data.get("user_code") or "")
-                device_auth_id = str(device_data.get("device_auth_id") or "")
-                poll_interval = max(3, int(device_data.get("interval") or 5))
-                if not user_code or not device_auth_id:
-                    await query.answer(text="New auth failed: empty device code.")
-                    return
-            except Exception as exc:
-                logger.error("gptprof new auth start failed: %s", exc, exc_info=True)
-                await query.answer(text="New auth failed to start.")
-                return
-
-            _write_json(pending_auth_path, {
-                "slug": slug,
-                "issuer": issuer,
-                "client_id": client_id,
-                "token_url": token_url,
-                "device_auth_id": device_auth_id,
-                "user_code": user_code,
-                "poll_interval": poll_interval,
-                "created_at": time.time(),
-                "expires_at": time.time() + 15 * 60,
-            })
-
-            await query.answer(text="New auth started.")
-            if message is not None:
-                try:
-                    await message.reply_text(
-                        "🔑 New Codex auth\n\n"
-                        f"Profile: {slug}\n"
-                        f"Open: {issuer}/codex/device\n"
-                        f"Code: {user_code}\n\n"
-                        "After sign-in, press Check auth.",
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("✅ Check auth", callback_data="gptprof:check_auth"),
-                        ]]),
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    pass
-
-
-        async def _check_pending_auth() -> None:
-            pending = _load_json(pending_auth_path, {})
-            if not isinstance(pending, dict) or not pending.get("device_auth_id"):
-                await query.answer(text="No pending auth. Press New auth first.")
-                return
-            if time.time() > float(pending.get("expires_at") or 0):
-                try:
-                    os.unlink(pending_auth_path)
-                except OSError:
-                    pass
-                await query.answer(text="Auth code expired. Press New auth again.")
-                return
-
-            slug = str(pending.get("slug") or _active_slug())
-            issuer = str(pending.get("issuer") or "https://auth.openai.com")
-            client_id = str(pending.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann")
-            token_url = str(pending.get("token_url") or "https://auth.openai.com/oauth/token")
-            device_auth_id = str(pending.get("device_auth_id") or "")
-            user_code = str(pending.get("user_code") or "")
-            message = getattr(query, "message", None)
-
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                    poll_resp = await client.post(
-                        f"{issuer}/api/accounts/deviceauth/token",
-                        json={"device_auth_id": device_auth_id, "user_code": user_code},
-                        headers={"Content-Type": "application/json"},
-                    )
-                if poll_resp.status_code in (403, 404):
-                    await query.answer(text="Auth is not completed yet.")
-                    return
-                if poll_resp.status_code != 200:
-                    await query.answer(text=f"Auth check failed: {poll_resp.status_code}")
-                    return
-                code_resp = poll_resp.json()
-                authorization_code = str(code_resp.get("authorization_code") or "")
-                code_verifier = str(code_resp.get("code_verifier") or "")
-                if not authorization_code or not code_verifier:
-                    await query.answer(text="Auth check returned incomplete data.")
-                    return
-
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                    token_resp = await client.post(
-                        token_url,
-                        data={
-                            "grant_type": "authorization_code",
-                            "code": authorization_code,
-                            "redirect_uri": f"{issuer}/deviceauth/callback",
-                            "client_id": client_id,
-                            "code_verifier": code_verifier,
-                        },
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    )
-                if token_resp.status_code != 200:
-                    await query.answer(text=f"Token exchange failed: {token_resp.status_code}")
-                    return
-                tokens = token_resp.json()
-                access_token = str(tokens.get("access_token") or "")
-                refresh_token = str(tokens.get("refresh_token") or "")
-                if not access_token or not refresh_token:
-                    await query.answer(text="Token exchange returned incomplete tokens.")
-                    return
-
-                _persist_new_auth(slug, access_token, refresh_token)
-                try:
-                    os.unlink(pending_auth_path)
-                except OSError:
-                    pass
-                try:
-                    cache = _load_json("/tmp/gptprof_usage_cache.json", {})
-                    if isinstance(cache, dict):
-                        cache.pop(slug, None)
-                        _write_json("/tmp/gptprof_usage_cache.json", cache)
-                except Exception:
-                    pass
-                await query.answer(text=f"Auth saved: {slug}")
-                if message is not None:
-                    try:
-                        await message.reply_text(f"✅ New auth saved for {slug}. Refreshing usage…")
-                    except Exception:
-                        pass
-                try:
-                    subprocess.Popen(
-                        [python_bin, send_script],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                except Exception:
-                    pass
-            except Exception as exc:
-                logger.error("gptprof auth check failed: %s", exc, exc_info=True)
-                await query.answer(text="Auth check failed.")
-
-        async def _switch(slug: str, model: str, *, autoswitch: bool = False) -> None:
-            safe_slugs = {"gptinvest23", "markov495", "mintsage", "omnifocusme"}
-            if slug not in safe_slugs:
-                await query.answer(text="Unknown profile.")
-                return
-            # Ignore the model embedded in legacy callback_data. Profile choice
-            # selects credentials; model selection is pinned globally here.
-            model = "gpt-5.5"
-            profile_path = os.path.join(hcp_dir, f"{slug}.json")
-            profile = _load_json(profile_path, {})
-            if not isinstance(profile, dict) or not profile.get("access_token"):
-                await query.answer(text="Profile token not found.")
-                return
-
-            auth = _load_json(auth_path, {})
-            if not isinstance(auth, dict):
-                auth = {}
-            codex_entry = {
-                "profile": slug,
-                "plan": profile.get("plan"),
-                "email": profile.get("email"),
-                "access_token": profile.get("access_token"),
-                "refresh_token": profile.get("refresh_token"),
-            }
-            auth["codex"] = codex_entry
-
-            pool_root = auth.setdefault("credential_pool", {})
-            if isinstance(pool_root, dict):
-                pool = pool_root.get("openai-codex")
-                if not isinstance(pool, list):
-                    pool = []
-                # Put the selected profile first so Codex inference uses it immediately.
-                selected_source = f"gptprof:{slug}"
-                existing = [c for c in pool if isinstance(c, dict) and c.get("source") != selected_source]
-                selected = {
-                    "id": f"gptprof-{slug}",
-                    "label": profile.get("email") or slug,
-                    "auth_type": "oauth",
-                    "priority": 0,
-                    "source": selected_source,
-                    "access_token": profile.get("access_token"),
-                    "refresh_token": profile.get("refresh_token"),
-                    "base_url": "https://chatgpt.com/backend-api/codex",
-                    "last_status": "ok",
-                    "last_status_at": time.time(),
-                    "request_count": 0,
-                }
-                for idx, item in enumerate(existing, start=1):
-                    if isinstance(item, dict):
-                        item["priority"] = idx
-                pool_root["openai-codex"] = [selected, *existing]
-
-            _write_json(auth_path, auth)
-
-            try:
-                import yaml as _yaml
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = _yaml.safe_load(f) or {}
-                model_cfg = cfg.get("model")
-                if not isinstance(model_cfg, dict):
-                    model_cfg = {"default": model}
-                model_cfg["provider"] = "openai-codex"
-                model_cfg["default"] = model
-                model_cfg["base_url"] = "https://chatgpt.com/backend-api/codex"
-                model_cfg["api_mode"] = "codex_responses"
-                cfg["model"] = model_cfg
-                _write_yaml(config_path, cfg)
-            except Exception as exc:
-                logger.error("gptprof config update failed: %s", exc, exc_info=True)
-                await query.answer(text="Profile switched, config update failed.")
-                return
-
-            label = "Autoswitched" if autoswitch else "Switched"
-            await query.answer(text=f"{label}: {slug}")
-            try:
-                await query.edit_message_text(
-                    text=f"✅ {label} to {slug}\n🧠 Model: openai-codex/{model}\n\nUse /new for a fresh session.",
-                    reply_markup=None,
-                    parse_mode=None,
-                )
-            except Exception:
-                pass
-            try:
-                subprocess.Popen(
-                    [python_bin, send_script],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception:
-                pass
-
-        if data == "gptprof:close":
-            await query.answer(text="Closed.")
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            return
-        if data in {"gptprof:add", "gptprof:new_auth"}:
-            await _start_new_auth()
-            return
-        if data == "gptprof:pi_route":
-            await query.answer(text="Pi route stays available as fallback.")
-            return
-        if data == "gptprof:refresh":
-            await _send_fresh_card("Usage refreshed.", clear_cache=True)
-            return
-        if data == "gptprof:check_auth":
-            await _check_pending_auth()
-            return
-        if data == "gptprof:autoswitch":
-            model_by_slug = {
-                "gptinvest23": "gpt-5.5",
-                "markov495": "gpt-5.5",
-                "mintsage": "gpt-5.5",
-                "omnifocusme": "gpt-5.5",
-            }
-            slug = max(model_by_slug, key=_usage_score)
-            await _switch(slug, model_by_slug[slug], autoswitch=True)
-            return
-
-        parts = data.split(":", 2)
-        if len(parts) != 3:
-            await query.answer(text="Invalid gptprof action.")
-            return
-        _, slug, model = parts
-        await _switch(slug, model)
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
@@ -5153,8 +4728,8 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> Optional[Any]:
         metadata = metadata or {}
         # This CTA is only for Telegram Business delegated inbox replies —
-        # i.e. when Chip invokes Sigurd in personal chats with other people.
-        # Do not attach it to Chip's direct bot DM or ordinary Telegram chats.
+        # i.e. when the operator invokes the agent in personal chats with other people.
+        # Do not attach it to the operator's direct bot DM or ordinary Telegram chats.
         if not self._business_connection_id_from_metadata(metadata):
             return reply_markup
         if self._outbound_chat_type(chat_id, metadata) != "dm":
@@ -5330,7 +4905,7 @@ class TelegramAdapter(BasePlatformAdapter):
             telegram:
               auto_skill_routes:
                 - skill: tg
-                  chats: [-1003437858232]
+                  chats: [-1001234567890]
                   match:
                     urls: true
                     media: [photo, video]
@@ -5359,11 +4934,11 @@ class TelegramAdapter(BasePlatformAdapter):
     def _load_inline_preview_guard(self) -> Dict[str, Any]:
         """Load per-chat guard against Hermes-bot `/tg` previews.
 
-        Chip's TG chats are fail-closed by default in this install: finished
-        post previews must be routed through telegram-chip/ChipCR even when the
+        operator's TG chats are fail-closed by default in this install: finished
+        post previews must be routed through the configured external preview bridge even when the
         config entry is missing or incomplete. Config can still add chats or
-        override script/timeout, but not silently disable the hardcoded Chip
-        guard unless HERMES_DISABLE_CHIP_TG_PREVIEW_GUARD=1 is set for tests.
+        override script/timeout, but not silently disable the configured preview
+        guard unless HERMES_DISABLE_TG_PREVIEW_GUARD=1 is set for tests.
         """
         raw = self.config.extra.get("inline_preview_guard", {})
         if raw is True:
@@ -5374,16 +4949,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(chats, (str, int)):
             chats = [chats]
         chat_set = {str(chat_id) for chat_id in chats}
-        if os.getenv("HERMES_DISABLE_CHIP_TG_PREVIEW_GUARD", "0") != "1":
-            chat_set |= set(_CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
-        enabled = bool(raw.get("enabled", False)) or bool(chat_set & _CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
+        if os.getenv("HERMES_DISABLE_TG_PREVIEW_GUARD", "0") != "1":
+            chat_set |= set(_TG_PREVIEW_GUARD_CHAT_IDS)
+        enabled = bool(raw.get("enabled", False)) or bool(chat_set & _TG_PREVIEW_GUARD_CHAT_IDS)
         return {
             "enabled": enabled,
             "chats": chat_set,
             "blocker": str(raw.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER),
-            "action": str(raw.get("action") or "chipcr_preview"),
-            "script": str(raw.get("script") or "/home/hermes/.hermes/skills/tg/scripts/send-reworked-preview.sh"),
+            "action": str(raw.get("action") or "external_preview"),
+            "script": str(raw.get("script") or ""),
             "timeout": float(raw.get("timeout", 120)),
+            "echo_user_ids": {str(v).strip() for v in (raw.get("echo_user_ids") or []) if str(v).strip()},
+            "echo_usernames": {str(v).strip().lstrip("@").lower() for v in (raw.get("echo_usernames") or []) if str(v).strip()},
         }
 
     def _inline_preview_guard_applies(
@@ -5442,12 +5019,12 @@ class TelegramAdapter(BasePlatformAdapter):
             stderr = (proc.stderr or "").strip()
             if proc.returncode != 0:
                 detail = stderr or stdout or f"exit {proc.returncode}"
-                return SendResult(success=False, error=f"ChipCR preview send failed: {detail[:500]}")
+                return SendResult(success=False, error=f"Preview bridge send failed: {detail[:500]}")
             message_id = self._extract_tg_preview_state_message_id()
             if not message_id:
                 return SendResult(
                     success=False,
-                    error="ChipCR preview send did not leave verified /tmp/tg_preview_state.json",
+                    error="Preview bridge send did not leave verified /tmp/tg_preview_state.json",
                 )
             return SendResult(
                 success=True,
@@ -5458,7 +5035,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 },
             )
         except Exception as exc:
-            return SendResult(success=False, error=f"ChipCR preview guard exception: {exc}")
+            return SendResult(success=False, error=f"Preview bridge guard exception: {exc}")
         finally:
             try:
                 os.unlink(tmp_path)
@@ -5471,7 +5048,7 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[SendResult]:
-        """Route configured inline `/tg` previews through ChipCR instead of bot-send."""
+        """Route configured inline `/tg` previews through an external preview bridge instead of bot-send."""
         if not self._inline_preview_guard_applies(chat_id, content):
             return None
         guard = getattr(self, "_inline_preview_guard", None) or {}
@@ -5486,7 +5063,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         if result.success:
             logger.info(
-                "[%s] Routed inline TG preview through ChipCR guard (chat=%s message_id=%s)",
+                "[%s] Routed inline TG preview through external preview guard (chat=%s message_id=%s)",
                 self.name,
                 chat_id,
                 result.message_id,
@@ -5494,7 +5071,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return result
         self._last_inline_preview_guard_error = result.error
         logger.error(
-            "[%s] ChipCR inline TG preview guard failed (chat=%s): %s",
+            "[%s] External inline TG preview guard failed (chat=%s): %s",
             self.name,
             chat_id,
             result.error,
@@ -5529,9 +5106,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _recent_chipcr_preview_message_ids() -> set[str]:
-        """Return exact message ids sent by the ChipCR `/tg` preview path.
+        """Return exact message ids sent by the external `/tg` preview path.
 
-        `telegram-chip` sends previews from Chip's human account, so Telegram
+        `the external preview bridge sends previews from a non-bot account, so Telegram
         delivers those messages back to this bot as normal user messages. If we
         process that echo, the auto `/tg` route can recursively preview the
         preview. The canonical sender writes verified ids to these local state
@@ -5566,7 +5143,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _pending_chipcr_preview_echo_fingerprints(chat_id: str) -> set[str]:
         """Return still-valid pre-send preview fingerprints for this chat.
 
-        The exact-id guard is not enough: Telegram can deliver the ChipCR echo
+        The exact-id guard is not enough: Telegram can deliver the external-preview echo
         while `send-preview.sh` is still verifying and before it has written the
         final state file (or when callers use a custom state path). The sender
         therefore writes a short-lived content fingerprint before sending.
@@ -5600,22 +5177,24 @@ class TelegramAdapter(BasePlatformAdapter):
         return fingerprints
 
     def _is_chipcr_tg_preview_echo(self, message: Message) -> bool:
-        """Return True for ChipCR preview messages that must be ignored.
+        """Return True for external preview messages that must be ignored.
 
-        `telegram-chip` posts from Chip's human account, so Bot API receives the
+        `the external preview bridge posts from a non-bot account, so Bot API receives the
         preview as a normal user message. Exact ids are preferred; pending
         fingerprints cover the race before exact state is visible.
         """
         chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
         guard = getattr(self, "_inline_preview_guard", None) or {}
-        guarded_chats = guard.get("chats") or set(_CHIP_TG_PREVIEW_GUARD_CHAT_IDS)
+        guarded_chats = guard.get("chats") or set(_TG_PREVIEW_GUARD_CHAT_IDS)
         if guarded_chats and chat_id not in guarded_chats:
             return False
 
         user = getattr(message, "from_user", None)
         user_id = str(getattr(user, "id", "") or "")
         username = str(getattr(user, "username", "") or "").lstrip("@").lower()
-        if user_id and user_id != "617744661" and username != "chipcr":
+        allowed_user_ids = guard.get("echo_user_ids") or set()
+        allowed_usernames = guard.get("echo_usernames") or set()
+        if (allowed_user_ids or allowed_usernames) and user_id not in allowed_user_ids and username not in allowed_usernames:
             return False
 
         message_id = str(getattr(message, "message_id", "") or "")
@@ -5820,7 +5399,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if self._is_chipcr_tg_preview_echo(update.message):
             logger.info(
-                "[Telegram] Ignoring ChipCR /tg preview echo chat=%s message_id=%s",
+                "[Telegram] Ignoring external /tg preview echo chat=%s message_id=%s",
                 getattr(getattr(update.message, "chat", None), "id", None),
                 getattr(update.message, "message_id", None),
             )
@@ -6033,7 +5612,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if self._is_chipcr_tg_preview_echo(update.message):
             logger.info(
-                "[Telegram] Ignoring ChipCR /tg preview media echo chat=%s message_id=%s",
+                "[Telegram] Ignoring external /tg preview media echo chat=%s message_id=%s",
                 getattr(getattr(update.message, "chat", None), "id", None),
                 getattr(update.message, "message_id", None),
             )
