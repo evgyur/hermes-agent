@@ -8,6 +8,10 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    is_postcraft_loaded_message,
+    is_postcraft_trigger_message,
+    maybe_build_postcraft_autoload_message,
+    postcraft_reasoning_config,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -766,3 +770,38 @@ class TestInlineShellExpansion:
         # The command's intended stdout never made it through — only the
         # timeout marker (which echoes the command text) survives.
         assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
+
+
+class TestPostcraftAutoload:
+    def test_detects_editorial_writing_requests(self):
+        assert is_postcraft_trigger_message("перепиши этот текст человеческим языком")
+        assert is_postcraft_trigger_message("напиши пост про память агентов")
+        assert is_postcraft_trigger_message("make it tighter and humanize this draft")
+        assert not is_postcraft_trigger_message("/status")
+        assert not is_postcraft_trigger_message("проверь порт 443")
+
+    def test_reasoning_config_is_xhigh(self):
+        assert postcraft_reasoning_config() == {"enabled": True, "effort": "xhigh"}
+
+    def test_autoloads_postcraft_skill_file_backed(self, tmp_path):
+        _make_skill(
+            tmp_path,
+            "postcraft",
+            body="Postcraft rail: run quality_check and write alive Russian text.",
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            msg = maybe_build_postcraft_autoload_message(
+                "перепиши этот черновик",
+                task_id="test-session",
+            )
+
+        assert msg is not None
+        assert "postcraft" in msg.lower()
+        assert "reasoning=xhigh" in msg
+        assert "перепиши этот черновик" in msg
+        assert is_postcraft_loaded_message(msg)
+
+    def test_does_not_double_autoload_loaded_postcraft(self):
+        loaded = '[IMPORTANT: The user has invoked the "postcraft" skill, indicating they want you to follow its instructions.]'
+        assert is_postcraft_loaded_message(loaded)
+        assert maybe_build_postcraft_autoload_message(loaded) is None
