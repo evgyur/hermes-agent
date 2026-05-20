@@ -11018,6 +11018,32 @@ class HermesCLI:
         if not self._ensure_runtime_credentials():
             return None
 
+        _postcraft_persist_user_message = None
+        _postcraft_force_xhigh = False
+        if isinstance(message, str):
+            try:
+                from agent.skill_commands import (
+                    is_postcraft_loaded_message,
+                    maybe_build_postcraft_autoload_message,
+                    postcraft_reasoning_config,
+                )
+                if is_postcraft_loaded_message(message):
+                    _postcraft_force_xhigh = True
+                    self.reasoning_config = postcraft_reasoning_config()
+                else:
+                    _postcraft_msg = maybe_build_postcraft_autoload_message(
+                        message,
+                        task_id=self.session_id,
+                    )
+                    if _postcraft_msg:
+                        _postcraft_persist_user_message = message
+                        message = _postcraft_msg
+                        _postcraft_force_xhigh = True
+                        self.reasoning_config = postcraft_reasoning_config()
+                        _cprint(f"{_DIM}⚡ Auto-loading postcraft (reasoning=xhigh){_RST}")
+            except Exception as exc:
+                logging.debug("postcraft autoload check failed: %s", exc)
+
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
@@ -11031,6 +11057,12 @@ class HermesCLI:
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        if _postcraft_force_xhigh:
+            try:
+                from agent.skill_commands import postcraft_reasoning_config
+                self.agent.reasoning_config = postcraft_reasoning_config()
+            except Exception:
+                pass
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -11238,7 +11270,10 @@ class HermesCLI:
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
                         task_id=self.session_id,
-                        persist_user_message=message if _voice_prefix else None,
+                        persist_user_message=(
+                            _postcraft_persist_user_message
+                            or (message if _voice_prefix else None)
+                        ),
                     )
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)

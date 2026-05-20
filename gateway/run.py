@@ -7817,6 +7817,20 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
+        try:
+            from agent.skill_commands import maybe_build_postcraft_autoload_message
+            _postcraft_msg = maybe_build_postcraft_autoload_message(
+                message_text,
+                task_id=session_key,
+            )
+            if _postcraft_msg:
+                logger.info(
+                    "Auto-loaded postcraft skill for editorial turn; forcing reasoning=xhigh"
+                )
+                message_text = _postcraft_msg
+        except Exception as exc:
+            logger.debug("postcraft autoload check failed: %s", exc)
+
         return message_text
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
@@ -11438,6 +11452,15 @@ class GatewayRunner:
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._resolve_session_reasoning_config(source=source)
+            try:
+                from agent.skill_commands import (
+                    is_postcraft_trigger_message,
+                    postcraft_reasoning_config,
+                )
+                if is_postcraft_trigger_message(prompt):
+                    reasoning_config = postcraft_reasoning_config()
+            except Exception as exc:
+                logger.debug("postcraft background reasoning override check failed: %s", exc)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -16194,6 +16217,15 @@ class GatewayRunner:
                 source=source,
                 session_key=session_key,
             )
+            try:
+                from agent.skill_commands import (
+                    is_postcraft_loaded_message,
+                    postcraft_reasoning_config,
+                )
+                if is_postcraft_loaded_message(message):
+                    reasoning_config = postcraft_reasoning_config()
+            except Exception as exc:
+                logger.debug("postcraft reasoning override check failed: %s", exc)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
