@@ -1303,18 +1303,42 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     ``_resolve_auto`` Step 1 falls through to the next provider in the chain).
     """
     try:
-        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+        from hermes_cli.auth import (
+            DEFAULT_XAI_OAUTH_BASE_URL,
+            resolve_xai_oauth_runtime_credentials,
+        )
 
         creds = resolve_xai_oauth_runtime_credentials()
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
-        return None
+        creds = None
 
-    api_key = str(creds.get("api_key") or "").strip()
-    base_url = str(creds.get("base_url") or "").strip().rstrip("/")
-    if not api_key or not base_url:
-        return None
-    return api_key, base_url
+    if isinstance(creds, dict):
+        api_key = str(creds.get("api_key") or "").strip()
+        base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+        if api_key and base_url:
+            return api_key, base_url
+
+    # Pool-only credentials are valid for runtime use even when auth.json has
+    # no singleton xAI entry.  `hermes auth status` reports these as logged in,
+    # so auxiliary tasks must see them too.
+    try:
+        default_base_url = DEFAULT_XAI_OAUTH_BASE_URL
+    except Exception:
+        default_base_url = "https://api.x.ai/v1"
+    pool_present, entry = _select_pool_entry("xai-oauth")
+    if pool_present:
+        api_key = _pool_runtime_api_key(entry)
+        base_url = (
+            os.getenv("HERMES_XAI_BASE_URL")
+            or os.getenv("XAI_BASE_URL")
+            or _pool_runtime_base_url(entry, default_base_url)
+            or default_base_url
+        )
+        base_url = str(base_url or "").strip().rstrip("/")
+        if api_key and base_url:
+            return api_key, base_url
+    return None
 
 
 def _read_codex_access_token() -> Optional[str]:
@@ -3814,7 +3838,11 @@ def resolve_vision_provider_client(
         #   4. Stop
         main_provider = _read_main_provider()
         main_model = _read_main_model()
-        if main_provider and main_provider not in {"auto", ""}:
+        if (
+            main_provider
+            and main_provider not in {"auto", ""}
+            and main_provider not in _PROVIDERS_WITHOUT_VISION
+        ):
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
