@@ -900,52 +900,57 @@ DEFAULT_CONFIG = {
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
         "web_extract": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
         },
         "compression": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
         },
-        # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
-        # single-shape tool returns DB content directly). The old
-        # ``auxiliary.session_search.*`` block was removed here. Existing
-        # values in user config.yaml files are harmless leftovers and ignored.
+        "session_search": {
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+            "max_concurrency": 3,  # Clamp parallel summaries to avoid request-burst 429s on small providers
+        },
         "skills_hub": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
         },
         "approval": {
-            "provider": "auto",
-            "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",           # fast/cheap model recommended (e.g. mmfast, haiku)
             "base_url": "",
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
         },
         "mcp": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
         },
         "title_generation": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -954,11 +959,11 @@ DEFAULT_CONFIG = {
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
-        # cheap, capable model here (gemini-flash works well); the main
+        # cheap, capable model here (MiniMax works well); the main
         # model is overkill for short spec expansion.
         "triage_specifier": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 120,
@@ -993,10 +998,10 @@ DEFAULT_CONFIG = {
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
         # model; override via `hermes model` → auxiliary → Curator to route
-        # to a cheaper aux model (e.g. openrouter google/gemini-3-flash-preview).
+        # to a cheaper aux model (e.g. MiniMax).
         "curator": {
-            "provider": "auto",
-            "model": "",
+            "provider": "minimax",
+            "model": "MiniMax-M2.7",
             "base_url": "",
             "api_key": "",
             "timeout": 600,

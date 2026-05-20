@@ -248,8 +248,8 @@ Every task above follows the same **provider / model / base_url** pattern. Conte
 ```yaml
 auxiliary:
   compression:
-    provider: main                                    # Same provider options as other auxiliary tasks
-    model: google/gemini-3-flash-preview
+    provider: minimax                                 # Same provider options as other auxiliary tasks
+    model: MiniMax-M2.7
     base_url: null                                    # Custom OpenAI-compatible endpoint
 ```
 
