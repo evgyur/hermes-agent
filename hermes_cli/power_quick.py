@@ -16,6 +16,8 @@ from typing import Sequence
 PUBLIC_MODEL_PROFILES = {
     "mmfast": "/model MiniMax-M2.7 --provider minimax --global",
     "gptt": "/model gpt-5.5 --provider openai-codex --global",
+    "xai": "/model grok-4.3 --provider xai-oauth --global",
+    "rp": "bundled /rp skill alias for reasoning-personas",
 }
 
 

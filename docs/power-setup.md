@@ -10,10 +10,10 @@ Hermes Power Setup is an opinionated multimodal setup layer for Hermes Agent. It
 - Vision/doc intake: image understanding, screenshot analysis, OCR/PDF dependency checks.
 - Image studio: `/img`-style image generation and deterministic asset-composition guardrails.
 - Video generation: PiAPI-backed video generation for Seedance/Veo/Kling/Wan model choice, pricing, and `generate -> remove watermark -> download` workflows. The public pack ships provider config and the bundled skill; `PIAPI_API_KEY` stays local.
-- Model profile switching foundation: compatibility quick commands `/gptprof`, `/gptt`, and `/mmfast` for public profile discovery and fast/specialized model routes.
+- Model profile switching foundation: compatibility quick commands `/gptprof`, `/gptt`, `/mmfast`, and `/xai` for public profile discovery and fast/specialized model routes.
 - Compatibility command pack: `/say`, `/img`, and `/video` wrappers that call the public TTS, image generation, and PiAPI video-generation surfaces when their providers are configured.
 - Telegram user bridge foundation: single Telethon-client companion service pattern.
-- Browser relay, media intake, cron/watchdogs, memory/skill hygiene, MCP/webhook starter modules.
+- Browser relay, media intake, cron/watchdogs, memory/skill hygiene, `/rp` reasoning-personas, MCP/webhook starter modules.
 - Ops doctor: local readiness checks and secret-scan guardrails.
 
 ## Explicitly not included by default

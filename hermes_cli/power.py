@@ -36,6 +36,7 @@ POWER_DEFAULT_MODULES: tuple[str, ...] = (
     "media-intake",
     "ops-doctor",
     "memory-skill-hygiene",
+    "reasoning-personas",
     "mcp-webhook-starter",
 )
 
@@ -239,6 +240,10 @@ def power_preset_defaults() -> dict[str, Any]:
                 "type": "alias",
                 "target": "/model gpt-5.5 --provider openai-codex --global",
             },
+            "xai": {
+                "type": "alias",
+                "target": "/model grok-4.3 --provider xai-oauth --global",
+            },
             "say": {
                 "type": "exec",
                 "command": "python3 -m hermes_cli.power_quick say",
@@ -259,7 +264,7 @@ def power_preset_defaults() -> dict[str, Any]:
             "enabled": True,
             "preset": "default",
             "modules": list(POWER_DEFAULT_MODULES),
-            "bundled_skills": ["piapi-video-toolkit"],
+            "bundled_skills": ["piapi-video-toolkit", "reasoning-personas", "rp"],
             "private_overlay_required": False,
             "smoke_surfaces": [surface["id"] for surface in POWER_SMOKE_SURFACES],
         },
