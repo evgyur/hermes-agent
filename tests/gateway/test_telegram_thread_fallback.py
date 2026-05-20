@@ -253,7 +253,7 @@ async def test_send_omits_general_topic_thread_id():
 
 
 @pytest.mark.asyncio
-async def test_send_adds_human20_button_for_private_dms():
+async def test_send_does_not_add_human20_button_for_private_bot_dms():
     from gateway.platforms import telegram as telegram_mod
 
     adapter = _make_adapter()
@@ -284,11 +284,7 @@ async def test_send_adds_human20_button_for_private_dms():
 
     assert result.success is True
     assert len(call_log) == 1
-    markup = call_log[0]["reply_markup"]
-    assert markup is not None
-    button = markup.inline_keyboard[-1][0]
-    assert button.text == "перейти в @human20"
-    assert button.kwargs["url"] == "https://t.me/human20"
+    assert call_log[0].get("reply_markup") is None
 
 
 @pytest.mark.asyncio

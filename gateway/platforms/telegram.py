@@ -4728,8 +4728,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_markup: Optional[Any] = None,
     ) -> Optional[Any]:
         metadata = metadata or {}
-        # Attach CTA to known private DM replies.  Business delegated inboxes
-        # and ordinary private bot DMs both benefit; group/channel replies do not.
+        # Attach the Human20 CTA only to external Telegram Business DM replies.
+        # Ordinary bot DMs can be the operator's own chat; adding promo buttons
+        # there is noisy and caused private-chat leakage in tests.
+        if not metadata.get("external_safe_mode"):
+            return reply_markup
+        if not self._business_connection_id_from_metadata(metadata):
+            return reply_markup
         if self._outbound_chat_type(chat_id, metadata) != "dm":
             return reply_markup
         try:

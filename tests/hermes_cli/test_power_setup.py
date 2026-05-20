@@ -76,6 +76,11 @@ def test_collect_power_checks_reports_voice_and_vision(monkeypatch):
     }
     monkeypatch.setenv("OPENROUTER_API_KEY", "present-for-test")
     monkeypatch.setenv("PIAPI_API_KEY", "present-for-test")
+    monkeypatch.setattr(
+        power.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"ffmpeg", "ffprobe", "git"} else None,
+    )
     with patch("hermes_cli.power.load_config", return_value=cfg):
         checks = power.collect_power_checks()
 
