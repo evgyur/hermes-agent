@@ -14,7 +14,7 @@ class FakeSessionDB:
             "s1": {
                 "id": "s1",
                 "source": "telegram",
-                "user_id": "617744661",
+                "user_id": "123456789",
                 "title": "Project Flow fix",
                 "started_at": 1_700_000_000,
                 "last_active": 1_700_000_100,
@@ -32,7 +32,7 @@ class FakeSessionDB:
             "s3": {
                 "id": "s3",
                 "source": "telegram",
-                "user_id": "617744661",
+                "user_id": "123456789",
                 "title": "Recent promise",
                 "started_at": 1_700_000_400,
                 "last_active": 1_700_000_500,
@@ -79,7 +79,7 @@ def _source(**overrides):
     data = {
         "platform": SimpleNamespace(value="telegram"),
         "chat_type": "dm",
-        "user_id": "617744661",
+        "user_id": "123456789",
         "external_safe_mode": False,
     }
     data.update(overrides)

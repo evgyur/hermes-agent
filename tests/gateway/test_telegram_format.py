@@ -973,19 +973,19 @@ class TestInlinePreviewGuard:
     def test_chip_tg_guard_is_hardcoded_by_default(self):
         adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
         assert adapter._inline_preview_guard["enabled"] is True
-        assert "-1003712304136" in adapter._inline_preview_guard["chats"]
-        assert adapter._inline_preview_guard["action"] == "chipcr_preview"
+        assert "-1009876543210" in adapter._inline_preview_guard["chats"]
+        assert adapter._inline_preview_guard["action"] == "external_preview"
 
     @pytest.mark.asyncio
-    async def test_chipcr_action_suppresses_bot_send(self, monkeypatch):
+    async def test_external_preview_action_suppresses_bot_send(self, monkeypatch):
         config = PlatformConfig(
             enabled=True,
             token="fake-token",
             extra={
                 "inline_preview_guard": {
                     "enabled": True,
-                    "action": "chipcr_preview",
-                    "chats": ["-1003712304136"],
+                    "action": "external_preview",
+                    "chats": ["-1009876543210"],
                 }
             },
         )
@@ -993,14 +993,14 @@ class TestInlinePreviewGuard:
         adapter._bot = SimpleNamespace(send_message=AsyncMock())
         post = "<b>GPT-5.5 впервые закрыл задачу</b>\n⠀\nТекст поста.\n\nИсточник: ProgramBench"
 
-        def fake_chipcr_send(chat_id, content, metadata=None):
-            assert chat_id == "-1003712304136"
+        def fake_external_preview_send(chat_id, content, metadata=None):
+            assert chat_id == "-1009876543210"
             assert content == post
             return SendResult(success=True, message_id="777")
 
-        monkeypatch.setattr(adapter, "_send_inline_preview_via_chipcr_sync", fake_chipcr_send)
+        monkeypatch.setattr(adapter, "_send_inline_preview_via_external_bridge_sync", fake_external_preview_send)
 
-        result = await adapter.send("-1003712304136", post)
+        result = await adapter.send("-1009876543210", post)
 
         assert result.success is True
         assert result.message_id == "777"

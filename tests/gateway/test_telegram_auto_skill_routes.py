@@ -29,7 +29,7 @@ def test_auto_skill_routes_load_valid_routes():
         "auto_skill_routes": [
             {
                 "skill": "tg",
-                "chats": [-1003437858232, "617744661"],
+                "chats": [-1001234567890, "123456789"],
                 "match": {"urls": True, "media": ["photo", "video"]},
             }
         ]
@@ -38,7 +38,7 @@ def test_auto_skill_routes_load_valid_routes():
     assert adapter._auto_skill_routes == [
         {
             "skill": "tg",
-            "chats": {"-1003437858232", "617744661"},
+            "chats": {"-1001234567890", "123456789"},
             "match_urls": True,
             "match_media": {"photo", "video"},
         }
@@ -134,35 +134,35 @@ def test_inline_tg_preview_detector_ignores_operator_report():
 
 def test_inline_preview_guard_loads_from_config():
     adapter = _make_adapter({
-        "inline_preview_guard": {"enabled": True, "chats": [-1003712304136]}
+        "inline_preview_guard": {"enabled": True, "chats": [-1009876543210]}
     })
     adapter._inline_preview_guard = adapter._load_inline_preview_guard()
 
     assert adapter._inline_preview_guard["enabled"] is True
-    assert adapter._inline_preview_guard["chats"] >= {"-1003712304136"}
+    assert adapter._inline_preview_guard["chats"] >= {"-1009876543210"}
 
 
-def test_chipcr_preview_echo_is_ignored_by_exact_message_id(tmp_path, monkeypatch):
+def test_external_preview_echo_is_ignored_by_exact_message_id(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     message_id_path = tmp_path / "message_id.txt"
     state_path.write_text(
-        json.dumps({"ok": True, "verified": True, "chat_id": "-1003712304136", "message_ids": ["730"]}),
+        json.dumps({"ok": True, "verified": True, "chat_id": "-1009876543210", "message_ids": ["730"]}),
         encoding="utf-8",
     )
     message_id_path.write_text("730\n", encoding="utf-8")
     monkeypatch.setenv("TG_PREVIEW_STATE_FILE", str(state_path))
     monkeypatch.setenv("TG_PREVIEW_MESSAGE_ID_FILE", str(message_id_path))
-    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1003712304136"]}})
+    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1009876543210"]}})
     adapter._inline_preview_guard = adapter._load_inline_preview_guard()
     message = SimpleNamespace(
         message_id=730,
-        chat=SimpleNamespace(id=-1003712304136),
-        from_user=SimpleNamespace(id=617744661, username="ChipCR"),
+        chat=SimpleNamespace(id=-1009876543210),
+        from_user=SimpleNamespace(id=123456789, username="PreviewBridge"),
         text="USDH уступает место USDC\n⠀\nИсточник: Hyperliquid",
         caption=None,
     )
 
-    assert adapter._is_chipcr_tg_preview_echo(message) is True
+    assert adapter._is_external_tg_preview_echo(message) is True
 
 
 def test_non_preview_message_id_is_not_ignored(tmp_path, monkeypatch):
@@ -172,20 +172,20 @@ def test_non_preview_message_id_is_not_ignored(tmp_path, monkeypatch):
     message_id_path.write_text("730\n", encoding="utf-8")
     monkeypatch.setenv("TG_PREVIEW_STATE_FILE", str(state_path))
     monkeypatch.setenv("TG_PREVIEW_MESSAGE_ID_FILE", str(message_id_path))
-    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1003712304136"]}})
+    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1009876543210"]}})
     adapter._inline_preview_guard = adapter._load_inline_preview_guard()
     message = SimpleNamespace(
         message_id=731,
-        chat=SimpleNamespace(id=-1003712304136),
-        from_user=SimpleNamespace(id=617744661, username="ChipCR"),
+        chat=SimpleNamespace(id=-1009876543210),
+        from_user=SimpleNamespace(id=123456789, username="PreviewBridge"),
         text="/tg новый ручной запрос",
         caption=None,
     )
 
-    assert adapter._is_chipcr_tg_preview_echo(message) is False
+    assert adapter._is_external_tg_preview_echo(message) is False
 
 
-def test_chipcr_preview_echo_is_ignored_by_pending_fingerprint(tmp_path, monkeypatch):
+def test_external_preview_echo_is_ignored_by_pending_fingerprint(tmp_path, monkeypatch):
     pending_path = tmp_path / "pending.jsonl"
     visible = (
         "Apple не стала витриной OpenAI\n"
@@ -197,7 +197,7 @@ def test_chipcr_preview_echo_is_ignored_by_pending_fingerprint(tmp_path, monkeyp
     pending_path.write_text(
         json.dumps(
             {
-                "chat_id": "-1003712304136",
+                "chat_id": "-1009876543210",
                 "sha256": _tg_preview_echo_fingerprint(visible),
                 "created_at": time.time(),
                 "expires_at": time.time() + 300,
@@ -207,17 +207,17 @@ def test_chipcr_preview_echo_is_ignored_by_pending_fingerprint(tmp_path, monkeyp
         encoding="utf-8",
     )
     monkeypatch.setenv("TG_PREVIEW_PENDING_ECHO_FILE", str(pending_path))
-    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1003712304136"]}})
+    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1009876543210"]}})
     adapter._inline_preview_guard = adapter._load_inline_preview_guard()
     message = SimpleNamespace(
         message_id=999,
-        chat=SimpleNamespace(id=-1003712304136),
-        from_user=SimpleNamespace(id=617744661, username="ChipCR"),
+        chat=SimpleNamespace(id=-1009876543210),
+        from_user=SimpleNamespace(id=123456789, username="PreviewBridge"),
         text=None,
         caption=visible,
     )
 
-    assert adapter._is_chipcr_tg_preview_echo(message) is True
+    assert adapter._is_external_tg_preview_echo(message) is True
 
 
 def test_manual_slash_tg_media_is_not_ignored_by_pending_fingerprint(tmp_path, monkeypatch):
@@ -225,7 +225,7 @@ def test_manual_slash_tg_media_is_not_ignored_by_pending_fingerprint(tmp_path, m
     pending_path.write_text(
         json.dumps(
             {
-                "chat_id": "-1003712304136",
+                "chat_id": "-1009876543210",
                 "sha256": hashlib.sha256(b"different").hexdigest(),
                 "created_at": time.time(),
                 "expires_at": time.time() + 300,
@@ -235,17 +235,17 @@ def test_manual_slash_tg_media_is_not_ignored_by_pending_fingerprint(tmp_path, m
         encoding="utf-8",
     )
     monkeypatch.setenv("TG_PREVIEW_PENDING_ECHO_FILE", str(pending_path))
-    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1003712304136"]}})
+    adapter = _make_adapter({"inline_preview_guard": {"enabled": True, "chats": ["-1009876543210"]}})
     adapter._inline_preview_guard = adapter._load_inline_preview_guard()
     message = SimpleNamespace(
         message_id=1000,
-        chat=SimpleNamespace(id=-1003712304136),
-        from_user=SimpleNamespace(id=617744661, username="ChipCR"),
+        chat=SimpleNamespace(id=-1009876543210),
+        from_user=SimpleNamespace(id=123456789, username="PreviewBridge"),
         text=None,
         caption="/tg Apple не стала витриной OpenAI\n⠀\nИсточник: Bloomberg",
     )
 
-    assert adapter._is_chipcr_tg_preview_echo(message) is False
+    assert adapter._is_external_tg_preview_echo(message) is False
 
 
 @pytest.mark.asyncio

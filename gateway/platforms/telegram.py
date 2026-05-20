@@ -4987,7 +4987,7 @@ class TelegramAdapter(BasePlatformAdapter):
         mid = data.get("message_id") or (data.get("message_ids") or [None])[0]
         return str(mid) if mid else None
 
-    def _send_inline_preview_via_chipcr_sync(
+    def _send_inline_preview_via_external_bridge_sync(
         self,
         chat_id: str,
         content: str,
@@ -5030,7 +5030,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=True,
                 message_id=message_id,
                 raw_response={
-                    "inline_preview_guard": "chipcr_preview",
+                    "inline_preview_guard": "external_preview",
                     "stdout": stdout[-1000:],
                 },
             )
@@ -5053,10 +5053,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         guard = getattr(self, "_inline_preview_guard", None) or {}
         action = str(guard.get("action") or "blocker").strip().lower()
-        if action not in {"chipcr_preview", "chipcr", "send_chipcr"}:
+        if action not in {"external_preview", "external_preview", "send_external_preview"}:
             return None
         result = await asyncio.to_thread(
-            self._send_inline_preview_via_chipcr_sync,
+            self._send_inline_preview_via_external_bridge_sync,
             chat_id,
             content,
             metadata,
@@ -5105,7 +5105,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return blocker
 
     @staticmethod
-    def _recent_chipcr_preview_message_ids() -> set[str]:
+    def _recent_external_preview_message_ids() -> set[str]:
         """Return exact message ids sent by the external `/tg` preview path.
 
         `the external preview bridge sends previews from a non-bot account, so Telegram
@@ -5140,7 +5140,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return ids
 
     @staticmethod
-    def _pending_chipcr_preview_echo_fingerprints(chat_id: str) -> set[str]:
+    def _pending_external_preview_echo_fingerprints(chat_id: str) -> set[str]:
         """Return still-valid pre-send preview fingerprints for this chat.
 
         The exact-id guard is not enough: Telegram can deliver the external-preview echo
@@ -5176,7 +5176,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 fingerprints.add(value)
         return fingerprints
 
-    def _is_chipcr_tg_preview_echo(self, message: Message) -> bool:
+    def _is_external_tg_preview_echo(self, message: Message) -> bool:
         """Return True for external preview messages that must be ignored.
 
         `the external preview bridge posts from a non-bot account, so Bot API receives the
@@ -5198,13 +5198,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
         message_id = str(getattr(message, "message_id", "") or "")
-        if message_id and message_id in self._recent_chipcr_preview_message_ids():
+        if message_id and message_id in self._recent_external_preview_message_ids():
             return True
 
         visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
         if not _looks_like_inline_tg_preview(visible_text):
             return False
-        pending = self._pending_chipcr_preview_echo_fingerprints(chat_id)
+        pending = self._pending_external_preview_echo_fingerprints(chat_id)
         return bool(pending and _tg_preview_echo_fingerprint(visible_text) in pending)
 
     def _auto_skill_prefix_for_text(self, chat_id: str, text: str) -> Optional[str]:
@@ -5397,7 +5397,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if self._is_chipcr_tg_preview_echo(update.message):
+        if self._is_external_tg_preview_echo(update.message):
             logger.info(
                 "[Telegram] Ignoring external /tg preview echo chat=%s message_id=%s",
                 getattr(getattr(update.message, "chat", None), "id", None),
@@ -5610,7 +5610,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
-        if self._is_chipcr_tg_preview_echo(update.message):
+        if self._is_external_tg_preview_echo(update.message):
             logger.info(
                 "[Telegram] Ignoring external /tg preview media echo chat=%s message_id=%s",
                 getattr(getattr(update.message, "chat", None), "id", None),

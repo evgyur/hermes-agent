@@ -18,8 +18,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import get_hermes_home
 
-DEFAULT_ENV_FILE = "/home/hermes/.hermes/secrets/mem0g-hermes-agent.env"
+
+DEFAULT_ENV_FILE = str(get_hermes_home() / "secrets" / "mem0g-hermes-agent.env")
 
 
 def _load_env_file(path: str | None = None) -> None:
@@ -41,9 +43,9 @@ def _config() -> dict[str, str]:
     return {
         "base_url": base_url.rstrip("/"),
         "api_key": os.environ.get("MEM0G_API_KEY", ""),
-        "actor_id": os.environ.get("MEM0G_ACTOR_ID", "hermes-agent:ryzen64"),
+        "actor_id": os.environ.get("MEM0G_ACTOR_ID", "hermes-agent"),
         "environment": os.environ.get("MEM0G_ENVIRONMENT", "prod"),
-        "canonical_host": os.environ.get("MEM0G_CANONICAL_HOST", "ryzen64"),
+        "canonical_host": os.environ.get("MEM0G_CANONICAL_HOST", "default"),
     }
 
 

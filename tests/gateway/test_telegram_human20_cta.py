@@ -62,10 +62,10 @@ def _button_text_and_url(markup):
 
 def test_human20_cta_not_added_to_direct_bot_dm():
     adapter = _make_adapter()
-    adapter._cache_observed_chat_type("617744661", "dm")
+    adapter._cache_observed_chat_type("123456789", "dm")
 
-    assert adapter._human20_inline_markup("617744661", metadata=None) is None
-    assert adapter._human20_inline_markup("617744661", metadata={"thread_id": "1"}) is None
+    assert adapter._human20_inline_markup("123456789", metadata=None) is None
+    assert adapter._human20_inline_markup("123456789", metadata={"thread_id": "1"}) is None
 
 
 def test_human20_cta_added_only_for_business_dm_reply():

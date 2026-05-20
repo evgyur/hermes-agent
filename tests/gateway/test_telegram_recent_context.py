@@ -36,7 +36,7 @@ def _make_adapter():
 
 def _make_message(text: str, *, message_id: int, thread_id=None):
     chat = SimpleNamespace(id=-100123, type="supergroup", title="Hermes // Marketing", full_name=None, is_forum=True)
-    user = SimpleNamespace(id=617744661, full_name='Evgeny "Chip"')
+    user = SimpleNamespace(id=123456789, full_name='Example User')
     return SimpleNamespace(
         chat=chat,
         from_user=user,
@@ -84,13 +84,13 @@ def test_recent_context_includes_prior_same_topic_messages_only():
 
 
 def test_recent_context_prompt_appended_to_system_prompt_not_user_text():
-    event = SimpleNamespace(recent_context="## Recent visible Telegram context\n\n- ID 1 | Chip: prior")
+    event = SimpleNamespace(recent_context="## Recent visible Telegram context\n\n- ID 1 | Example: prior")
 
     combined = _append_recent_context_prompt("## Current Session Context\n\nSource: Telegram", event)
 
     assert "## Current Session Context" in combined
     assert "## Recent visible Telegram context" in combined
-    assert "ID 1 | Chip: prior" in combined
+    assert "ID 1 | Example: prior" in combined
 
 
 def test_recent_context_prompt_ignores_empty_context():
