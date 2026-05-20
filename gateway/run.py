@@ -7252,11 +7252,13 @@ class GatewayRunner:
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            sanitized_env["HERMES_COMMAND_NAME"] = command
+                            sanitized_env["HERMES_COMMAND_ARGS"] = user_args
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
-                                env=env,
+                                env=sanitized_env,
                                 start_new_session=True,
                             )
                             communicate_task = asyncio.create_task(proc.communicate())
@@ -7270,7 +7272,12 @@ class GatewayRunner:
                         except asyncio.TimeoutError:
                             if proc.returncode is None:
                                 try:
-                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                    killpg = getattr(os, "killpg", None)
+                                    if killpg is not None:
+                                        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                                        killpg(os.getpgid(proc.pid), sigkill)
+                                    else:
+                                        proc.kill()
                                 except ProcessLookupError:
                                     pass
                                 except Exception:
