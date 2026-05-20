@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{TITLE}}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f7f4ed;
+      --bg-grid: rgba(92, 72, 45, 0.08);
+      --panel: rgba(255, 255, 255, 0.9);
+      --panel-strong: #fffdfa;
+      --border: rgba(70, 48, 19, 0.12);
+      --text: #2e2418;
+      --muted: #7a6c5b;
+      --accent: #b45309;
+      --accent-2: #0f766e;
+      --accent-3: #9f1239;
+      --good: #4d7c0f;
+      --warn: #b91c1c;
+      --shadow: 0 20px 50px rgba(51, 35, 12, 0.12);
+      --font-body: "Bricolage Grotesque", system-ui, sans-serif;
+      --font-mono: "IBM Plex Mono", monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16120d;
+        --bg-grid: rgba(255, 234, 202, 0.08);
+        --panel: rgba(34, 28, 20, 0.94);
+        --panel-strong: #211a12;
+        --border: rgba(255, 242, 224, 0.09);
+        --text: #f3eadf;
+        --muted: #b8aa97;
+        --accent: #fb923c;
+        --accent-2: #5eead4;
+        --accent-3: #fda4af;
+        --good: #bef264;
+        --warn: #fca5a5;
+        --shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-body);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 0% 0%, rgba(180, 83, 9, 0.12), transparent 30%),
+        radial-gradient(circle at 100% 100%, rgba(15, 118, 110, 0.14), transparent 26%),
+        linear-gradient(var(--bg-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px),
+        var(--bg);
+      background-size: auto, auto, 28px 28px, 28px 28px, auto;
+      min-height: 100vh;
+      padding: 32px;
+    }
+    .page {
+      max-width: 1440px;
+      margin: 0 auto;
+      display: grid;
+      gap: 24px;
+    }
+    .hero {
+      background: linear-gradient(135deg, rgba(180,83,9,0.12), rgba(15,118,110,0.08)), var(--panel-strong);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: var(--shadow);
+    }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 44px;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+    .subtitle {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 15px;
+      max-width: 900px;
+      line-height: 1.6;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 22px;
+    }
+    .summary-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      backdrop-filter: blur(8px);
+    }
+    .summary-card .label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .summary-card .value {
+      margin-top: 10px;
+      font-size: 28px;
+      font-weight: 700;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(360px, 0.8fr);
+      gap: 24px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+    }
+    .panel-head h2 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }
+    .panel-head .meta {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .diagram-wrap {
+      padding: 16px;
+      overflow: auto;
+    }
+    .mermaid {
+      min-width: 820px;
+    }
+    .hosts {
+      display: grid;
+      gap: 14px;
+      padding: 16px;
+    }
+    .host-card {
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 18px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), transparent), var(--panel-strong);
+    }
+    .host-card h3 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: -0.03em;
+    }
+    .host-meta {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      background: rgba(180, 83, 9, 0.08);
+    }
+    .services {
+      margin-top: 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .service {
+      border-left: 3px solid var(--accent);
+      background: rgba(180,83,9,0.06);
+      border-radius: 12px;
+      padding: 12px 12px 12px 14px;
+    }
+    .service:nth-child(2n) {
+      border-left-color: var(--accent-2);
+      background: rgba(15,118,110,0.08);
+    }
+    .service:nth-child(3n) {
+      border-left-color: var(--accent-3);
+      background: rgba(159,18,57,0.08);
+    }
+    .service-title {
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .service-title a {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px dotted currentColor;
+    }
+    .service-body {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .notes {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .note {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      background: var(--panel-strong);
+    }
+    .note strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+    .foot {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--muted);
+      text-align: right;
+      padding: 2px 6px 18px;
+    }
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 720px) {
+      body { padding: 16px; }
+      h1 { font-size: 34px; }
+      .summary-grid { grid-template-columns: 1fr; }
+      .mermaid { min-width: 640px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow">present x visual_map</div>
+      <h1>{{TITLE}}</h1>
+      <div class="subtitle">{{SUBTITLE}}</div>
+      <div class="summary-grid">
+        {{SUMMARY_CARDS}}
+      </div>
+    </section>
+
+    <section class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Topology</h2>
+          <div class="meta">Mermaid diagram</div>
+        </div>
+        <div class="diagram-wrap">
+          <pre class="mermaid">{{MERMAID}}</pre>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Operator Notes</h2>
+          <div class="meta">Critical paths</div>
+        </div>
+        <div class="notes">
+          {{NOTES}}
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Hosts And Services</h2>
+        <div class="meta">Machines, users, bots, runtime</div>
+      </div>
+      <div class="hosts">
+        {{HOST_CARDS}}
+      </div>
+    </section>
+
+    <div class="foot">Generated by /present visual-map mode · {{TIMESTAMP}}</div>
+  </main>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      flowchart: { useMaxWidth: true, htmlLabels: true, curve: "basis" },
+      themeVariables: {
+        fontFamily: "Bricolage Grotesque, system-ui, sans-serif",
+        primaryColor: "#f4d7b5",
+        primaryTextColor: "#2e2418",
+        primaryBorderColor: "#b45309",
+        lineColor: "#7a6c5b",
+        secondaryColor: "#d9f1ea",
+        tertiaryColor: "#f7d6df",
+        clusterBkg: "#fffdfa",
+        clusterBorder: "#c9b8a2",
+        edgeLabelBackground: "#fffdfa"
+      }
+    });
+  </script>
+</body>
+</html>

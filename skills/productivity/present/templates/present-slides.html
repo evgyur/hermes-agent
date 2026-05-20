@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{TITLE_TEXT}}</title>
+  <style>
+    :root {
+      --bg: #09090b;
+      --panel: #151518;
+      --panel2: #1d1d22;
+      --text: #f4f4f5;
+      --muted: #b4b4bd;
+      --line: rgba(255,255,255,.12);
+      --gold: #e3b341;
+      --blue: #7c9cff;
+      --green: #31c46b;
+      --red: #ff6b6b;
+      --shadow: 0 24px 90px rgba(0,0,0,.34);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body {
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      background:
+        linear-gradient(135deg, rgba(124,156,255,.15), transparent 36%),
+        linear-gradient(315deg, rgba(227,179,65,.12), transparent 34%),
+        var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    .deck {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      padding: 28px;
+      display: grid;
+      place-items: center;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(24px) scale(.985);
+      transition: opacity .24s ease, transform .24s ease;
+    }
+
+    .slide.active {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0) scale(1);
+    }
+
+    .panel {
+      width: min(1120px, calc(100vw - 56px));
+      height: min(86vh, calc(100vh - 96px));
+      display: grid;
+      align-content: center;
+      gap: 26px;
+      padding: clamp(30px, 5vw, 72px);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.02)), var(--panel);
+      box-shadow: var(--shadow);
+      overflow: auto;
+    }
+
+    .slide.title-slide .panel {
+      align-content: center;
+    }
+
+    h1, h2, h3, p { margin: 0; }
+    h1 { max-width: 940px; font-size: clamp(44px, 7vw, 82px); line-height: 1.04; letter-spacing: 0; }
+    h2 { font-size: clamp(32px, 4.8vw, 58px); line-height: 1.08; letter-spacing: 0; }
+    h3 { font-size: 20px; }
+
+    .kicker {
+      width: fit-content;
+      padding: 7px 12px;
+      border: 1px solid rgba(227,179,65,.42);
+      border-radius: 999px;
+      color: #ffe5a3;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .subtitle, .slide-body p {
+      max-width: 840px;
+      color: var(--muted);
+      font-size: clamp(18px, 2.3vw, 25px);
+      line-height: 1.55;
+    }
+
+    .slide-body {
+      display: grid;
+      gap: 18px;
+    }
+
+    .slide-body p { font-size: clamp(16px, 2vw, 24px); max-width: none; }
+    .slide-body > * + * { margin-top: 0; }
+
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .grid.two, .grid-2, .compare { grid-template-columns: repeat(2, 1fr); }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+
+    .card, .mini, .compare-side, .phase-card, .entity-card, .timeline-content, .stack-item,
+    .question, .note, .warning, .risk, .check, .take, .avoid, .decision, .verdict, .quote,
+    .meta-block, .infra-item, .kpi {
+      min-height: 156px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel2);
+    }
+
+    .mini, .compare-side, .phase-card, .entity-card, .timeline-content, .stack-item,
+    .question, .note, .warning, .risk, .check, .take, .avoid, .decision, .verdict, .quote,
+    .meta-block, .infra-item, .kpi {
+      min-height: auto;
+    }
+
+    .card p, .mini p, .compare-body, .phase-desc, .entity-body, .timeline-body,
+    .stack-body, .meta-row, .decision-why, .verdict-body, .risk div, .question div,
+    .note div, .warning div, .check, .take, .avoid, li, td {
+      color: var(--muted);
+    }
+
+    .metric, .kpi .value, .kpi-value { font-size: 46px; line-height: 1; font-weight: 900; color: var(--gold); }
+    .metric.blue { color: var(--blue); }
+    .metric.green { color: var(--green); }
+
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+    .step {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+    }
+    .step strong { display: block; color: var(--gold); margin-bottom: 8px; }
+
+    .table-wrap { margin-top: 14px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: rgba(255,255,255,.03); box-shadow: 0 8px 26px rgba(0,0,0,.18); }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; }
+    th, td { padding: 15px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #fff; background: rgba(124,156,255,.13); }
+    td { background: rgba(255,255,255,.025); }
+    tbody tr:last-child td { border-bottom: none; }
+
+    code {
+      color: #fff;
+      background: rgba(124,156,255,.18);
+      border: 1px solid rgba(124,156,255,.28);
+      border-radius: 6px;
+      padding: 2px 6px;
+      white-space: nowrap;
+    }
+
+    pre {
+      max-width: 100%;
+      overflow: auto;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+
+    ul.clean, ol.clean.ordered {
+      margin: 0;
+      padding-left: 20px;
+      display: grid;
+      gap: 10px;
+    }
+    ul.clean { list-style: disc; }
+    ol.clean.ordered { list-style: decimal; }
+    ul.clean li::before, ol.clean.ordered li::before { content: none; }
+    li { margin: 0; }
+
+    .meta-block, .stack, .timeline { display: grid; gap: 12px; }
+    .meta-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      padding-bottom: 8px;
+    }
+    .meta-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .meta-key { color: var(--muted); }
+    .meta-val, .decision-answer, .compare-label, .timeline-label, .stack-title, .entity-title, .phase-title, .verdict-title, .card h3, .mini h3, strong { color: var(--text); }
+
+    .compare { display: grid; gap: 14px; }
+    .compare-label {
+      font-size: .78rem;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      font-weight: 800;
+      color: #c7d2fe;
+    }
+
+    .timeline-item { display: grid; grid-template-columns: 32px minmax(0,1fr); gap: 12px; align-items: start; }
+    .timeline-node {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--blue), #a5b6ff);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .stack-item { display: grid; grid-template-columns: 42px minmax(0,1fr); gap: 12px; align-items: start; }
+    .stack-emoji, .phase-emoji { font-size: 1.2rem; }
+
+    .entity-card {
+      display: grid;
+      grid-template-columns: 42px minmax(0,1fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .entity-emoji {
+      font-size: 1.35rem;
+      line-height: 1;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding-top: 2px;
+    }
+
+    .entity-title {
+      font-size: 1rem;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+
+    .entity-content {
+      min-width: 0;
+    }
+
+    .entity-body {
+      line-height: 1.5;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+
+    .rich-link { color: #fff; text-decoration: none; border-bottom: 1px dashed rgba(124,156,255,.6); }
+    .rich-link:hover { color: var(--blue); border-bottom-color: var(--blue); }
+    .title-accent { color: var(--blue); }
+
+    .deck-ui {
+      position: fixed;
+      left: 28px;
+      right: 28px;
+      bottom: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      z-index: 10;
+      pointer-events: none;
+      opacity: 1;
+      transition: opacity .22s ease;
+    }
+
+    .deck-ui.hidden {
+      opacity: 0;
+    }
+
+    .progress {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      pointer-events: auto;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.24);
+      border: 1px solid rgba(255,255,255,.2);
+      cursor: pointer;
+      transition: transform .18s ease, background .18s ease;
+    }
+
+    .dot.active {
+      background: var(--gold);
+      transform: scale(1.25);
+      border-color: rgba(227,179,65,.45);
+    }
+
+    .counter, .hint {
+      font-size: 12px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: rgba(244,244,245,.72);
+      background: rgba(0,0,0,.26);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 999px;
+      padding: 8px 12px;
+      backdrop-filter: blur(10px);
+      pointer-events: auto;
+    }
+
+    .fullscreen-btn {
+      font-size: 12px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: rgba(244,244,245,.88);
+      background: rgba(0,0,0,.34);
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 999px;
+      padding: 8px 12px;
+      backdrop-filter: blur(10px);
+      pointer-events: auto;
+      cursor: pointer;
+    }
+
+    @media (max-width: 820px) {
+      .slide { padding: 14px; }
+      .panel {
+        width: calc(100vw - 28px);
+        height: calc(100vh - 72px);
+        padding: 26px;
+      }
+      .grid, .grid.two, .grid-2, .grid-3, .flow, .compare { grid-template-columns: 1fr; }
+      .metric, .kpi .value, .kpi-value { font-size: 38px; }
+      table { display: block; overflow-x: auto; }
+      .deck-ui {
+        left: 14px;
+        right: 14px;
+        bottom: 12px;
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .progress { justify-content: center; }
+      .counter, .hint { text-align: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="deck">
+    {{SLIDES}}
+  </div>
+
+  <div class="deck-ui">
+    <div class="counter"><span id="slideCounter">1 / 1</span></div>
+    <div class="progress" id="slideDots">{{DOTS}}</div>
+    <button class="fullscreen-btn" id="fullscreenBtn" type="button">Fullscreen</button>
+    <div class="hint">Левая половина экрана / ←: назад · правая половина / → / пробел: вперёд</div>
+  </div>
+
+  <script>
+    (() => {
+      const slides = Array.from(document.querySelectorAll('.slide'));
+      const dots = Array.from(document.querySelectorAll('.dot'));
+      const counter = document.getElementById('slideCounter');
+      const deckUi = document.querySelector('.deck-ui');
+      const fullscreenBtn = document.getElementById('fullscreenBtn');
+      let index = 0;
+      let hideUiTimer = null;
+
+      function showUiTemporarily() {
+        if (!deckUi) return;
+        deckUi.classList.remove('hidden');
+        if (hideUiTimer) clearTimeout(hideUiTimer);
+        hideUiTimer = setTimeout(() => {
+          deckUi.classList.add('hidden');
+        }, 2200);
+      }
+
+      function setSlide(next) {
+        if (!slides.length) return;
+        index = Math.max(0, Math.min(next, slides.length - 1));
+        slides.forEach((slide, i) => slide.classList.toggle('active', i === index));
+        dots.forEach((dot, i) => dot.classList.toggle('active', i === index));
+        if (counter) counter.textContent = `${index + 1} / ${slides.length}`;
+        const url = new URL(window.location.href);
+        url.hash = `slide-${index + 1}`;
+        history.replaceState(null, '', url);
+        showUiTemporarily();
+      }
+
+      function nextSlide() { setSlide(index + 1); }
+      function prevSlide() { setSlide(index - 1); }
+
+      dots.forEach((dot, i) => dot.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setSlide(i);
+      }));
+
+      document.addEventListener('keydown', (e) => {
+        if (["ArrowRight", " ", "Spacebar", "PageDown"].includes(e.key)) {
+          e.preventDefault();
+          nextSlide();
+        } else if (["ArrowLeft", "PageUp"].includes(e.key)) {
+          e.preventDefault();
+          prevSlide();
+        }
+      });
+
+      document.addEventListener('click', (e) => {
+        if (e.button !== 0) return;
+        if (e.target.closest('a, button, input, textarea, select, label')) return;
+        const x = e.clientX ?? 0;
+        const width = window.innerWidth || document.documentElement.clientWidth || 1;
+        const centerBand = width * 0.18;
+        if (Math.abs(x - width / 2) <= centerBand / 2) {
+          showUiTemporarily();
+          return;
+        }
+        if (x < width / 2) {
+          prevSlide();
+        } else {
+          nextSlide();
+        }
+      });
+
+      document.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        prevSlide();
+      });
+
+      document.addEventListener('mousemove', () => {
+        showUiTemporarily();
+      }, { passive: true });
+
+      document.addEventListener('touchstart', () => {
+        showUiTemporarily();
+      }, { passive: true });
+
+      if (fullscreenBtn) {
+        fullscreenBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          try {
+            if (!document.fullscreenElement) {
+              await document.documentElement.requestFullscreen();
+              fullscreenBtn.textContent = 'Exit fullscreen';
+            } else {
+              await document.exitFullscreen();
+              fullscreenBtn.textContent = 'Fullscreen';
+            }
+          } catch (_) {
+            // ignore fullscreen failures
+          }
+          showUiTemporarily();
+        });
+      }
+
+      document.addEventListener('fullscreenchange', () => {
+        if (!fullscreenBtn) return;
+        fullscreenBtn.textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen';
+        showUiTemporarily();
+      });
+
+      let startX = null;
+      document.addEventListener('touchstart', (e) => {
+        startX = e.touches[0]?.clientX ?? null;
+      }, { passive: true });
+      document.addEventListener('touchend', (e) => {
+        if (startX == null) return;
+        const endX = e.changedTouches[0]?.clientX ?? startX;
+        const dx = endX - startX;
+        if (Math.abs(dx) > 36) {
+          if (dx < 0) nextSlide(); else prevSlide();
+        }
+        startX = null;
+      }, { passive: true });
+
+      const match = window.location.hash.match(/slide-(\d+)/);
+      const initial = match ? Number(match[1]) - 1 : 0;
+      setSlide(Number.isFinite(initial) ? initial : 0);
+      showUiTemporarily();
+    })();
+  </script>
+</body>
+</html>

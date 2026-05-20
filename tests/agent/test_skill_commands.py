@@ -58,6 +58,24 @@ class TestScanSkillCommands:
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
 
+    def test_bundled_present_skill_registers_slash_command_and_slides_mode(self):
+        """The bundled /present skill must expose /present and document slides routing."""
+        repo_root = Path(__file__).resolve().parents[2]
+        bundled_skills = repo_root / "skills"
+
+        with patch("tools.skills_tool.SKILLS_DIR", bundled_skills):
+            result = scan_skill_commands()
+            message = build_skill_invocation_message(
+                "/present",
+                user_instruction="slides roadmap for launch",
+            )
+
+        assert "/present" in result
+        assert result["/present"]["name"] == "present"
+        assert message is not None
+        assert "/present slides" in message
+        assert "separate fullscreen deck mode" in message
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()
