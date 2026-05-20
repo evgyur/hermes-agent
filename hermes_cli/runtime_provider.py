@@ -180,7 +180,7 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+_VALID_API_MODES = {"chat_completions", "codex_responses", "codex_app_server", "anthropic_messages", "bedrock_converse"}
 _MINIMAX_ANTHROPIC_PROVIDERS = {"minimax", "minimax-cn", "minimax-oauth"}
 
 

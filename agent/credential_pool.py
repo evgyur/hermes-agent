@@ -763,6 +763,51 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    def _quarantine_terminal_oauth_entry(self, entry: PooledCredential, exc: Exception) -> None:
+        """Remove terminally dead singleton OAuth tokens while preserving manual credentials."""
+        provider = self.provider
+        try:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                state = _load_provider_state(auth_store, provider) or {}
+                if isinstance(state, dict):
+                    tokens = state.get("tokens")
+                    if isinstance(tokens, dict):
+                        tokens.pop("access_token", None)
+                        tokens.pop("refresh_token", None)
+                    for key in ("access_token", "refresh_token", "expires_at", "expires_at_ms", "last_refresh"):
+                        state.pop(key, None)
+                    state["last_auth_error"] = {
+                        "provider": provider,
+                        "code": getattr(exc, "code", None),
+                        "message": str(exc),
+                        "reason": "credential_pool_refresh_failure",
+                        "relogin_required": True,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _store_provider_state(auth_store, provider, state, set_active=False)
+
+                self._entries = [
+                    item for item in self._entries
+                    if item.id == entry.id and item.auth_type != AUTH_TYPE_OAUTH
+                    or item.id != entry.id and (_is_manual_source(item.source) or item.auth_type != AUTH_TYPE_OAUTH)
+                ]
+                if self._current_id == entry.id:
+                    self._current_id = None
+                auth_store.setdefault("credential_pool", {})[provider] = [
+                    item.to_dict() for item in self._entries
+                ]
+                _save_auth_store(auth_store)
+        except Exception as clear_exc:
+            logger.debug("Failed to clear terminal %s OAuth state: %s", provider, clear_exc)
+            self._entries = [
+                item for item in self._entries
+                if item.id != entry.id and (_is_manual_source(item.source) or item.auth_type != AUTH_TYPE_OAUTH)
+            ]
+            if self._current_id == entry.id:
+                self._current_id = None
+            self._persist()
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
@@ -895,7 +940,9 @@ class CredentialPool:
             # HTTP call.  Re-check auth.json and adopt the fresh tokens if
             # they have rotated since.  Only meaningful for singleton-seeded
             # (loopback_pkce) entries; manual entries don't share state with
-            # the singleton.
+            # the singleton.  If the refresh token is terminally invalid,
+            # quarantine only the singleton OAuth material; manual API-key
+            # entries must survive.
             if self.provider == "xai-oauth":
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced.refresh_token != entry.refresh_token:
@@ -914,6 +961,14 @@ class CredentialPool:
                     self._replace_entry(synced, updated)
                     self._persist()
                     return updated
+                if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
+                    logger.debug("xAI OAuth refresh token is terminally invalid; clearing local token state")
+                    self._quarantine_terminal_oauth_entry(entry, exc)
+                    return None
+            if self.provider == "openai-codex" and auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                logger.debug("Codex OAuth refresh token is terminally invalid; clearing local token state")
+                self._quarantine_terminal_oauth_entry(entry, exc)
+                return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
             # auth.json and adopt the fresh tokens if available.

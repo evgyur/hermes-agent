@@ -1483,8 +1483,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
                 "requested": job.get("provider"),
-                "target_model": model,
             }
+            try:
+                import inspect
+                if "target_model" in inspect.signature(resolve_runtime_provider).parameters:
+                    runtime_kwargs["target_model"] = model
+            except (TypeError, ValueError):
+                # Some tests/plugins monkeypatch this resolver with a minimal
+                # callable; keep the cron path backward-compatible.
+                pass
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)

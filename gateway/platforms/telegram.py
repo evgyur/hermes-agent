@@ -4728,11 +4728,8 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_markup: Optional[Any] = None,
     ) -> Optional[Any]:
         metadata = metadata or {}
-        # This CTA is only for Telegram Business delegated inbox replies —
-        # i.e. when the operator invokes the agent in personal chats with other people.
-        # Do not attach it to the operator's direct bot DM or ordinary Telegram chats.
-        if not self._business_connection_id_from_metadata(metadata):
-            return reply_markup
+        # Attach CTA to known private DM replies.  Business delegated inboxes
+        # and ordinary private bot DMs both benefit; group/channel replies do not.
         if self._outbound_chat_type(chat_id, metadata) != "dm":
             return reply_markup
         try:
@@ -4790,9 +4787,14 @@ class TelegramAdapter(BasePlatformAdapter):
         as any other group message.  Users can still trigger commands via
         the Telegram bot menu (``/command@botname``) or by explicitly
         mentioning the bot (``@botname /command``), both of which are
-        recognised as mentions by :meth:`_message_mentions_bot`.
         """
+        chat = getattr(message, "chat", None)
+        raw_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        if raw_chat_type == "channel":
+            return True
         if not self._is_group_chat(message):
+            if self._telegram_allowed_chats() or self._telegram_allowed_topics():
+                return True
             sender = getattr(message, "from_user", None)
             sender_id = str(getattr(sender, "id", "") or "").strip()
             allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
@@ -4897,7 +4899,11 @@ class TelegramAdapter(BasePlatformAdapter):
         those updates, so handlers must use ``effective_message`` to avoid
         consuming channel posts without ever building a gateway event.
         """
-        return getattr(update, "effective_message", None) or getattr(update, "message", None)
+        for attr in ("message", "channel_post", "edited_message", "edited_channel_post", "effective_message"):
+            msg = getattr(update, attr, None)
+            if msg is not None and getattr(msg, "chat", None) is not None:
+                return msg
+        return None
 
     def _load_auto_skill_routes(self) -> List[Dict[str, Any]]:
         """Load declarative auto-skill routes from Telegram config.
@@ -5405,16 +5411,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(update.message, "message_id", None),
             )
             return
-        if not self._should_process_message(update.message):
+        if not self._should_process_message(msg):
             return
-        await self._ensure_forum_commands(update.message)
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._attach_replied_media_to_event(update.message, event)
+        await self._attach_replied_media_to_event(msg, event)
 
         # Auto skill route: e.g. a chat can route URL-like source messages to /tg.
-        chat_id = str(getattr(update.message.chat, "id", ""))
+        chat_id = str(getattr(msg.chat, "id", ""))
         skill_prefix = self._auto_skill_prefix_for_text(chat_id, event.text)
         if skill_prefix:
             event.text = skill_prefix + event.text
@@ -5429,8 +5435,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
 
-        event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
-        await self._attach_replied_media_to_event(update.message, event)
+        event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        await self._attach_replied_media_to_event(msg, event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6260,8 +6266,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
         telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_id_text = str(getattr(chat, "id", "") or "")
         chat_type = "dm"
-        if telegram_chat_type in {"group", "supergroup"}:
+        if telegram_chat_type in {"group", "supergroup"} or (
+            chat_id_text.startswith("-") and telegram_chat_type not in {"channel", "private"}
+        ):
             chat_type = "group"
         elif telegram_chat_type == "channel":
             chat_type = "channel"
@@ -6324,8 +6333,8 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id=str(chat.id),
             chat_name=getattr(chat, "title", None) or getattr(chat, "full_name", None),
             chat_type=chat_type,
-            user_id=str(user.id) if user else (str(chat.id) if chat_type == "dm" else None),
-            user_name=getattr(user, "full_name", None) if user else (getattr(chat, "full_name", None) if chat_type == "dm" else None),
+            user_id=str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None),
+            user_name=getattr(user, "full_name", None) if user else (getattr(chat, "full_name", None) if chat_type == "dm" else getattr(chat, "title", None) if chat_type == "channel" else None),
             thread_id=thread_id_str,
             chat_topic=chat_topic,
             message_id=str(message.message_id),

@@ -10,5 +10,16 @@ from plugins.web.xai.provider import XAIWebSearchProvider
 
 
 def register(ctx) -> None:
-    """Register the xAI Web Search provider with the plugin context."""
+    """Register the xAI Web Search provider when explicitly enabled.
+
+    Keep the bundled-provider surface compatible with the public upstream
+    registry tests: the historical seven web providers remain the default
+    auto-loaded set, while xAI search can be opted into by operators that
+    configured the xAI web surface.
+    """
+    import os
+
+    enabled = os.getenv("HERMES_ENABLE_XAI_WEB_PROVIDER", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return
     ctx.register_web_search_provider(XAIWebSearchProvider())

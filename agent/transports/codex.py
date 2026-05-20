@@ -96,7 +96,10 @@ class ResponsesApiTransport(ProviderTransport):
         kwargs = {
             "model": model,
             "instructions": instructions,
-            "input": _chat_messages_to_responses_input(payload_messages),
+            "input": _chat_messages_to_responses_input(
+                payload_messages,
+                is_xai_responses=bool(is_xai_responses),
+            ),
             "tools": response_tools,
             "store": False,
         }
