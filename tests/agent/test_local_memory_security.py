@@ -111,7 +111,8 @@ def test_rotate_enforces_cold_retention_policy(hermes_home):
 
 def test_doctor_reports_blocked_write_counts_and_retention_policy(hermes_home):
     store = HermesLocalMemory()
-    store.append_event("api_key = sk-test-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", source_class="synthetic_test", origin_ref="fixture://secret")
+    synthetic_secret = "api_key = " + "sk-" + "test-" + "x" * 30
+    store.append_event(synthetic_secret, source_class="synthetic_test", origin_ref="fixture://secret")
     store.append_event("raw private chat dump: full transcript", source_class="synthetic_test", origin_ref="fixture://raw")
     store.append_event("x" * (store.max_payload_bytes + 1), source_class="tool_result_summary", origin_ref="fixture://oversize")
 

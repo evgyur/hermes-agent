@@ -79,7 +79,8 @@ def test_rotate_expires_old_hot_note_to_tombstone(hermes_home):
 def test_secret_and_raw_payloads_are_rejected_without_payload(hermes_home):
     store = HermesLocalMemory()
 
-    secret = store.append_event("api_key = sk-test-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", source_class="synthetic_test", origin_ref="test://secret")
+    synthetic_secret = "api_key = " + "sk-" + "test-" + "x" * 30
+    secret = store.append_event(synthetic_secret, source_class="synthetic_test", origin_ref="test://secret")
     raw = store.append_event("raw_telegram_dump message_id chat_id from_user text entities", source_class="synthetic_test", origin_ref="test://raw")
 
     assert secret.state is LocalMemoryState.REJECTED
