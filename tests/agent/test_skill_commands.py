@@ -80,6 +80,41 @@ class TestScanSkillCommands:
         assert "/present slides" in message
         assert "separate fullscreen deck mode" in message
 
+    def test_bundled_decision_rp_and_superpowers_register_slash_commands(self):
+        """Public distro convenience skills should be invokable as slash commands."""
+        repo_root = Path(__file__).resolve().parents[2]
+        bundled_skills = repo_root / "skills"
+
+        with patch("tools.skills_tool.SKILLS_DIR", bundled_skills):
+            result = scan_skill_commands()
+            decision = build_skill_invocation_message(
+                "/decision",
+                user_instruction="ship now or wait?",
+            )
+            rp = build_skill_invocation_message(
+                "/rp",
+                user_instruction="stress-test this plan",
+            )
+            superpowers = build_skill_invocation_message(
+                "/superpowers",
+                user_instruction="fix the failing test suite",
+            )
+
+        assert "/decision" in result
+        assert result["/decision"]["name"] == "decision"
+        assert decision is not None
+        assert "Phase 1: Decision deconstruction" in decision
+
+        assert "/rp" in result
+        assert result["/rp"]["name"] == "rp"
+        assert rp is not None
+        assert "Reasoning Personas Shortcut" in rp
+
+        assert "/superpowers" in result
+        assert result["/superpowers"]["name"] == "superpowers"
+        assert superpowers is not None
+        assert "Rigorous Execution Mode" in superpowers
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()
