@@ -30,7 +30,13 @@ def test_power_preset_has_voice_vision_and_no_private_overlay():
     assert "postcraft" not in preset["power"]["modules"]
     assert preset["power"]["private_overlay_required"] is False
     assert "piapi-video-generation" in preset["power"]["modules"]
-    assert preset["power"]["bundled_skills"] == ["piapi-video-toolkit", "reasoning-personas", "rp"]
+    assert preset["power"]["bundled_skills"] == [
+        "piapi-video-toolkit",
+        "reasoning-personas",
+        "rp",
+        "decision",
+        "superpowers",
+    ]
     assert {"gptprof", "gptt", "mmfast", "xai", "say", "img", "video"} <= set(preset["quick_commands"])
     assert preset["quick_commands"]["say"]["append_args"] is True
 

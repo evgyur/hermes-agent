@@ -97,6 +97,10 @@ power:
   private_overlay_required: false
   bundled_skills:
     - piapi-video-toolkit
+    - reasoning-personas
+    - rp
+    - decision
+    - superpowers
   smoke_surfaces:
     # Public smoke inventory only; real provider keys stay in .env, never in templates.
     - stt
