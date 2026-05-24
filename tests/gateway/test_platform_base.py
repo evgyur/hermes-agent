@@ -329,6 +329,35 @@ class TestExtractMedia:
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
 
+    def test_media_tag_supports_html_documents(self):
+        content = "File attached:\nMEDIA:/home/hermes/report.html"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/home/hermes/report.html", False)]
+        assert "MEDIA:" not in cleaned
+        assert "File attached" in cleaned
+
+    def test_media_tag_supports_htm_documents(self):
+        content = "MEDIA:/home/hermes/report.htm"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/home/hermes/report.htm", False)]
+        assert cleaned == ""
+
+    def test_media_tag_supports_markdown_documents(self):
+        content = "Here is the file again:\nMEDIA:/home/hermes/notes.md"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/home/hermes/notes.md", False)]
+        assert "MEDIA:" not in cleaned
+        assert "Here is the file again" in cleaned
+
+    def test_media_tag_supports_uppercase_document_extensions(self):
+        content = "MEDIA:/home/hermes/NOTES.MD\nMEDIA:/home/hermes/report.HTML"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/home/hermes/NOTES.MD", False),
+            ("/home/hermes/report.HTML", False),
+        ]
+        assert cleaned == ""
+
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
         user-visible text just like [[audio_as_voice]]. Callers detect the
