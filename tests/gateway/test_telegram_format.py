@@ -746,13 +746,13 @@ class TestEditMessageStreamingSafety:
         adapter._bot = MagicMock()
         adapter._bot.edit_message_text = AsyncMock()
 
-        result = await adapter.edit_message("123", "456", "partial **bold", finalize=False)
+        result = await adapter.edit_message("123", "456", "partial **bold**", finalize=False)
 
         assert result.success is True
         adapter._bot.edit_message_text.assert_awaited_once_with(
             chat_id=123,
             message_id=456,
-            text="partial **bold",
+            text="partial bold",
         )
 
     @pytest.mark.asyncio
@@ -771,7 +771,7 @@ class TestEditMessageStreamingSafety:
         assert second_call == {
             "chat_id": 123,
             "message_id": 456,
-            "text": "final **bold**",
+            "text": "final bold",
         }
 
     @pytest.mark.asyncio
@@ -851,6 +851,7 @@ def _guest_test_adapter(*, guest_mode=True, require_mention=True, allowed_chats=
             "guest_mode": guest_mode,
             "require_mention": require_mention,
             "allowed_chats": allowed_chats or ["-100200"],
+            "allowed_topics": [],
         },
     )
     adapter = object.__new__(TelegramAdapter)
@@ -1005,3 +1006,41 @@ class TestInlinePreviewGuard:
         assert result.success is True
         assert result.message_id == "777"
         adapter._bot.send_message.assert_not_called()
+
+class TestTelegramEditPlainFallbacks:
+    @pytest.mark.asyncio
+    async def test_nonfinal_edit_strips_markdown_markers(self, adapter):
+        adapter._bot = SimpleNamespace(edit_message_text=AsyncMock())
+
+        result = await adapter.edit_message(
+            "123", "456", "Working on **bold** and `code`", finalize=False
+        )
+
+        assert result.success is True
+        kwargs = adapter._bot.edit_message_text.await_args.kwargs
+        assert kwargs["text"] == "Working on bold and code"
+        assert "**" not in kwargs["text"]
+        assert "parse_mode" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_final_edit_parse_fallback_strips_markdown_markers(self, adapter):
+        calls = []
+
+        async def edit_message_text(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise Exception("MarkdownV2 parse error")
+            return SimpleNamespace(message_id=456)
+
+        adapter._bot = SimpleNamespace(edit_message_text=AsyncMock(side_effect=edit_message_text))
+
+        result = await adapter.edit_message(
+            "123", "456", "Final **bold** message", finalize=True
+        )
+
+        assert result.success is True
+        assert len(calls) == 2
+        assert calls[0]["parse_mode"] is not None
+        assert calls[1]["text"] == "Final bold message"
+        assert "**" not in calls[1]["text"]
+        assert "parse_mode" not in calls[1]
