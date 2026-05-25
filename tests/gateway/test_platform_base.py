@@ -11,6 +11,7 @@ from gateway.platforms.base import (
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    SUPPORTED_DOCUMENT_TYPES,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -329,6 +330,30 @@ class TestExtractMedia:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
+
+    def test_media_tag_accepts_supported_text_document_extensions(self):
+        content = "\n".join([
+            "MEDIA:/tmp/report.html",
+            "MEDIA:/tmp/notes.md",
+            "MEDIA:/tmp/debug.log",
+            "MEDIA:/tmp/config.yaml",
+            "MEDIA:/tmp/data.json",
+        ])
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/tmp/report.html", False),
+            ("/tmp/notes.md", False),
+            ("/tmp/debug.log", False),
+            ("/tmp/config.yaml", False),
+            ("/tmp/data.json", False),
+        ]
+        assert cleaned == ""
+
+    def test_media_tag_uses_supported_document_types_as_source_of_truth(self):
+        for ext in SUPPORTED_DOCUMENT_TYPES:
+            media, cleaned = BasePlatformAdapter.extract_media(f"MEDIA:/tmp/artifact{ext}")
+            assert media == [(f"/tmp/artifact{ext}", False)]
+            assert cleaned == ""
 
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from

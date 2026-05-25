@@ -2456,9 +2456,22 @@ class BasePlatformAdapter(ABC):
         cleaned = cleaned.replace("[[as_document]]", "")
         
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
-        # and quoted/backticked paths for LLM-formatted outputs.
+        # and quoted/backticked paths for LLM-formatted outputs. Keep the
+        # extension allowlist in sync with the document types accepted by the
+        # gateway so text-ish artifacts such as .html/.md/.json are not silently
+        # ignored after the final response is stripped from chat text.
+        media_exts = {ext.lstrip(".") for ext in SUPPORTED_DOCUMENT_TYPES}
+        media_exts.update({
+            "png", "jpg", "jpeg", "gif", "webp",
+            "mp4", "mov", "avi", "mkv", "webm", "3gp",
+            "ogg", "opus", "mp3", "wav", "m4a", "flac",
+            "rar", "7z", "tar", "gz", "tgz", "bz2", "xz",
+            "epub", "apk", "ipa",
+        })
+        ext_pattern = "|".join(sorted((re.escape(ext) for ext in media_exts), key=lambda x: (-len(x), x)))
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:''' + ext_pattern + r''')(?=[\s`"',;:)\]}]|$))[`"']?''',
+            re.IGNORECASE,
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
