@@ -3185,12 +3185,21 @@ class TelegramAdapter(BasePlatformAdapter):
             plan_map = {
                 "plus": "Plus $20",
                 "pro": "Pro $200",
+                "prolite": "ProLite $100",
+                "pro lite": "ProLite $100",
                 "team": "Team",
                 "enterprise": "Enterprise",
                 "free": "Free",
             }
             out["plan"] = plan_map.get(plan_type.strip().lower(), plan_type.strip())
         return out
+
+    def _gptprof_normalize_plan(self, plan: str) -> str:
+        plan_map = {
+            "prolite": "ProLite $100",
+            "pro lite": "ProLite $100",
+        }
+        return plan_map.get(plan.strip().lower(), plan)
 
     def _gptprof_slug_from_email(self, email: str) -> str:
         local = email.split("@", 1)[0].lower()
@@ -3223,7 +3232,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(refresh_token, str) or not refresh_token.strip():
             raise ValueError(f"gptprof profile {slug!r} has no refresh token")
 
-        plan = str(profile.get("plan") or "")
+        plan = self._gptprof_normalize_plan(str(profile.get("plan") or ""))
         email = str(profile.get("email") or "")
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -3481,9 +3490,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             await query.answer(text="GPT usage refreshed.")
             return
-        if action == "autoswitch":
-            await query.answer(text="Autoswitch is not active for retired profiles.")
-            return
         if action == "new_auth":
             auth_path, _config_path, _hcp_dir = self._gptprof_paths()
             auth = self._gptprof_load_json(auth_path)
@@ -3512,11 +3518,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if action == "check_auth":
             auth_path, _config_path, _hcp_dir = self._gptprof_paths()
             auth = self._gptprof_load_json(auth_path)
-            current = (auth.get("codex") or {}).get("profile") if isinstance(auth.get("codex"), dict) else None
-            await query.answer(text=f"Current GPT profile: {current or 'unknown'}")
-            return
-        if action == "pi_route":
-            await query.answer(text="Pi route switch is handled outside gptprof.")
+            codex = auth.get("codex") if isinstance(auth.get("codex"), dict) else {}
+            current = codex.get("profile")
+            email = codex.get("email")
+            plan = codex.get("plan")
+            parts = [f"slot: {current or 'unknown'}"]
+            if email:
+                parts.append(f"email: {email}")
+            if plan:
+                parts.append(f"plan: {plan}")
+            await query.answer(text=" · ".join(parts), show_alert=True)
             return
         if action not in self._gptprof_known_slugs():
             await query.answer(text="Unknown GPT profile callback.")
