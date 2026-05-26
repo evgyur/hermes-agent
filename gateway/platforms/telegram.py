@@ -3145,14 +3145,169 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
-    async def _handle_gptprof_callback(self, query, data: str) -> None:
-        """Handle optional profile-switcher callbacks.
+    def _gptprof_paths(self) -> tuple[_Path, _Path, _Path]:
+        home = _Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
+        return home / "auth.json", home / "config.yaml", home / "skills" / "chip" / "hcp"
 
-        The public fork does not bundle private OAuth profile files or operator
-        overlays. Install a private profile-switcher pack to enable these
-        callback payloads.
-        """
-        await query.answer(text="Profile switcher callbacks are not bundled in the public distro.")
+    def _gptprof_load_json(self, path: _Path) -> dict:
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _gptprof_write_json(self, path: _Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        tmp.replace(path)
+
+    def _gptprof_switch_profile(self, slug: str) -> dict:
+        auth_path, config_path, hcp_dir = self._gptprof_paths()
+        profile_path = hcp_dir / f"{slug}.json"
+        profile = self._gptprof_load_json(profile_path)
+        access_token = profile.get("access_token")
+        refresh_token = profile.get("refresh_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise ValueError(f"gptprof profile {slug!r} has no access token")
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            raise ValueError(f"gptprof profile {slug!r} has no refresh token")
+
+        plan = str(profile.get("plan") or "")
+        email = str(profile.get("email") or "")
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        auth = self._gptprof_load_json(auth_path)
+        auth["active_provider"] = "openai-codex"
+        auth["updated_at"] = now
+
+        codex = auth.setdefault("codex", {})
+        if not isinstance(codex, dict):
+            codex = {}
+            auth["codex"] = codex
+        codex.update(
+            {
+                "profile": slug,
+                "plan": plan,
+                "email": email,
+                "access_token": access_token.strip(),
+                "refresh_token": refresh_token.strip(),
+            }
+        )
+
+        providers = auth.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            auth["providers"] = providers
+        openai_codex = providers.setdefault("openai-codex", {})
+        if not isinstance(openai_codex, dict):
+            openai_codex = {}
+            providers["openai-codex"] = openai_codex
+        tokens = openai_codex.setdefault("tokens", {})
+        if not isinstance(tokens, dict):
+            tokens = {}
+            openai_codex["tokens"] = tokens
+        tokens.update(
+            {
+                "access_token": access_token.strip(),
+                "refresh_token": refresh_token.strip(),
+                "profile": slug,
+                "plan": plan,
+                "email": email,
+            }
+        )
+        openai_codex["auth_mode"] = "chatgpt"
+
+        pool_root = auth.setdefault("credential_pool", {})
+        if not isinstance(pool_root, dict):
+            pool_root = {}
+            auth["credential_pool"] = pool_root
+        pool = pool_root.setdefault("openai-codex", [])
+        if not isinstance(pool, list):
+            pool = []
+            pool_root["openai-codex"] = pool
+        if pool and isinstance(pool[0], dict):
+            item = pool[0]
+        else:
+            item = {"id": "gptprof", "auth_type": "oauth", "priority": 1}
+            pool.insert(0, item)
+        item.update(
+            {
+                "label": f"gptprof:{slug}",
+                "source": f"gptprof:{slug}",
+                "profile": slug,
+                "plan": plan,
+                "email": email,
+                "access_token": access_token.strip(),
+                "refresh_token": refresh_token.strip(),
+                "last_status": "ok",
+                "last_status_at": time.time(),
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "request_count": 0,
+            }
+        )
+        self._gptprof_write_json(auth_path, auth)
+
+        try:
+            import yaml
+
+            cfg = yaml.safe_load(config_path.read_text()) or {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            model = cfg.setdefault("model", {})
+            if not isinstance(model, dict):
+                model = {}
+                cfg["model"] = model
+            model.update(
+                {
+                    "default": "gpt-5.5",
+                    "provider": "openai-codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "codex_responses",
+                }
+            )
+            tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+            tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
+            tmp.replace(config_path)
+        except Exception:
+            logger.warning("[%s] gptprof switched auth but failed to pin config model", self.name, exc_info=True)
+
+        return {"slug": slug, "plan": plan, "email": email}
+
+    async def _handle_gptprof_callback(self, query, data: str) -> None:
+        """Handle Chip's private GPT profile-switcher callbacks."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+        if action in {"refresh", "autoswitch"}:
+            await query.answer(text="Run /gptprof again to refresh the card.")
+            return
+        if action == "new_auth":
+            await query.answer(text="New auth is handled by the gptprof skill.")
+            return
+        if action == "check_auth":
+            auth_path, _config_path, _hcp_dir = self._gptprof_paths()
+            auth = self._gptprof_load_json(auth_path)
+            current = (auth.get("codex") or {}).get("profile") if isinstance(auth.get("codex"), dict) else None
+            await query.answer(text=f"Current GPT profile: {current or 'unknown'}")
+            return
+        if action == "pi_route":
+            await query.answer(text="Pi route switch is handled outside gptprof.")
+            return
+        if action not in {"gptinvest23", "markov495", "mintsage", "omnifocusme"}:
+            await query.answer(text="Unknown GPT profile callback.")
+            return
+
+        try:
+            switched = await asyncio.to_thread(self._gptprof_switch_profile, action)
+        except Exception as exc:
+            logger.error("[%s] gptprof callback failed for %s: %s", self.name, action, exc, exc_info=True)
+            await query.answer(text="GPT profile switch failed; see logs.")
+            return
+
+        label = switched["slug"]
+        if switched.get("plan"):
+            label = f"{label} ({switched['plan']})"
+        await query.answer(text=f"GPT profile switched: {label} · model pinned to gpt-5.5")
 
 
     async def _handle_callback_query(
