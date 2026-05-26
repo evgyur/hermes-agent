@@ -3192,6 +3192,26 @@ class TelegramAdapter(BasePlatformAdapter):
             out["plan"] = plan_map.get(plan_type.strip().lower(), plan_type.strip())
         return out
 
+    def _gptprof_slug_from_email(self, email: str) -> str:
+        local = email.split("@", 1)[0].lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", local).strip("-")
+        return slug or "profile"
+
+    def _gptprof_unique_slug(self, base_slug: str, *, hcp_dir: _Path) -> str:
+        slug = base_slug
+        idx = 2
+        while (hcp_dir / f"{slug}.json").exists():
+            idx += 1
+            slug = f"{base_slug}-{idx}"
+        return slug
+
+    def _gptprof_known_slugs(self) -> set[str]:
+        _auth_path, _config_path, hcp_dir = self._gptprof_paths()
+        try:
+            return {path.stem for path in hcp_dir.glob("*.json") if path.is_file()}
+        except Exception:
+            return set()
+
     def _gptprof_switch_profile(self, slug: str) -> dict:
         auth_path, config_path, hcp_dir = self._gptprof_paths()
         profile_path = hcp_dir / f"{slug}.json"
@@ -3322,7 +3342,7 @@ class TelegramAdapter(BasePlatformAdapter):
         data["verification_uri"] = f"{issuer}/codex/device"
         return data
 
-    def _gptprof_finish_device_code(self, slug: str, device_data: dict) -> dict:
+    def _gptprof_finish_device_code(self, slot_slug: str | None, device_data: dict) -> dict:
         import httpx
 
         issuer = "https://auth.openai.com"
@@ -3376,9 +3396,20 @@ class TelegramAdapter(BasePlatformAdapter):
             raise ValueError("token exchange did not return access_token")
 
         _auth_path, _config_path, hcp_dir = self._gptprof_paths()
+        token_meta = self._gptprof_token_metadata(access_token)
+        email = str(token_meta.get("email") or "").strip()
+        if email:
+            base_slug = self._gptprof_slug_from_email(email)
+            existing = self._gptprof_load_json(hcp_dir / f"{base_slug}.json")
+            existing_email = str(existing.get("email") or "").strip().lower()
+            slug = base_slug if existing_email == email.lower() else self._gptprof_unique_slug(base_slug, hcp_dir=hcp_dir)
+        elif slot_slug:
+            slug = slot_slug
+        else:
+            slug = self._gptprof_unique_slug("profile", hcp_dir=hcp_dir)
+
         profile_path = hcp_dir / f"{slug}.json"
         profile = self._gptprof_load_json(profile_path)
-        token_meta = self._gptprof_token_metadata(access_token)
         profile["profile"] = slug
         profile["access_token"] = access_token
         if isinstance(refresh_token, str) and refresh_token:
@@ -3391,26 +3422,29 @@ class TelegramAdapter(BasePlatformAdapter):
         profile["source"] = "telegram-device-code"
         profile.pop("_refresh_error", None)
         self._gptprof_write_json(profile_path, profile)
-        return self._gptprof_switch_profile(slug)
+        result = self._gptprof_switch_profile(slug)
+        result["created_new_slot"] = slug != slot_slug
+        return result
 
-    async def _gptprof_complete_new_auth(self, message, slug: str, device_data: dict) -> None:
+    async def _gptprof_complete_new_auth(self, message, slot_slug: str | None, device_data: dict) -> None:
         try:
-            result = await asyncio.to_thread(self._gptprof_finish_device_code, slug, device_data)
+            result = await asyncio.to_thread(self._gptprof_finish_device_code, slot_slug, device_data)
         except Exception as exc:
-            logger.error("[%s] gptprof new-auth failed for %s: %s", self.name, slug, exc, exc_info=True)
+            logger.error("[%s] gptprof new-auth failed for %s: %s", self.name, slot_slug, exc, exc_info=True)
             try:
-                await message.reply_text(f"GPT new auth failed for {slug}: {type(exc).__name__}")
+                await message.reply_text(f"GPT new auth failed: {type(exc).__name__}")
             except Exception:
                 pass
             return
 
+        prefix = "GPT profile created" if result.get("created_new_slot") else "GPT auth updated"
         label = f"slot {result['slug']}"
         if result.get("email"):
             label = f"{label} · {result['email']}"
         if result.get("plan"):
             label = f"{label} ({result['plan']})"
         try:
-            await message.reply_text(f"GPT auth updated: {label}\nModel remains pinned to gpt-5.5.")
+            await message.reply_text(f"{prefix}: {label}\nModel remains pinned to gpt-5.5.")
         except Exception:
             pass
 
@@ -3425,9 +3459,6 @@ class TelegramAdapter(BasePlatformAdapter):
             auth_path, _config_path, _hcp_dir = self._gptprof_paths()
             auth = self._gptprof_load_json(auth_path)
             slug = (auth.get("codex") or {}).get("profile") if isinstance(auth.get("codex"), dict) else None
-            if slug not in {"gptinvest23", "markov495", "mintsage", "omnifocusme"}:
-                await query.answer(text="Select a GPT profile before starting new auth.")
-                return
             try:
                 device_data = await asyncio.to_thread(self._gptprof_request_device_code)
             except Exception as exc:
@@ -3440,10 +3471,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if query.message:
                 await query.message.reply_text(
                     (
-                        f"GPT new auth for slot {slug}\n\n"
+                        "GPT new auth for a new profile slot\n\n"
                         f"Open: {verification_uri}\n"
                         f"Code: {user_code}\n\n"
-                        "I will save the confirmed account into this slot automatically."
+                        "I will create/switch to a profile slot from the confirmed account email."
                     ),
                     disable_web_page_preview=True,
                 )
@@ -3458,7 +3489,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if action == "pi_route":
             await query.answer(text="Pi route switch is handled outside gptprof.")
             return
-        if action not in {"gptinvest23", "markov495", "mintsage", "omnifocusme"}:
+        if action not in self._gptprof_known_slugs():
             await query.answer(text="Unknown GPT profile callback.")
             return
 
