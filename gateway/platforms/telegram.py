@@ -3448,12 +3448,41 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    def _gptprof_run_send_buttons(self) -> subprocess.CompletedProcess[str]:
+        script = _Path("/home/hermes/.hermes/skills/chip/gptprof/send_buttons.py")
+        return subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            text=True,
+            capture_output=True,
+            timeout=90,
+        )
+
     async def _handle_gptprof_callback(self, query, data: str) -> None:
         """Handle Chip's private GPT profile-switcher callbacks."""
         parts = data.split(":")
         action = parts[1] if len(parts) >= 2 else ""
-        if action in {"refresh", "autoswitch"}:
-            await query.answer(text="Run /gptprof again to refresh the card.")
+        if action == "refresh":
+            await query.answer(text="Refreshing GPT usage…")
+            try:
+                proc = await asyncio.to_thread(self._gptprof_run_send_buttons)
+            except Exception as exc:
+                logger.error("[%s] gptprof refresh failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="GPT usage refresh failed; see logs.")
+                return
+            if proc.returncode != 0:
+                logger.error(
+                    "[%s] gptprof refresh command failed rc=%s stderr=%s",
+                    self.name,
+                    proc.returncode,
+                    (proc.stderr or proc.stdout or "").strip()[:1000],
+                )
+                await query.answer(text="GPT usage refresh failed; see logs.")
+                return
+            await query.answer(text="GPT usage refreshed.")
+            return
+        if action == "autoswitch":
+            await query.answer(text="Autoswitch is not active for retired profiles.")
             return
         if action == "new_auth":
             auth_path, _config_path, _hcp_dir = self._gptprof_paths()
