@@ -3274,6 +3274,109 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return {"slug": slug, "plan": plan, "email": email}
 
+    def _gptprof_request_device_code(self) -> dict:
+        import httpx
+
+        issuer = "https://auth.openai.com"
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            resp = client.post(
+                f"{issuer}/api/accounts/deviceauth/usercode",
+                json={"client_id": client_id},
+                headers={"Content-Type": "application/json"},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("user_code") or not data.get("device_auth_id"):
+            raise ValueError("device-code response missing user_code or device_auth_id")
+        data["verification_uri"] = f"{issuer}/codex/device"
+        return data
+
+    def _gptprof_finish_device_code(self, slug: str, device_data: dict) -> dict:
+        import httpx
+
+        issuer = "https://auth.openai.com"
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        user_code = str(device_data["user_code"])
+        device_auth_id = str(device_data["device_auth_id"])
+        interval = max(3, int(device_data.get("interval") or 5))
+        deadline = time.monotonic() + 15 * 60
+
+        code_resp = None
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            while time.monotonic() < deadline:
+                time.sleep(interval)
+                poll_resp = client.post(
+                    f"{issuer}/api/accounts/deviceauth/token",
+                    json={"device_auth_id": device_auth_id, "user_code": user_code},
+                    headers={"Content-Type": "application/json"},
+                )
+                if poll_resp.status_code == 200:
+                    code_resp = poll_resp.json()
+                    break
+                if poll_resp.status_code in {403, 404}:
+                    continue
+                poll_resp.raise_for_status()
+
+            if code_resp is None:
+                raise TimeoutError("device-code login timed out after 15 minutes")
+
+            authorization_code = code_resp.get("authorization_code")
+            code_verifier = code_resp.get("code_verifier")
+            if not authorization_code or not code_verifier:
+                raise ValueError("device auth response missing authorization_code or code_verifier")
+
+            token_resp = client.post(
+                "https://auth.openai.com/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": authorization_code,
+                    "redirect_uri": f"{issuer}/deviceauth/callback",
+                    "client_id": client_id,
+                    "code_verifier": code_verifier,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            token_resp.raise_for_status()
+
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ValueError("token exchange did not return access_token")
+
+        _auth_path, _config_path, hcp_dir = self._gptprof_paths()
+        profile_path = hcp_dir / f"{slug}.json"
+        profile = self._gptprof_load_json(profile_path)
+        profile["profile"] = slug
+        profile["access_token"] = access_token
+        if isinstance(refresh_token, str) and refresh_token:
+            profile["refresh_token"] = refresh_token
+        profile["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        profile["source"] = "telegram-device-code"
+        profile.pop("_refresh_error", None)
+        self._gptprof_write_json(profile_path, profile)
+        return self._gptprof_switch_profile(slug)
+
+    async def _gptprof_complete_new_auth(self, message, slug: str, device_data: dict) -> None:
+        try:
+            result = await asyncio.to_thread(self._gptprof_finish_device_code, slug, device_data)
+        except Exception as exc:
+            logger.error("[%s] gptprof new-auth failed for %s: %s", self.name, slug, exc, exc_info=True)
+            try:
+                await message.reply_text(f"GPT new auth failed for {slug}: {type(exc).__name__}")
+            except Exception:
+                pass
+            return
+
+        label = result["slug"]
+        if result.get("plan"):
+            label = f"{label} ({result['plan']})"
+        try:
+            await message.reply_text(f"GPT auth updated: {label}\nModel remains pinned to gpt-5.5.")
+        except Exception:
+            pass
+
     async def _handle_gptprof_callback(self, query, data: str) -> None:
         """Handle Chip's private GPT profile-switcher callbacks."""
         parts = data.split(":")
@@ -3282,7 +3385,32 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="Run /gptprof again to refresh the card.")
             return
         if action == "new_auth":
-            await query.answer(text="New auth is handled by the gptprof skill.")
+            auth_path, _config_path, _hcp_dir = self._gptprof_paths()
+            auth = self._gptprof_load_json(auth_path)
+            slug = (auth.get("codex") or {}).get("profile") if isinstance(auth.get("codex"), dict) else None
+            if slug not in {"gptinvest23", "markov495", "mintsage", "omnifocusme"}:
+                await query.answer(text="Select a GPT profile before starting new auth.")
+                return
+            try:
+                device_data = await asyncio.to_thread(self._gptprof_request_device_code)
+            except Exception as exc:
+                logger.error("[%s] gptprof device-code request failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Could not start GPT new auth; see logs.")
+                return
+            user_code = str(device_data["user_code"])
+            verification_uri = str(device_data["verification_uri"])
+            await query.answer(text=f"New auth code: {user_code}", show_alert=True)
+            if query.message:
+                await query.message.reply_text(
+                    (
+                        f"GPT new auth for {slug}\n\n"
+                        f"Open: {verification_uri}\n"
+                        f"Code: {user_code}\n\n"
+                        "I will save the new token automatically after confirmation."
+                    ),
+                    disable_web_page_preview=True,
+                )
+                asyncio.create_task(self._gptprof_complete_new_auth(query.message, slug, device_data))
             return
         if action == "check_auth":
             auth_path, _config_path, _hcp_dir = self._gptprof_paths()
