@@ -3162,6 +3162,36 @@ class TelegramAdapter(BasePlatformAdapter):
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         tmp.replace(path)
 
+    def _gptprof_token_metadata(self, access_token: str) -> dict:
+        try:
+            import base64
+
+            payload = access_token.split(".", 2)[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        except Exception:
+            return {}
+        if not isinstance(claims, dict):
+            return {}
+
+        profile = claims.get("https://api.openai.com/profile") or {}
+        auth = claims.get("https://api.openai.com/auth") or {}
+        out: dict[str, str] = {}
+        email = profile.get("email") if isinstance(profile, dict) else None
+        if isinstance(email, str) and email.strip():
+            out["email"] = email.strip()
+        plan_type = auth.get("chatgpt_plan_type") if isinstance(auth, dict) else None
+        if isinstance(plan_type, str) and plan_type.strip():
+            plan_map = {
+                "plus": "Plus $20",
+                "pro": "Pro $200",
+                "team": "Team",
+                "enterprise": "Enterprise",
+                "free": "Free",
+            }
+            out["plan"] = plan_map.get(plan_type.strip().lower(), plan_type.strip())
+        return out
+
     def _gptprof_switch_profile(self, slug: str) -> dict:
         auth_path, config_path, hcp_dir = self._gptprof_paths()
         profile_path = hcp_dir / f"{slug}.json"
@@ -3348,10 +3378,15 @@ class TelegramAdapter(BasePlatformAdapter):
         _auth_path, _config_path, hcp_dir = self._gptprof_paths()
         profile_path = hcp_dir / f"{slug}.json"
         profile = self._gptprof_load_json(profile_path)
+        token_meta = self._gptprof_token_metadata(access_token)
         profile["profile"] = slug
         profile["access_token"] = access_token
         if isinstance(refresh_token, str) and refresh_token:
             profile["refresh_token"] = refresh_token
+        if token_meta.get("email"):
+            profile["email"] = token_meta["email"]
+        if token_meta.get("plan"):
+            profile["plan"] = token_meta["plan"]
         profile["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         profile["source"] = "telegram-device-code"
         profile.pop("_refresh_error", None)
@@ -3369,7 +3404,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             return
 
-        label = result["slug"]
+        label = f"slot {result['slug']}"
+        if result.get("email"):
+            label = f"{label} · {result['email']}"
         if result.get("plan"):
             label = f"{label} ({result['plan']})"
         try:
@@ -3403,10 +3440,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if query.message:
                 await query.message.reply_text(
                     (
-                        f"GPT new auth for {slug}\n\n"
+                        f"GPT new auth for slot {slug}\n\n"
                         f"Open: {verification_uri}\n"
                         f"Code: {user_code}\n\n"
-                        "I will save the new token automatically after confirmation."
+                        "I will save the confirmed account into this slot automatically."
                     ),
                     disable_web_page_preview=True,
                 )
@@ -3437,6 +3474,161 @@ class TelegramAdapter(BasePlatformAdapter):
             label = f"{label} ({switched['plan']})"
         await query.answer(text=f"GPT profile switched: {label} · model pinned to gpt-5.5")
 
+
+    def _subc_state_paths(self) -> tuple[_Path, _Path]:
+        room = _Path(os.environ.get("SUBC_ROOM", "/home/hermes/.hermes/profiles/subc/room"))
+        project = _Path(os.environ.get("SUBC_PROJECT", "/home/hermes/workspace/chip-subconscious"))
+        return room, project
+
+    def _subc_load_state(self, room: _Path) -> dict:
+        state_path = room / "posted_pending_intents.json"
+        if not state_path.exists():
+            return {"posted": {}, "tokens": {}}
+        try:
+            return json.loads(state_path.read_text())
+        except Exception:
+            logger.warning("[%s] failed to read SUBCONSCIOUS pending state: %s", self.name, state_path, exc_info=True)
+            return {"posted": {}, "tokens": {}}
+
+    def _subc_save_state(self, room: _Path, state: dict) -> None:
+        state_path = room / "posted_pending_intents.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        tmp.replace(state_path)
+
+    def _subc_intent_for_token(self, state: dict, token: str) -> Optional[str]:
+        tokens = state.get("tokens") or {}
+        mapped = tokens.get(token)
+        if mapped:
+            return str(mapped)
+        for intent_id, entry in (state.get("posted") or {}).items():
+            if isinstance(entry, dict) and entry.get("callback_token") == token:
+                return str(intent_id)
+        return None
+
+    def _subc_run_script(self, project: _Path, script_name: str, args: List[str]) -> dict:
+        script = project / "scripts" / script_name
+        proc = subprocess.run(
+            [sys.executable, str(script), *args],
+            cwd=str(project),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{script_name} failed rc={proc.returncode}: {(proc.stderr or proc.stdout or '').strip()}"
+            )
+        output = (proc.stdout or "").strip()
+        if not output:
+            return {}
+        try:
+            return json.loads(output)
+        except Exception:
+            return {"stdout": output}
+
+    async def _handle_subc_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"y", "n"} or not parts[2]:
+            await query.answer(text="Некорректная кнопка SUBCONSCIOUS.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Недостаточно прав для решения SUBCONSCIOUS-задач.")
+            return
+
+        choice, token = parts[1], parts[2]
+        decision = "approved" if choice == "y" else "rejected"
+        room, project = self._subc_state_paths()
+        state = self._subc_load_state(room)
+        intent_id = self._subc_intent_for_token(state, token)
+        if not intent_id:
+            await query.answer(text="SUBCONSCIOUS: карточка не найдена или уже устарела.")
+            return
+
+        user_display = getattr(query.from_user, "first_name", None) or getattr(query.from_user, "username", None) or "User"
+        source_message_id = str(getattr(getattr(query, "message", None), "message_id", "") or "")
+
+        try:
+            result = await asyncio.to_thread(
+                self._subc_run_script,
+                project,
+                "subc_transition.py",
+                [
+                    "--room", str(room),
+                    "--intent-id", intent_id,
+                    "--decision", decision,
+                    "--approver", str(user_display),
+                    "--source-message-id", source_message_id,
+                ],
+            )
+            entry = state.setdefault("posted", {}).setdefault(intent_id, {})
+            entry["decision"] = decision
+            entry["decided_by"] = str(user_display)
+            entry["decided_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if result.get("artifact"):
+                entry["path"] = result.get("artifact")
+
+            followup_bits: List[str] = []
+            if decision == "approved":
+                packet = await asyncio.to_thread(
+                    self._subc_run_script,
+                    project,
+                    "subc_build_packet.py",
+                    ["--room", str(room), "--intent-id", intent_id],
+                )
+                if packet.get("build_packet"):
+                    entry["build_packet"] = packet.get("build_packet")
+                shaw = await asyncio.to_thread(
+                    self._subc_run_script,
+                    project,
+                    "subc_shaw_enqueue.py",
+                    ["--room", str(room), "--project", str(project), "--intent-id", intent_id],
+                )
+                if shaw.get("shaw_run"):
+                    entry["shaw_run"] = shaw.get("shaw_run")
+                if shaw.get("pid"):
+                    entry["shaw_pid"] = shaw.get("pid")
+                followup_bits.append("передано в Approved Builds")
+                if entry.get("shaw_run"):
+                    followup_bits.append("Shaw worker запущен")
+            else:
+                followup_bits.append("убрано в архив")
+
+            self._subc_save_state(room, state)
+        except Exception as exc:
+            logger.error("[%s] SUBCONSCIOUS callback failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="SUBCONSCIOUS: ошибка обработки, см. логи.")
+            return
+
+        label = "✅ Одобрено" if decision == "approved" else "❌ Отклонено"
+        await query.answer(text=label)
+        try:
+            suffix = f" — {', '.join(followup_bits)}" if followup_bits else ""
+            await query.edit_message_text(
+                text=f"{label}: {intent_id}{suffix}\n\nРешил: {_html.escape(str(user_display))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
@@ -3478,6 +3670,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- SUBCONSCIOUS pending-intent callbacks (subc:y|n:token) ---
+        if data.startswith("subc:"):
+            await self._handle_subc_callback(
                 query,
                 data,
                 query_chat_id=query_chat_id,
@@ -5764,6 +5968,12 @@ class TelegramAdapter(BasePlatformAdapter):
             raw = [raw]
         return {str(item).strip() for item in raw if str(item).strip()}
 
+    def _telegram_business_free_response_chats(self) -> set[str]:
+        raw = self._telegram_business_config().get("free_response_chats") or []
+        if isinstance(raw, (str, int)):
+            raw = [raw]
+        return {str(item).strip() for item in raw if str(item).strip()}
+
     def _telegram_business_trigger_words(self) -> List[str]:
         raw = self._telegram_business_config().get("trigger_words") or []
         if isinstance(raw, str):
@@ -5787,6 +5997,10 @@ class TelegramAdapter(BasePlatformAdapter):
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _message_matches_business_trigger(self, message: Message) -> bool:
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", "") or "").strip()
+        if chat_id and chat_id in self._telegram_business_free_response_chats():
+            return True
         if self._telegram_business_allow_reply_trigger() and self._is_reply_to_bot(message):
             return True
         if self._message_mentions_bot(message):
