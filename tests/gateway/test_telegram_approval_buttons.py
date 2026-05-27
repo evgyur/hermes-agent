@@ -1,7 +1,9 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
 import asyncio
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -359,6 +361,50 @@ class TestTelegramApprovalCallback:
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_subconscious_pending_intent_approval_runs_transition_packet_and_enqueue(self, tmp_path):
+        adapter = _make_adapter()
+        room = tmp_path / "room"
+        project = tmp_path / "project"
+        room.mkdir()
+        project.mkdir()
+        (room / "posted_pending_intents.json").write_text(
+            '{"posted":{"intent_mem0g-health-issue":{"message_id":12854,"path":"pending_intents/intent_mem0g-health-issue.yaml","callback_token":"f2079a0dad52"}},"tokens":{"f2079a0dad52":"intent_mem0g-health-issue"}}\n'
+        )
+
+        query = AsyncMock()
+        query.data = "subc:y:f2079a0dad52"
+        query.message = MagicMock()
+        query.message.chat_id = -1003971448755
+        query.message.message_id = 12854
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = "617744661"
+        query.from_user.first_name = 'Evgeny "Chip"'
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout='{"ok":true,"build_packet":"bp.json","shaw_run":"sr.json"}', stderr="")
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*", "SUBC_ROOM": str(room), "SUBC_PROJECT": str(project)}, clear=False):
+            with patch("gateway.platforms.telegram.subprocess.run", return_value=completed) as run:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        commands = [call.args[0] for call in run.call_args_list]
+        assert any("subc_transition.py" in " ".join(cmd) and "approved" in cmd for cmd in commands)
+        assert any("subc_build_packet.py" in " ".join(cmd) for cmd in commands)
+        assert any("subc_shaw_enqueue.py" in " ".join(cmd) for cmd in commands)
+        state = json.loads((room / "posted_pending_intents.json").read_text())
+        entry = state["posted"]["intent_mem0g-health-issue"]
+        assert entry["decision"] == "approved"
+        assert entry["build_packet"] == "bp.json"
+        assert entry["shaw_run"] == "sr.json"
+        query.answer.assert_called()
+        query.edit_message_text.assert_called_once()
+        assert query.edit_message_text.call_args.kwargs["reply_markup"] is None
 
     @pytest.mark.asyncio
     async def test_deny_button(self):

@@ -509,6 +509,18 @@ def test_business_reply_trigger_requires_explicit_opt_in():
     assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is True
 
 
+def test_business_free_response_chat_bypasses_trigger_requirement():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "free_response_chats": ["6442556885"],
+    }
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain message", from_user_id=6442556885)) is True
+    assert adapter._message_matches_business_trigger(_dm_message("plain message", from_user_id=617744661)) is False
+
+
 def test_free_response_chats_bypass_mention_requirement():
     adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
 
