@@ -155,9 +155,11 @@ def _codex_ack_message_response(text: str):
 
 
 class _FakeResponsesStream:
-    def __init__(self, *, final_response=None, final_error=None):
+    def __init__(self, *, final_response=None, final_error=None, events=None, iter_error=None):
         self._final_response = final_response
         self._final_error = final_error
+        self._events = list(events or [])
+        self._iter_error = iter_error
 
     def __enter__(self):
         return self
@@ -166,7 +168,10 @@ class _FakeResponsesStream:
         return False
 
     def __iter__(self):
-        return iter(())
+        for event in self._events:
+            yield event
+        if self._iter_error is not None:
+            raise self._iter_error
 
     def get_final_response(self):
         if self._final_error is not None:
@@ -180,7 +185,10 @@ class _FakeCreateStream:
         self.closed = False
 
     def __iter__(self):
-        return iter(self._events)
+        for event in self._events:
+            yield event
+        if self._iter_error is not None:
+            raise self._iter_error
 
     def close(self):
         self.closed = True
@@ -419,6 +427,60 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     response = agent._run_codex_stream(_codex_request_kwargs())
     assert calls["stream"] == 2
     assert response.output[0].content[0].text == "stream ok"
+
+
+def test_run_codex_stream_recovers_when_final_output_is_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    streamed_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="stream recovered")],
+    )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _FakeResponsesStream(
+                events=[SimpleNamespace(type="response.output_item.done", item=streamed_item)],
+                final_error=TypeError("'NoneType' object is not iterable"),
+            ),
+            create=lambda **kwargs: _codex_message_response("fallback should not run"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.output == [streamed_item]
+
+
+def test_run_codex_stream_falls_back_to_create_when_stream_parser_hits_none_output(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream([
+        SimpleNamespace(type="response.output_text.delta", delta="parser fallback ok"),
+        SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed", output=[])),
+    ])
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(iter_error=TypeError("'NoneType' object is not iterable"))
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["stream"] == 1
+    assert calls["create"] == 1
+    assert response.output[0].content[0].text == "parser fallback ok"
 
 
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):
