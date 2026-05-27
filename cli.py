@@ -6505,8 +6505,43 @@ class HermesCLI:
             else:
                 print("(^_^)v New session started!")
 
+    def _handle_recall_command(self, cmd_original: str) -> None:
+        """Handle ``/recall <query>`` — compact search over local session traces."""
+        parts = cmd_original.split(maxsplit=1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if not query:
+            _cprint("  Usage: /recall <query>")
+            return
+        try:
+            from hermes_cli.recall import RecallCommand
+            db_path = getattr(self._session_db, "db_path", None) if self._session_db else None
+            output = RecallCommand(db_path=str(db_path) if db_path else None).execute(query)
+        except Exception as exc:
+            _cprint(f"  /recall failed: {exc}")
+            return
+        _cprint(output)
+
+    def _handle_handoff_summary_command(self, topic: str) -> None:
+        """Handle topic-mode ``/handoff <topic>`` — write local artifacts."""
+        topic = topic.strip()
+        if not topic:
+            _cprint("  Usage: /handoff <topic|platform>")
+            return
+        try:
+            from hermes_cli.handoff_summary import HandoffSummaryCommand
+            db_path = getattr(self._session_db, "db_path", None) if self._session_db else None
+            output = HandoffSummaryCommand(db_path=str(db_path) if db_path else None).execute(topic)
+        except Exception as exc:
+            _cprint(f"  /handoff artifact failed: {exc}")
+            return
+        _cprint(output)
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
-        """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
+        """Handle ``/handoff <topic|platform>``.
+
+        Known gateway platform names keep the existing CLI→gateway transfer
+        behavior. Any other argument is treated as a local artifact topic for
+        the session-handoff layer.
 
         Flow:
           1. Validate platform name + the gateway has a home channel for it.
@@ -6543,7 +6578,10 @@ class HermesCLI:
         try:
             platform = Platform(platform_name)
         except (ValueError, KeyError):
-            _cprint(f"  Unknown platform '{platform_name}'.")
+            # Topic mode: `/handoff guardian setup` writes a local continuation
+            # artifact. Existing platform transfer still wins for known platform
+            # names such as `telegram` or `discord`.
+            self._handle_handoff_summary_command(parts[1].strip())
             return True
 
         try:
@@ -8433,6 +8471,8 @@ class HermesCLI:
         elif canonical == "handoff":
             if not self._handle_handoff_command(cmd_original):
                 return False
+        elif canonical == "recall":
+            self._handle_recall_command(cmd_original)
         elif canonical == "new":
             # Strip inline-skip tokens (now/--yes/-y) before deriving the title
             # so "/new now My Session" yields title="My Session" instead of
