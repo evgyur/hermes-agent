@@ -1211,6 +1211,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    def _business_connection_kwargs(
+        self, metadata: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        business_connection_id = (metadata or {}).get("business_connection_id")
+        if not business_connection_id:
+            return {}
+        return {"business_connection_id": str(business_connection_id)}
+
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
 
@@ -2268,6 +2276,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
+                                **self._business_connection_kwargs(metadata),
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
@@ -2282,6 +2291,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
+                                    **self._business_connection_kwargs(metadata),
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
@@ -2500,6 +2510,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=strip_markdown(content),
+                    **self._business_connection_kwargs(metadata),
                 )
                 return SendResult(success=True, message_id=message_id)
 
@@ -2510,6 +2521,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **self._business_connection_kwargs(metadata),
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -2521,6 +2533,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=_strip_mdv2(formatted),
+                    **self._business_connection_kwargs(metadata),
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -4781,6 +4794,56 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_business_config(self) -> Dict[str, Any]:
+        raw = self.config.extra.get("business")
+        return raw if isinstance(raw, dict) else {}
+
+    def _telegram_business_enabled(self) -> bool:
+        value = self._telegram_business_config().get("enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _is_telegram_business_message(self, message: Message) -> bool:
+        return bool(getattr(message, "business_connection_id", None))
+
+    def _telegram_business_free_response_chats(self) -> set[str]:
+        raw = self._telegram_business_config().get("free_response_chats", [])
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _message_matches_business_trigger(self, message: Message) -> bool:
+        if not self._telegram_business_enabled():
+            return False
+
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        free_response = self._telegram_business_free_response_chats()
+        if user_id in free_response or chat_id in free_response:
+            return True
+
+        if self._message_mentions_bot(message):
+            return True
+
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        raw_words = self._telegram_business_config().get("trigger_words", [])
+        if isinstance(raw_words, str):
+            trigger_words = [part.strip() for part in re.split(r"[\n,]+", raw_words) if part.strip()]
+        elif isinstance(raw_words, list):
+            trigger_words = [str(part).strip() for part in raw_words if str(part).strip()]
+        else:
+            trigger_words = []
+        for word in trigger_words:
+            if re.search(rf"(?i)(?<![\w@]){re.escape(word)}(?![\w@])", text):
+                return True
+
+        allow_reply = self._telegram_business_config().get("allow_reply_trigger", False)
+        if isinstance(allow_reply, str):
+            allow_reply = allow_reply.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(allow_reply and self._is_reply_to_bot(message))
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -5215,9 +5278,6 @@ class TelegramAdapter(BasePlatformAdapter):
         mentioning the bot (``@botname /command``), both of which are
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
-        if not self._is_group_chat(message):
-            return True
-
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
@@ -5234,6 +5294,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
 
         if not self._is_group_chat(message):
+            if self._is_telegram_business_message(message):
+                return self._message_matches_business_trigger(message)
             # Root DM (non-topic): ignore if ignore_root_dm is configured
             if thread_id is None and self.config.extra.get("ignore_root_dm", False):
                 chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
@@ -6074,6 +6136,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     break
 
         # Build source
+        business_connection_id = getattr(message, "business_connection_id", None)
         source = self.build_source(
             chat_id=str(chat.id),
             chat_name=getattr(chat, "title", None) or (getattr(chat, "full_name", None) if hasattr(chat, "full_name") else None),
@@ -6096,6 +6159,9 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             message_id=str(message.message_id),
         )
+        if business_connection_id:
+            source.business_connection_id = str(business_connection_id)
+            source.external_safe_mode = True
 
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)

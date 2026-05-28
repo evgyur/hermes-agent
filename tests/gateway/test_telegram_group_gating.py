@@ -136,6 +136,12 @@ def _dm_message(text="hello", *, from_user_id=111, reply_to_bot=False, entities=
     )
 
 
+def _business_dm_message(text="hello", *, from_user_id=111, business_connection_id="biz-123", **kwargs):
+    message = _dm_message(text, from_user_id=from_user_id, **kwargs)
+    message.business_connection_id = business_connection_id
+    return message
+
+
 def _mention_entity(text, mention="@hermes_bot"):
     offset = text.index(mention)
     return SimpleNamespace(type="mention", offset=offset, length=len(mention))
@@ -496,6 +502,29 @@ def test_business_messages_are_wake_word_or_mention_only_by_default():
     assert adapter._message_matches_business_trigger(
         _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
     ) is True
+
+
+def test_business_dm_dispatch_requires_trigger():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._should_process_message(_business_dm_message("plain customer reply")) is False
+    assert adapter._should_process_message(_business_dm_message("Sigurd, посчитай")) is True
+    assert adapter._should_process_message(
+        _business_dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_business_message_source_keeps_business_connection_id():
+    adapter = _make_adapter(require_mention=False)
+    message = _business_dm_message("Sigurd, ping", from_user_id=95948382)
+
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=123)
+
+    assert event.source.chat_id == "95948382"
+    assert event.source.user_id == "95948382"
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is True
 
 
 def test_business_reply_trigger_requires_explicit_opt_in():

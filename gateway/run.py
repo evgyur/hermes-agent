@@ -6559,6 +6559,17 @@ class GatewayRunner:
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
+        # Telegram Business delegated inbox messages have already passed the
+        # adapter-side wake-word/mention gate before reaching gateway auth.
+        # They are external contacts by design, so the platform allowlist must
+        # not drop a valid "Sigurd, ..." business-chat command.
+        if (
+            source.platform == Platform.TELEGRAM
+            and source.chat_type == "dm"
+            and getattr(source, "business_connection_id", None)
+        ):
+            return True
+
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
         if self.pairing_store.is_approved(platform_name, user_id):
