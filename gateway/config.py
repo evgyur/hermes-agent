@@ -832,6 +832,10 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if plat == Platform.TELEGRAM and "require_mention_chats" in platform_cfg:
                     bridged["require_mention_chats"] = platform_cfg["require_mention_chats"]
+                if plat == Platform.TELEGRAM and "private_chats" in platform_cfg:
+                    bridged["private_chats"] = platform_cfg["private_chats"]
+                if plat == Platform.TELEGRAM and "public_chats" in platform_cfg:
+                    bridged["public_chats"] = platform_cfg["public_chats"]
                 if plat == Platform.TELEGRAM and "suppress_tool_progress_chats" in platform_cfg:
                     bridged["suppress_tool_progress_chats"] = platform_cfg["suppress_tool_progress_chats"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
@@ -983,6 +987,16 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                private_chats = telegram_cfg.get("private_chats")
+                if private_chats is not None and not os.getenv("TELEGRAM_PRIVATE_CHATS"):
+                    if isinstance(private_chats, list):
+                        private_chats = ",".join(str(v) for v in private_chats)
+                    os.environ["TELEGRAM_PRIVATE_CHATS"] = str(private_chats)
+                public_chats = telegram_cfg.get("public_chats")
+                if public_chats is not None and not os.getenv("TELEGRAM_PUBLIC_CHATS"):
+                    if isinstance(public_chats, list):
+                        public_chats = ",".join(str(v) for v in public_chats)
+                    os.environ["TELEGRAM_PUBLIC_CHATS"] = str(public_chats)
                 # allowed_chats: if set, bot ONLY responds in these group chats (whitelist)
                 ac = telegram_cfg.get("allowed_chats")
                 if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):

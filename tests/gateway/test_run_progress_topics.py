@@ -792,7 +792,7 @@ async def test_run_agent_suppresses_still_working_for_configured_telegram_chat(m
 
 
 @pytest.mark.asyncio
-async def test_run_agent_suppresses_tool_progress_for_telegram_group_by_chat_type(monkeypatch, tmp_path):
+async def test_run_agent_suppresses_tool_progress_for_configured_public_telegram_group(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -800,7 +800,10 @@ async def test_run_agent_suppresses_tool_progress_for_telegram_group_by_chat_typ
         session_id="sess-public-group",
         chat_id="-1001",
         chat_type="group",
-        config_data={"display": {"tool_progress": "all"}},
+        config_data={
+            "display": {"tool_progress": "all"},
+            "telegram": {"private_chats": ["-300"], "public_chats": ["-1001"]},
+        },
     )
 
     assert result["final_response"] == "done"
@@ -808,6 +811,47 @@ async def test_run_agent_suppresses_tool_progress_for_telegram_group_by_chat_typ
     assert adapter.edits == []
     assert adapter.typing == []
 
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_tool_progress_for_configured_private_telegram_group(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-private-work-group",
+        chat_id="-300",
+        chat_type="group",
+        config_data={
+            "display": {"tool_progress": "all"},
+            "telegram": {"private_chats": ["-300"], "public_chats": ["-200"]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == '💻 terminal: "pwd"'
+
+
+@pytest.mark.asyncio
+async def test_run_agent_suppresses_tool_progress_for_configured_public_telegram_chat(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-public-policy-chat",
+        chat_id="-200",
+        chat_type="group",
+        config_data={
+            "display": {"tool_progress": "all"},
+            "telegram": {"private_chats": ["-300"], "public_chats": ["-200"]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.typing == []
 
 @pytest.mark.asyncio
 async def test_run_agent_keeps_tool_progress_for_telegram_dm(monkeypatch, tmp_path):

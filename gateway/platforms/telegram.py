@@ -4807,6 +4807,48 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    @staticmethod
+    def _telegram_chat_id_set(raw: Any) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_private_chats(self) -> set[str]:
+        raw = self.config.extra.get("private_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_PRIVATE_CHATS", "")
+        private = self._telegram_chat_id_set(raw)
+        # Backward-compatible migration path: legacy free-response chats are
+        # private by policy, unless the new explicit lists are absent entirely.
+        private.update(self._telegram_free_response_chats())
+        return private
+
+    def _telegram_public_chats(self) -> set[str]:
+        raw = self.config.extra.get("public_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_PUBLIC_CHATS", "")
+        public = self._telegram_chat_id_set(raw)
+        public.update(self._telegram_require_mention_chats())
+        return public
+
+    def _telegram_has_explicit_chat_policy(self) -> bool:
+        private_raw = self.config.extra.get("private_chats")
+        public_raw = self.config.extra.get("public_chats")
+        if private_raw is not None or public_raw is not None:
+            return bool(self._telegram_chat_id_set(private_raw) or self._telegram_chat_id_set(public_raw))
+        return bool(os.getenv("TELEGRAM_PRIVATE_CHATS", "").strip() or os.getenv("TELEGRAM_PUBLIC_CHATS", "").strip())
+
+    def _telegram_public_triggered(self, message: Message, *, guest_mention: Optional[bool] = None) -> bool:
+        if self._is_reply_to_bot(message):
+            return True
+        if guest_mention is True:
+            return True
+        if guest_mention is None and self._message_mentions_bot(message):
+            return True
+        return self._message_matches_mention_patterns(message)
+
     def _telegram_business_config(self) -> Dict[str, Any]:
         raw = self.config.extra.get("business")
         return raw if isinstance(raw, dict) else {}
@@ -5301,17 +5343,29 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
 
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        explicit_policy = self._telegram_has_explicit_chat_policy()
+        private_chats = self._telegram_private_chats() if explicit_policy else set()
+        public_chats = self._telegram_public_chats() if explicit_policy else set()
+
         if not self._is_group_chat(message):
             if self._is_telegram_business_message(message):
+                if explicit_policy and chat_id_str not in private_chats:
+                    user = getattr(message, "from_user", None)
+                    user_id = str(getattr(user, "id", "") or "")
+                    if user_id not in private_chats:
+                        return False
                 return self._message_matches_business_trigger(message)
             # Root DM (non-topic): ignore if ignore_root_dm is configured
             if thread_id is None and self.config.extra.get("ignore_root_dm", False):
-                chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-                if not is_command and chat_id in self._dm_topic_chat_ids:
+                if not is_command and chat_id_str in self._dm_topic_chat_ids:
                     return False
+            if explicit_policy:
+                user = getattr(message, "from_user", None)
+                user_id = str(getattr(user, "id", "") or "")
+                return chat_id_str in private_chats or user_id in private_chats
             return True
 
-        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
@@ -5326,6 +5380,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
 
+        if explicit_policy:
+            if chat_id_str in private_chats:
+                return True
+            if chat_id_str in public_chats:
+                return self._telegram_public_triggered(
+                    message,
+                    guest_mention=guest_mention if self._telegram_guest_mode() else None,
+                )
+            return False
+
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
         # exact message as an explicit direct mention. DMs are excluded above.
@@ -5339,13 +5403,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if not self._telegram_chat_requires_mention(chat_id_str):
             return True
-        if self._is_reply_to_bot(message):
-            return True
-        # When guest_mode is True, _is_guest_mention already called
-        # _message_mentions_bot above — skip the redundant second call.
-        if not self._telegram_guest_mode() and self._message_mentions_bot(message):
-            return True
-        return self._message_matches_mention_patterns(message)
+        return self._telegram_public_triggered(
+            message,
+            guest_mention=guest_mention if self._telegram_guest_mode() else None,
+        )
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
