@@ -861,10 +861,10 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 
 @pytest.mark.asyncio
 async def test_startup_auto_resume_schedules_fresh_pending_sessions():
-    """Fresh resume_pending sessions should continue automatically after startup.
+    """Fresh drain-timeout resume_pending sessions continue automatically.
 
-    This closes the UX gap where restart recovery only happened if the user sent
-    another message after the gateway came back.
+    These entries are written by _stop_impl() from the live _running_agents map,
+    so they represent the task that was actually active at restart time.
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
@@ -900,13 +900,12 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_includes_crash_recovery():
-    """Crash-recovered sessions (reason=restart_interrupted) are also auto-resumed.
+async def test_startup_auto_resume_skips_crash_recovery_candidates():
+    """Crash-recovered sessions are resumable, but not auto-started.
 
-    suspend_recently_active() marks in-flight sessions with resume_reason
-    "restart_interrupted" when the previous gateway exit was not clean
-    (crash/SIGKILL/OOM).  These should get the same magic continuation as
-    drain-timeout interruptions.
+    ``suspend_recently_active()`` uses recency after an unclean exit. That is a
+    conservative candidate, not proof that this exact session was running when
+    the gateway died, so it must wait for the next real user message.
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="crash-chat")
@@ -928,8 +927,8 @@ async def test_startup_auto_resume_includes_crash_recovery():
     scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -3793,14 +3793,11 @@ class GatewayRunner:
         task.add_done_callback(self._background_tasks.discard)
         return True
 
-    # Drain-timeout reasons set by _stop_impl() when a still-running turn is
-    # force-interrupted; "restart_interrupted" is set by
-    # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
-    _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
-    )
+    # Drain-timeout reasons are set by _stop_impl() before interrupting an
+    # actually running agent during graceful gateway restart/shutdown.  Those
+    # are safe to synthesize at startup: they represent the exact task that was
+    # active when the gateway went down.
+    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout"})
 
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
