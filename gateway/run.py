@@ -8860,6 +8860,14 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            if agent_result.get("suppress_delivery"):
+                logger.info(
+                    "agent result suppressed delivery: platform=%s chat=%s error=%s",
+                    _platform_name,
+                    source.chat_id or "unknown",
+                    str(agent_result.get("error") or "")[:160],
+                )
+                return None
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to

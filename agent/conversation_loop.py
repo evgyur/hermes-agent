@@ -3173,6 +3173,10 @@ def run_conversation(
                         continue
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
+                    _is_codex_useful_byte_watchdog = (
+                        "codex stream produced no useful bytes" in str(_final_summary).lower()
+                        and "chatgpt.com/backend-api/codex" in str(_final_summary).lower()
+                    )
                     if classified.reason == FailoverReason.billing:
                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
                         _billing_guidance = _billing_or_entitlement_message(
@@ -3187,6 +3191,14 @@ def run_conversation(
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
+                        )
+                    elif _is_codex_useful_byte_watchdog:
+                        # This is retry/watchdog plumbing for the ChatGPT Codex
+                        # backend. Keep it in logs, but do not turn it into a
+                        # scary Telegram final message after retries exhaust.
+                        agent._vprint(
+                            f"{agent.log_prefix}   ⚠️ Codex useful-byte watchdog exhausted retries; suppressing chat delivery.",
+                            force=True,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -3237,6 +3249,8 @@ def run_conversation(
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
+                    elif _is_codex_useful_byte_watchdog:
+                        _final_response = ""
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_stream_drop:
@@ -3254,7 +3268,8 @@ def run_conversation(
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": _final_summary,
+                        "error": "" if _is_codex_useful_byte_watchdog else _final_summary,
+                        "suppress_delivery": bool(_is_codex_useful_byte_watchdog),
                     }
 
                 # For rate limits, respect the Retry-After header if present
