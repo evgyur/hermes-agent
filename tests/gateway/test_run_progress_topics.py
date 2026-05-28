@@ -144,6 +144,19 @@ class FakeAgent:
         }
 
 
+class SlowAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class LongPreviewAgent:
     """Agent that emits a tool call with a very long preview string."""
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
@@ -700,6 +713,7 @@ async def _run_with_agent(
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for fake-agent tests
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
@@ -743,6 +757,27 @@ async def test_run_agent_suppresses_tool_progress_for_configured_telegram_chat(m
         tmp_path,
         FakeAgent,
         session_id="sess-quiet-chat",
+        chat_id="-1001234567890",
+        config_data={
+            "display": {"tool_progress": "all"},
+            "telegram": {"suppress_tool_progress_chats": [-1001234567890]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.typing == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_suppresses_still_working_for_configured_telegram_chat(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.1")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowAgent,
+        session_id="sess-quiet-chat-still-working",
         chat_id="-1001234567890",
         config_data={
             "display": {"tool_progress": "all"},

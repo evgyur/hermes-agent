@@ -6450,6 +6450,35 @@ class GatewayRunner:
             group_chat_allowlist = os.getenv(platform_group_chat_env_map.get(source.platform, ""), "").strip()
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
+        # Telegram public/shared chats sometimes need stricter sender rules
+        # than the global group allowlist. When a chat-specific rule exists,
+        # it is authoritative for that chat: a user must be listed there even
+        # if they are listed in TELEGRAM_GROUP_ALLOWED_USERS.
+        if source.platform == Platform.TELEGRAM and source.chat_type in {"group", "forum"} and source.chat_id:
+            raw_per_chat_group_users = os.getenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", "").strip()
+            if raw_per_chat_group_users:
+                try:
+                    per_chat_group_users = json.loads(raw_per_chat_group_users)
+                except json.JSONDecodeError:
+                    per_chat_group_users = {}
+                    logger.warning("Invalid TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS JSON; ignoring per-chat group auth")
+                if isinstance(per_chat_group_users, dict) and source.chat_id in {str(k) for k in per_chat_group_users}:
+                    allowed_for_chat_raw = per_chat_group_users.get(source.chat_id)
+                    if allowed_for_chat_raw is None:
+                        allowed_for_chat_raw = per_chat_group_users.get(str(source.chat_id))
+                    if isinstance(allowed_for_chat_raw, str):
+                        allowed_for_chat = {v.strip() for v in allowed_for_chat_raw.split(",") if v.strip()}
+                    elif isinstance(allowed_for_chat_raw, (list, tuple, set)):
+                        allowed_for_chat = {str(v).strip() for v in allowed_for_chat_raw if str(v).strip()}
+                    else:
+                        allowed_for_chat = set()
+                    if "*" in allowed_for_chat:
+                        return True
+                    check_ids = {user_id}
+                    if "@" in user_id:
+                        check_ids.add(user_id.split("@", 1)[0])
+                    return bool(check_ids & allowed_for_chat)
+
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
@@ -15796,11 +15825,13 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
-        if tool_progress_enabled and source.platform == Platform.TELEGRAM:
+        suppress_tool_status_for_chat = False
+        if source.platform == Platform.TELEGRAM:
             try:
                 quiet_chats = (user_config.get("telegram") or {}).get("suppress_tool_progress_chats") or []
                 quiet_ids = {str(chat_id) for chat_id in quiet_chats}
-                if str(getattr(source, "chat_id", "")) in quiet_ids:
+                suppress_tool_status_for_chat = str(getattr(source, "chat_id", "")) in quiet_ids
+                if tool_progress_enabled and suppress_tool_status_for_chat:
                     tool_progress_enabled = False
             except Exception:
                 pass
@@ -17357,6 +17388,8 @@ class GatewayRunner:
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        if suppress_tool_status_for_chat:
+            _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
         async def _notify_long_running():

@@ -12,6 +12,7 @@ def _clear_auth_env(monkeypatch) -> None:
     for key in (
         "TELEGRAM_ALLOWED_USERS",
         "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS",
         "DISCORD_ALLOWED_USERS",
         "WHATSAPP_ALLOWED_USERS",
         "SLACK_ALLOWED_USERS",
@@ -274,6 +275,43 @@ def test_telegram_group_chat_allowlist_authorizes_group_chat_without_user_allowl
     )
 
     assert runner._is_user_authorized(source) is True
+
+
+def test_telegram_per_chat_group_allow_from_overrides_global_group_users(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "111,222")
+    monkeypatch.setenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", '{"-10042": ["111"]}')
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)}),
+    )
+
+    allowed = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_id="-10042",
+        user_name="allowed",
+        chat_type="group",
+    )
+    globally_allowed_but_blocked_here = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="222",
+        chat_id="-10042",
+        user_name="blocked",
+        chat_type="group",
+    )
+    other_chat_global_rule = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="222",
+        chat_id="-10099",
+        user_name="global",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(allowed) is True
+    assert runner._is_user_authorized(globally_allowed_but_blocked_here) is False
+    assert runner._is_user_authorized(other_chat_global_rule) is True
 
 
 def test_telegram_group_chat_allowlist_authorizes_anonymous_sender(monkeypatch):

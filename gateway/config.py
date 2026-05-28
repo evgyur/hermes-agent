@@ -1028,6 +1028,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(group_allowed_chats, list):
                         group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
                     os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
+                per_chat_group_allowed_users = telegram_cfg.get("per_chat_group_allow_from")
+                if per_chat_group_allowed_users is not None and not os.getenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"):
+                    if isinstance(per_chat_group_allowed_users, dict):
+                        per_chat_group_allowed_users = json.dumps(per_chat_group_allowed_users)
+                    os.environ["TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"] = str(per_chat_group_allowed_users)
                 for _telegram_extra_key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
                     if _telegram_extra_key in telegram_cfg:
                         plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
