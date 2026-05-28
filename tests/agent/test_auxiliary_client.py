@@ -2624,23 +2624,23 @@ class TestCodexAuxiliaryAdapterTimeout:
             type="message",
             content=[SimpleNamespace(type="output_text", text="summary recovered")],
         )
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=streamed_item),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(
+                status="completed", id="r1", usage=None, output=None,
+            )),
+        ]
 
-        class FakeStream:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
+        class FakeCreateStream:
             def __iter__(self):
-                return iter([SimpleNamespace(type="response.output_item.done", item=streamed_item)])
+                return iter(events)
 
-            def get_final_response(self):
-                raise TypeError("'NoneType' object is not iterable")
+            def close(self):
+                pass
 
         class FakeResponses:
-            def stream(self, **kwargs):
-                return FakeStream()
+            def create(self, **kwargs):
+                return FakeCreateStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses())
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
@@ -2655,23 +2655,18 @@ class TestCodexAuxiliaryAdapterTimeout:
             content=[SimpleNamespace(type="output_text", text="iterator recovered")],
         )
 
-        class FakeStream:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
+        class FakeCreateStream:
             def __iter__(self):
                 yield SimpleNamespace(type="response.output_item.done", item=streamed_item)
-                raise TypeError("'NoneType' object is not iterable")
+                # No terminal event: raw-event assembly should still return
+                # the collected output item instead of relying on SDK final output.
 
-            def get_final_response(self):
-                raise AssertionError("parser failure should recover before final response")
+            def close(self):
+                pass
 
         class FakeResponses:
-            def stream(self, **kwargs):
-                return FakeStream()
+            def create(self, **kwargs):
+                return FakeCreateStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses())
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
