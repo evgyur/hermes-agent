@@ -43,8 +43,8 @@ def test_hint_fires_for_bare_gpt_5_5_on_codex(tmp_path):
     agent.api_mode = "codex_responses"
     hint = agent._codex_silent_hang_hint(model="gpt-5.5")
     assert hint is not None
-    assert "gpt-5.4-codex" in hint
-    assert "fallback chain" in hint
+    assert "gpt-5.4-codex" not in hint
+    assert "keep using the requested model" in hint
 
 
 def test_hint_fires_for_vendor_prefixed_gpt_5_5(tmp_path):
@@ -73,7 +73,7 @@ def test_hint_fires_when_model_arg_omitted(tmp_path):
 
 
 def test_hint_skipped_for_gpt_5_4_codex(tmp_path):
-    """gpt-5.4-codex is the recommended workaround — must not trigger."""
+    """Only the gpt-5.5 silent-hang family should trigger."""
     agent = _make_agent(tmp_path, model="gpt-5.4-codex")
     agent.api_mode = "codex_responses"
     assert agent._codex_silent_hang_hint(model="gpt-5.4-codex") is None

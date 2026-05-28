@@ -8,10 +8,10 @@ retry loop can reconnect promptly. Once any stream event arrives, the stream is
 considered healthy and only the wall-clock stale timeout applies — long
 generations must never be interrupted by the TTFB cutoff.
 
-The "bytes flowing" signal is ``agent._codex_stream_last_event_ts``, set on
-*any* event by ``codex_runtime.run_codex_stream`` — so reasoning-only or
-tool-call-only turns (which emit no output-text deltas) are not mistaken for a
-stall.
+The watchdog uses ``agent._codex_stream_useful_event_ts``. Raw
+``response.created`` / ``response.in_progress`` events update diagnostics but
+do not count as useful bytes, while reasoning-only or tool-call-only turns are
+accepted once they emit reasoning/tool events.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
     stop = {"flag": False}
 
     def fake_hang(api_kwargs, client=None, on_first_delta=None):
-        # Never set _codex_stream_last_event_ts: simulate zero events arriving.
+        # Never set useful-event marker: simulate zero useful events arriving.
         deadline = time.time() + 30
         while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
             time.sleep(0.02)
@@ -101,6 +101,45 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
     finally:
         stop["flag"] = True
 
+
+
+def test_ttfb_kills_when_only_prelude_events_flow(tmp_path, monkeypatch):
+    """Raw response.created / response.in_progress events are not useful
+    bytes. They must not keep a silent gpt-5.5 Codex call alive until the
+    much slower stale timeout."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    stop = {"flag": False}
+
+    def fake_prelude_only(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"]:
+            agent._codex_stream_last_event_ts = time.time()
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_prelude_only)
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert "useful bytes" in str(excinfo.value)
+        assert "codex_ttfb_kill" in closes
+    finally:
+        stop["flag"] = True
 
 def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     """Once a stream event has arrived, a generation that runs past the TTFB
@@ -125,9 +164,10 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     sentinel = SimpleNamespace(ok=True)
 
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        # Bytes flowing: mark stream activity right away, then keep generating
-        # past the 1s TTFB cutoff before returning a real response.
+        # Useful bytes flowing: mark useful stream activity right away, then keep
+        # generating past the 1s TTFB cutoff before returning a real response.
         agent._codex_stream_last_event_ts = time.time()
+        agent._codex_stream_useful_event_ts = time.time()
         if on_first_delta:
             on_first_delta()
         time.sleep(2.0)

@@ -244,15 +244,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
                 for event in stream:
-                    # Mark stream activity for the TTFB watchdog in
-                    # interruptible_api_call. The Codex backend can accept the
-                    # connection but never emit a single event; this timestamp
-                    # staying None tells the watchdog no bytes are flowing.
-                    agent._codex_stream_last_event_ts = time.time()
+                    # Mark raw stream activity for diagnostics, then separately
+                    # mark useful activity once the event carries model output,
+                    # a tool call/output item, reasoning, or a terminal response.
+                    # Prelude/heartbeat events alone should not defeat the
+                    # Codex TTFB watchdog.
+                    now = time.time()
+                    agent._codex_stream_last_event_ts = now
                     agent._touch_activity("receiving stream response")
                     if agent._interrupt_requested:
                         break
                     event_type = getattr(event, "type", "")
+                    if (
+                        "output_text.delta" in event_type
+                        or event_type == "response.output_text.delta"
+                        or "function_call" in event_type
+                        or ("reasoning" in event_type and "delta" in event_type)
+                        or event_type == "response.output_item.done"
+                        or event_type in {"response.completed", "response.incomplete", "response.failed"}
+                    ):
+                        agent._codex_stream_useful_event_ts = now
                     # Fire callbacks on text content deltas (suppress during tool calls)
                     if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                         delta_text = getattr(event, "delta", "")
