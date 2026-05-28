@@ -157,9 +157,10 @@ def _codex_ack_message_response(text: str):
 
 
 class _FakeResponsesStream:
-    def __init__(self, *, final_response=None, final_error=None):
+    def __init__(self, *, final_response=None, final_error=None, events=None):
         self._final_response = final_response
         self._final_error = final_error
+        self._events = list(events or [])
 
     def __enter__(self):
         return self
@@ -168,7 +169,7 @@ class _FakeResponsesStream:
         return False
 
     def __iter__(self):
-        return iter(())
+        return iter(self._events)
 
     def get_final_response(self):
         if self._final_error is not None:
@@ -420,6 +421,52 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     response = agent._run_codex_stream(_codex_request_kwargs())
     assert calls["stream"] == 2
     assert response.output[0].content[0].text == "stream ok"
+
+
+def test_run_codex_stream_recovers_when_final_output_is_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    streamed_item = _codex_message_response("stream item ok").output[0]
+
+    def _fake_stream(**kwargs):
+        return _FakeResponsesStream(
+            events=[SimpleNamespace(type="response.output_item.done", item=streamed_item)],
+            final_error=TypeError("'NoneType' object is not iterable"),
+        )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=lambda **kwargs: pytest.fail("create fallback should not be used"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response is not None
+    assert response.output == [streamed_item]
+
+
+def test_run_codex_stream_synthesizes_text_when_final_output_is_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    def _fake_stream(**kwargs):
+        return _FakeResponsesStream(
+            events=[
+                SimpleNamespace(type="response.output_text.delta", delta="hello "),
+                SimpleNamespace(type="response.output_text.delta", delta="world"),
+            ],
+            final_error=TypeError("'NoneType' object is not iterable"),
+        )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=lambda **kwargs: pytest.fail("create fallback should not be used"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response is not None
+    assert response.output[0].content[0].text == "hello world"
 
 
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):

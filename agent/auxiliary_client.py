@@ -578,6 +578,50 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
+
+def _backfill_responses_output(
+    final: Any,
+    collected_output_items: List[Any],
+    collected_text_deltas: List[str],
+    *,
+    has_function_calls: bool,
+    label: str,
+) -> Any:
+    """Repair Responses stream finals whose output is missing or empty."""
+    if final is None:
+        final = SimpleNamespace(status="completed", output=[])
+
+    if isinstance(final, dict):
+        output = final.get("output")
+    else:
+        output = getattr(final, "output", None)
+
+    if isinstance(output, list) and output:
+        return final
+
+    def _set_output(value: List[Any]) -> None:
+        if isinstance(final, dict):
+            final["output"] = value
+        else:
+            final.output = value
+
+    if collected_output_items:
+        _set_output(list(collected_output_items))
+        logger.debug("%s: backfilled %d output items from stream events", label, len(collected_output_items))
+    elif collected_text_deltas and not has_function_calls:
+        assembled = "".join(collected_text_deltas)
+        _set_output([SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text=assembled)],
+        )])
+        logger.debug("%s: synthesized from %d deltas (%d chars)", label, len(collected_text_deltas), len(assembled))
+    elif not isinstance(output, list):
+        _set_output([])
+
+    return final
+
 def _convert_content_for_responses(content: Any) -> Any:
     """Convert chat.completions content to Responses API format.
 
@@ -811,30 +855,27 @@ class _CodexCompletionsAdapter:
                     elif "function_call" in _etype:
                         has_function_calls = True
                 _check_cancelled()
-                final = stream.get_final_response()
+                try:
+                    final = stream.get_final_response()
+                except TypeError as exc:
+                    err_text = str(exc)
+                    if "NoneType" not in err_text or "not iterable" not in err_text:
+                        raise
+                    if not (collected_output_items or collected_text_deltas):
+                        raise
+                    logger.warning(
+                        "Codex auxiliary final Responses payload had output=None; "
+                        "recovering from streamed output events"
+                    )
+                    final = SimpleNamespace(status="completed", output=[], usage=None)
 
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
-                    )
+            final = _backfill_responses_output(
+                final,
+                collected_output_items,
+                collected_text_deltas,
+                has_function_calls=has_function_calls,
+                label="Codex auxiliary",
+            )
 
             # Extract text and tool calls from the Responses output.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
@@ -869,6 +910,40 @@ class _CodexCompletionsAdapter:
                     completion_tokens=getattr(resp_usage, "output_tokens", 0),
                     total_tokens=getattr(resp_usage, "total_tokens", 0),
                 )
+        except TypeError as exc:
+            err_text = str(exc)
+            if "NoneType" not in err_text or "not iterable" not in err_text:
+                raise
+            if not (collected_output_items or collected_text_deltas):
+                raise
+            logger.warning(
+                "Codex auxiliary stream parser failed on output=None; "
+                "recovering from streamed output events"
+            )
+            final = _backfill_responses_output(
+                SimpleNamespace(status="completed", output=[], usage=None),
+                collected_output_items,
+                collected_text_deltas,
+                has_function_calls=has_function_calls,
+                label="Codex auxiliary",
+            )
+            for item in getattr(final, "output", []):
+                item_type = getattr(item, "type", None)
+                if item_type is None and isinstance(item, dict):
+                    item_type = item.get("type")
+                if item_type == "message":
+                    content = getattr(item, "content", None)
+                    if content is None and isinstance(item, dict):
+                        content = item.get("content")
+                    for part in (content or []):
+                        ptype = getattr(part, "type", None)
+                        if ptype is None and isinstance(part, dict):
+                            ptype = part.get("type")
+                        if ptype in {"output_text", "text"}:
+                            text = getattr(part, "text", None)
+                            if text is None and isinstance(part, dict):
+                                text = part.get("text", "")
+                            text_parts.append(text or "")
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc

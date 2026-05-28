@@ -25,6 +25,55 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _backfill_responses_output(
+    final_response: Any,
+    collected_output_items: list,
+    collected_text_deltas: list,
+    *,
+    has_tool_calls: bool,
+    label: str,
+    model: str | None = None,
+) -> Any:
+    """Repair Responses stream finals whose output is missing or empty."""
+    if final_response is None:
+        final_response = SimpleNamespace(status="completed", model=model, output=[], usage=None)
+
+    if isinstance(final_response, dict):
+        output = final_response.get("output")
+        if model and not final_response.get("model"):
+            final_response["model"] = model
+    else:
+        output = getattr(final_response, "output", None)
+        if model and not getattr(final_response, "model", None):
+            final_response.model = model
+
+    if isinstance(output, list) and output:
+        return final_response
+
+    def _set_output(value: list) -> None:
+        if isinstance(final_response, dict):
+            final_response["output"] = value
+        else:
+            final_response.output = value
+
+    if collected_output_items:
+        _set_output(list(collected_output_items))
+        logger.debug("%s: backfilled %d output items from stream events", label, len(collected_output_items))
+    elif collected_text_deltas and not has_tool_calls:
+        assembled = "".join(collected_text_deltas)
+        _set_output([SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text=assembled)],
+        )])
+        logger.debug("%s: synthesized output from %d text deltas (%d chars)", label, len(collected_text_deltas), len(assembled))
+    elif not isinstance(output, list):
+        _set_output([])
+
+    return final_response
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -240,31 +289,52 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             sum(len(p) for p in agent._codex_streamed_text_parts),
                             agent._client_log_context(),
                         )
-                final_response = stream.get_final_response()
-                # PATCH: ChatGPT Codex backend streams valid output items
-                # but get_final_response() can return an empty output list.
-                # Backfill from collected items or synthesize from deltas.
-                _out = getattr(final_response, "output", None)
-                if isinstance(_out, list) and not _out:
-                    if collected_output_items:
-                        final_response.output = list(collected_output_items)
-                        logger.debug(
-                            "Codex stream: backfilled %d output items from stream events",
-                            len(collected_output_items),
-                        )
-                    elif agent._codex_streamed_text_parts and not has_tool_calls:
-                        assembled = "".join(agent._codex_streamed_text_parts)
-                        final_response.output = [SimpleNamespace(
-                            type="message",
-                            role="assistant",
-                            status="completed",
-                            content=[SimpleNamespace(type="output_text", text=assembled)],
-                        )]
-                        logger.debug(
-                            "Codex stream: synthesized output from %d text deltas (%d chars)",
-                            len(agent._codex_streamed_text_parts), len(assembled),
-                        )
-                return final_response
+                try:
+                    final_response = stream.get_final_response()
+                except TypeError as exc:
+                    err_text = str(exc)
+                    if "NoneType" not in err_text or "not iterable" not in err_text:
+                        raise
+                    if not (collected_output_items or agent._codex_streamed_text_parts):
+                        raise
+                    logger.warning(
+                        "Codex stream final Responses payload had output=None; "
+                        "recovering from streamed output events. %s",
+                        agent._client_log_context(),
+                    )
+                    final_response = SimpleNamespace(status="completed", model=agent.model, output=[], usage=None)
+                return _backfill_responses_output(
+                    final_response,
+                    collected_output_items,
+                    agent._codex_streamed_text_parts,
+                    has_tool_calls=has_tool_calls,
+                    label="Codex stream",
+                    model=getattr(agent, "model", None),
+                )
+        except TypeError as exc:
+            err_text = str(exc)
+            if "NoneType" not in err_text or "not iterable" not in err_text:
+                raise
+            if collected_output_items or agent._codex_streamed_text_parts:
+                logger.warning(
+                    "Codex stream parser failed on output=None; "
+                    "recovering from streamed output events. %s",
+                    agent._client_log_context(),
+                )
+                return _backfill_responses_output(
+                    SimpleNamespace(status="completed", model=getattr(agent, "model", None), output=[], usage=None),
+                    collected_output_items,
+                    agent._codex_streamed_text_parts,
+                    has_tool_calls=has_tool_calls,
+                    label="Codex stream",
+                    model=getattr(agent, "model", None),
+                )
+            logger.warning(
+                "Codex stream parser failed on output=None before yielding recoverable events; "
+                "falling back to create(stream=True). %s",
+                agent._client_log_context(),
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
@@ -406,27 +476,14 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is None and isinstance(event, dict):
                 terminal_response = event.get("response")
             if terminal_response is not None:
-                # Backfill empty output from collected stream events
-                _out = getattr(terminal_response, "output", None)
-                if isinstance(_out, list) and not _out:
-                    if collected_output_items:
-                        terminal_response.output = list(collected_output_items)
-                        logger.debug(
-                            "Codex fallback stream: backfilled %d output items",
-                            len(collected_output_items),
-                        )
-                    elif collected_text_deltas:
-                        assembled = "".join(collected_text_deltas)
-                        terminal_response.output = [SimpleNamespace(
-                            type="message", role="assistant",
-                            status="completed",
-                            content=[SimpleNamespace(type="output_text", text=assembled)],
-                        )]
-                        logger.debug(
-                            "Codex fallback stream: synthesized from %d deltas (%d chars)",
-                            len(collected_text_deltas), len(assembled),
-                        )
-                return terminal_response
+                return _backfill_responses_output(
+                    terminal_response,
+                    collected_output_items,
+                    collected_text_deltas,
+                    has_tool_calls=False,
+                    label="Codex fallback stream",
+                    model=getattr(agent, "model", None),
+                )
     finally:
         close_fn = getattr(stream_or_response, "close", None)
         if callable(close_fn):

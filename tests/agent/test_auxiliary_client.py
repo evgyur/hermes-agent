@@ -2292,6 +2292,36 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
+    def test_recovers_when_final_output_is_none(self):
+        streamed_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="streamed summary")],
+        )
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([SimpleNamespace(type="response.output_item.done", item=streamed_item)])
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize"}])
+
+        assert response.choices[0].message.content == "streamed summary"
+
     def test_forwards_timeout_to_responses_stream(self):
         class FakeStream:
             def __enter__(self):
