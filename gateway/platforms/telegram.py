@@ -9,7 +9,6 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
-import hashlib
 import json
 import logging
 import os
@@ -17,8 +16,6 @@ import subprocess
 import tempfile
 import html as _html
 import re
-import time
-from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
@@ -35,8 +32,6 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
-        BusinessConnectionHandler,
-        BusinessMessagesDeletedHandler,
         ContextTypes,
         filters,
     )
@@ -55,8 +50,6 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
-    BusinessConnectionHandler = None
-    BusinessMessagesDeletedHandler = None
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -86,7 +79,7 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
-    TEXT_DOCUMENT_EXTENSIONS,
+    SUPPORTED_IMAGE_DOCUMENT_TYPES,
     utf16_len,
 )
 from gateway.platforms.helpers import strip_markdown
@@ -318,7 +311,7 @@ def _render_table_block_for_telegram(table_block: list[str]) -> str:
     first_data_row = _split_markdown_table_row(table_block[2]) if len(table_block) > 2 else []
     has_row_label_col = len(first_data_row) == len(headers) + 1
 
-    rendered_rows: list[str] = []
+    rendered_groups: list[str] = []
     for index, row in enumerate(table_block[2:], start=1):
         cells = _split_markdown_table_row(row)
         if has_row_label_col:
@@ -336,12 +329,24 @@ def _render_table_block_for_telegram(table_block: list[str]) -> str:
         elif len(data_cells) > len(headers):
             data_cells = data_cells[: len(headers)]
 
-        rendered_rows.append(f"**{heading}**")
-        rendered_rows.extend(
-            f"• {header}: {value}" for header, value in zip(headers, data_cells)
-        )
+        # Build the bulleted lines for this row.  Skip any bullet whose value
+        # duplicates the heading text -- when has_row_label_col is False the
+        # heading IS the first data cell, and emitting it twice (once as the
+        # bold heading, once as the first bullet) is visual noise.
+        bullets: list[str] = []
+        for header, value in zip(headers, data_cells):
+            if not has_row_label_col and value == heading:
+                continue
+            bullets.append(f"• {header}: {value}")
 
-    return "\n\n".join(rendered_rows)
+        # Within a row-group: single newline between heading and its bullets,
+        # and between successive bullets.  This keeps the row visually tight
+        # on Telegram instead of stretching each bullet into its own paragraph.
+        group_lines = [f"**{heading}**", *bullets]
+        rendered_groups.append("\n".join(group_lines))
+
+    # Between row-groups: blank line so each group reads as a distinct block.
+    return "\n\n".join(rendered_groups)
 
 
 def _wrap_markdown_tables(text: str) -> str:
@@ -534,8 +539,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
-        # Auto skill routes: declarative per-chat skill modes (e.g. route URLs/media to /tg).
-        self._auto_skill_routes: List[Dict[str, Any]] = self._load_auto_skill_routes()
         # Inline preview guard: fail closed when a configured chat would receive
         # a finished `/tg` preview from the Hermes bot instead of the required
         # human-account sender path.
@@ -559,93 +562,286 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
-        # Cache of observed Telegram chat types so outbound replies can add
-        # DM-only affordances without extra Bot API lookups on every send.
-        self._chat_type_cache: Dict[str, str] = {}
-        # Ephemeral, in-memory cache of recent user-visible Telegram messages
-        # keyed by chat/topic lane. Telegram Bot API cannot fetch arbitrary
-        # history, so we keep the updates the gateway has actually observed and
-        # inject a compact per-turn snapshot before the model asks avoidable
-        # clarifying questions. This is never persisted to memory/transcripts.
-        self._recent_visible_messages: Dict[str, deque[dict[str, str]]] = {}
-        self._recent_visible_limit: int = int(os.getenv("HERMES_TELEGRAM_RECENT_CONTEXT_LIMIT", "20"))
-        self._recent_visible_store_limit: int = max(20, self._recent_visible_limit * 2)
         # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
 
-    def _recent_context_key_for_source(self, source) -> str:
-        """Return an isolation key for recent visible Telegram context."""
-        chat_id = str(getattr(source, "chat_id", "") or "")
-        thread_id = getattr(source, "thread_id", None)
-        if thread_id is not None:
-            return f"{chat_id}:thread:{thread_id}"
-        return chat_id
+    def _load_inline_preview_guard(self) -> Dict[str, Any]:
+        """Load per-chat guard against Hermes-bot `/tg` previews.
+
+        operator's TG chats are fail-closed by default in this install: finished
+        post previews must be routed through the configured external preview bridge even when the
+        config entry is missing or incomplete. Config can still add chats or
+        override script/timeout, but not silently disable the configured preview
+        guard unless HERMES_DISABLE_TG_PREVIEW_GUARD=1 is set for tests.
+        """
+        raw = self.config.extra.get("inline_preview_guard", {})
+        if raw is True:
+            raw = {"enabled": True}
+        if not isinstance(raw, dict):
+            raw = {}
+        chats = raw.get("chats") or []
+        if isinstance(chats, (str, int)):
+            chats = [chats]
+        chat_set = {str(chat_id) for chat_id in chats}
+        if os.getenv("HERMES_DISABLE_TG_PREVIEW_GUARD", "0") != "1":
+            chat_set |= set(_TG_PREVIEW_GUARD_CHAT_IDS)
+        enabled = bool(raw.get("enabled", False)) or bool(chat_set & _TG_PREVIEW_GUARD_CHAT_IDS)
+        return {
+            "enabled": enabled,
+            "chats": chat_set,
+            "blocker": str(raw.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER),
+            "action": str(raw.get("action") or "external_preview"),
+            "script": str(raw.get("script") or ""),
+            "timeout": float(raw.get("timeout", 120)),
+            "echo_user_ids": {str(v).strip() for v in (raw.get("echo_user_ids") or []) if str(v).strip()},
+            "echo_usernames": {str(v).strip().lstrip("@").lower() for v in (raw.get("echo_usernames") or []) if str(v).strip()},
+        }
+
+    def _inline_preview_guard_applies(
+        self,
+        chat_id: str,
+        content: str,
+    ) -> bool:
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        if not guard.get("enabled"):
+            return False
+        chats = guard.get("chats") or set()
+        if chats and str(chat_id) not in chats:
+            return False
+        return _looks_like_inline_tg_preview(content)
 
     @staticmethod
-    def _recent_context_snippet(text: str, *, limit: int = 240) -> str:
-        snippet = " ".join(str(text or "").split())
-        if len(snippet) <= limit:
-            return snippet
-        return snippet[: limit - 1].rstrip() + "…"
-
-    def _format_recent_visible_context(self, event: MessageEvent) -> Optional[str]:
-        """Format recent same-chat/topic Telegram messages for prompt injection."""
-        key = self._recent_context_key_for_source(event.source)
-        recent = list(self._recent_visible_messages.get(key) or [])
-        if not recent:
+    def _extract_tg_preview_state_message_id(state_path: str = "/tmp/tg_preview_state.json") -> Optional[str]:
+        try:
+            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
+        except Exception:
             return None
-        limit = max(1, self._recent_visible_limit)
-        lines = [
-            "## Recent visible Telegram context",
-            "",
-            "Same chat/topic, newest last. Ephemeral: do not save this to memory. Use it before asking clarifying questions.",
-        ]
-        for item in recent[-limit:]:
-            msg_id = item.get("message_id") or "?"
-            sender = item.get("sender") or "Telegram user"
-            text = item.get("text") or ""
-            if not text:
-                continue
-            lines.append(f"- ID {msg_id} | {sender}: {text}")
-        return "\n".join(lines) if len(lines) > 3 else None
+        if not (data.get("ok") and data.get("verified")):
+            return None
+        mid = data.get("message_id") or (data.get("message_ids") or [None])[0]
+        return str(mid) if mid else None
 
-    def _attach_recent_visible_context(self, event: MessageEvent) -> None:
-        event.recent_context = self._format_recent_visible_context(event)
+    def _send_inline_preview_via_external_bridge_sync(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        script = str(guard.get("script") or "")
+        timeout = float(guard.get("timeout") or 120)
+        if not script or not os.path.exists(script):
+            return SendResult(success=False, error=f"inline preview guard script missing: {script}")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".html",
+            prefix="hermes-inline-tg-preview-",
+            delete=False,
+        ) as tmp:
+            tmp.write(content.strip() + "\n")
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                [script, "--chat-id", str(chat_id), "--file", tmp_path, "--no-media"],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode != 0:
+                detail = stderr or stdout or f"exit {proc.returncode}"
+                return SendResult(success=False, error=f"Preview bridge send failed: {detail[:500]}")
+            message_id = self._extract_tg_preview_state_message_id()
+            if not message_id:
+                return SendResult(
+                    success=False,
+                    error="Preview bridge send did not leave verified /tmp/tg_preview_state.json",
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response={
+                    "inline_preview_guard": "external_preview",
+                    "stdout": stdout[-1000:],
+                },
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=f"Preview bridge guard exception: {exc}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-    def _record_recent_visible_message(self, event: MessageEvent) -> None:
-        """Record the incoming Telegram message for later same-lane context."""
-        key = self._recent_context_key_for_source(event.source)
-        if not key:
-            return
-        raw = getattr(event, "raw_message", None)
-        visible_text = (
-            getattr(raw, "text", None)
-            or getattr(raw, "caption", None)
-            or event.text
-            or ""
+    async def _inline_preview_guard_send_result(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Route configured inline `/tg` previews through an external preview bridge instead of bot-send."""
+        if not self._inline_preview_guard_applies(chat_id, content):
+            return None
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        action = str(guard.get("action") or "blocker").strip().lower()
+        if action not in {"external_preview", "external_preview", "send_external_preview"}:
+            return None
+        result = await asyncio.to_thread(
+            self._send_inline_preview_via_external_bridge_sync,
+            chat_id,
+            content,
+            metadata,
         )
-        if not visible_text:
-            return
-        source = event.source
-        sender = getattr(source, "user_name", None) or getattr(source, "user_id", None) or "Telegram user"
-        entry = {
-            "message_id": str(getattr(event, "message_id", "") or "?"),
-            "sender": str(sender),
-            "text": self._recent_context_snippet(visible_text),
-        }
-        bucket = self._recent_visible_messages.get(key)
-        if bucket is None:
-            bucket = deque(maxlen=self._recent_visible_store_limit)
-            self._recent_visible_messages[key] = bucket
-        bucket.append(entry)
+        if result.success:
+            logger.info(
+                "[%s] Routed inline TG preview through external preview guard (chat=%s message_id=%s)",
+                self.name,
+                chat_id,
+                result.message_id,
+            )
+            return result
+        self._last_inline_preview_guard_error = result.error
+        logger.error(
+            "[%s] External inline TG preview guard failed (chat=%s): %s",
+            self.name,
+            chat_id,
+            result.error,
+        )
+        return None
 
-    async def handle_message(self, event: MessageEvent) -> None:
-        """Attach same-chat/topic recent context before normal dispatch."""
-        self._attach_recent_visible_context(event)
-        self._record_recent_visible_message(event)
-        await super().handle_message(event)
+    def _inline_preview_guard_replacement(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return blocker text when a configured chat would get inline preview."""
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        if not self._inline_preview_guard_applies(chat_id, content):
+            return None
+        thread_id = self._metadata_thread_id(metadata)
+        error = getattr(self, "_last_inline_preview_guard_error", "") or ""
+        logger.error(
+            "[%s] Blocked inline TG preview from Hermes bot (chat=%s thread=%s len=%d error=%s)",
+            self.name,
+            chat_id,
+            thread_id,
+            len(content or ""),
+            error,
+        )
+        blocker = str(guard.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER)
+        if error:
+            blocker = f"превью не отправлено/не подтверждено: {error[:700]}"
+            self._last_inline_preview_guard_error = ""
+        return blocker
+
+    @staticmethod
+    def _recent_external_preview_message_ids() -> set[str]:
+        """Return exact message ids sent by the external `/tg` preview path.
+
+        `the external preview bridge sends previews from a non-bot account, so Telegram
+        delivers those messages back to this bot as normal user messages. If we
+        process that echo, the auto `/tg` route can recursively preview the
+        preview. The canonical sender writes verified ids to these local state
+        files; treat only exact ids as self-generated preview echoes.
+        """
+        ids: set[str] = set()
+        state_path = os.getenv("TG_PREVIEW_STATE_FILE", "/tmp/tg_preview_state.json")
+        message_id_path = os.getenv("TG_PREVIEW_MESSAGE_ID_FILE", "/tmp/tg_preview_message_id.txt")
+
+        try:
+            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
+            if data.get("ok") and data.get("verified"):
+                for value in data.get("message_ids") or []:
+                    if value is not None:
+                        ids.add(str(value))
+                if data.get("message_id") is not None:
+                    ids.add(str(data.get("message_id")))
+        except Exception:
+            pass
+
+        try:
+            for line in _Path(message_id_path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    ids.add(line)
+        except Exception:
+            pass
+
+        return ids
+
+    @staticmethod
+    def _pending_external_preview_echo_fingerprints(chat_id: str) -> set[str]:
+        """Return still-valid pre-send preview fingerprints for this chat.
+
+        The exact-id guard is not enough: Telegram can deliver the external-preview echo
+        while `send-preview.sh` is still verifying and before it has written the
+        final state file (or when callers use a custom state path). The sender
+        therefore writes a short-lived content fingerprint before sending.
+        """
+        path = os.getenv("TG_PREVIEW_PENDING_ECHO_FILE", _TG_PREVIEW_PENDING_ECHO_FILE)
+        now = time.time()
+        fingerprints: set[str] = set()
+        try:
+            lines = _Path(path).read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return fingerprints
+        for line in lines[-200:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            if str(data.get("chat_id") or "") != str(chat_id):
+                continue
+            try:
+                expires_at = float(data.get("expires_at") or 0)
+            except (TypeError, ValueError):
+                expires_at = 0
+            if expires_at and expires_at < now:
+                continue
+            value = str(data.get("sha256") or "").strip()
+            if value:
+                fingerprints.add(value)
+        return fingerprints
+
+    def _is_external_tg_preview_echo(self, message: Message) -> bool:
+        """Return True for external preview messages that must be ignored.
+
+        `the external preview bridge posts from a non-bot account, so Bot API receives the
+        preview as a normal user message. Exact ids are preferred; pending
+        fingerprints cover the race before exact state is visible.
+        """
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        guard = getattr(self, "_inline_preview_guard", None) or {}
+        guarded_chats = guard.get("chats") or set(_TG_PREVIEW_GUARD_CHAT_IDS)
+        if guarded_chats and chat_id not in guarded_chats:
+            return False
+
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        username = str(getattr(user, "username", "") or "").lstrip("@").lower()
+        allowed_user_ids = guard.get("echo_user_ids") or set()
+        allowed_usernames = guard.get("echo_usernames") or set()
+        if (allowed_user_ids or allowed_usernames) and user_id not in allowed_user_ids and username not in allowed_usernames:
+            return False
+
+        message_id = str(getattr(message, "message_id", "") or "")
+        if message_id and message_id in self._recent_external_preview_message_ids():
+            return True
+
+        visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        if not _looks_like_inline_tg_preview(visible_text):
+            return False
+        pending = self._pending_external_preview_echo_fingerprints(chat_id)
+        return bool(pending and _tg_preview_echo_fingerprint(visible_text) in pending)
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -722,18 +918,6 @@ class TelegramAdapter(BasePlatformAdapter):
         return str(thread_id) if thread_id is not None else None
 
     @classmethod
-    def _business_connection_id_from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not metadata:
-            return None
-        value = metadata.get("business_connection_id") or metadata.get("telegram_business_connection_id")
-        return str(value) if value else None
-
-    @classmethod
-    def _business_kwargs(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        business_connection_id = cls._business_connection_id_from_metadata(metadata)
-        return {"business_connection_id": business_connection_id} if business_connection_id else {}
-
-    @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
             return None
@@ -746,6 +930,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         reply_to = metadata.get("telegram_reply_to_message_id")
         return int(reply_to) if reply_to is not None else None
+
+    @staticmethod
+    def _looks_like_private_chat_id(chat_id: str) -> bool:
+        try:
+            return int(chat_id) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _is_private_dm_topic_send(
+        cls,
+        chat_id: str,
+        thread_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        if cls._metadata_direct_messages_topic_id(metadata) is not None:
+            return False
+        if metadata and metadata.get("telegram_dm_topic_created_for_send"):
+            return False
+        return bool(
+            thread_id
+            and (
+                metadata and metadata.get("telegram_dm_topic_reply_fallback")
+                or cls._looks_like_private_chat_id(chat_id)
+            )
+        )
+
+    @staticmethod
+    def _dm_topic_missing_anchor_error() -> str:
+        return "Telegram DM topic delivery requires a reply anchor; refusing to send outside the requested topic"
 
     @classmethod
     def _reply_to_message_id_for_send(
@@ -1341,6 +1555,59 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = await self._create_dm_topic(chat_id_int, name=name)
         return str(thread_id) if thread_id else None
 
+    async def ensure_dm_topic(self, chat_id: str, topic_name: str, force_create: bool = False) -> Optional[str]:
+        """Return a private DM topic thread id, creating and persisting it if needed."""
+        name = str(topic_name or "").strip()
+        if not name:
+            return None
+        try:
+            chat_id_int = int(chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        cache_key = f"{chat_id_int}:{name}"
+        cached = self._dm_topics.get(cache_key)
+        if cached and not force_create:
+            return str(cached)
+
+        topic_conf: Optional[Dict[str, Any]] = None
+        chat_entry: Optional[Dict[str, Any]] = None
+        for entry in self._dm_topics_config:
+            if str(entry.get("chat_id")) != str(chat_id_int):
+                continue
+            chat_entry = entry
+            for candidate in entry.get("topics", []):
+                if candidate.get("name") == name:
+                    topic_conf = candidate
+                    break
+            break
+
+        if topic_conf and topic_conf.get("thread_id") and not force_create:
+            thread_id = int(topic_conf["thread_id"])
+            self._dm_topics[cache_key] = thread_id
+            return str(thread_id)
+
+        if chat_entry is None:
+            chat_entry = {"chat_id": chat_id_int, "topics": []}
+            self._dm_topics_config.append(chat_entry)
+        if topic_conf is None:
+            topic_conf = {"name": name}
+            chat_entry.setdefault("topics", []).append(topic_conf)
+
+        thread_id = await self._create_dm_topic(
+            chat_id_int,
+            name=name,
+            icon_color=topic_conf.get("icon_color"),
+            icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"),
+        )
+        if not thread_id:
+            return None
+
+        topic_conf["thread_id"] = thread_id
+        self._dm_topics[cache_key] = int(thread_id)
+        self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
+        return str(thread_id)
+
     async def rename_dm_topic(
         self,
         chat_id: int,
@@ -1364,7 +1631,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self.name, chat_id, thread_id, name,
         )
 
-    def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int) -> None:
+    def _persist_dm_topic_thread_id(
+        self,
+        chat_id: int,
+        topic_name: str,
+        thread_id: int,
+        replace_existing: bool = False,
+    ) -> None:
         """Save a newly created thread_id back into config.yaml so it persists across restarts."""
         try:
             from hermes_constants import get_hermes_home
@@ -1377,25 +1650,44 @@ class TelegramAdapter(BasePlatformAdapter):
             with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
-            # Navigate to platforms.telegram.extra.dm_topics
-            dm_topics = (
-                config.get("platforms", {})
-                .get("telegram", {})
-                .get("extra", {})
-                .get("dm_topics", [])
-            )
-            if not dm_topics:
-                return
+            # Navigate to platforms.telegram.extra.dm_topics, creating the path
+            # when a named delivery target asks us to create a topic that was
+            # not predeclared in config.yaml.
+            platforms = config.setdefault("platforms", {})
+            telegram_config = platforms.setdefault("telegram", {})
+            extra = telegram_config.setdefault("extra", {})
+            dm_topics = extra.setdefault("dm_topics", [])
 
             changed = False
+            matching_chat_entry = None
             for chat_entry in dm_topics:
-                if int(chat_entry.get("chat_id", 0)) != int(chat_id):
+                try:
+                    chat_matches = int(chat_entry.get("chat_id", 0)) == int(chat_id)
+                except (TypeError, ValueError):
+                    chat_matches = False
+                if not chat_matches:
                     continue
-                for t in chat_entry.get("topics", []):
-                    if t.get("name") == topic_name and not t.get("thread_id"):
-                        t["thread_id"] = thread_id
-                        changed = True
+                matching_chat_entry = chat_entry
+                for t in chat_entry.setdefault("topics", []):
+                    if t.get("name") == topic_name:
+                        if replace_existing or not t.get("thread_id"):
+                            if t.get("thread_id") != thread_id:
+                                t["thread_id"] = thread_id
+                                changed = True
                         break
+                else:
+                    chat_entry.setdefault("topics", []).append(
+                        {"name": topic_name, "thread_id": thread_id}
+                    )
+                    changed = True
+                break
+
+            if matching_chat_entry is None:
+                dm_topics.append({
+                    "chat_id": chat_id,
+                    "topics": [{"name": topic_name, "thread_id": thread_id}],
+                })
+                changed = True
 
             if changed:
                 fd, tmp_path = tempfile.mkstemp(
@@ -1622,15 +1914,6 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
 
             # Register handlers
-            if getattr(filters.UpdateType, "BUSINESS_MESSAGE", None) is not None:
-                self._app.add_handler(TelegramMessageHandler(
-                    filters.UpdateType.BUSINESS_MESSAGE,
-                    self._handle_business_message,
-                ))
-            if BusinessConnectionHandler is not None:
-                self._app.add_handler(BusinessConnectionHandler(self._handle_business_connection))
-            if BusinessMessagesDeletedHandler is not None:
-                self._app.add_handler(BusinessMessagesDeletedHandler(self._handle_business_messages_deleted))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -1934,11 +2217,21 @@ class TelegramAdapter(BasePlatformAdapter):
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
-                reply_to_source = reply_to or (
-                    str(metadata_reply_to)
-                    if metadata and metadata.get("telegram_dm_topic_reply_fallback") and metadata_reply_to is not None else None
+                private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
+                # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
+                # is an explicit user opt-in to "message_thread_id alone is enough" (PR #23994
+                # / commit 21a15b671). Honor it — don't fail loud just because the anchor was
+                # suppressed by config. The new fail-loud contract only applies when the caller
+                # didn't ask for the anchor to be dropped.
+                dm_topic_reply_to_off = (
+                    private_dm_topic_send
+                    and self._reply_to_mode == "off"
+                    and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
-                if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+                reply_to_source = reply_to or (
+                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
+                )
+                if private_dm_topic_send:
                     should_thread = (
                         reply_to_source is not None
                         and self._reply_to_mode != "off"
@@ -1946,7 +2239,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     should_thread = self._should_thread_reply(reply_to_source, i)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
-                human20_reply_markup = self._human20_inline_markup(chat_id, metadata) if i == len(chunks) - 1 else None
+                if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+                    return SendResult(
+                        success=False,
+                        error=self._dm_topic_missing_anchor_error(),
+                        retryable=False,
+                    )
                 thread_kwargs = self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -1970,9 +2268,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
-                                **self._business_kwargs(metadata),
                                 **self._link_preview_kwargs(),
-                                reply_markup=human20_reply_markup,
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
@@ -1986,9 +2282,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
-                                    **self._business_kwargs(metadata),
                                     **self._link_preview_kwargs(),
-                                    reply_markup=human20_reply_markup,
                                     **self._notification_kwargs(metadata),
                                 )
                             else:
@@ -2001,6 +2295,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
+                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
                                 # Telegram has been observed to return a
                                 # one-off "thread not found" that recovers on
                                 # an immediate retry (transient flake — see
@@ -2027,6 +2327,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
+                                if private_dm_topic_send:
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
                                 # Original message was deleted before we
                                 # could reply. For private-topic fallback
                                 # sends, message_thread_id is only valid with
@@ -2250,7 +2556,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._bot.edit_message_text(
                         chat_id=int(chat_id),
                         message_id=int(message_id),
-                        text=strip_markdown(content),
+                        text=content,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -2345,13 +2651,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._bot.edit_message_text(
                             chat_id=int(chat_id),
                             message_id=int(message_id),
-                            text=strip_markdown(first_chunk),
+                            text=first_chunk,
                         )
             else:
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
-                    text=strip_markdown(first_chunk),
+                    text=first_chunk,
                 )
         except Exception as e:
             err_str = str(e).lower()
@@ -2412,7 +2718,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         try:
                             sent_msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
-                                text=strip_markdown(chunk),
+                                text=chunk,
                                 **retry_thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -3145,563 +3451,6 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
-    def _gptprof_paths(self) -> tuple[_Path, _Path, _Path]:
-        home = _Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
-        return home / "auth.json", home / "config.yaml", home / "skills" / "chip" / "hcp"
-
-    def _gptprof_load_json(self, path: _Path) -> dict:
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def _gptprof_write_json(self, path: _Path, data: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-        tmp.replace(path)
-
-    def _gptprof_token_metadata(self, access_token: str) -> dict:
-        try:
-            import base64
-
-            payload = access_token.split(".", 2)[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
-        except Exception:
-            return {}
-        if not isinstance(claims, dict):
-            return {}
-
-        profile = claims.get("https://api.openai.com/profile") or {}
-        auth = claims.get("https://api.openai.com/auth") or {}
-        out: dict[str, str] = {}
-        email = profile.get("email") if isinstance(profile, dict) else None
-        if isinstance(email, str) and email.strip():
-            out["email"] = email.strip()
-        plan_type = auth.get("chatgpt_plan_type") if isinstance(auth, dict) else None
-        if isinstance(plan_type, str) and plan_type.strip():
-            plan_map = {
-                "plus": "Plus $20",
-                "pro": "Pro $200",
-                "prolite": "ProLite $100",
-                "pro lite": "ProLite $100",
-                "team": "Team",
-                "enterprise": "Enterprise",
-                "free": "Free",
-            }
-            out["plan"] = plan_map.get(plan_type.strip().lower(), plan_type.strip())
-        return out
-
-    def _gptprof_normalize_plan(self, plan: str) -> str:
-        plan_map = {
-            "prolite": "ProLite $100",
-            "pro lite": "ProLite $100",
-        }
-        return plan_map.get(plan.strip().lower(), plan)
-
-    def _gptprof_slug_from_email(self, email: str) -> str:
-        local = email.split("@", 1)[0].lower()
-        slug = re.sub(r"[^a-z0-9]+", "-", local).strip("-")
-        return slug or "profile"
-
-    def _gptprof_unique_slug(self, base_slug: str, *, hcp_dir: _Path) -> str:
-        slug = base_slug
-        idx = 2
-        while (hcp_dir / f"{slug}.json").exists():
-            idx += 1
-            slug = f"{base_slug}-{idx}"
-        return slug
-
-    def _gptprof_known_slugs(self) -> set[str]:
-        _auth_path, _config_path, hcp_dir = self._gptprof_paths()
-        try:
-            return {path.stem for path in hcp_dir.glob("*.json") if path.is_file()}
-        except Exception:
-            return set()
-
-    def _gptprof_switch_profile(self, slug: str) -> dict:
-        auth_path, config_path, hcp_dir = self._gptprof_paths()
-        profile_path = hcp_dir / f"{slug}.json"
-        profile = self._gptprof_load_json(profile_path)
-        access_token = profile.get("access_token")
-        refresh_token = profile.get("refresh_token")
-        if not isinstance(access_token, str) or not access_token.strip():
-            raise ValueError(f"gptprof profile {slug!r} has no access token")
-        if not isinstance(refresh_token, str) or not refresh_token.strip():
-            raise ValueError(f"gptprof profile {slug!r} has no refresh token")
-
-        plan = self._gptprof_normalize_plan(str(profile.get("plan") or ""))
-        email = str(profile.get("email") or "")
-        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-        auth = self._gptprof_load_json(auth_path)
-        auth["active_provider"] = "openai-codex"
-        auth["updated_at"] = now
-
-        codex = auth.setdefault("codex", {})
-        if not isinstance(codex, dict):
-            codex = {}
-            auth["codex"] = codex
-        codex.update(
-            {
-                "profile": slug,
-                "plan": plan,
-                "email": email,
-                "access_token": access_token.strip(),
-                "refresh_token": refresh_token.strip(),
-            }
-        )
-
-        providers = auth.setdefault("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            auth["providers"] = providers
-        openai_codex = providers.setdefault("openai-codex", {})
-        if not isinstance(openai_codex, dict):
-            openai_codex = {}
-            providers["openai-codex"] = openai_codex
-        tokens = openai_codex.setdefault("tokens", {})
-        if not isinstance(tokens, dict):
-            tokens = {}
-            openai_codex["tokens"] = tokens
-        tokens.update(
-            {
-                "access_token": access_token.strip(),
-                "refresh_token": refresh_token.strip(),
-                "profile": slug,
-                "plan": plan,
-                "email": email,
-            }
-        )
-        openai_codex["auth_mode"] = "chatgpt"
-
-        pool_root = auth.setdefault("credential_pool", {})
-        if not isinstance(pool_root, dict):
-            pool_root = {}
-            auth["credential_pool"] = pool_root
-        pool = pool_root.setdefault("openai-codex", [])
-        if not isinstance(pool, list):
-            pool = []
-            pool_root["openai-codex"] = pool
-        if pool and isinstance(pool[0], dict):
-            item = pool[0]
-        else:
-            item = {"id": "gptprof", "auth_type": "oauth", "priority": 1}
-            pool.insert(0, item)
-        item.update(
-            {
-                "label": f"gptprof:{slug}",
-                "source": f"gptprof:{slug}",
-                "profile": slug,
-                "plan": plan,
-                "email": email,
-                "access_token": access_token.strip(),
-                "refresh_token": refresh_token.strip(),
-                "last_status": "ok",
-                "last_status_at": time.time(),
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "request_count": 0,
-            }
-        )
-        self._gptprof_write_json(auth_path, auth)
-
-        try:
-            import yaml
-
-            cfg = yaml.safe_load(config_path.read_text()) or {}
-            if not isinstance(cfg, dict):
-                cfg = {}
-            model = cfg.setdefault("model", {})
-            if not isinstance(model, dict):
-                model = {}
-                cfg["model"] = model
-            model.update(
-                {
-                    "default": "gpt-5.5",
-                    "provider": "openai-codex",
-                    "base_url": "https://chatgpt.com/backend-api/codex",
-                    "api_mode": "codex_responses",
-                }
-            )
-            tmp = config_path.with_suffix(config_path.suffix + ".tmp")
-            tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
-            tmp.replace(config_path)
-        except Exception:
-            logger.warning("[%s] gptprof switched auth but failed to pin config model", self.name, exc_info=True)
-
-        return {"slug": slug, "plan": plan, "email": email}
-
-    def _gptprof_request_device_code(self) -> dict:
-        import httpx
-
-        issuer = "https://auth.openai.com"
-        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": client_id},
-                headers={"Content-Type": "application/json"},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("user_code") or not data.get("device_auth_id"):
-            raise ValueError("device-code response missing user_code or device_auth_id")
-        data["verification_uri"] = f"{issuer}/codex/device"
-        return data
-
-    def _gptprof_finish_device_code(self, slot_slug: str | None, device_data: dict) -> dict:
-        import httpx
-
-        issuer = "https://auth.openai.com"
-        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-        user_code = str(device_data["user_code"])
-        device_auth_id = str(device_data["device_auth_id"])
-        interval = max(3, int(device_data.get("interval") or 5))
-        deadline = time.monotonic() + 15 * 60
-
-        code_resp = None
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            while time.monotonic() < deadline:
-                time.sleep(interval)
-                poll_resp = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
-                )
-                if poll_resp.status_code == 200:
-                    code_resp = poll_resp.json()
-                    break
-                if poll_resp.status_code in {403, 404}:
-                    continue
-                poll_resp.raise_for_status()
-
-            if code_resp is None:
-                raise TimeoutError("device-code login timed out after 15 minutes")
-
-            authorization_code = code_resp.get("authorization_code")
-            code_verifier = code_resp.get("code_verifier")
-            if not authorization_code or not code_verifier:
-                raise ValueError("device auth response missing authorization_code or code_verifier")
-
-            token_resp = client.post(
-                "https://auth.openai.com/oauth/token",
-                data={
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": f"{issuer}/deviceauth/callback",
-                    "client_id": client_id,
-                    "code_verifier": code_verifier,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            token_resp.raise_for_status()
-
-        tokens = token_resp.json()
-        access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
-        if not isinstance(access_token, str) or not access_token:
-            raise ValueError("token exchange did not return access_token")
-
-        _auth_path, _config_path, hcp_dir = self._gptprof_paths()
-        token_meta = self._gptprof_token_metadata(access_token)
-        email = str(token_meta.get("email") or "").strip()
-        if email:
-            base_slug = self._gptprof_slug_from_email(email)
-            existing = self._gptprof_load_json(hcp_dir / f"{base_slug}.json")
-            existing_email = str(existing.get("email") or "").strip().lower()
-            slug = base_slug if existing_email == email.lower() else self._gptprof_unique_slug(base_slug, hcp_dir=hcp_dir)
-        elif slot_slug:
-            slug = slot_slug
-        else:
-            slug = self._gptprof_unique_slug("profile", hcp_dir=hcp_dir)
-
-        profile_path = hcp_dir / f"{slug}.json"
-        profile = self._gptprof_load_json(profile_path)
-        profile["profile"] = slug
-        profile["access_token"] = access_token
-        if isinstance(refresh_token, str) and refresh_token:
-            profile["refresh_token"] = refresh_token
-        if token_meta.get("email"):
-            profile["email"] = token_meta["email"]
-        if token_meta.get("plan"):
-            profile["plan"] = token_meta["plan"]
-        profile["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        profile["source"] = "telegram-device-code"
-        profile.pop("_refresh_error", None)
-        self._gptprof_write_json(profile_path, profile)
-        result = self._gptprof_switch_profile(slug)
-        result["created_new_slot"] = slug != slot_slug
-        return result
-
-    async def _gptprof_complete_new_auth(self, message, slot_slug: str | None, device_data: dict) -> None:
-        try:
-            result = await asyncio.to_thread(self._gptprof_finish_device_code, slot_slug, device_data)
-        except Exception as exc:
-            logger.error("[%s] gptprof new-auth failed for %s: %s", self.name, slot_slug, exc, exc_info=True)
-            try:
-                await message.reply_text(f"GPT new auth failed: {type(exc).__name__}")
-            except Exception:
-                pass
-            return
-
-        prefix = "GPT profile created" if result.get("created_new_slot") else "GPT auth updated"
-        label = f"slot {result['slug']}"
-        if result.get("email"):
-            label = f"{label} · {result['email']}"
-        if result.get("plan"):
-            label = f"{label} ({result['plan']})"
-        try:
-            await message.reply_text(f"{prefix}: {label}\nModel remains pinned to gpt-5.5.")
-        except Exception:
-            pass
-
-    def _gptprof_run_send_buttons(self) -> subprocess.CompletedProcess[str]:
-        script = _Path("/home/hermes/.hermes/skills/chip/gptprof/send_buttons.py")
-        return subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(script.parent),
-            text=True,
-            capture_output=True,
-            timeout=90,
-        )
-
-    async def _handle_gptprof_callback(self, query, data: str) -> None:
-        """Handle Chip's private GPT profile-switcher callbacks."""
-        parts = data.split(":")
-        action = parts[1] if len(parts) >= 2 else ""
-        if action == "refresh":
-            await query.answer(text="Refreshing GPT usage…")
-            try:
-                proc = await asyncio.to_thread(self._gptprof_run_send_buttons)
-            except Exception as exc:
-                logger.error("[%s] gptprof refresh failed: %s", self.name, exc, exc_info=True)
-                await query.answer(text="GPT usage refresh failed; see logs.")
-                return
-            if proc.returncode != 0:
-                logger.error(
-                    "[%s] gptprof refresh command failed rc=%s stderr=%s",
-                    self.name,
-                    proc.returncode,
-                    (proc.stderr or proc.stdout or "").strip()[:1000],
-                )
-                await query.answer(text="GPT usage refresh failed; see logs.")
-                return
-            await query.answer(text="GPT usage refreshed.")
-            return
-        if action == "new_auth":
-            auth_path, _config_path, _hcp_dir = self._gptprof_paths()
-            auth = self._gptprof_load_json(auth_path)
-            slug = (auth.get("codex") or {}).get("profile") if isinstance(auth.get("codex"), dict) else None
-            try:
-                device_data = await asyncio.to_thread(self._gptprof_request_device_code)
-            except Exception as exc:
-                logger.error("[%s] gptprof device-code request failed: %s", self.name, exc, exc_info=True)
-                await query.answer(text="Could not start GPT new auth; see logs.")
-                return
-            user_code = str(device_data["user_code"])
-            verification_uri = str(device_data["verification_uri"])
-            await query.answer(text=f"New auth code: {user_code}", show_alert=True)
-            if query.message:
-                await query.message.reply_text(
-                    (
-                        "GPT new auth for a new profile slot\n\n"
-                        f"Open: {verification_uri}\n"
-                        f"Code: {user_code}\n\n"
-                        "I will create/switch to a profile slot from the confirmed account email."
-                    ),
-                    disable_web_page_preview=True,
-                )
-                asyncio.create_task(self._gptprof_complete_new_auth(query.message, slug, device_data))
-            return
-        if action == "check_auth":
-            auth_path, _config_path, _hcp_dir = self._gptprof_paths()
-            auth = self._gptprof_load_json(auth_path)
-            codex = auth.get("codex") if isinstance(auth.get("codex"), dict) else {}
-            current = codex.get("profile")
-            email = codex.get("email")
-            plan = codex.get("plan")
-            parts = [f"slot: {current or 'unknown'}"]
-            if email:
-                parts.append(f"email: {email}")
-            if plan:
-                parts.append(f"plan: {plan}")
-            await query.answer(text=" · ".join(parts), show_alert=True)
-            return
-        if action not in self._gptprof_known_slugs():
-            await query.answer(text="Unknown GPT profile callback.")
-            return
-
-        try:
-            switched = await asyncio.to_thread(self._gptprof_switch_profile, action)
-        except Exception as exc:
-            logger.error("[%s] gptprof callback failed for %s: %s", self.name, action, exc, exc_info=True)
-            await query.answer(text="GPT profile switch failed; see logs.")
-            return
-
-        label = switched["slug"]
-        if switched.get("plan"):
-            label = f"{label} ({switched['plan']})"
-        await query.answer(text=f"GPT profile switched: {label} · model pinned to gpt-5.5")
-
-
-    def _subc_state_paths(self) -> tuple[_Path, _Path]:
-        home = _Path.home()
-        room = _Path(os.environ.get("SUBC_ROOM", str(home / ".hermes" / "profiles" / "subc" / "room")))
-        project = _Path(os.environ.get("SUBC_PROJECT", str(home / "workspace" / "chip-subconscious")))
-        return room, project
-
-    def _subc_load_state(self, room: _Path) -> dict:
-        state_path = room / "posted_pending_intents.json"
-        if not state_path.exists():
-            return {"posted": {}, "tokens": {}}
-        try:
-            return json.loads(state_path.read_text())
-        except Exception:
-            logger.warning("[%s] failed to read SUBCONSCIOUS pending state: %s", self.name, state_path, exc_info=True)
-            return {"posted": {}, "tokens": {}}
-
-    def _subc_save_state(self, room: _Path, state: dict) -> None:
-        state_path = room / "posted_pending_intents.json"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state_path.with_suffix(state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-        tmp.replace(state_path)
-
-    def _subc_intent_for_token(self, state: dict, token: str) -> Optional[str]:
-        tokens = state.get("tokens") or {}
-        mapped = tokens.get(token)
-        if mapped:
-            return str(mapped)
-        for intent_id, entry in (state.get("posted") or {}).items():
-            if isinstance(entry, dict) and entry.get("callback_token") == token:
-                return str(intent_id)
-        return None
-
-    def _subc_run_script(self, project: _Path, script_name: str, args: List[str]) -> dict:
-        script = project / "scripts" / script_name
-        proc = subprocess.run(
-            [sys.executable, str(script), *args],
-            cwd=str(project),
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"{script_name} failed rc={proc.returncode}: {(proc.stderr or proc.stdout or '').strip()}"
-            )
-        output = (proc.stdout or "").strip()
-        if not output:
-            return {}
-        try:
-            return json.loads(output)
-        except Exception:
-            return {"stdout": output}
-
-    async def _handle_subc_callback(
-        self,
-        query,
-        data: str,
-        *,
-        query_chat_id,
-        query_chat_type,
-        query_thread_id,
-        query_user_name,
-    ) -> None:
-        parts = data.split(":", 2)
-        if len(parts) != 3 or parts[1] not in {"y", "n"} or not parts[2]:
-            await query.answer(text="Некорректная кнопка SUBCONSCIOUS.")
-            return
-
-        caller_id = str(getattr(query.from_user, "id", ""))
-        if not self._is_callback_user_authorized(
-            caller_id,
-            chat_id=query_chat_id,
-            chat_type=str(query_chat_type) if query_chat_type is not None else None,
-            thread_id=str(query_thread_id) if query_thread_id is not None else None,
-            user_name=query_user_name,
-        ):
-            await query.answer(text="⛔ Недостаточно прав для решения SUBCONSCIOUS-задач.")
-            return
-
-        choice, token = parts[1], parts[2]
-        decision = "approved" if choice == "y" else "rejected"
-        room, project = self._subc_state_paths()
-        state = self._subc_load_state(room)
-        intent_id = self._subc_intent_for_token(state, token)
-        if not intent_id:
-            await query.answer(text="SUBCONSCIOUS: карточка не найдена или уже устарела.")
-            return
-
-        user_display = getattr(query.from_user, "first_name", None) or getattr(query.from_user, "username", None) or "User"
-        source_message_id = str(getattr(getattr(query, "message", None), "message_id", "") or "")
-
-        try:
-            result = await asyncio.to_thread(
-                self._subc_run_script,
-                project,
-                "subc_transition.py",
-                [
-                    "--room", str(room),
-                    "--intent-id", intent_id,
-                    "--decision", decision,
-                    "--approver", str(user_display),
-                    "--source-message-id", source_message_id,
-                ],
-            )
-            entry = state.setdefault("posted", {}).setdefault(intent_id, {})
-            entry["decision"] = decision
-            entry["decided_by"] = str(user_display)
-            entry["decided_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            if result.get("artifact"):
-                entry["path"] = result.get("artifact")
-
-            followup_bits: List[str] = []
-            if decision == "approved":
-                packet = await asyncio.to_thread(
-                    self._subc_run_script,
-                    project,
-                    "subc_build_packet.py",
-                    ["--room", str(room), "--intent-id", intent_id],
-                )
-                if packet.get("build_packet"):
-                    entry["build_packet"] = packet.get("build_packet")
-                shaw = await asyncio.to_thread(
-                    self._subc_run_script,
-                    project,
-                    "subc_shaw_enqueue.py",
-                    ["--room", str(room), "--project", str(project), "--intent-id", intent_id],
-                )
-                if shaw.get("shaw_run"):
-                    entry["shaw_run"] = shaw.get("shaw_run")
-                if shaw.get("pid"):
-                    entry["shaw_pid"] = shaw.get("pid")
-                followup_bits.append("передано в Approved Builds")
-                if entry.get("shaw_run"):
-                    followup_bits.append("Shaw worker запущен")
-            else:
-                followup_bits.append("убрано в архив")
-
-            self._subc_save_state(room, state)
-        except Exception as exc:
-            logger.error("[%s] SUBCONSCIOUS callback failed: %s", self.name, exc, exc_info=True)
-            await query.answer(text="SUBCONSCIOUS: ошибка обработки, см. логи.")
-            return
-
-        label = "✅ Одобрено" if decision == "approved" else "❌ Отклонено"
-        await query.answer(text=label)
-        try:
-            suffix = f" — {', '.join(followup_bits)}" if followup_bits else ""
-            await query.edit_message_text(
-                text=f"{label}: {intent_id}{suffix}\n\nРешил: {_html.escape(str(user_display))}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=None,
-            )
-        except Exception:
-            pass
-
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3717,21 +3466,6 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
-        # --- GPT profile callbacks ---
-        if data.startswith("gptprof:"):
-            caller_id = str(getattr(query.from_user, "id", ""))
-            if not self._is_callback_user_authorized(
-                caller_id,
-                chat_id=query_chat_id,
-                chat_type=str(query_chat_type) if query_chat_type is not None else None,
-                thread_id=str(query_thread_id) if query_thread_id is not None else None,
-                user_name=query_user_name,
-            ):
-                await query.answer(text="⛔ You are not authorized to switch GPT profiles.")
-                return
-            await self._handle_gptprof_callback(query, data)
-            return
-
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -3742,18 +3476,6 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
-                query,
-                data,
-                query_chat_id=query_chat_id,
-                query_chat_type=query_chat_type,
-                query_thread_id=query_thread_id,
-                query_user_name=query_user_name,
-            )
-            return
-
-        # --- SUBCONSCIOUS pending-intent callbacks (subc:y|n:token) ---
-        if data.startswith("subc:"):
-            await self._handle_subc_callback(
                 query,
                 data,
                 query_chat_id=query_chat_id,
@@ -4243,7 +3965,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             "voice": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
-                            "reply_markup": self._human20_inline_markup(chat_id, metadata),
                             **voice_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -4270,7 +3991,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             "audio": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
-                            "reply_markup": self._human20_inline_markup(chat_id, metadata),
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -4565,7 +4285,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         "filename": display_name,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -4613,7 +4332,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         "video": f,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -4666,7 +4384,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo": image_url,
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
-                    "reply_markup": self._human20_inline_markup(chat_id, metadata),
                     **photo_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -4704,7 +4421,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         "photo": image_data,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "reply_markup": self._human20_inline_markup(chat_id, metadata),
                         **upload_thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -4752,7 +4468,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     "animation": animation_url,
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
-                    "reply_markup": self._human20_inline_markup(chat_id, metadata),
                     **animation_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -4784,7 +4499,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     action="typing",
                     message_thread_id=message_thread_id,
-                    **self._business_kwargs(metadata),
                 )
             except Exception as e:
                 # For DM topic lanes, Telegram may reject message_thread_id.
@@ -5067,20 +4781,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
-    def _telegram_require_mention_chats(self) -> set[str]:
-        """Return group chat IDs that require an explicit bot trigger.
-
-        This is the per-chat counterpart to the global ``require_mention``
-        switch. It lets one noisy group/topic behave as mention/reply-only
-        without changing the default free-response behavior in other chats.
-        """
-        raw = self.config.extra.get("require_mention_chats")
-        if raw is None:
-            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
-
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -5170,7 +4870,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         loaded = [part.strip() for part in raw.split(",") if part.strip()]
                 patterns = loaded
 
-        adapter_name = getattr(getattr(self, "platform", None), "value", "telegram").title()
         if patterns is None:
             return []
         if isinstance(patterns, str):
@@ -5178,7 +4877,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(patterns, list):
             logger.warning(
                 "[%s] telegram mention_patterns must be a list or string; got %s",
-                adapter_name,
+                self.name,
                 type(patterns).__name__,
             )
             return []
@@ -5190,9 +4889,9 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 compiled.append(re.compile(pattern, re.IGNORECASE))
             except re.error as exc:
-                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", adapter_name, pattern, exc)
+                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", self.name, pattern, exc)
         if compiled:
-            logger.info("[%s] Loaded %d Telegram mention pattern(s)", adapter_name, len(compiled))
+            logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
         return compiled
 
     def _is_group_chat(self, message: Message) -> bool:
@@ -5353,61 +5052,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     return True
         return False
 
-    @staticmethod
-    def _message_matches_sigurd_trigger(message: Message) -> bool:
-        for candidate in (getattr(message, "text", None), getattr(message, "caption", None)):
-            if candidate and re.search(r"(?i)\bsigurd\b", candidate):
-                return True
-        return False
-
-    def _cache_observed_chat_type(self, chat_id: str, chat_type: str) -> None:
-        chat_type = str(chat_type or "").strip().lower()
-        if not chat_type:
-            return
-        cache = getattr(self, "_chat_type_cache", None)
-        if cache is None:
-            cache = {}
-            self._chat_type_cache = cache
-        cache[str(chat_id)] = chat_type
-
-    def _outbound_chat_type(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
-            return "dm"
-        cache = getattr(self, "_chat_type_cache", None) or {}
-        return cache.get(str(chat_id))
-
-    def _human20_inline_markup(
-        self,
-        chat_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        reply_markup: Optional[Any] = None,
-    ) -> Optional[Any]:
-        metadata = metadata or {}
-        # Attach the Human20 CTA only to external Telegram Business DM replies.
-        # Ordinary bot DMs can be the operator's own chat; adding promo buttons
-        # there is noisy and caused private-chat leakage in tests.
-        if not metadata.get("external_safe_mode"):
-            return reply_markup
-        if not self._business_connection_id_from_metadata(metadata):
-            return reply_markup
-        if self._outbound_chat_type(chat_id, metadata) != "dm":
-            return reply_markup
-        try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        except Exception:
-            return reply_markup
-
-        button = InlineKeyboardButton(_HUMAN20_CTA_TEXT, url=_HUMAN20_CTA_URL)
-        if reply_markup is None:
-            return InlineKeyboardMarkup([[button]])
-
-        try:
-            rows = [list(row) for row in getattr(reply_markup, "inline_keyboard", [])]
-        except Exception:
-            rows = []
-        rows.append([button])
-        return InlineKeyboardMarkup(rows)
-
     def _is_guest_mention(self, message: Message) -> bool:
         """Return True for the narrow guest-mode bypass: explicit bot mention.
 
@@ -5552,13 +5196,9 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
-        DMs require a direct trigger: reply, explicit @mention, or the
-        configured Sigurd wake word. Group/supergroup messages are accepted when:
+        DMs remain unrestricted. Group/supergroup messages are accepted when:
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
-        - the chat is explicitly listed in ``require_mention_chats`` and the
-          message replies to the bot, @mentions the bot, or matches a configured
-          regex wake-word pattern
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message replies to the bot
@@ -5573,25 +5213,10 @@ class TelegramAdapter(BasePlatformAdapter):
         as any other group message.  Users can still trigger commands via
         the Telegram bot menu (``/command@botname``) or by explicitly
         mentioning the bot (``@botname /command``), both of which are
+        recognised as mentions by :meth:`_message_mentions_bot`.
         """
-        chat = getattr(message, "chat", None)
-        raw_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
-        if raw_chat_type == "channel":
-            return True
         if not self._is_group_chat(message):
-            if self._telegram_allowed_chats() or self._telegram_allowed_topics():
-                return True
-            sender = getattr(message, "from_user", None)
-            sender_id = str(getattr(sender, "id", "") or "").strip()
-            allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
-            allowed_ids = {part.strip() for part in allowed_csv.split(",") if part.strip()}
-            if sender_id and ("*" in allowed_ids or sender_id in allowed_ids):
-                return True
-            return (
-                bool(getattr(message, "reply_to_message", None))
-                or self._message_mentions_bot(message)
-                or self._message_matches_sigurd_trigger(message)
-            )
+            return True
 
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
@@ -5634,12 +5259,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_require_mention_chats():
-            if self._is_reply_to_bot(message):
-                return True
-            if self._message_mentions_bot(message):
-                return True
-            return self._message_matches_mention_patterns(message)
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
@@ -5685,510 +5304,7 @@ class TelegramAdapter(BasePlatformAdapter):
         those updates, so handlers must use ``effective_message`` to avoid
         consuming channel posts without ever building a gateway event.
         """
-        for attr in ("message", "channel_post", "edited_message", "edited_channel_post", "effective_message"):
-            msg = getattr(update, attr, None)
-            if msg is not None and getattr(msg, "chat", None) is not None:
-                return msg
-        return None
-
-    def _load_auto_skill_routes(self) -> List[Dict[str, Any]]:
-        """Load declarative auto-skill routes from Telegram config.
-
-        Example:
-            telegram:
-              auto_skill_routes:
-                - skill: tg
-                  chats: [-1001234567890]
-                  match:
-                    urls: true
-                    media: [photo, video]
-        """
-        raw_routes = self.config.extra.get("auto_skill_routes", [])
-        if not isinstance(raw_routes, list):
-            return []
-
-        routes: List[Dict[str, Any]] = []
-        for raw in raw_routes:
-            if not isinstance(raw, dict):
-                continue
-            skill = str(raw.get("skill") or "").strip().lstrip("/")
-            chats = raw.get("chats") or []
-            match = raw.get("match") or {}
-            if not skill or not isinstance(chats, list) or not isinstance(match, dict):
-                continue
-            routes.append({
-                "skill": skill,
-                "chats": {str(chat_id) for chat_id in chats},
-                "match_urls": bool(match.get("urls", False)),
-                "match_media": {str(kind).lower() for kind in (match.get("media") or [])},
-            })
-        return routes
-
-    def _load_inline_preview_guard(self) -> Dict[str, Any]:
-        """Load per-chat guard against Hermes-bot `/tg` previews.
-
-        operator's TG chats are fail-closed by default in this install: finished
-        post previews must be routed through the configured external preview bridge even when the
-        config entry is missing or incomplete. Config can still add chats or
-        override script/timeout, but not silently disable the configured preview
-        guard unless HERMES_DISABLE_TG_PREVIEW_GUARD=1 is set for tests.
-        """
-        raw = self.config.extra.get("inline_preview_guard", {})
-        if raw is True:
-            raw = {"enabled": True}
-        if not isinstance(raw, dict):
-            raw = {}
-        chats = raw.get("chats") or []
-        if isinstance(chats, (str, int)):
-            chats = [chats]
-        chat_set = {str(chat_id) for chat_id in chats}
-        if os.getenv("HERMES_DISABLE_TG_PREVIEW_GUARD", "0") != "1":
-            chat_set |= set(_TG_PREVIEW_GUARD_CHAT_IDS)
-        enabled = bool(raw.get("enabled", False)) or bool(chat_set & _TG_PREVIEW_GUARD_CHAT_IDS)
-        return {
-            "enabled": enabled,
-            "chats": chat_set,
-            "blocker": str(raw.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER),
-            "action": str(raw.get("action") or "external_preview"),
-            "script": str(raw.get("script") or ""),
-            "timeout": float(raw.get("timeout", 120)),
-            "echo_user_ids": {str(v).strip() for v in (raw.get("echo_user_ids") or []) if str(v).strip()},
-            "echo_usernames": {str(v).strip().lstrip("@").lower() for v in (raw.get("echo_usernames") or []) if str(v).strip()},
-        }
-
-    def _inline_preview_guard_applies(
-        self,
-        chat_id: str,
-        content: str,
-    ) -> bool:
-        guard = getattr(self, "_inline_preview_guard", None) or {}
-        if not guard.get("enabled"):
-            return False
-        chats = guard.get("chats") or set()
-        if chats and str(chat_id) not in chats:
-            return False
-        return _looks_like_inline_tg_preview(content)
-
-    @staticmethod
-    def _extract_tg_preview_state_message_id(state_path: str = "/tmp/tg_preview_state.json") -> Optional[str]:
-        try:
-            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if not (data.get("ok") and data.get("verified")):
-            return None
-        mid = data.get("message_id") or (data.get("message_ids") or [None])[0]
-        return str(mid) if mid else None
-
-    def _send_inline_preview_via_external_bridge_sync(
-        self,
-        chat_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        guard = getattr(self, "_inline_preview_guard", None) or {}
-        script = str(guard.get("script") or "")
-        timeout = float(guard.get("timeout") or 120)
-        if not script or not os.path.exists(script):
-            return SendResult(success=False, error=f"inline preview guard script missing: {script}")
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            suffix=".html",
-            prefix="hermes-inline-tg-preview-",
-            delete=False,
-        ) as tmp:
-            tmp.write(content.strip() + "\n")
-            tmp_path = tmp.name
-        try:
-            proc = subprocess.run(
-                [script, "--chat-id", str(chat_id), "--file", tmp_path, "--no-media"],
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
-            if proc.returncode != 0:
-                detail = stderr or stdout or f"exit {proc.returncode}"
-                return SendResult(success=False, error=f"Preview bridge send failed: {detail[:500]}")
-            message_id = self._extract_tg_preview_state_message_id()
-            if not message_id:
-                return SendResult(
-                    success=False,
-                    error="Preview bridge send did not leave verified /tmp/tg_preview_state.json",
-                )
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response={
-                    "inline_preview_guard": "external_preview",
-                    "stdout": stdout[-1000:],
-                },
-            )
-        except Exception as exc:
-            return SendResult(success=False, error=f"Preview bridge guard exception: {exc}")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    async def _inline_preview_guard_send_result(
-        self,
-        chat_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[SendResult]:
-        """Route configured inline `/tg` previews through an external preview bridge instead of bot-send."""
-        if not self._inline_preview_guard_applies(chat_id, content):
-            return None
-        guard = getattr(self, "_inline_preview_guard", None) or {}
-        action = str(guard.get("action") or "blocker").strip().lower()
-        if action not in {"external_preview", "external_preview", "send_external_preview"}:
-            return None
-        result = await asyncio.to_thread(
-            self._send_inline_preview_via_external_bridge_sync,
-            chat_id,
-            content,
-            metadata,
-        )
-        if result.success:
-            logger.info(
-                "[%s] Routed inline TG preview through external preview guard (chat=%s message_id=%s)",
-                self.name,
-                chat_id,
-                result.message_id,
-            )
-            return result
-        self._last_inline_preview_guard_error = result.error
-        logger.error(
-            "[%s] External inline TG preview guard failed (chat=%s): %s",
-            self.name,
-            chat_id,
-            result.error,
-        )
-        return None
-
-    def _inline_preview_guard_replacement(
-        self,
-        chat_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """Return blocker text when a configured chat would get inline preview."""
-        guard = getattr(self, "_inline_preview_guard", None) or {}
-        if not self._inline_preview_guard_applies(chat_id, content):
-            return None
-        thread_id = self._metadata_thread_id(metadata)
-        error = getattr(self, "_last_inline_preview_guard_error", "") or ""
-        logger.error(
-            "[%s] Blocked inline TG preview from Hermes bot (chat=%s thread=%s len=%d error=%s)",
-            self.name,
-            chat_id,
-            thread_id,
-            len(content or ""),
-            error,
-        )
-        blocker = str(guard.get("blocker") or _INLINE_TG_PREVIEW_BLOCKER)
-        if error:
-            blocker = f"превью не отправлено/не подтверждено: {error[:700]}"
-            self._last_inline_preview_guard_error = ""
-        return blocker
-
-    @staticmethod
-    def _recent_external_preview_message_ids() -> set[str]:
-        """Return exact message ids sent by the external `/tg` preview path.
-
-        `the external preview bridge sends previews from a non-bot account, so Telegram
-        delivers those messages back to this bot as normal user messages. If we
-        process that echo, the auto `/tg` route can recursively preview the
-        preview. The canonical sender writes verified ids to these local state
-        files; treat only exact ids as self-generated preview echoes.
-        """
-        ids: set[str] = set()
-        state_path = os.getenv("TG_PREVIEW_STATE_FILE", "/tmp/tg_preview_state.json")
-        message_id_path = os.getenv("TG_PREVIEW_MESSAGE_ID_FILE", "/tmp/tg_preview_message_id.txt")
-
-        try:
-            data = json.loads(_Path(state_path).read_text(encoding="utf-8"))
-            if data.get("ok") and data.get("verified"):
-                for value in data.get("message_ids") or []:
-                    if value is not None:
-                        ids.add(str(value))
-                if data.get("message_id") is not None:
-                    ids.add(str(data.get("message_id")))
-        except Exception:
-            pass
-
-        try:
-            for line in _Path(message_id_path).read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line:
-                    ids.add(line)
-        except Exception:
-            pass
-
-        return ids
-
-    @staticmethod
-    def _pending_external_preview_echo_fingerprints(chat_id: str) -> set[str]:
-        """Return still-valid pre-send preview fingerprints for this chat.
-
-        The exact-id guard is not enough: Telegram can deliver the external-preview echo
-        while `send-preview.sh` is still verifying and before it has written the
-        final state file (or when callers use a custom state path). The sender
-        therefore writes a short-lived content fingerprint before sending.
-        """
-        path = os.getenv("TG_PREVIEW_PENDING_ECHO_FILE", _TG_PREVIEW_PENDING_ECHO_FILE)
-        now = time.time()
-        fingerprints: set[str] = set()
-        try:
-            lines = _Path(path).read_text(encoding="utf-8").splitlines()
-        except Exception:
-            return fingerprints
-        for line in lines[-200:]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except Exception:
-                continue
-            if str(data.get("chat_id") or "") != str(chat_id):
-                continue
-            try:
-                expires_at = float(data.get("expires_at") or 0)
-            except (TypeError, ValueError):
-                expires_at = 0
-            if expires_at and expires_at < now:
-                continue
-            value = str(data.get("sha256") or "").strip()
-            if value:
-                fingerprints.add(value)
-        return fingerprints
-
-    def _is_external_tg_preview_echo(self, message: Message) -> bool:
-        """Return True for external preview messages that must be ignored.
-
-        `the external preview bridge posts from a non-bot account, so Bot API receives the
-        preview as a normal user message. Exact ids are preferred; pending
-        fingerprints cover the race before exact state is visible.
-        """
-        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-        guard = getattr(self, "_inline_preview_guard", None) or {}
-        guarded_chats = guard.get("chats") or set(_TG_PREVIEW_GUARD_CHAT_IDS)
-        if guarded_chats and chat_id not in guarded_chats:
-            return False
-
-        user = getattr(message, "from_user", None)
-        user_id = str(getattr(user, "id", "") or "")
-        username = str(getattr(user, "username", "") or "").lstrip("@").lower()
-        allowed_user_ids = guard.get("echo_user_ids") or set()
-        allowed_usernames = guard.get("echo_usernames") or set()
-        if (allowed_user_ids or allowed_usernames) and user_id not in allowed_user_ids and username not in allowed_usernames:
-            return False
-
-        message_id = str(getattr(message, "message_id", "") or "")
-        if message_id and message_id in self._recent_external_preview_message_ids():
-            return True
-
-        visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
-        if not _looks_like_inline_tg_preview(visible_text):
-            return False
-        pending = self._pending_external_preview_echo_fingerprints(chat_id)
-        return bool(pending and _tg_preview_echo_fingerprint(visible_text) in pending)
-
-    def _auto_skill_prefix_for_text(self, chat_id: str, text: str) -> Optional[str]:
-        """Return a slash-command prefix when text matches an auto-skill route."""
-        if not chat_id or not text or text.lstrip().startswith("/"):
-            return None
-        if _looks_like_inline_tg_preview(text):
-            return None
-        has_url = bool(re.search(r"https?://\S+|t\.co/\S+", text))
-        for route in getattr(self, "_auto_skill_routes", []):
-            if chat_id not in route["chats"]:
-                continue
-            if has_url and route.get("match_urls"):
-                return f"/{route['skill']} "
-        return None
-
-    def _auto_skill_prefix_for_media(self, chat_id: str, msg_type: MessageType) -> Optional[str]:
-        """Return a slash-command prefix when media matches an auto-skill route."""
-        if not chat_id:
-            return None
-        media_kind = msg_type.value.lower()
-        for route in getattr(self, "_auto_skill_routes", []):
-            if chat_id not in route["chats"]:
-                continue
-            if media_kind in route.get("match_media", set()):
-                return f"/{route['skill']} "
-        return None
-
-    def _telegram_business_config(self) -> Dict[str, Any]:
-        cfg = self.config.extra.get("business") or {}
-        return cfg if isinstance(cfg, dict) else {}
-
-    def _telegram_business_enabled(self) -> bool:
-        value = self._telegram_business_config().get("enabled", False)
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-    def _telegram_business_allowed_chats(self) -> set[str]:
-        raw = self._telegram_business_config().get("allowed_chats") or []
-        if isinstance(raw, (str, int)):
-            raw = [raw]
-        return {str(item).strip() for item in raw if str(item).strip()}
-
-    def _telegram_business_free_response_chats(self) -> set[str]:
-        raw = self._telegram_business_config().get("free_response_chats") or []
-        if isinstance(raw, (str, int)):
-            raw = [raw]
-        return {str(item).strip() for item in raw if str(item).strip()}
-
-    def _telegram_business_trigger_words(self) -> List[str]:
-        raw = self._telegram_business_config().get("trigger_words") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        words = [str(item).strip() for item in raw if str(item).strip()]
-        if not words:
-            words = ["Sigurd", "Сигурд"]
-        return words
-
-    def _telegram_business_allow_reply_trigger(self) -> bool:
-        """Return whether replying to a prior bot message wakes Business mode.
-
-        Telegram Business delegated chats are often used as ambient operator
-        inboxes. A plain reply to a previous bot message can be accidental noise
-        (especially around inline-keyboard/status messages), so Business mode is
-        wake-word/mention-only by default. Installations that explicitly want
-        reply-to-bot follow-ups can opt in with
-        ``telegram.business.allow_reply_trigger: true``.
-        """
-        value = self._telegram_business_config().get("allow_reply_trigger", False)
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-    def _message_matches_business_trigger(self, message: Message) -> bool:
-        chat = getattr(message, "chat", None)
-        chat_id = str(getattr(chat, "id", "") or "").strip()
-        if chat_id and chat_id in self._telegram_business_free_response_chats():
-            return True
-        if self._telegram_business_allow_reply_trigger() and self._is_reply_to_bot(message):
-            return True
-        if self._message_mentions_bot(message):
-            return True
-        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
-        if not text:
-            return False
-        for word in self._telegram_business_trigger_words():
-            if re.match(rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])", text):
-                return True
-        return False
-
-    def _strip_business_trigger_text(self, text: Optional[str]) -> Optional[str]:
-        if not text:
-            return text
-        cleaned = self._clean_bot_trigger_text(text)
-        for word in self._telegram_business_trigger_words():
-            stripped = re.sub(rf"(?iu)^\s*{re.escape(word)}(?:\b|[\s,.:;!?-])*\s*", "", cleaned, count=1).strip()
-            stripped = stripped.lstrip(" ,.:;!?-").strip()
-            if stripped != cleaned:
-                return stripped or cleaned
-        return cleaned
-
-    def _is_business_trusted_actor(self, message: Message) -> bool:
-        sender = getattr(message, "from_user", None)
-        sender_id = str(getattr(sender, "id", "") or "").strip()
-        if not sender_id:
-            return False
-        explicit_ids: set[str] = set()
-        for env_name in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
-            for part in os.getenv(env_name, "").split(","):
-                part = part.strip()
-                if part and part != "*":
-                    explicit_ids.add(part)
-        if sender_id in explicit_ids:
-            return True
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        pairing_store = getattr(runner, "pairing_store", None)
-        is_approved = getattr(pairing_store, "is_approved", None)
-        if callable(is_approved):
-            try:
-                return bool(is_approved("telegram", sender_id))
-            except Exception:
-                logger.debug("[Telegram] Business pairing-store trust check failed", exc_info=True)
-        return False
-
-    async def _handle_business_connection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        conn = getattr(update, "business_connection", None)
-        logger.info(
-            "Received Telegram Business connection update id=%s user_id=%s can_reply=%s",
-            getattr(conn, "id", None),
-            getattr(getattr(conn, "user", None), "id", None),
-            getattr(conn, "can_reply", None),
-        )
-
-    async def _handle_business_messages_deleted(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        deleted = getattr(update, "deleted_business_messages", None)
-        logger.info(
-            "Received Telegram Business messages deleted update business_connection_id=%s chat_id=%s",
-            getattr(deleted, "business_connection_id", None),
-            getattr(getattr(deleted, "chat", None), "id", None),
-        )
-
-    async def _handle_business_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = getattr(update, "business_message", None)
-        if not msg:
-            return
-        chat = getattr(msg, "chat", None)
-        sender = getattr(msg, "from_user", None)
-        business_connection_id = getattr(msg, "business_connection_id", None)
-        has_text = bool(getattr(msg, "text", None) or getattr(msg, "caption", None))
-        logger.info(
-            "Received Telegram Business message update chat_id=%s user_id=%s has_text=%s business_connection_id=%s",
-            getattr(chat, "id", None),
-            getattr(sender, "id", None),
-            has_text,
-            bool(business_connection_id),
-        )
-        if not self._telegram_business_enabled():
-            logger.info("Ignored Telegram Business message chat_id=%s reason=business_disabled", getattr(chat, "id", None))
-            return
-        if not business_connection_id:
-            logger.warning("Ignored Telegram Business message chat_id=%s reason=missing_business_connection_id", getattr(chat, "id", None))
-            return
-        if not has_text:
-            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_text", getattr(chat, "id", None))
-            return
-        if sender and getattr(sender, "is_bot", False):
-            logger.info("Ignored Telegram Business message chat_id=%s reason=bot_sender", getattr(chat, "id", None))
-            return
-        if self._bot and sender and getattr(sender, "id", None) == getattr(self._bot, "id", None):
-            logger.info("Ignored Telegram Business message chat_id=%s reason=self_sender", getattr(chat, "id", None))
-            return
-        chat_id = str(getattr(chat, "id", "") or "")
-        allowed_chats = self._telegram_business_allowed_chats()
-        if allowed_chats and chat_id not in allowed_chats:
-            logger.info("Ignored Telegram Business message chat_id=%s reason=chat_not_allowed", chat_id)
-            return
-        if not self._message_matches_business_trigger(msg):
-            logger.info("Ignored Telegram Business message chat_id=%s reason=missing_trigger", chat_id)
-            return
-
-        trusted = self._is_business_trusted_actor(msg)
-        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-        event.text = self._strip_business_trigger_text(getattr(msg, "text", None) or getattr(msg, "caption", None) or event.text) or event.text
-        event.source.business_connection_id = str(business_connection_id)
-        event.source.external_safe_mode = not trusted
-        event.source.chat_type = "dm"
-        await self._attach_replied_media_to_event(msg, event)
-        logger.info(
-            "Accepted Telegram Business message chat_id=%s user_id=%s business_connection_id=True external_safe_mode=%s",
-            chat_id,
-            getattr(sender, "id", None),
-            event.source.external_safe_mode,
-        )
-        self._enqueue_text_event(event)
+        return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
@@ -6200,29 +5316,14 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if self._is_external_tg_preview_echo(update.message):
-            logger.info(
-                "[Telegram] Ignoring external /tg preview echo chat=%s message_id=%s",
-                getattr(getattr(update.message, "chat", None), "id", None),
-                getattr(update.message, "message_id", None),
-            )
-            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(msg)
+        await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._attach_replied_media_to_event(msg, event)
-
-        # Auto skill route: e.g. a chat can route URL-like source messages to /tg.
-        chat_id = str(getattr(msg.chat, "id", ""))
-        skill_prefix = self._auto_skill_prefix_for_text(chat_id, event.text)
-        if skill_prefix:
-            event.text = skill_prefix + event.text
-
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
@@ -6233,10 +5334,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg, is_command=True):
             return
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._attach_replied_media_to_event(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
@@ -6421,13 +5522,6 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
-        if self._is_external_tg_preview_echo(update.message):
-            logger.info(
-                "[Telegram] Ignoring external /tg preview media echo chat=%s message_id=%s",
-                getattr(getattr(update.message, "chat", None), "id", None),
-                getattr(update.message, "message_id", None),
-            )
-            return
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
                 _m = update.message
@@ -6465,20 +5559,10 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        await self._attach_replied_media_to_event(msg, event)
 
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
-
-        # Auto skill route early, before photo/video batching can return.
-        chat_id = str(getattr(msg.chat, "id", ""))
-        skill_prefix = self._auto_skill_prefix_for_media(chat_id, msg_type)
-        if skill_prefix:
-            if event.text:
-                event.text = skill_prefix + event.text
-            else:
-                event.text = skill_prefix
 
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -6679,7 +5763,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in TEXT_DOCUMENT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
                         display_name = original_filename or f"document{ext}"
@@ -6704,169 +5788,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
-
-    async def _attach_replied_media_to_event(self, msg: Message, event: MessageEvent) -> None:
-        """Attach media from the Telegram message being replied to.
-
-        Telegram reply updates include ``reply_to_message`` metadata. Hermes
-        already injects replied-to text/captions into context, but file-only
-        messages have empty text and were previously invisible to the agent.
-        This downloads supported replied-to media into the same local caches as
-        first-class incoming media so commands like ``/summ`` can operate on a
-        file referenced via Telegram's native Reply UI.
-        """
-        replied = getattr(msg, "reply_to_message", None)
-        if not replied:
-            return
-
-        def merge_replied_context(note: str) -> None:
-            if event.text and event.text.startswith("/"):
-                event.text = f"{event.text}\n\n{note}"
-            else:
-                event.text = f"{note}\n\n{event.text}" if event.text else note
-
-        try:
-            if getattr(replied, "photo", None):
-                photo = replied.photo[-1]
-                file_obj = await photo.get_file()
-                image_bytes = await file_obj.download_as_bytearray()
-                ext = ".jpg"
-                if getattr(file_obj, "file_path", None):
-                    for candidate in [".png", ".webp", ".gif", ".jpeg", ".jpg"]:
-                        if file_obj.file_path.lower().endswith(candidate):
-                            ext = candidate
-                            break
-                cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
-                event.media_urls.append(cached_path)
-                event.media_types.append(f"image/{ext.lstrip('.')}")
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.PHOTO
-                logger.info("[Telegram] Cached replied-to photo at %s", cached_path)
-                return
-
-            if getattr(replied, "voice", None):
-                file_obj = await replied.voice.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
-                event.media_urls.append(cached_path)
-                event.media_types.append("audio/ogg")
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.VOICE
-                logger.info("[Telegram] Cached replied-to voice at %s", cached_path)
-                return
-
-            if getattr(replied, "audio", None):
-                file_obj = await replied.audio.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
-                event.media_urls.append(cached_path)
-                event.media_types.append("audio/mp3")
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.AUDIO
-                logger.info("[Telegram] Cached replied-to audio at %s", cached_path)
-                return
-
-            if getattr(replied, "video", None):
-                file_obj = await replied.video.get_file()
-                video_bytes = await file_obj.download_as_bytearray()
-                ext = ".mp4"
-                if getattr(file_obj, "file_path", None):
-                    for candidate in SUPPORTED_VIDEO_TYPES:
-                        if file_obj.file_path.lower().endswith(candidate):
-                            ext = candidate
-                            break
-                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
-                event.media_urls.append(cached_path)
-                event.media_types.append(SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4"))
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.VIDEO
-                logger.info("[Telegram] Cached replied-to video at %s", cached_path)
-                return
-
-            doc = getattr(replied, "document", None)
-            if not doc:
-                return
-
-            original_filename = doc.file_name or ""
-            _, ext = os.path.splitext(original_filename)
-            ext = ext.lower()
-            doc_mime = (doc.mime_type or "").lower()
-            if not ext and doc_mime:
-                ext = _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, "")
-                if not ext:
-                    mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
-                    ext = mime_to_ext.get(doc_mime, "")
-                if not ext:
-                    video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
-                    ext = video_mime_to_ext.get(doc_mime, "")
-
-            MAX_DOC_BYTES = 20 * 1024 * 1024
-            if not doc.file_size or doc.file_size > MAX_DOC_BYTES:
-                note = (
-                    "[The message you replied to contains a document that is too large "
-                    "or whose size could not be verified. Maximum: 20 MB.]"
-                )
-                merge_replied_context(note)
-                logger.info("[Telegram] Replied-to document too large: %s bytes", doc.file_size)
-                return
-
-            if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                file_obj = await doc.get_file()
-                image_bytes = await file_obj.download_as_bytearray()
-                image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
-                cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
-                event.media_urls.append(cached_path)
-                event.media_types.append(doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg"))
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.PHOTO
-                logger.info("[Telegram] Cached replied-to image-document at %s", cached_path)
-                return
-
-            if ext in SUPPORTED_VIDEO_TYPES:
-                file_obj = await doc.get_file()
-                video_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
-                event.media_urls.append(cached_path)
-                event.media_types.append(SUPPORTED_VIDEO_TYPES[ext])
-                if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                    event.message_type = MessageType.VIDEO
-                logger.info("[Telegram] Cached replied-to video document at %s", cached_path)
-                return
-
-            if ext not in SUPPORTED_DOCUMENT_TYPES:
-                note = (
-                    f"[The message you replied to contains an unsupported document type "
-                    f"'{ext or 'unknown'}'. Supported types: {', '.join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))}.]"
-                )
-                merge_replied_context(note)
-                logger.info("[Telegram] Unsupported replied-to document type: %s", ext or "unknown")
-                return
-
-            file_obj = await doc.get_file()
-            doc_bytes = await file_obj.download_as_bytearray()
-            raw_bytes = bytes(doc_bytes)
-            cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-            event.media_urls.append(cached_path)
-            event.media_types.append(SUPPORTED_DOCUMENT_TYPES[ext])
-            if event.message_type in (MessageType.TEXT, MessageType.COMMAND):
-                event.message_type = MessageType.DOCUMENT
-            logger.info("[Telegram] Cached replied-to document at %s", cached_path)
-
-            MAX_TEXT_INJECT_BYTES = 100 * 1024
-            if ext in TEXT_DOCUMENT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
-                try:
-                    text_content = raw_bytes.decode("utf-8")
-                    display_name = original_filename or f"document{ext}"
-                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                    injection = f"[Content of replied-to {display_name}]:\n{text_content}"
-                    merge_replied_context(injection)
-                except UnicodeDecodeError:
-                    logger.warning(
-                        "[Telegram] Could not decode replied-to text file as UTF-8, skipping content injection",
-                        exc_info=True,
-                    )
-        except Exception as e:
-            logger.warning("[Telegram] Failed to cache replied-to media: %s", e, exc_info=True)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
@@ -7155,15 +6076,26 @@ class TelegramAdapter(BasePlatformAdapter):
         # Build source
         source = self.build_source(
             chat_id=str(chat.id),
-            chat_name=getattr(chat, "title", None) or getattr(chat, "full_name", None),
+            chat_name=getattr(chat, "title", None) or (getattr(chat, "full_name", None) if hasattr(chat, "full_name") else None),
             chat_type=chat_type,
-            user_id=str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None),
-            user_name=getattr(user, "full_name", None) if user else (getattr(chat, "full_name", None) if chat_type == "dm" else getattr(chat, "title", None) if chat_type == "channel" else None),
+            user_id=(
+                str(user.id)
+                if user
+                else (str(chat.id) if chat_type in {"dm", "channel"} else None)
+            ),
+            user_name=(
+                user.full_name
+                if user
+                else (
+                    getattr(chat, "full_name", None)
+                    if hasattr(chat, "full_name") and chat_type == "dm"
+                    else (getattr(chat, "title", None) if chat_type == "channel" else None)
+                )
+            ),
             thread_id=thread_id_str,
             chat_topic=chat_topic,
             message_id=str(message.message_id),
         )
-        self._cache_observed_chat_type(str(chat.id), chat_type)
 
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)

@@ -269,7 +269,6 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "minimax-oauth": "MiniMax-M2.7-highspeed",
     "minimax-cn": "MiniMax-M2.7",
     "anthropic": "claude-haiku-4-5-20251001",
-    "ai-gateway": "google/gemini-3-flash",
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
@@ -384,15 +383,6 @@ def build_nvidia_nim_headers(base_url: str | None) -> dict:
     return {}
 
 
-# Vercel AI Gateway app attribution headers. HTTP-Referer maps to
-# referrerUrl and X-Title maps to appName in the gateway's analytics.
-from hermes_cli import __version__ as _HERMES_VERSION
-
-_AI_GATEWAY_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
-}
 
 # Nous Portal extra_body for product attribution.
 # Callers should pass this as extra_body in chat.completions.create()
@@ -576,51 +566,6 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
 # All auxiliary consumers call client.chat.completions.create(**kwargs) and
 # read response.choices[0].message.content. This adapter translates those
 # calls to the Codex Responses API so callers don't need any changes.
-
-
-
-def _backfill_responses_output(
-    final: Any,
-    collected_output_items: List[Any],
-    collected_text_deltas: List[str],
-    *,
-    has_function_calls: bool,
-    label: str,
-) -> Any:
-    """Repair Responses stream finals whose output is missing or empty."""
-    if final is None:
-        final = SimpleNamespace(status="completed", output=[])
-
-    if isinstance(final, dict):
-        output = final.get("output")
-    else:
-        output = getattr(final, "output", None)
-
-    if isinstance(output, list) and output:
-        return final
-
-    def _set_output(value: List[Any]) -> None:
-        if isinstance(final, dict):
-            final["output"] = value
-        else:
-            final.output = value
-
-    if collected_output_items:
-        _set_output(list(collected_output_items))
-        logger.debug("%s: backfilled %d output items from stream events", label, len(collected_output_items))
-    elif collected_text_deltas and not has_function_calls:
-        assembled = "".join(collected_text_deltas)
-        _set_output([SimpleNamespace(
-            type="message",
-            role="assistant",
-            status="completed",
-            content=[SimpleNamespace(type="output_text", text=assembled)],
-        )])
-        logger.debug("%s: synthesized from %d deltas (%d chars)", label, len(collected_text_deltas), len(assembled))
-    elif not isinstance(output, list):
-        _set_output([])
-
-    return final
 
 
 def _convert_content_for_responses(content: Any) -> Any:
@@ -830,64 +775,60 @@ class _CodexCompletionsAdapter:
                 pass
 
         try:
-            # Collect output items and text deltas during streaming —
-            # the Codex backend can return empty response.output from
-            # get_final_response() even when items were streamed.
-            collected_output_items: List[Any] = []
-            collected_text_deltas: List[str] = []
-            has_function_calls = False
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                try:
-                    final = stream.get_final_response()
-                except TypeError as exc:
-                    err_text = str(exc)
-                    if "NoneType" not in err_text or "not iterable" not in err_text:
-                        raise
-                    if not (collected_output_items or collected_text_deltas):
-                        raise
-                    logger.warning(
-                        "Codex auxiliary final Responses payload had output=None; "
-                        "recovering from streamed output events"
-                    )
-                    final = SimpleNamespace(status="completed", output=[], usage=None)
 
-            final = _backfill_responses_output(
-                final,
-                collected_output_items,
-                collected_text_deltas,
-                has_function_calls=has_function_calls,
-                label="Codex auxiliary",
-            )
+            # Event-driven Responses streaming via the low-level
+            # ``responses.create(stream=True)`` path.  The high-level
+            # ``responses.stream(...)`` helper does post-hoc typed
+            # reconstruction from ``response.completed.response.output``,
+            # which the chatgpt.com Codex backend has been observed to
+            # return as ``null`` (gpt-5.5, May 2026) — that crashes the SDK
+            # with ``TypeError: 'NoneType' object is not iterable``.
+            # Consuming raw events and assembling the final response
+            # ourselves from ``response.output_item.done`` makes us
+            # structurally immune to that drift.
+            from agent.codex_runtime import _consume_codex_event_stream
+
+            stream_kwargs = dict(resp_kwargs)
+            stream_kwargs["stream"] = True
+
+            def _on_each_event(_event: Any) -> None:
+                # Re-check timeout/cancellation per event, matching the
+                # cadence the old in-line ``_check_cancelled()`` used.
+                _check_cancelled()
+
+            event_stream = self._client.responses.create(**stream_kwargs)
+            try:
+                final = _consume_codex_event_stream(
+                    event_stream,
+                    model=resp_kwargs.get("model"),
+                    on_event=_on_each_event,
+                )
+            finally:
+                close_fn = getattr(event_stream, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+
+            if final is None:
+                raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
             # Extract text and tool calls from the Responses output.
-            # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
-            # so use a helper that handles both shapes.
+            # Items may be SimpleNamespace (raw-event path) or dicts
+            # (some legacy fallback paths), so handle both shapes.
             def _item_get(obj: Any, key: str, default: Any = None) -> Any:
                 val = getattr(obj, key, None)
                 if val is None and isinstance(obj, dict):
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
@@ -907,44 +848,13 @@ class _CodexCompletionsAdapter:
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0),
+                    prompt_tokens=getattr(resp_usage, "input_tokens", 0)
+                        or (resp_usage.get("input_tokens", 0) if isinstance(resp_usage, dict) else 0),
+                    completion_tokens=getattr(resp_usage, "output_tokens", 0)
+                        or (resp_usage.get("output_tokens", 0) if isinstance(resp_usage, dict) else 0),
+                    total_tokens=getattr(resp_usage, "total_tokens", 0)
+                        or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
-        except TypeError as exc:
-            err_text = str(exc)
-            if "NoneType" not in err_text or "not iterable" not in err_text:
-                raise
-            if not (collected_output_items or collected_text_deltas):
-                raise
-            logger.warning(
-                "Codex auxiliary stream parser failed on output=None; "
-                "recovering from streamed output events"
-            )
-            final = _backfill_responses_output(
-                SimpleNamespace(status="completed", output=[], usage=None),
-                collected_output_items,
-                collected_text_deltas,
-                has_function_calls=has_function_calls,
-                label="Codex auxiliary",
-            )
-            for item in getattr(final, "output", []):
-                item_type = getattr(item, "type", None)
-                if item_type is None and isinstance(item, dict):
-                    item_type = item.get("type")
-                if item_type == "message":
-                    content = getattr(item, "content", None)
-                    if content is None and isinstance(item, dict):
-                        content = item.get("content")
-                    for part in (content or []):
-                        ptype = getattr(part, "type", None)
-                        if ptype is None and isinstance(part, dict):
-                            ptype = part.get("type")
-                        if ptype in {"output_text", "text"}:
-                            text = getattr(part, "text", None)
-                            if text is None and isinstance(part, dict):
-                                text = part.get("text", "")
-                            text_parts.append(text or "")
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
@@ -1372,49 +1282,56 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
 def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     """Resolve a fresh xAI OAuth (api_key, base_url) for auxiliary clients.
 
-    Routes through ``hermes_cli.auth``'s runtime resolver so the auto-refresh
-    path is shared with the main agent, instead of relying on whatever raw
-    tokens happen to be sitting in auth.json or the credential pool.  Returns
-    ``None`` if the user is not authenticated with xAI Grok OAuth (so
-    ``_resolve_auto`` Step 1 falls through to the next provider in the chain).
+    Prefer the credential pool, matching the main runtime/provider status
+    path.  Some xAI OAuth logins live only as pool entries; falling straight
+    to the singleton auth-store resolver would make auxiliary tasks such as
+    compression report "no provider configured" even though ``hermes auth
+    status`` shows xAI OAuth as logged in.
+
+    Falls back to ``hermes_cli.auth``'s singleton runtime resolver for older
+    auth-store-only logins. Returns ``None`` if the user is not authenticated
+    with xAI Grok OAuth.
     """
     try:
         from hermes_cli.auth import (
             DEFAULT_XAI_OAUTH_BASE_URL,
-            resolve_xai_oauth_runtime_credentials,
+            _xai_validate_inference_base_url,
         )
+
+        pool = load_pool("xai-oauth")
+        if pool and pool.has_credentials():
+            entry = pool.select()
+            if entry is not None:
+                api_key = str(
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                    or ""
+                ).strip()
+                base_url = _xai_validate_inference_base_url(
+                    os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
+                    or os.getenv("XAI_BASE_URL", "").strip().rstrip("/")
+                    or str(getattr(entry, "runtime_base_url", None) or "").strip().rstrip("/")
+                    or str(getattr(entry, "base_url", None) or "").strip().rstrip("/"),
+                    fallback=DEFAULT_XAI_OAUTH_BASE_URL,
+                )
+                if api_key and base_url:
+                    return api_key, base_url
+    except Exception as exc:
+        logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
+
+    try:
+        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
         creds = resolve_xai_oauth_runtime_credentials()
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
-        creds = None
+        return None
 
-    if isinstance(creds, dict):
-        api_key = str(creds.get("api_key") or "").strip()
-        base_url = str(creds.get("base_url") or "").strip().rstrip("/")
-        if api_key and base_url:
-            return api_key, base_url
-
-    # Pool-only credentials are valid for runtime use even when auth.json has
-    # no singleton xAI entry.  `hermes auth status` reports these as logged in,
-    # so auxiliary tasks must see them too.
-    try:
-        default_base_url = DEFAULT_XAI_OAUTH_BASE_URL
-    except Exception:
-        default_base_url = "https://api.x.ai/v1"
-    pool_present, entry = _select_pool_entry("xai-oauth")
-    if pool_present:
-        api_key = _pool_runtime_api_key(entry)
-        base_url = (
-            os.getenv("HERMES_XAI_BASE_URL")
-            or os.getenv("XAI_BASE_URL")
-            or _pool_runtime_base_url(entry, default_base_url)
-            or default_base_url
-        )
-        base_url = str(base_url or "").strip().rstrip("/")
-        if api_key and base_url:
-            return api_key, base_url
-    return None
+    api_key = str(creds.get("api_key") or "").strip()
+    base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+    if not api_key or not base_url:
+        return None
+    return api_key, base_url
 
 
 def _read_codex_access_token() -> Optional[str]:
@@ -2327,11 +2244,15 @@ def _is_payment_error(exc: Exception) -> bool:
     # but sometimes wrap them in 429 or other codes.
     # Daily quota exhaustion from Bedrock, Vertex AI, and similar providers
     # uses different language but is semantically identical to credit exhaustion.
-    if status in {402, 429, None}:
+    if status in {402, 404, 429, None}:
         if any(kw in err_lower for kw in (
             "credits", "insufficient funds",
             "can only afford", "billing",
             "payment required",
+            "out of funds", "run out of funds",
+            "balance_depleted", "no usable credits",
+            "model_not_supported_on_free_tier",
+            "not available on the free tier",
             # Daily / monthly / weekly quota exhaustion keywords
             "quota exceeded", "quota_exceeded",
             "too many tokens per day", "daily limit",
@@ -2341,6 +2262,18 @@ def _is_payment_error(exc: Exception) -> bool:
         )):
             return True
     return False
+
+
+def _nous_portal_account_has_fresh_paid_access() -> bool:
+    """Return True only when the fresh Nous account API says paid access is allowed."""
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account_info = get_nous_portal_account_info(force_fresh=True)
+        return account_info.paid_service_access is True
+    except Exception as exc:
+        logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
+        return False
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -2371,6 +2304,10 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         if not any(kw in err_lower for kw in (
             "credits", "insufficient funds", "billing",
             "payment required", "can only afford",
+            "out of funds", "run out of funds",
+            "balance_depleted", "no usable credits",
+            "model_not_supported_on_free_tier",
+            "not available on the free tier",
         )):
             return True
     return False
@@ -3682,8 +3619,7 @@ def resolve_provider_client(
         else:
             # Fall back to profile.default_headers for providers that declare
             # client-level attribution headers on their profile (e.g. GMI
-            # User-Agent for traffic identification, Vercel AI Gateway
-            # Referer/Title for analytics).
+            # User-Agent for traffic identification).
             try:
                 from providers import get_provider_profile as _gpf_main
                 _ph_main = _gpf_main(provider)
@@ -4011,11 +3947,7 @@ def resolve_vision_provider_client(
         #   4. Stop
         main_provider = _read_main_provider()
         main_model = _read_main_model()
-        if (
-            main_provider
-            and main_provider not in {"auto", ""}
-            and main_provider not in _PROVIDERS_WITHOUT_VISION
-        ):
+        if main_provider and main_provider not in {"auto", ""}:
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
@@ -5025,6 +4957,41 @@ def call_llm(
             resolved_provider == "nous"
             or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
         )
+        if (
+            _is_payment_error(first_err)
+            and client_is_nous
+            and _nous_portal_account_has_fresh_paid_access()
+        ):
+            refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
+                cache_provider=resolved_provider or "nous",
+                model=final_model,
+                async_mode=False,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                is_vision=(task == "vision"),
+            )
+            if refreshed_client is not None:
+                logger.info(
+                    "Auxiliary %s: refreshed Nous runtime credentials after paid account check, retrying",
+                    task or "call",
+                )
+                if refreshed_model and refreshed_model != kwargs.get("model"):
+                    kwargs["model"] = refreshed_model
+                try:
+                    return _validate_llm_response(
+                        refreshed_client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (
+                        _is_auth_error(retry_err)
+                        or _is_payment_error(retry_err)
+                        or _is_connection_error(retry_err)
+                        or _is_rate_limit_error(retry_err)
+                    ):
+                        raise
+                    first_err = retry_err
+
         if _is_auth_error(first_err) and client_is_nous:
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
@@ -5427,6 +5394,40 @@ async def async_call_llm(
             resolved_provider == "nous"
             or base_url_host_matches(_client_base, "inference-api.nousresearch.com")
         )
+        if (
+            _is_payment_error(first_err)
+            and client_is_nous
+            and _nous_portal_account_has_fresh_paid_access()
+        ):
+            refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
+                cache_provider=resolved_provider or "nous",
+                model=final_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                is_vision=(task == "vision"),
+            )
+            if refreshed_client is not None:
+                logger.info(
+                    "Auxiliary %s (async): refreshed Nous runtime credentials after paid account check, retrying",
+                    task or "call",
+                )
+                if refreshed_model and refreshed_model != kwargs.get("model"):
+                    kwargs["model"] = refreshed_model
+                try:
+                    return _validate_llm_response(
+                        await refreshed_client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (
+                        _is_auth_error(retry_err)
+                        or _is_payment_error(retry_err)
+                        or _is_connection_error(retry_err)
+                        or _is_rate_limit_error(retry_err)
+                    ):
+                        raise
+                    first_err = retry_err
+
         if _is_auth_error(first_err) and client_is_nous:
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",

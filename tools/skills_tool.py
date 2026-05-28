@@ -114,7 +114,7 @@ _EXCLUDED_SKILL_DIRS = frozenset(
     )
 )
 _REMOTE_ENV_BACKENDS = frozenset(
-    {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
+    {"docker", "singularity", "modal", "ssh", "daytona"}
 )
 _secret_capture_callback = None
 
