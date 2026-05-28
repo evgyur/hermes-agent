@@ -409,18 +409,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 "connection so the retry loop can reconnect.",
                 _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"), _last_codex_event_ts is not None,
             )
-            if _silent_hint:
-                agent._emit_status(
-                    f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
-                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting. {_silent_hint}"
-                )
-            else:
-                agent._emit_status(
-                    f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
-                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting."
-                )
+            # This is an internal retryable reconnect. Do not surface it to
+            # chat by default: a recovered first attempt should not look like a
+            # user-visible failure. Operators can opt in while debugging.
+            _show_codex_watchdog_status = os.environ.get(
+                "HERMES_CODEX_WATCHDOG_STATUS", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if _show_codex_watchdog_status:
+                if _silent_hint:
+                    agent._emit_status(
+                        f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
+                        f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Reconnecting. {_silent_hint}"
+                    )
+                else:
+                    agent._emit_status(
+                        f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
+                        f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Reconnecting."
+                    )
             try:
                 _close_request_client_once("codex_ttfb_kill")
             except Exception:

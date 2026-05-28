@@ -102,6 +102,42 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+
+def test_ttfb_status_is_silent_by_default_for_retryable_reconnect(tmp_path, monkeypatch):
+    """A first-attempt Codex watchdog reconnect is internal retry plumbing.
+    It should not emit a scary chat-visible status unless an operator opts in."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    monkeypatch.delenv("HERMES_CODEX_WATCHDOG_STATUS", raising=False)
+
+    statuses: list[str] = []
+    closes: list[str] = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason))
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
+
+    stop = {"flag": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"]:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert "codex_ttfb_kill" in closes
+        assert statuses == []
+    finally:
+        stop["flag"] = True
+
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     """The no-first-byte watchdog should surface the same actionable hint as the
     stale-call timeout path when the model matches the silent-hang heuristic."""
@@ -109,6 +145,7 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_CODEX_WATCHDOG_STATUS", "1")
 
     closes: list = []
     statuses: list[str] = []
