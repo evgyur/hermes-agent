@@ -44,10 +44,10 @@ def test_hint_fires_for_bare_gpt_5_5_on_codex(tmp_path):
     agent.api_mode = "codex_responses"
     hint = agent._codex_silent_hang_hint(model="gpt-5.5")
     assert hint is not None
-    assert "gpt-5.4" in hint
-    assert "gpt-5.3-codex" in hint
-    assert "gpt-5.4-codex" in hint
-    assert "fallback chain" in hint
+    assert "gpt-5.4" not in hint
+    assert "gpt-5.3-codex" not in hint
+    assert "gpt-5.4-codex" not in hint
+    assert "keep using the requested model" in hint
 
 
 def test_hint_fires_for_vendor_prefixed_gpt_5_5(tmp_path):

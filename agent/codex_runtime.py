@@ -444,8 +444,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:
-        # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        # Raw SSE activity refreshes the idle watchdog. Useful activity is
+        # tracked separately so prelude/heartbeat-only streams do not defeat
+        # the Codex TTFB/TTFUB watchdog.
+        now = time.time()
+        agent._codex_stream_last_event_ts = now
+        event_type = _event_field(event, "type", "")
+        if isinstance(event_type, str) and (
+            "output_text.delta" in event_type
+            or event_type == "response.output_text.delta"
+            or "function_call" in event_type
+            or ("reasoning" in event_type and "delta" in event_type)
+            or event_type == "response.output_item.done"
+            or event_type in _TERMINAL_EVENT_TYPES
+        ):
+            agent._codex_stream_useful_event_ts = now
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:

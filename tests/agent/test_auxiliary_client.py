@@ -2619,6 +2619,62 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
+    def test_recovers_when_final_output_is_none(self):
+        streamed_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="summary recovered")],
+        )
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=streamed_item),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(
+                status="completed", id="r1", usage=None, output=None,
+            )),
+        ]
+
+        class FakeCreateStream:
+            def __iter__(self):
+                return iter(events)
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return FakeCreateStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content == "summary recovered"
+
+    def test_recovers_when_iterator_parser_hits_none_output(self):
+        streamed_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="iterator recovered")],
+        )
+
+        class FakeCreateStream:
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_item.done", item=streamed_item)
+                # No terminal event: raw-event assembly should still return
+                # the collected output item instead of relying on SDK final output.
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return FakeCreateStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content == "iterator recovered"
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):

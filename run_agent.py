@@ -1062,9 +1062,9 @@ class AIAgent:
         changes — the heuristic stays in place as future-proofing even when
         the symptom is dormant.
 
-        Does NOT fix the backend issue.  Only converts an opaque stale-timeout
-        into actionable text so users learn the workaround in seconds rather
-        than digging through logs.
+        The active mitigation is the Codex useful-byte watchdog in
+        ``interruptible_api_call``; this helper only labels stale-timeout
+        remnants with the known backend pattern.
         """
         if self.api_mode != "codex_responses":
             return None
@@ -1089,11 +1089,9 @@ class AIAgent:
             f"Codex backend appears to be silently rejecting {eff_model!r} "
             "on chatgpt.com/backend-api/codex (no stream events, no error). "
             "This is a known backend-side pattern that has affected ChatGPT "
-            "Plus accounts intermittently. "
-            "Workaround: try `gpt-5.4` on the same OAuth profile, or `gpt-5.3-codex`, "
-            "or switch to a different model/provider in your fallback chain. "
-            "Some ChatGPT Codex accounts do not support `gpt-5.4-codex`. "
-            "See hermes-agent#21444 for symptom history."
+            "Plus accounts intermittently. Hermes will keep using the requested "
+            "model and reconnect earlier when the stream produces no useful "
+            "bytes. See hermes-agent#21444 for symptom history."
         )
 
     def _is_openrouter_url(self) -> bool:

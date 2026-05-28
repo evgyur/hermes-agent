@@ -311,6 +311,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _codex_idle_timeout_default = 12.0
 
     _ttfb_enabled = _codex_watchdog_enabled
+    _ttfb_requires_any_event = False
     _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 12.0)
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
@@ -324,10 +325,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _ttfb_disable_above > 0
             and _est_tokens_for_codex_watchdog >= _ttfb_disable_above
         ):
-            _ttfb_enabled = False
+            # For large Codex requests, do not kill before the first SSE event:
+            # backend admission/prefill can legitimately be slow. Still guard
+            # the HEL1 failure mode where only prelude/heartbeat events arrive
+            # and no useful output/reasoning/tool/terminal event ever follows.
+            _ttfb_requires_any_event = True
             logger.info(
                 "Disabling openai-codex no-byte TTFB watchdog for large request "
-                "(context=~%s tokens >= %.0f). Waiting for backend response instead. "
+                "(context=~%s tokens >= %.0f). Prelude-only streams remain guarded. "
                 "Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_disable_above,
@@ -353,10 +358,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _codex_idle_enabled = False
 
     if _codex_watchdog_enabled:
-        # Reset before the worker starts so a marker left over from a previous
-        # call on this agent can't be misread as first-byte for this one.
+        # Reset before the worker starts so markers left over from a previous
+        # call on this agent cannot be misread as activity for this one.
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
+        agent._codex_stream_useful_event_ts = None
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -378,15 +384,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         _elapsed = time.time() - _call_start
 
-        # TTFB detector: the Codex stream has produced no event at all and
-        # we're past the first-byte cutoff → the backend opened the
-        # connection but isn't responding. Kill it so the retry loop can
-        # reconnect (a fresh connection typically succeeds in seconds),
-        # instead of waiting out the much longer wall-clock stale timeout.
+        # TTFB/TTFUB detector: kill if Codex produces no useful event before
+        # the cutoff. For large openai-codex requests we require at least one
+        # raw SSE event first, so legitimate long no-byte prefill is not killed
+        # but prelude-only heartbeat loops still reconnect promptly.
+        _last_codex_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
+        _last_codex_useful_ts = getattr(agent, "_codex_stream_useful_event_ts", None)
         if (
             _ttfb_enabled
             and _elapsed > _ttfb_timeout
-            and getattr(agent, "_codex_stream_last_event_ts", None) is None
+            and _last_codex_useful_ts is None
+            and (not _ttfb_requires_any_event or _last_codex_event_ts is not None)
         ):
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -396,21 +404,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 except Exception:
                     _silent_hint = None
             logger.warning(
-                "Codex stream produced no bytes within TTFB cutoff "
-                "(%.0fs > %.0fs, model=%s). Backend accepted the connection "
-                "but sent no stream events. Killing connection so the retry "
-                "loop can reconnect.",
-                _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"),
+                "Codex stream produced no useful bytes within TTFB cutoff "
+                "(%.0fs > %.0fs, model=%s, any_event_seen=%s). Killing "
+                "connection so the retry loop can reconnect.",
+                _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"), _last_codex_event_ts is not None,
             )
             if _silent_hint:
                 agent._emit_status(
-                    f"⚠️ No first byte from provider in {int(_elapsed)}s "
+                    f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Reconnecting. {_silent_hint}"
                 )
             else:
                 agent._emit_status(
-                    f"⚠️ No first byte from provider in {int(_elapsed)}s "
+                    f"⚠️ No useful response bytes from provider in {int(_elapsed)}s "
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Reconnecting."
                 )
@@ -419,19 +426,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._touch_activity(
-                f"codex stream killed after {int(_elapsed)}s with no first byte"
+                f"codex stream killed after {int(_elapsed)}s with no useful bytes"
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"Codex stream produced no useful bytes within {int(_elapsed)}s "
                         f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"Codex stream produced no useful bytes within {int(_elapsed)}s "
                         f"(TTFB threshold: {int(_ttfb_timeout)}s)"
                     )
             break
@@ -439,7 +446,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stream-idle detector: the Codex backend emitted at least one SSE
         # frame, then stopped emitting events. Valid keepalive / in_progress
         # frames refresh _codex_stream_last_event_ts and should not be killed.
-        _last_codex_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
         if (
             _codex_idle_enabled
             and _last_codex_event_ts is not None
