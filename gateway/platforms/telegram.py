@@ -4751,6 +4751,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_chat_requires_mention(self, chat_id: str) -> bool:
+        if str(chat_id) in self._telegram_require_mention_chats():
+            return True
+        return self._telegram_require_mention()
+
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
 
@@ -5169,7 +5182,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # if require_mention is disabled, every group message is a request.
         if chat_id_str in self._telegram_free_response_chats():
             return False
-        if not self._telegram_require_mention():
+        if not self._telegram_chat_requires_mention(chat_id_str):
             return False
         if self._is_reply_to_bot(message):
             return False
@@ -5279,11 +5292,6 @@ class TelegramAdapter(BasePlatformAdapter):
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
         thread_id = getattr(message, "message_thread_id", None)
-        allowed_topics = self._telegram_allowed_topics()
-        if allowed_topics:
-            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
-            if topic_id not in allowed_topics:
-                return False
 
         # Check ignored_threads first — applies to both groups and DM topics
         if thread_id is not None:
@@ -5305,6 +5313,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+            if topic_id not in allowed_topics:
+                return False
+
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -5323,7 +5337,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if chat_id_str in self._telegram_free_response_chats():
             return True
-        if not self._telegram_require_mention():
+        if not self._telegram_chat_requires_mention(chat_id_str):
             return True
         if self._is_reply_to_bot(message):
             return True
