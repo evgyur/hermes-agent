@@ -16023,9 +16023,15 @@ class GatewayRunner:
         suppress_tool_status_for_chat = False
         if source.platform == Platform.TELEGRAM:
             try:
-                quiet_chats = (user_config.get("telegram") or {}).get("suppress_tool_progress_chats") or []
-                quiet_ids = {str(chat_id) for chat_id in quiet_chats}
-                suppress_tool_status_for_chat = str(getattr(source, "chat_id", "")) in quiet_ids
+                chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+                # Telegram group/forum/channel chats are public-facing. Keep tool
+                # progress visible in DMs and managed private chats, but do not
+                # leak terminal/tool chatter into public conversations.
+                suppress_tool_status_for_chat = chat_type in {"group", "forum", "channel", "supergroup"}
+                if not suppress_tool_status_for_chat:
+                    quiet_chats = (user_config.get("telegram") or {}).get("suppress_tool_progress_chats") or []
+                    quiet_ids = {str(chat_id) for chat_id in quiet_chats}
+                    suppress_tool_status_for_chat = str(getattr(source, "chat_id", "")) in quiet_ids
                 if tool_progress_enabled and suppress_tool_status_for_chat:
                     tool_progress_enabled = False
             except Exception:

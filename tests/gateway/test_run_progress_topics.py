@@ -792,13 +792,33 @@ async def test_run_agent_suppresses_still_working_for_configured_telegram_chat(m
 
 
 @pytest.mark.asyncio
-async def test_run_agent_keeps_tool_progress_for_other_telegram_chats(monkeypatch, tmp_path):
+async def test_run_agent_suppresses_tool_progress_for_telegram_group_by_chat_type(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         FakeAgent,
-        session_id="sess-normal-chat",
+        session_id="sess-public-group",
         chat_id="-1001",
+        chat_type="group",
+        config_data={"display": {"tool_progress": "all"}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.typing == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_tool_progress_for_telegram_dm(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-normal-dm",
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
         config_data={
             "display": {"tool_progress": "all"},
             "telegram": {"suppress_tool_progress_chats": [-1001234567890]},
