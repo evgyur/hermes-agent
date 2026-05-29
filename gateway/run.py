@@ -7728,13 +7728,19 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            user_args = event.get_command_args().strip()
+                            run_cmd = exec_cmd
+                            if qcmd.get("append_args") and user_args:
+                                run_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            sanitized_env["HERMES_COMMAND_NAME"] = command
+                            sanitized_env["HERMES_COMMAND_ARGS"] = user_args
                             proc = await asyncio.create_subprocess_shell(
-                                exec_cmd,
+                                run_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
