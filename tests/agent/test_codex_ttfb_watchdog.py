@@ -103,6 +103,7 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
 
 
 
+
 def test_ttfb_status_is_silent_by_default_for_retryable_reconnect(tmp_path, monkeypatch):
     """A first-attempt Codex watchdog reconnect is internal retry plumbing.
     It should not emit a scary chat-visible status unless an operator opts in."""
@@ -116,7 +117,7 @@ def test_ttfb_status_is_silent_by_default_for_retryable_reconnect(tmp_path, monk
     closes: list[str] = []
     dummy_client = SimpleNamespace()
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
-    monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
+    monkeypatch.setattr(agent, "_buffer_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason))
     monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
 
@@ -138,6 +139,35 @@ def test_ttfb_status_is_silent_by_default_for_retryable_reconnect(tmp_path, monk
     finally:
         stop["flag"] = True
 
+
+def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
+    """With no env var set, the no-byte TTFB default is generous (120s)."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_MAX_SECONDS", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason))
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_slow_first_event(api_kwargs, client=None, on_first_delta=None):
+        time.sleep(2.0)
+        agent._codex_stream_last_event_ts = time.time()
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_first_event)
+
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert resp is sentinel
+    assert "codex_ttfb_kill" not in closes
+
+
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     """The no-first-byte watchdog should surface the same actionable hint as the
     stale-call timeout path when the model matches the silent-hang heuristic."""
@@ -151,6 +181,7 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     statuses: list[str] = []
     dummy_client = SimpleNamespace()
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_buffer_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",

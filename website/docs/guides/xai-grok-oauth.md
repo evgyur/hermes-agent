@@ -67,6 +67,25 @@ If you need to force this behaviour explicitly:
 hermes auth add xai-oauth --no-browser
 ```
 
+Through a jump box / bastion: add `-J jump-user@jump-host`.
+
+See [OAuth over SSH / Remote Hosts](./oauth-over-ssh.md) for the full step-by-step, including ProxyJump chains, mosh/tmux, and ControlMaster gotchas.
+
+### Browser-only remotes (Cloud Shell, Codespaces, EC2 Instance Connect)
+
+If you don't have a regular SSH client (e.g. you're running Hermes inside GCP Cloud Shell, GitHub Codespaces, AWS EC2 Instance Connect, Gitpod, or another browser-based console), the `ssh -L` recipe above isn't available. Use `--manual-paste` instead — Hermes skips the loopback listener and lets you paste the failed callback URL straight from your browser:
+
+```bash
+hermes auth add xai-oauth --manual-paste
+# Or via the model picker:
+hermes model --manual-paste
+```
+
+See [OAuth over SSH / Remote Hosts](./oauth-over-ssh.md#browser-only-remote-cloud-shell--codespaces--ec2-instance-connect) for the full walkthrough. Regression fix for [#26923](https://github.com/NousResearch/hermes-agent/issues/26923).
+
+If the consent page renders the authorization code directly on the page (xAI's current behavior on browser-based consoles) instead of redirecting to your `127.0.0.1:56121/callback`, paste **just the bare code value** at the `Callback URL:` prompt — Hermes accepts the full URL, a bare `?code=...&state=...` query fragment, or a bare code interchangeably.
+
+
 ## How the Login Works
 
 1. Hermes opens your browser to `accounts.x.ai`.

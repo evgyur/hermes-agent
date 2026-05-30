@@ -492,10 +492,10 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
-def test_private_dms_require_direct_trigger_or_sigurd():
+def test_private_dms_remain_unrestricted_without_explicit_chat_policy():
     adapter = _make_adapter(require_mention=False)
 
-    assert adapter._should_process_message(_dm_message("hello there")) is False
+    assert adapter._should_process_message(_dm_message("hello there")) is True
     assert adapter._should_process_message(
         _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
     ) is True
@@ -820,8 +820,8 @@ def test_config_env_overrides_telegram_user_allowlists(monkeypatch, tmp_path):
 def test_dm_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
     adapter = _make_adapter(allow_from=["111", "222"])
 
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is False
-    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is False
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=111)) is True
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=333)) is True
 
 
 def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():

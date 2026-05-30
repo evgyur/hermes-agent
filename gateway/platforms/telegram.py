@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import html as _html
 import re
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
@@ -2049,7 +2050,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllPrivateChats,
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
-                    BotCommandScopeChat,
                 )
                 from hermes_cli.commands import telegram_menu_commands
                 # Telegram allows up to 100 commands but has an undocumented
@@ -3177,21 +3177,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         try:
-            # Build provider buttons — 2 per row
-            buttons: list = []
-            for p in providers:
-                count = p.get("total_models", len(p.get("models", [])))
-                label = f"{p['name']} ({count})"
-                if p.get("is_current"):
-                    label = f"✓ {label}"
-                # Compact callback data: mp:<slug>  (max 64 bytes)
-                buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
-                )
-
-            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
-            keyboard = InlineKeyboardMarkup(rows)
+            # Build provider buttons — folds provider groups (display only).
+            keyboard = self._build_provider_keyboard(providers)
 
             provider_label = get_label(current_provider)
             text = self.format_message(
@@ -3237,6 +3224,56 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     _MODEL_PAGE_SIZE = 8
+
+    def _build_provider_keyboard(self, providers: list):
+        """Build the top-level provider keyboard, folding provider groups.
+
+        Provider families (Kimi/Moonshot, MiniMax, xAI Grok, ...) collapse to
+        a single ``mpg:<gid>`` button; tapping it drills into a member
+        sub-keyboard. Single providers (and groups with only one authenticated
+        member) render as direct ``mp:<slug>`` buttons. Grouping mirrors the
+        CLI ``hermes model`` picker via the shared ``group_providers`` fold,
+        so all surfaces stay consistent.
+        """
+        try:
+            from hermes_cli.models import group_providers
+        except Exception:
+            group_providers = None
+
+        by_slug = {p.get("slug"): p for p in providers}
+
+        def _provider_button(p):
+            count = p.get("total_models", len(p.get("models", [])))
+            label = f"{p['name']} ({count})"
+            if p.get("is_current"):
+                label = f"✓ {label}"
+            return InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
+
+        buttons: list = []
+        if group_providers is not None:
+            for row in group_providers([p.get("slug") for p in providers]):
+                if row["kind"] == "group":
+                    members = [by_slug[m] for m in row["members"] if m in by_slug]
+                    count = sum(
+                        m.get("total_models", len(m.get("models", []))) for m in members
+                    )
+                    label = f"{row['label']} ▸ ({count})"
+                    if any(m.get("is_current") for m in members):
+                        label = f"✓ {label}"
+                    buttons.append(
+                        InlineKeyboardButton(label, callback_data=f"mpg:{row['group_id']}")
+                    )
+                else:
+                    p = by_slug.get(row["slug"])
+                    if p is not None:
+                        buttons.append(_provider_button(p))
+        else:
+            for p in providers:
+                buttons.append(_provider_button(p))
+
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+        return InlineKeyboardMarkup(rows)
 
     def _build_model_keyboard(self, models: list, page: int) -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
@@ -3416,10 +3453,23 @@ class TelegramAdapter(BasePlatformAdapter):
             # Clean up state
             self._model_picker_state.pop(chat_id, None)
 
-        elif data == "mb":
-            # --- Back to provider list ---
+        elif data.startswith("mpg:"):
+            # --- Provider group selected: show member providers ---
+            group_id = data[4:]
+            try:
+                from hermes_cli.models import PROVIDER_GROUPS
+                _label, member_slugs = PROVIDER_GROUPS.get(group_id, ("", []))
+            except Exception:
+                _label, member_slugs = "", []
+
+            by_slug = {p["slug"]: p for p in state["providers"]}
+            members = [by_slug[m] for m in member_slugs if m in by_slug]
+            if not members:
+                await query.answer(text="Group not found.")
+                return
+
             buttons = []
-            for p in state["providers"]:
+            for p in members:
                 count = p.get("total_models", len(p.get("models", [])))
                 label = f"{p['name']} ({count})"
                 if p.get("is_current"):
@@ -3427,10 +3477,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 buttons.append(
                     InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
                 )
-
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+            rows.append([
+                InlineKeyboardButton("◀ Back", callback_data="mb"),
+                InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+            ])
             keyboard = InlineKeyboardMarkup(rows)
+
+            await query.edit_message_text(
+                text=self.format_message(
+                    (
+                        f"⚙ *Model Configuration*\n\n"
+                        f"Provider family: *{_label or group_id}*\n\n"
+                        f"Select a provider:"
+                    )
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+
+        elif data == "mb":
+            # --- Back to provider list (folds groups) ---
+            keyboard = self._build_provider_keyboard(state["providers"])
 
             try:
                 provider_label = get_label(state["current_provider"])
@@ -3480,7 +3549,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
@@ -3567,6 +3636,75 @@ class TelegramAdapter(BasePlatformAdapter):
                 # button click.
                 if count and query_chat_id is not None:
                     self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Subconscious pending-intent callbacks (subc:y|n:token) ---
+        if data.startswith("subc:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"y", "n"}:
+                await query.answer(text="Invalid pending-intent data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                return
+
+            decision = "approved" if parts[1] == "y" else "denied"
+            token = parts[2]
+            room = Path(os.getenv("SUBC_ROOM", ""))
+            project = Path(os.getenv("SUBC_PROJECT", ""))
+            state_path = room / "posted_pending_intents.json"
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                intent_id = state.get("tokens", {}).get(token)
+                if not intent_id:
+                    await query.answer(text="This pending intent has already been resolved.")
+                    return
+                entry = state.get("posted", {}).get(intent_id, {})
+                intent_path = room / str(entry.get("path", ""))
+
+                transition_cmd = ["subc_transition.py", str(intent_path), decision]
+                build_cmd = ["subc_build_packet.py", str(intent_path), "--project", str(project)]
+                enqueue_cmd = ["subc_shaw_enqueue.py", str(intent_path), "--project", str(project)]
+
+                transition = subprocess.run(transition_cmd, capture_output=True, text=True, check=False)
+                build = subprocess.run(build_cmd, capture_output=True, text=True, check=False)
+                enqueue = subprocess.run(enqueue_cmd, capture_output=True, text=True, check=False)
+
+                payload = {}
+                for completed in (transition, build, enqueue):
+                    if completed.stdout:
+                        try:
+                            payload.update(json.loads(completed.stdout))
+                        except json.JSONDecodeError:
+                            pass
+                    if completed.returncode != 0:
+                        raise RuntimeError(completed.stderr or f"command failed: {completed.args}")
+
+                entry["decision"] = decision
+                if payload.get("build_packet"):
+                    entry["build_packet"] = payload["build_packet"]
+                if payload.get("shaw_run"):
+                    entry["shaw_run"] = payload["shaw_run"]
+                state.setdefault("posted", {})[intent_id] = entry
+                state_path.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+
+                await query.answer(text="Approved" if decision == "approved" else "Denied")
+                await query.edit_message_text(
+                    text=self.format_message(f"Pending intent {decision} by {query_user_name or 'User'}"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve Subconscious pending-intent callback: %s", exc)
+                await query.answer(text="Failed to resolve pending intent.")
             return
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---
@@ -5523,8 +5661,14 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching."""
+        """Session-scoped key for text message batching.
+
+        Applies the installed topic-recovery hook first so DM-topic batches
+        coalesce on (and dispatch to) the recovered lane rather than the
+        raw inbound ``message_thread_id`` Telegram may have attached.
+        """
         from gateway.session import build_session_key
+        self._apply_topic_recovery(event)
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
