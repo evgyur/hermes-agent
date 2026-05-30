@@ -16,6 +16,10 @@ import subprocess
 import tempfile
 import html as _html
 import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
@@ -3533,6 +3537,251 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _gptprof_paths(self) -> dict[str, Path]:
+        """Return gptprof storage paths, with env overrides for tests/profiles."""
+        hermes_home = Path(os.getenv("HERMES_HOME", "/home/hermes/.hermes"))
+        return {
+            "auth": Path(os.getenv("GPTPROF_AUTH_PATH", str(hermes_home / "auth.json"))),
+            "config": Path(os.getenv("GPTPROF_CONFIG_PATH", str(hermes_home / "config.yaml"))),
+            "hcp": Path(os.getenv("GPTPROF_HCP_DIR", str(hermes_home / "skills" / "chip" / "hcp"))),
+            "cache": Path(os.getenv("GPTPROF_CACHE_PATH", "/tmp/gptprof_usage_cache.json")),
+            "send_buttons": Path(os.getenv("GPTPROF_SEND_BUTTONS", str(hermes_home / "skills" / "chip" / "gptprof" / "send_buttons.py"))),
+        }
+
+    @staticmethod
+    def _gptprof_load_json(path: Path, default: Any) -> Any:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _gptprof_save_json(path: Path, data: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _gptprof_atomic_text(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _gptprof_switch_profile(self, slug: str, model: str) -> str:
+        """Switch the active Codex OAuth profile used by gptprof buttons."""
+        paths = self._gptprof_paths()
+        profile_path = paths["hcp"] / f"{slug}.json"
+        profile = self._gptprof_load_json(profile_path, {})
+        if not isinstance(profile, dict) or not profile.get("access_token"):
+            raise FileNotFoundError(f"Profile token not found: {slug}")
+
+        auth = self._gptprof_load_json(paths["auth"], {})
+        if not isinstance(auth, dict):
+            auth = {}
+        codex = dict(auth.get("codex") or {})
+        codex.update({
+            "profile": slug,
+            "email": profile.get("email"),
+            "plan": profile.get("plan"),
+            "access_token": profile.get("access_token"),
+            "refresh_token": profile.get("refresh_token"),
+        })
+        auth["codex"] = codex
+
+        pool_root = auth.setdefault("credential_pool", {})
+        pool = pool_root.setdefault("openai-codex", [])
+        if not isinstance(pool, list):
+            pool = []
+            pool_root["openai-codex"] = pool
+        source = f"gptprof:{slug}"
+        updated = False
+        for item in pool:
+            if isinstance(item, dict) and item.get("source") in {source, "device_code"}:
+                item.update({
+                    "access_token": profile.get("access_token"),
+                    "refresh_token": profile.get("refresh_token"),
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                })
+                updated = True
+        if not updated:
+            pool.append({
+                "source": source,
+                "access_token": profile.get("access_token"),
+                "refresh_token": profile.get("refresh_token"),
+                "last_status": "ok",
+                "last_status_at": time.time(),
+            })
+        self._gptprof_save_json(paths["auth"], auth)
+
+        # Persist the model route so a gateway restart keeps the selected GPT profile on 5.5.
+        try:
+            import yaml
+            config = yaml.safe_load(paths["config"].read_text(encoding="utf-8")) or {}
+            if isinstance(config, dict):
+                model_cfg = config.setdefault("model", {})
+                if isinstance(model_cfg, dict):
+                    model_cfg["provider"] = "openai-codex"
+                    model_cfg["default"] = model
+                    self._gptprof_atomic_text(paths["config"], yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
+        except Exception as exc:
+            logger.warning("Failed to persist gptprof model route: %s", exc)
+
+        try:
+            if paths["cache"].exists():
+                cache = self._gptprof_load_json(paths["cache"], {})
+                if isinstance(cache, dict):
+                    cache.pop(slug, None)
+                    self._gptprof_save_json(paths["cache"], cache)
+        except Exception:
+            pass
+        return str(profile.get("email") or slug)
+
+    def _gptprof_post_json(self, url: str, payload: dict[str, Any], *, form: bool = False) -> dict[str, Any]:
+        data = (urllib.parse.urlencode(payload).encode("utf-8") if form else json.dumps(payload).encode("utf-8"))
+        headers = {"Content-Type": "application/x-www-form-urlencoded" if form else "application/json"}
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+
+    def _gptprof_save_new_auth_tokens(self, slug: str, access_token: str, refresh_token: str) -> None:
+        paths = self._gptprof_paths()
+        profile_path = paths["hcp"] / f"{slug}.json"
+        profile = self._gptprof_load_json(profile_path, {})
+        if not isinstance(profile, dict):
+            profile = {}
+        profile.update({
+            "profile": slug,
+            "email": profile.get("email") or f"{slug}@gmail.com",
+            "plan": profile.get("plan") or "OpenAI",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "updated_at": time.time(),
+            "source": "gptprof:new_auth_device_code",
+        })
+        profile.pop("_refresh_error", None)
+        self._gptprof_save_json(profile_path, profile)
+        self._gptprof_switch_profile(slug, "gpt-5.5")
+
+    async def _gptprof_poll_device_auth(self, slug: str, user_code: str, device_auth_id: str, interval: int, chat_id: int | str | None) -> None:
+        issuer = "https://auth.openai.com"
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        deadline = time.monotonic() + 15 * 60
+
+        def poll_once() -> dict[str, Any] | None:
+            try:
+                return self._gptprof_post_json(
+                    f"{issuer}/api/accounts/deviceauth/token",
+                    {"device_auth_id": device_auth_id, "user_code": user_code},
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code in {403, 404}:
+                    return None
+                raise
+
+        try:
+            code_resp = None
+            while time.monotonic() < deadline:
+                await asyncio.sleep(max(3, int(interval or 5)))
+                code_resp = await asyncio.to_thread(poll_once)
+                if code_resp:
+                    break
+            if not code_resp:
+                if chat_id and self._bot:
+                    await self._bot.send_message(chat_id=chat_id, text=f"gptprof auth timeout for {slug}")
+                return
+            token_data = await asyncio.to_thread(
+                self._gptprof_post_json,
+                f"{issuer}/oauth/token",
+                {
+                    "grant_type": "authorization_code",
+                    "code": code_resp.get("authorization_code", ""),
+                    "code_verifier": code_resp.get("code_verifier", ""),
+                    "client_id": client_id,
+                    "redirect_uri": f"{issuer}/deviceauth/callback",
+                },
+                form=True,
+            )
+            await asyncio.to_thread(
+                self._gptprof_save_new_auth_tokens,
+                slug,
+                token_data["access_token"],
+                token_data.get("refresh_token") or "",
+            )
+            await asyncio.to_thread(self._gptprof_send_card)
+            if chat_id and self._bot:
+                await self._bot.send_message(chat_id=chat_id, text=f"✅ gptprof auth saved for {slug}")
+        except Exception as exc:
+            logger.exception("gptprof device auth failed for %s: %s", slug, exc)
+            if chat_id and self._bot:
+                await self._bot.send_message(chat_id=chat_id, text=f"⚠️ gptprof auth failed for {slug}: {type(exc).__name__}")
+
+    def _gptprof_send_card(self) -> None:
+        script = self._gptprof_paths()["send_buttons"]
+        if script.exists():
+            subprocess.run([sys.executable, str(script)], check=False, timeout=90)
+
+    async def _handle_gptprof_callback(self, query, data: str, query_chat_id: int | str | None) -> None:
+        """Handle Chip's GPT profile switcher callbacks."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if caller_id != os.getenv("GPTPROF_ALLOWED_USER", "617744661"):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        if data in {"gptprof:refresh", "gptprof:check_auth"}:
+            await query.answer(text="Refreshing gptprof…")
+            await asyncio.to_thread(self._gptprof_send_card)
+            return
+
+        if data == "gptprof:new_auth":
+            paths = self._gptprof_paths()
+            auth = self._gptprof_load_json(paths["auth"], {})
+            slug = str(((auth.get("codex") or {}) if isinstance(auth, dict) else {}).get("profile") or "markov495")
+            issuer = "https://auth.openai.com"
+            client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+            try:
+                device = await asyncio.to_thread(
+                    self._gptprof_post_json,
+                    f"{issuer}/api/accounts/deviceauth/usercode",
+                    {"client_id": client_id},
+                )
+                code = device["user_code"]
+                interval = int(device.get("interval") or 5)
+                asyncio.create_task(self._gptprof_poll_device_auth(slug, code, device["device_auth_id"], interval, query_chat_id))
+                await query.answer(text=f"Auth code for {slug}: {code}")
+                await query.edit_message_text(
+                    text=(
+                        f"➕ New auth for {slug}\n\n"
+                        f"Open: {issuer}/codex/device\n"
+                        f"Code: {code}\n\n"
+                        "Log into the matching ChatGPT account, then return here."
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Failed to start gptprof device auth: %s", exc)
+                await query.answer(text="Failed to start auth.")
+            return
+
+        parts = data.split(":", 2)
+        if len(parts) == 3 and parts[0] == "gptprof":
+            slug, model = parts[1], parts[2]
+            try:
+                email = await asyncio.to_thread(self._gptprof_switch_profile, slug, model)
+                await query.answer(text=f"Switched to {slug}")
+                try:
+                    await query.edit_message_text(text=f"✅ GPT profile switched to {slug}\n{email}\nModel: {model}\n\nUse /new for a fresh session.")
+                except Exception:
+                    pass
+                await asyncio.to_thread(self._gptprof_send_card)
+            except Exception as exc:
+                logger.exception("Failed to switch gptprof profile: %s", exc)
+                await query.answer(text=f"Failed to switch {slug}.")
+            return
+
+        await query.answer(text="Unknown gptprof action.")
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3547,6 +3796,11 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Chip GPT profile callbacks (gptprof:<slug>:<model>, new auth, refresh) ---
+        if data.startswith("gptprof:"):
+            await self._handle_gptprof_callback(query, data, query_chat_id)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):

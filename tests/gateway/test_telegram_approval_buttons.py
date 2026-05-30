@@ -635,3 +635,77 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+
+class TestTelegramGptprofCallback:
+    """Regression tests for Chip's /gptprof inline keyboard callbacks."""
+
+    @pytest.mark.asyncio
+    async def test_gptprof_profile_button_switches_active_codex_profile(self, tmp_path):
+        adapter = _make_adapter()
+        hcp = tmp_path / "hcp"
+        hcp.mkdir()
+        auth = tmp_path / "auth.json"
+        config = tmp_path / "config.yaml"
+        cache = tmp_path / "cache.json"
+        send_buttons = tmp_path / "send_buttons.py"
+        send_buttons.write_text("print('noop')\n", encoding="utf-8")
+
+        (hcp / "markov495.json").write_text(json.dumps({
+            "email": "markov495@gmail.com",
+            "plan": "Pro $200",
+            "access_token": "access-markov",
+            "refresh_token": "refresh-markov",
+        }), encoding="utf-8")
+        auth.write_text(json.dumps({
+            "codex": {"profile": "mynightfly", "access_token": "old"},
+            "credential_pool": {"openai-codex": [{"source": "device_code", "access_token": "old"}]},
+        }), encoding="utf-8")
+        config.write_text("model:\n  provider: minimax\n  default: MiniMax-M2.7\n", encoding="utf-8")
+        cache.write_text(json.dumps({"markov495": {"stale": True}}), encoding="utf-8")
+
+        query = AsyncMock()
+        query.data = "gptprof:markov495:gpt-5.5"
+        query.message = MagicMock(chat_id=617744661)
+        query.from_user = MagicMock(id="617744661", first_name="Chip")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        env = {
+            "GPTPROF_AUTH_PATH": str(auth),
+            "GPTPROF_CONFIG_PATH": str(config),
+            "GPTPROF_HCP_DIR": str(hcp),
+            "GPTPROF_CACHE_PATH": str(cache),
+            "GPTPROF_SEND_BUTTONS": str(send_buttons),
+            "GPTPROF_ALLOWED_USER": "617744661",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.object(adapter, "_gptprof_send_card", return_value=None):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        saved_auth = json.loads(auth.read_text(encoding="utf-8"))
+        assert saved_auth["codex"]["profile"] == "markov495"
+        assert saved_auth["codex"]["email"] == "markov495@gmail.com"
+        assert saved_auth["codex"]["access_token"] == "access-markov"
+        assert saved_auth["credential_pool"]["openai-codex"][0]["access_token"] == "access-markov"
+        assert json.loads(cache.read_text(encoding="utf-8")) == {}
+        assert "provider: openai-codex" in config.read_text(encoding="utf-8")
+        assert "default: gpt-5.5" in config.read_text(encoding="utf-8")
+        query.answer.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_gptprof_callback_rejects_other_users(self, tmp_path):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "gptprof:markov495:gpt-5.5"
+        query.message = MagicMock(chat_id=617744661)
+        query.from_user = MagicMock(id="999", first_name="Mallory")
+        query.answer = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"GPTPROF_ALLOWED_USER": "617744661"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_called_once()
+        assert "authorized" in query.answer.call_args.kwargs["text"]
