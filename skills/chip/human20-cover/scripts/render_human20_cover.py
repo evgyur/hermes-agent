@@ -77,36 +77,49 @@ def render(args: argparse.Namespace) -> Path:
     d.text((badge_x, badge_y), args.badge, font=badge_font, fill='#F8FAFC')
 
     y = 174
-    for line in args.headline.split('\n')[:3]:
+    headline_bottom = y
+    headline_lines = args.headline.split('\n')[:3]
+    for line in headline_lines:
         title_font = fit_font(d, line, geologica_path if geologica_path.exists() else Path('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'), 72, 960, 42)
         d.text((58, y), line, font=title_font, fill='#FFFFFF')
+        headline_bottom = max(headline_bottom, d.textbbox((58, y), line, font=title_font)[3])
         y += int(title_font.size * 1.22)
 
+    subtitle_bottom = headline_bottom
     if args.subtitle:
         subtitle_font = fit_font(d, args.subtitle, onest_path if onest_path.exists() else Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'), 30, 960, 20)
-        d.text((58, 342), args.subtitle, font=subtitle_font, fill='#CBD5E1')
+        subtitle_y = max(342, headline_bottom + 10)
+        d.text((58, subtitle_y), args.subtitle, font=subtitle_font, fill='#CBD5E1')
+        subtitle_bottom = d.textbbox((58, subtitle_y), args.subtitle, font=subtitle_font)[3]
 
-    d.rounded_rectangle((58, 420, 1022, 800), radius=36, fill='#F8FAFC', outline='#7B8FFF', width=4)
+    # Keep the product card below the headline/subtitle. 3-line headlines with
+    # mixed Latin/Russian glyph metrics can otherwise visually collide with the
+    # white card even when the old fixed coordinates technically do not overlap.
+    card_top = max(420, subtitle_bottom + 34)
+    card_top = min(card_top, 452)
+    card_box = (58, card_top, 1022, card_top + 380)
+    d.rounded_rectangle(card_box, radius=36, fill='#F8FAFC', outline='#7B8FFF', width=4)
     if MARK.exists():
         mark = Image.open(MARK).convert('RGBA')
         mark.thumbnail((86, 54), Image.LANCZOS)
-        img.alpha_composite(mark, (88, 452))
+        img.alpha_composite(mark, (88, card_top + 32))
         title_x = 190
     else:
         title_x = 88
 
     card_font = fit_font(d, args.card_title, geologica_path if geologica_path.exists() else Path('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'), 38, 790, 24)
-    d.text((title_x, 452), args.card_title, font=card_font, fill='#0F172A')
+    d.text((title_x, card_top + 32), args.card_title, font=card_font, fill='#0F172A')
 
-    d.rounded_rectangle((88, 525, 992, 582), radius=20, fill='#EEF2FF')
+    chip_box = (88, card_top + 105, 992, card_top + 162)
+    d.rounded_rectangle(chip_box, radius=20, fill='#EEF2FF')
     chip_x = 118
     colors = ['#8A5A00', '#4F46E5', '#0F172A', '#64748B']
     for i, chip in enumerate([c.strip() for c in args.chips.split('|') if c.strip()][:4]):
         f = Onest(24)
-        d.text((chip_x, 539), chip, font=f, fill=colors[i % len(colors)])
+        d.text((chip_x, card_top + 119), chip, font=f, fill=colors[i % len(colors)])
         chip_x += text_width(d, chip, f) + 58
 
-    code_box = (88, 615, 992, 760)
+    code_box = (88, card_top + 195, 992, card_top + 340)
     d.rounded_rectangle(code_box, radius=20, fill='#0B1220')
     tone_color = {'error': '#FB7185', 'success': '#34D399', 'neutral': '#E2E8F0', 'muted': '#94A3B8'}
     code_lines = args.code[:4]

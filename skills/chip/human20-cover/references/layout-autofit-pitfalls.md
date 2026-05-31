@@ -27,11 +27,35 @@ Fix pattern:
 - shrink individual lines in a loop until `text_width <= max_text_w`, with a readable lower bound;
 - run vision QA with an actual 4-line fixture before returning media.
 
+## Headline → card vertical spacing
+
+Problem: a strong 3-line headline can visually collide with the white product/GitHub card below it. This happened with `Jailbreak / для open-source / моделей`: even when fixed coordinates were technically close, the third line looked like it touched the card.
+
+Fix pattern:
+- compute the headline/subtitle bounding box after drawing text;
+- set `card_top = max(default_card_top, subtitle_bottom + safe_gap)`;
+- move every card child using `card_top + offset`, never fixed absolute y-values;
+- keep the headline large and expressive; move the card first, shrink the headline only if CTA/footer would break.
+
+Pass condition: a clear dark-background gap between the last headline line and the white card; no touching, overlap, or visual crowding.
+
 ## QA fixture
 
-Use a fixture with four lines, because 3-line renders can hide the bug:
+Use fixtures with four code lines and a 3-line mixed Latin/Russian headline, because simpler renders can hide bugs:
 
 ```bash
+python3 scripts/render_human20_cover.py \
+  --headline $'Jailbreak\nдля open-source\nмоделей' \
+  --badge 'AI SAFETY' \
+  --subtitle '' \
+  --card-title 'GitHub: p-e-w/heretic' \
+  --chips '22.7k stars|AGPL-3.0|Gemma 3 12B' \
+  --code $'97/100 refusals → 3/100|success' \
+  --code $'KL divergence: 0.16|neutral' \
+  --code $'Optuna tunes ablation params|muted' \
+  --code $'open-weight safety = weights|error' \
+  --output /tmp/human20_cover_spacing_qa.png
+
 python3 scripts/render_human20_cover.py \
   --headline $'Агенту нужны\nглаза в интернет' \
   --badge 'AI TOOLS' \
@@ -46,6 +70,7 @@ python3 scripts/render_human20_cover.py \
 ```
 
 Vision QA must explicitly check:
+- headline/card vertical gap is clean for `Jailbreak / для open-source / моделей`;
 - badge text centered horizontally and vertically;
 - all four code lines fully inside the black box;
 - no fourth-line crop/overflow;

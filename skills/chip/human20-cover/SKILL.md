@@ -117,6 +117,7 @@ Every successful run returns:
 - [ ] Official Human20 lockup is visible in the top-left.
 - [ ] CTA is exactly `Подписаться: @human20`.
 - [ ] Cover headline is a hook, not a process label: it names the outcome, tension, or usable capability.
+- [ ] For 3-line headlines, keep a clean visual air gap before the white card; the card must move down dynamically instead of the headline touching/overlapping it.
 - [ ] Text fits inside cards/buttons and is readable on phone.
 - [ ] No misspelled repo/product names.
 - [ ] Avoid decorative glyphs in small chips (`★`, emoji, unusual symbols). They can render as tofu/broken boxes in the cover; use plain text like `80k stars` instead.
@@ -151,6 +152,11 @@ When `tg` receives `/tg human20 ...`:
 3. call this skill/script to make a cover;
 4. run one image QA pass;
 5. send preview through ChipCR only, with exact verify-gate.
+
+## Key references
+
+- `references/layout-autofit-pitfalls.md` — badge centering and 4-line code-field auto-fit lessons from live Human20 cover fixes.
+- `references/visual-contract.md` — approved Human20 cover family, fixed brand elements, variable fields, and QA failures.
 
 ## Done criteria
 
