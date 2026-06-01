@@ -918,6 +918,10 @@ def _guest_test_adapter(*, guest_mode=True, require_mention=True, allowed_chats=
             "require_mention": require_mention,
             "allowed_chats": allowed_chats or ["-100200"],
             "allowed_topics": [],
+            # Keep these unit tests focused on legacy allowed_chats/guest_mode
+            # even when the operator environment exports explicit policy lists.
+            "private_chats": [],
+            "public_chats": [],
         },
     )
     adapter = object.__new__(TelegramAdapter)

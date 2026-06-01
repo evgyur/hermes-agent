@@ -93,6 +93,7 @@ from tools.debug_helpers import DebugSession
 # tools.web_tools (the firecrawl plugin reads them via its own import chain).
 from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names for tests
     build_vendor_gateway_url,
+    peek_nous_access_token as _peek_nous_access_token,
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
@@ -129,7 +130,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "perplexity"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -138,6 +139,7 @@ def _get_backend() -> str:
     # Free-tier backends (searxng / brave-free / ddgs) trail the paid ones so
     # existing paid setups are unaffected.
     backend_candidates = (
+        ("perplexity", _has_env("PERPLEXITY_API_KEY") or _has_env("PPLX_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -217,6 +219,8 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY") or _has_env("PPLX_API_KEY")
     return False
 
 
@@ -817,10 +821,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch through the web search registry. All 7 providers
-        # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
-        # now live as plugins; the dispatcher is just a registry lookup +
-        # delegation. Sync only — every provider's search() is sync.
+        # Dispatch through the web search registry. Providers
+        # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl,
+        # xai, perplexity) live as plugins; the dispatcher is just a
+        # registry lookup + delegation. Sync only — every provider's
+        # search() is sync.
         _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
             get_active_search_provider,

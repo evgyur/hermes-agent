@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
@@ -951,7 +951,11 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> bool:
         if cls._metadata_direct_messages_topic_id(metadata) is not None:
-            return False
+            return bool(
+                metadata
+                and metadata.get("telegram_dm_topic_reply_fallback")
+                and cls._metadata_reply_to_message_id(metadata) is not None
+            )
         if metadata and metadata.get("telegram_dm_topic_created_for_send"):
             return False
         return bool(
@@ -1187,6 +1191,41 @@ class TelegramAdapter(BasePlatformAdapter):
             name = cur.__class__.__name__.lower()
             text = str(cur).lower()
             if "connecttimeout" in name or "connect timeout" in text or "connect timed out" in text:
+                return True
+            cause = getattr(cur, "__cause__", None)
+            context = getattr(cur, "__context__", None)
+            if cause is not None:
+                stack.append(cause)
+            if context is not None:
+                stack.append(context)
+        return False
+
+    @staticmethod
+    def _looks_like_pool_timeout(error: Exception) -> bool:
+        """Return True when a Telegram TimedOut wraps an httpx pool timeout.
+
+        PTB converts ``httpx.PoolTimeout`` into ``telegram.error.TimedOut`` with
+        a message that explicitly states the request was *not* sent
+        (``"Pool timeout: All connections in the connection pool are occupied.
+        Request was *not* sent to Telegram."``). Because the request never left
+        the process, re-sending is safe and cannot duplicate -- the opposite of
+        a generic TimedOut, which may have reached Telegram. We match the
+        wrapped ``httpx.PoolTimeout`` class as well as the message string so the
+        check survives PTB message-wording changes.
+        """
+        seen: set[int] = set()
+        stack: list[BaseException] = [error]
+        while stack:
+            cur = stack.pop()
+            ident = id(cur)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            name = cur.__class__.__name__.lower()
+            text = str(cur).lower()
+            if "pooltimeout" in name or "pool timeout" in text or (
+                "connection pool" in text and "occupied" in text
+            ):
                 return True
             cause = getattr(cur, "__cause__", None)
             context = getattr(cur, "__context__", None)
@@ -2374,11 +2413,15 @@ class TelegramAdapter(BasePlatformAdapter):
                         # TimedOut is also a subclass of NetworkError. A
                         # generic timeout may have reached Telegram, so don't
                         # retry; a wrapped ConnectTimeout means no connection
-                        # was established, so retrying is safe.
+                        # was established, so retrying is safe. A pool timeout
+                        # (httpx pool exhausted) is explicitly "not sent to
+                        # Telegram" -- retrying through the loop is safe and
+                        # prevents silent drops when the pool frees up.
                         if (
                             _TimedOut
                             and isinstance(send_err, _TimedOut)
                             and not self._looks_like_connect_timeout(send_err)
+                            and not self._looks_like_pool_timeout(send_err)
                         ):
                             raise
                         if _send_attempt < 2:
@@ -2438,12 +2481,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="message_too_long")
             # TimedOut usually means the request may have reached Telegram —
             # mark as non-retryable so _send_with_retry() doesn't re-send.
-            # Exception: wrapped ConnectTimeout, where no connection was
-            # established; retrying is safe and prevents silent drops.
+            # Exceptions: a wrapped ConnectTimeout (no connection established)
+            # and an httpx pool timeout (request explicitly not sent) -- both
+            # are safe to re-send and must not be silently dropped.
             _to = locals().get("_TimedOut")
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
-            return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or not is_timeout))
+            is_pool_timeout = self._looks_like_pool_timeout(e)
+            return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or is_pool_timeout or not is_timeout))
 
     async def send_or_update_status(
         self,
@@ -3462,7 +3507,7 @@ class TelegramAdapter(BasePlatformAdapter):
             group_id = data[4:]
             try:
                 from hermes_cli.models import PROVIDER_GROUPS
-                _label, member_slugs = PROVIDER_GROUPS.get(group_id, ("", []))
+                _label, _desc, member_slugs = PROVIDER_GROUPS.get(group_id, ("", "", []))
             except Exception:
                 _label, member_slugs = "", []
 
@@ -5368,6 +5413,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
+        adapter_name = getattr(getattr(self, "platform", None), "value", "Telegram").title()
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
             raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
@@ -5387,7 +5433,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(patterns, list):
             logger.warning(
                 "[%s] telegram mention_patterns must be a list or string; got %s",
-                self.name,
+                adapter_name,
                 type(patterns).__name__,
             )
             return []
@@ -5399,9 +5445,9 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 compiled.append(re.compile(pattern, re.IGNORECASE))
             except re.error as exc:
-                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", self.name, pattern, exc)
+                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", adapter_name, pattern, exc)
         if compiled:
-            logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
+            logger.info("[%s] Loaded %d Telegram mention pattern(s)", adapter_name, len(compiled))
         return compiled
 
     def _is_group_chat(self, message: Message) -> bool:

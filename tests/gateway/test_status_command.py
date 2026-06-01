@@ -96,10 +96,11 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Session ID:** `sess-1`" in result
-    assert "**Cumulative API tokens (re-sent each call):** 321" in result
-    assert "**Agent Running:** Yes ⚡" in result
-    assert "**Title:**" not in result
+    assert "🪽 **Hermes" in result
+    assert "🆔 Session ID: `sess-1`" in result
+    assert "🧮 Tokens: 200 in / 121 out · total 321" in result
+    assert "Agent: running ⚡" in result
+    assert "My titled session" not in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
 
@@ -120,8 +121,8 @@ async def test_status_command_includes_session_title_when_present():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Session ID:** `sess-1`" in result
-    assert "**Title:** My titled session" in result
+    assert "🆔 Session ID: `sess-1`" in result
+    assert "My titled session" in result
 
 
 @pytest.mark.asyncio
@@ -150,7 +151,8 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Cumulative API tokens (re-sent each call):** 1,900" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
+    assert "🗄️ Cache: 33% hit · 500 cached, 100 new" in result
 
 
 @pytest.mark.asyncio
@@ -171,7 +173,7 @@ async def test_status_command_tokens_zero_when_session_db_row_missing():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Cumulative API tokens (re-sent each call):** 0" in result
+    assert "🧮 Tokens: 0 in / 0 out · total 0" in result
 
 
 @pytest.mark.asyncio
