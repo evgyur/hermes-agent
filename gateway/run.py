@@ -11403,6 +11403,8 @@ class GatewayRunner:
                 model_cfg["provider"] = result.target_provider
                 if result.base_url:
                     model_cfg["base_url"] = result.base_url
+                if result.api_mode:
+                    model_cfg["api_mode"] = result.api_mode
                 from hermes_cli.config import save_config
                 save_config(cfg)
             except Exception as e:
