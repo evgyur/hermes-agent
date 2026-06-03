@@ -7,6 +7,19 @@ Powerpack can carry skills in two forms:
 
 Use submodules when a skill should have its own release cadence, privacy boundary, or standalone install path. The parent repo pins a commit; updates are explicit and reviewable.
 
+Current submodule skills:
+
+- `skills/chip-travel-agent` → `human20team/chip-travel-agent`
+- `skills/chip-browser-relay` → `human20team/chip-browser-relay`
+- `skills/shaw` → `evgyur/shaw-hermes`
+- `skills/server-doctor-public` → `evgyur/server-doctor-public`
+
+Current direct bundled skills added from local/private-safe packages:
+
+- `skills/create-skill`
+- `skills/perplex`
+- `skills/bird`
+
 ## Add a skill submodule
 
 ```bash
