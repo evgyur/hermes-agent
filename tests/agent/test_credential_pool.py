@@ -2906,6 +2906,47 @@ def test_is_terminal_codex_oauth_refresh_error():
     assert not _is_terminal_codex_oauth_refresh_error(ValueError("oops"))
 
 
+
+def test_codex_singleton_pool_label_follows_active_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+
+    auth = _codex_auth_store("access-token", "refresh-token")
+    auth["providers"]["openai-codex"]["tokens"].update({
+        "profile": "gptinvest23",
+        "email": "gptinvest23@gmail.com",
+        "plan": "Pro $200",
+    })
+    auth["credential_pool"] = {
+        "openai-codex": [
+            {
+                "id": "old-device",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "priority": 0,
+                "label": "device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+            }
+        ]
+    }
+    _write_auth_store(tmp_path, auth)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.entries()[0]
+    assert entry.source == "device_code"
+    assert entry.label == "gptinvest23"
+    assert entry.access_token == "access-token"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    stored_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert stored_entry["source"] == "device_code"
+    assert stored_entry["label"] == "gptinvest23"
+    assert stored_entry["access_token"] == "access-token"
+
 def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     tmp_path, monkeypatch
 ):

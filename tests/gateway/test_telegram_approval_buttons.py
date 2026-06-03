@@ -49,7 +49,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from gateway.platforms.telegram import TelegramAdapter
+from gateway.platforms.telegram import TelegramAdapter, ParseMode
 from gateway.config import Platform, PlatformConfig
 
 
@@ -688,11 +688,63 @@ class TestTelegramGptprofCallback:
         assert saved_auth["codex"]["profile"] == "markov495"
         assert saved_auth["codex"]["email"] == "markov495@gmail.com"
         assert saved_auth["codex"]["access_token"] == "access-markov"
-        assert saved_auth["credential_pool"]["openai-codex"][0]["access_token"] == "access-markov"
+        assert saved_auth["providers"]["openai-codex"]["tokens"]["access_token"] == "access-markov"
+        assert saved_auth["providers"]["openai-codex"]["tokens"]["refresh_token"] == "refresh-markov"
+        assert saved_auth["providers"]["openai-codex"]["auth_mode"] == "chatgpt"
+        assert saved_auth["active_provider"] == "openai-codex"
+        pool_entry = saved_auth["credential_pool"]["openai-codex"][0]
+        assert pool_entry["source"] == "gptprof:markov495"
+        assert pool_entry["profile"] == "markov495"
+        assert pool_entry["label"] == "markov495"
+        assert pool_entry["access_token"] == "access-markov"
+        assert pool_entry["refresh_token"] == "refresh-markov"
+        assert pool_entry["priority"] == 0
         assert json.loads(cache.read_text(encoding="utf-8")) == {}
         assert "provider: openai-codex" in config.read_text(encoding="utf-8")
         assert "default: gpt-5.5" in config.read_text(encoding="utf-8")
         query.answer.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_gptprof_new_auth_can_target_specific_profile(self, tmp_path):
+        adapter = _make_adapter()
+        auth = tmp_path / "auth.json"
+        auth.write_text(json.dumps({"codex": {"profile": "mynightfly"}}), encoding="utf-8")
+
+        query = AsyncMock()
+        query.data = "gptprof:new_auth:gptinvest23"
+        query.message = MagicMock(chat_id=617744661)
+        query.from_user = MagicMock(id="617744661", first_name="Chip")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        def close_created_task(coro):
+            coro.close()
+            return MagicMock()
+
+        env = {
+            "GPTPROF_AUTH_PATH": str(auth),
+            "GPTPROF_ALLOWED_USER": "617744661",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.object(adapter, "_gptprof_post_json", return_value={
+                "user_code": "ABCD-EFGH",
+                "interval": "5",
+                "device_auth_id": "deviceauth-test",
+            }) as post_json:
+                with patch.object(adapter, "_gptprof_poll_device_auth", AsyncMock()) as poll:
+                    with patch("gateway.platforms.telegram.asyncio.create_task", side_effect=close_created_task):
+                        await adapter._handle_callback_query(update, MagicMock())
+
+        post_json.assert_called_once()
+        poll.assert_called_once()
+        assert poll.call_args.args[0] == "gptinvest23"
+        query.answer.assert_called_once()
+        assert "gptinvest23" in query.answer.call_args.kwargs["text"]
+        assert "New auth for gptinvest23" in query.edit_message_text.call_args.kwargs["text"]
+        assert "<code>ABCD-EFGH</code>" in query.edit_message_text.call_args.kwargs["text"]
+        assert query.edit_message_text.call_args.kwargs["parse_mode"] == ParseMode.HTML
+
 
     @pytest.mark.asyncio
     async def test_gptprof_callback_rejects_other_users(self, tmp_path):

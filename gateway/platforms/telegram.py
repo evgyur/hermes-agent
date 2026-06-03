@@ -3635,30 +3635,52 @@ class TelegramAdapter(BasePlatformAdapter):
         })
         auth["codex"] = codex
 
+        providers = auth.setdefault("providers", {})
+        provider_state = providers.setdefault("openai-codex", {})
+        provider_tokens = dict(provider_state.get("tokens") or {})
+        provider_tokens.update({
+            "profile": slug,
+            "email": profile.get("email"),
+            "plan": profile.get("plan"),
+            "access_token": profile.get("access_token"),
+            "refresh_token": profile.get("refresh_token"),
+        })
+        provider_state["tokens"] = provider_tokens
+        provider_state["auth_mode"] = "chatgpt"
+        provider_state.pop("last_auth_error", None)
+        auth["active_provider"] = "openai-codex"
+
         pool_root = auth.setdefault("credential_pool", {})
         pool = pool_root.setdefault("openai-codex", [])
         if not isinstance(pool, list):
             pool = []
             pool_root["openai-codex"] = pool
         source = f"gptprof:{slug}"
-        updated = False
+        selected_entry = {
+            "source": source,
+            "profile": slug,
+            "label": slug,
+            "provider": "openai-codex",
+            "email": profile.get("email"),
+            "plan": profile.get("plan"),
+            "access_token": profile.get("access_token"),
+            "refresh_token": profile.get("refresh_token"),
+            "priority": 0,
+            "last_status": "ok",
+            "last_status_at": time.time(),
+        }
+        remaining_pool = []
         for item in pool:
-            if isinstance(item, dict) and item.get("source") in {source, "device_code"}:
-                item.update({
-                    "access_token": profile.get("access_token"),
-                    "refresh_token": profile.get("refresh_token"),
-                    "last_status": "ok",
-                    "last_status_at": time.time(),
-                })
-                updated = True
-        if not updated:
-            pool.append({
-                "source": source,
-                "access_token": profile.get("access_token"),
-                "refresh_token": profile.get("refresh_token"),
-                "last_status": "ok",
-                "last_status_at": time.time(),
-            })
+            if not isinstance(item, dict):
+                continue
+            item_source = str(item.get("source") or "")
+            item_profile = str(item.get("profile") or item.get("label") or "")
+            if item_source in {source, "device_code"} or item_profile == slug:
+                continue
+            if item.get("priority") == 0:
+                item = {**item, "priority": 10}
+            remaining_pool.append(item)
+        pool_root["openai-codex"] = [selected_entry, *remaining_pool]
         self._gptprof_save_json(paths["auth"], auth)
 
         # Persist the model route so a gateway restart keeps the selected GPT profile on 5.5.
@@ -3780,10 +3802,13 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._gptprof_send_card)
             return
 
-        if data == "gptprof:new_auth":
+        if data == "gptprof:new_auth" or data.startswith("gptprof:new_auth:"):
             paths = self._gptprof_paths()
             auth = self._gptprof_load_json(paths["auth"], {})
-            slug = str(((auth.get("codex") or {}) if isinstance(auth, dict) else {}).get("profile") or "markov495")
+            if data.startswith("gptprof:new_auth:"):
+                slug = data.rsplit(":", 1)[-1].strip()
+            else:
+                slug = str(((auth.get("codex") or {}) if isinstance(auth, dict) else {}).get("profile") or "markov495")
             issuer = "https://auth.openai.com"
             client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
             try:
@@ -3798,11 +3823,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text=f"Auth code for {slug}: {code}")
                 await query.edit_message_text(
                     text=(
-                        f"➕ New auth for {slug}\n\n"
+                        f"➕ New auth for {_html.escape(slug)}\n\n"
                         f"Open: {issuer}/codex/device\n"
-                        f"Code: {code}\n\n"
+                        f"Code: <code>{_html.escape(code)}</code>\n\n"
                         "Log into the matching ChatGPT account, then return here."
-                    )
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
             except Exception as exc:
                 logger.exception("Failed to start gptprof device auth: %s", exc)

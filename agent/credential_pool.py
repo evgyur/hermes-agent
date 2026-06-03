@@ -1513,7 +1513,12 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
         if key in {"id", "priority"} or value is None:
             continue
         if key == "label" and existing.label:
-            continue
+            # Codex gptprof/profile switches rewrite providers.openai-codex.tokens
+            # with the selected ChatGPT profile. The singleton-seeded pool entry
+            # intentionally stays source=device_code, but its visible label must
+            # follow the active profile instead of staying stuck on the first seed.
+            if not (provider == "openai-codex" and source == "device_code"):
+                continue
         if key in _field_names:
             if getattr(existing, key) != value:
                 field_updates[key] = value
@@ -1847,7 +1852,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
-                    "label": label_from_token(tokens.get("access_token", ""), "device_code"),
+                    "label": str(tokens.get("profile") or tokens.get("email") or "").strip() or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
 
