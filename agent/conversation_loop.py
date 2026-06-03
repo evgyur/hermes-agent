@@ -172,14 +172,6 @@ def _should_use_streaming_api(agent: Any) -> bool:
     ):
         return False
 
-    # Human20's local pilot gateway intentionally exposes only the
-    # non-streaming OpenAI-compatible path. Letting the first attempt hit
-    # streaming costs a failing 501 and delays Telegram replies.
-    if provider == "custom" and (
-        "127.0.0.1:18741" in base_url or "localhost:18741" in base_url
-    ):
-        return False
-
     if not agent._has_stream_consumers():
         # No display/TTS consumer. Still prefer streaming for health checking,
         # but skip for Mock clients in tests (mocks return SimpleNamespace,

@@ -1575,8 +1575,8 @@ class TestCopilotACPStreamingDecision:
         assert _use_streaming is True
 
 class TestLocalCustomGatewayStreamingDecision:
-    def test_h20_local_gateway_uses_non_streaming_transport(self):
-        """Human20 pilot gateway returns 501 for streaming requests."""
+    def test_h20_local_gateway_keeps_streaming_enabled(self):
+        """Human20 gateway now supports OpenAI-compatible SSE streaming."""
         from agent.conversation_loop import _should_use_streaming_api
 
         agent = SimpleNamespace(
@@ -1587,7 +1587,7 @@ class TestLocalCustomGatewayStreamingDecision:
             _has_stream_consumers=lambda: True,
         )
 
-        assert _should_use_streaming_api(agent) is False
+        assert _should_use_streaming_api(agent) is True
 
     def test_other_custom_gateway_keeps_streaming_enabled(self):
         from agent.conversation_loop import _should_use_streaming_api
