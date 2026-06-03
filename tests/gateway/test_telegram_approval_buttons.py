@@ -395,6 +395,11 @@ class TestTelegramApprovalCallback:
 
         commands = [call.args[0] for call in run.call_args_list]
         assert any("subc_transition.py" in " ".join(cmd) and "approved" in cmd for cmd in commands)
+        transition_cmd = commands[0]
+        assert "--room" in transition_cmd
+        assert "--intent-id" in transition_cmd
+        assert "--decision" in transition_cmd
+        assert "--approver" in transition_cmd
         assert any("subc_build_packet.py" in " ".join(cmd) for cmd in commands)
         assert any("subc_shaw_enqueue.py" in " ".join(cmd) for cmd in commands)
         state = json.loads((room / "posted_pending_intents.json").read_text())
@@ -405,6 +410,46 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called()
         query.edit_message_text.assert_called_once()
         assert query.edit_message_text.call_args.kwargs["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_subconscious_callback_uses_default_room_when_env_missing(self, tmp_path, monkeypatch):
+        adapter = _make_adapter()
+        room = tmp_path / "room"
+        project = tmp_path / "project"
+        room.mkdir()
+        project.mkdir()
+        (room / "posted_pending_intents.json").write_text(
+            '{"posted":{"intent_mem0g-health-issue":{"message_id":12854,"path":"pending_intents/intent_mem0g-health-issue.yaml","callback_token":"tok"}},"tokens":{"tok":"intent_mem0g-health-issue"}}\n'
+        )
+
+        query = AsyncMock()
+        query.data = "subc:y:tok"
+        query.message = MagicMock()
+        query.message.chat_id = -1003971448755
+        query.message.message_id = 12854
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = "617744661"
+        query.from_user.first_name = 'Evgeny "Chip"'
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        monkeypatch.delenv("SUBC_ROOM", raising=False)
+        monkeypatch.delenv("SUBC_PROJECT", raising=False)
+        monkeypatch.setattr("gateway.platforms.telegram.SUBC_DEFAULT_ROOM", room)
+        monkeypatch.setattr("gateway.platforms.telegram.SUBC_DEFAULT_PROJECT", project)
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout='{"ok":true,"build_packet":"bp.json","shaw_run":"sr.json"}', stderr="")
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("gateway.platforms.telegram.subprocess.run", return_value=completed):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_called()
+        assert "Failed to resolve" not in query.answer.call_args.kwargs.get("text", "")
+        state = json.loads((room / "posted_pending_intents.json").read_text())
+        assert "tok" not in state.get("tokens", {})
 
     @pytest.mark.asyncio
     async def test_deny_button(self):
