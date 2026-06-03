@@ -19294,10 +19294,7 @@ class GatewayRunner:
                             first_media_files = []
                             first_local_files = []
                             try:
-                                from gateway.platforms.base import (
-                                    BasePlatformAdapter,
-                                    should_send_media_as_audio,
-                                )
+                                from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
 
                                 media_files, cleaned = adapter.extract_media(first_response)
                                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -19349,7 +19346,7 @@ class GatewayRunner:
                                     )
                                 for media_path, is_voice in non_image_media:
                                     ext = Path(media_path).suffix.lower()
-                                    if should_send_media_as_audio(source.platform, ext, is_voice=is_voice):
+                                    if _should_send_media_as_audio(source.platform, ext, is_voice=is_voice):
                                         media_result = await adapter.send_voice(
                                             chat_id=source.chat_id,
                                             audio_path=media_path,
