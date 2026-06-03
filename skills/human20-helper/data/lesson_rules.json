@@ -1,0 +1,132 @@
+{
+  "lessons": [
+    {
+      "id": "lesson-1",
+      "title": "Cursor: первые шаги, интерфейс, три режима работы. Делаем сайт-визитку",
+      "homeworkTaskIds": ["l1-1", "l1-2", "l1-3", "l1-4"],
+      "nextStep": "Открыть материал урока и сверить, остались ли незавершённые шаги по сайту-портфолио.",
+      "practicalActions": [
+        "Открыть проект portfolio-site и проверить, что сайт запускается локально.",
+        "Сверить, что в проекте есть основные страницы и тексты портфолио.",
+        "Если что-то устарело, обновить содержимое сайта под текущий профиль."
+      ],
+      "requiredEvidence": [
+        "portfolio_project_exists",
+        "portfolio_git_repo",
+        "portfolio_site_files"
+      ],
+      "softEvidence": [
+        "portfolio_mentions"
+      ],
+      "fallbackQuestions": [
+        "Ты действительно собирал сайт-портфолио в рамках первого урока?",
+        "Сайт-портфолио у тебя уже был задеплоен или только локально собран?"
+      ]
+    },
+    {
+      "id": "lesson-2",
+      "title": "Как за один урок вывести сайт в интернет и добавить умного помощника",
+      "homeworkTaskIds": ["l2-1", "l2-4"],
+      "nextStep": "Проверить деплой и, если нужно, восстановить рабочий live-flow сайта и помощника.",
+      "practicalActions": [
+        "Проверить, что деплой-контур для portfolio-site ещё актуален.",
+        "Проверить live demo или текущую публичную ссылку сайта.",
+        "Сверить, что сайтовый помощник или chat API не сломаны."
+      ],
+      "requiredEvidence": [
+        "portfolio_git_remote",
+        "portfolio_vercel_traces"
+      ],
+      "softEvidence": [
+        "portfolio_live_demo_link",
+        "portfolio_chat_api"
+      ],
+      "fallbackQuestions": [
+        "Сайт уже публиковался наружу через Vercel или другой хостинг?",
+        "Умный помощник на сайте реально запускался или пока только планировался?"
+      ]
+    },
+    {
+      "id": "lesson-3",
+      "title": "Добавляем модель MiniMax + AGENTS.MD + WEBD скил. Разгоняем Cursor до PRO уровня",
+      "homeworkTaskIds": ["l3-1", "l3-2", "l3-3", "l3-4", "l3-5"],
+      "nextStep": "Сверить текущий агентный workflow с уроком 3 и добить пробелы, если они остались.",
+      "practicalActions": [
+        "Проверить, что MiniMax всё ещё подключён и реально доступен.",
+        "Сверить AGENTS.md с текущим способом работы.",
+        "Проверить, что webd используется как часть реального workflow, а не просто лежит в skills."
+      ],
+      "requiredEvidence": [
+        "minimax_configured",
+        "agents_md_exists",
+        "webd_skill_exists"
+      ],
+      "softEvidence": [],
+      "fallbackQuestions": []
+    },
+    {
+      "id": "lesson-4",
+      "title": "OpenClaw: установка, запуск бота и персонализация ассистента",
+      "homeworkTaskIds": ["l4-1", "l4-2", "l4-3", "l4-4", "l4-5", "l4-6"],
+      "nextStep": "Сверить текущий OpenClaw-контур и, если нужно, добить недостающую персонализацию или channel setup.",
+      "practicalActions": [
+        "Проверить, что OpenClaw запускается и Telegram-контур живой.",
+        "Сверить persona-файлы и правила общения с текущими привычками.",
+        "Проверить, нет ли хвостов в конфиге или авторизациях."
+      ],
+      "requiredEvidence": [
+        "openclaw_config_exists",
+        "telegram_enabled",
+        "persona_files_exist"
+      ],
+      "softEvidence": [],
+      "fallbackQuestions": []
+    },
+    {
+      "id": "lesson-5",
+      "title": "Skills + каналы + безопасность. Ставим рабочую операционку ассистента",
+      "homeworkTaskIds": ["l5-1", "l5-2", "l5-3"],
+      "nextStep": "Проверить skills/channel/security контур и выбрать, что стоит усилить дальше.",
+      "practicalActions": [
+        "Проверить, какие skills реально используются регулярно.",
+        "Сверить security-правила и каналы с текущим контуром работы.",
+        "Определить, какие skills уже можно считать устойчивыми, а какие требуют cleanup."
+      ],
+      "requiredEvidence": [
+        "security_skill_exists",
+        "tg_skill_exists",
+        "digest_skill_exists"
+      ],
+      "softEvidence": [
+        "create_skills_exists",
+        "tgpublish_exists"
+      ],
+      "fallbackQuestions": []
+    },
+    {
+      "id": "lesson-6",
+      "title": "Google + TG канал на автопилоте: Chromium, API и контент-конвейер",
+      "homeworkTaskIds": ["l6-1", "l6-2", "l6-3", "l6-4", "l6-5", "l6-6"],
+      "nextStep": "Проверить Google/TG/Chromium контур и добить automation loop, если он ещё не полностью устойчив.",
+      "practicalActions": [
+        "Проверить, жив ли Google OAuth-контур и не протухли ли доступы.",
+        "Сверить, что digest/cron/publish flow всё ещё работают как единый контур.",
+        "Определить, где pipeline уже устойчивый, а где ещё есть ручные костыли."
+      ],
+      "requiredEvidence": [
+        "chro_skill_exists",
+        "digest_skill_exists",
+        "tgpublish_exists",
+        "plan_times_exists"
+      ],
+      "softEvidence": [
+        "google_oauth_memory",
+        "digest_cron_memory",
+        "telegram_publish_memory"
+      ],
+      "fallbackQuestions": [
+        "Google-контур реально уже работал в бою или пока только настраивался?"
+      ]
+    }
+  ]
+}
