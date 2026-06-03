@@ -19290,11 +19290,111 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
+                            first_response_text = first_response
+                            first_media_files = []
+                            first_local_files = []
+                            try:
+                                from gateway.platforms.base import (
+                                    BasePlatformAdapter,
+                                    should_send_media_as_audio,
+                                )
+
+                                media_files, cleaned = adapter.extract_media(first_response)
+                                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                                _, cleaned = adapter.extract_images(cleaned)
+                                local_files, cleaned = adapter.extract_local_files(cleaned)
+                                local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+                                if media_files or local_files:
+                                    first_response_text = cleaned.strip()
+                                    first_media_files = list(media_files)
+                                    first_local_files = list(local_files)
+                            except Exception as media_extract_err:
+                                logger.warning(
+                                    "Queued follow-up media extraction failed for session %s: %s",
+                                    session_key or "?",
+                                    media_extract_err,
+                                )
+
+                            if first_response_text:
+                                await adapter.send(
+                                    source.chat_id,
+                                    first_response_text,
+                                    metadata=_status_thread_metadata,
+                                )
+
+                            if first_media_files or first_local_files:
+                                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+                                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+                                from urllib.parse import quote as _quote
+                                image_paths = []
+                                non_image_media = []
+                                for media_path, is_voice in first_media_files:
+                                    ext = Path(media_path).suffix.lower()
+                                    if ext in _IMAGE_EXTS and not is_voice:
+                                        image_paths.append(media_path)
+                                    else:
+                                        non_image_media.append((media_path, is_voice))
+                                non_image_local = []
+                                for file_path in first_local_files:
+                                    if Path(file_path).suffix.lower() in _IMAGE_EXTS:
+                                        image_paths.append(file_path)
+                                    else:
+                                        non_image_local.append(file_path)
+                                if image_paths:
+                                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                                    await adapter.send_multiple_images(
+                                        chat_id=source.chat_id,
+                                        images=images,
+                                        metadata=_status_thread_metadata,
+                                    )
+                                for media_path, is_voice in non_image_media:
+                                    ext = Path(media_path).suffix.lower()
+                                    if should_send_media_as_audio(source.platform, ext, is_voice=is_voice):
+                                        media_result = await adapter.send_voice(
+                                            chat_id=source.chat_id,
+                                            audio_path=media_path,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    elif ext in _VIDEO_EXTS:
+                                        media_result = await adapter.send_video(
+                                            chat_id=source.chat_id,
+                                            video_path=media_path,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    else:
+                                        media_result = await adapter.send_document(
+                                            chat_id=source.chat_id,
+                                            file_path=media_path,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    if not getattr(media_result, "success", False):
+                                        logger.warning(
+                                            "Queued follow-up media delivery failed for session %s (%s): %s",
+                                            session_key or "?",
+                                            ext,
+                                            getattr(media_result, "error", None),
+                                        )
+                                for file_path in non_image_local:
+                                    ext = Path(file_path).suffix.lower()
+                                    if ext in _VIDEO_EXTS:
+                                        file_result = await adapter.send_video(
+                                            chat_id=source.chat_id,
+                                            video_path=file_path,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    else:
+                                        file_result = await adapter.send_document(
+                                            chat_id=source.chat_id,
+                                            file_path=file_path,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    if not getattr(file_result, "success", False):
+                                        logger.warning(
+                                            "Queued follow-up file delivery failed for session %s (%s): %s",
+                                            session_key or "?",
+                                            ext,
+                                            getattr(file_result, "error", None),
+                                        )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
