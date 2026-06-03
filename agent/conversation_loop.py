@@ -154,6 +154,43 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+def _should_use_streaming_api(agent: Any) -> bool:
+    """Return whether the next model call should use the streaming transport."""
+    if getattr(agent, "_disable_streaming", False):
+        return False
+
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+
+    # CopilotACPClient communicates via subprocess stdio and returns a plain
+    # SimpleNamespace, not an iterable stream. Mirror the ACP exclusion used
+    # for Responses API upgrade.
+    if (
+        provider == "copilot-acp"
+        or base_url.startswith("acp://copilot")
+        or base_url.startswith("acp+tcp://")
+    ):
+        return False
+
+    # Human20's local pilot gateway intentionally exposes only the
+    # non-streaming OpenAI-compatible path. Letting the first attempt hit
+    # streaming costs a failing 501 and delays Telegram replies.
+    if provider == "custom" and (
+        "127.0.0.1:18741" in base_url or "localhost:18741" in base_url
+    ):
+        return False
+
+    if not agent._has_stream_consumers():
+        # No display/TTS consumer. Still prefer streaming for health checking,
+        # but skip for Mock clients in tests (mocks return SimpleNamespace,
+        # not stream iterators).
+        from unittest.mock import Mock
+        if isinstance(getattr(agent, "client", None), Mock):
+            return False
+
+    return True
+
+
 def _billing_or_entitlement_message(
     *,
     capability: str,
@@ -1276,31 +1313,7 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
-                # Provider signaled "stream not supported" on a previous
-                # attempt — switch to non-streaming for the rest of this
-                # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
-                    _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider == "copilot-acp"
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                elif not agent._has_stream_consumers():
-                    # No display/TTS consumer. Still prefer streaming for
-                    # health checking, but skip for Mock clients in tests
-                    # (mocks return SimpleNamespace, not stream iterators).
-                    from unittest.mock import Mock
-                    if isinstance(getattr(agent, "client", None), Mock):
-                        _use_streaming = False
-
-                if _use_streaming:
+                if _should_use_streaming_api(agent):
                     response = agent._interruptible_streaming_api_call(
                         api_kwargs, on_first_delta=_stop_spinner
                     )
