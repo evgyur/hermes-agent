@@ -882,6 +882,89 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
 
 
+def _load_config_from_home(home: Path) -> dict:
+    """Load a config.yaml from an explicit Hermes home without changing global env."""
+    cfg_path = Path(home) / "config.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        import yaml as _yaml
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = _yaml.safe_load(f) or {}
+        from hermes_cli.config import _expand_env_vars
+        return _expand_env_vars(cfg)
+    except Exception as exc:
+        logger.warning("Failed to load profile config from %s: %s", cfg_path, exc)
+        return {}
+
+
+def _resolve_gateway_profile_route(user_config: dict, source: Any) -> tuple[Optional[str], Optional[Path]]:
+    """Resolve optional per-chat gateway profile routing.
+
+    Supported platform config shapes, e.g. under ``telegram``:
+    ``profile_routes: {"<chat_id>": "profile"}``,
+    ``chat_profiles: {"<chat_id>": "profile"}``,
+    ``channel_profiles: {"<chat_id>": "profile"}``, or
+    ``profile_routes: [{chats: [...], profile: "profile"}]``.
+    """
+    try:
+        platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", "") or "")
+        platform_cfg = (user_config or {}).get(platform) or {}
+        if not isinstance(platform_cfg, dict):
+            return None, None
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+
+        def _candidate_from_mapping(obj):
+            if not isinstance(obj, dict):
+                return None
+            candidates = [f"{chat_id}:{thread_id}", chat_id]
+            if chat_id.lstrip("-").isdigit():
+                candidates.append(int(chat_id))
+            for candidate in candidates:
+                if candidate in obj:
+                    return obj[candidate]
+            return None
+
+        raw_profile = None
+        for key in ("profile_routes", "chat_profiles", "channel_profiles"):
+            routes = platform_cfg.get(key)
+            raw_profile = _candidate_from_mapping(routes)
+            if raw_profile:
+                break
+            if isinstance(routes, list):
+                for item in routes:
+                    if not isinstance(item, dict):
+                        continue
+                    chats = item.get("chats") or item.get("chat_ids") or item.get("channels") or []
+                    if isinstance(chats, (str, int)):
+                        chats = [chats]
+                    chat_matches = chat_id in {str(c) for c in chats}
+                    threads = item.get("threads") or item.get("thread_ids")
+                    if threads is not None:
+                        if isinstance(threads, (str, int)):
+                            threads = [threads]
+                        chat_matches = chat_matches and thread_id in {str(t) for t in threads}
+                    if chat_matches:
+                        raw_profile = item.get("profile") or item.get("name")
+                        break
+            if raw_profile:
+                break
+
+        if not raw_profile:
+            return None, None
+
+        from hermes_cli.profiles import normalize_profile_name, profile_exists, get_profile_dir
+        profile_name = normalize_profile_name(str(raw_profile))
+        if not profile_exists(profile_name):
+            logger.warning("Gateway profile route for chat %s points to missing profile %r", chat_id, profile_name)
+            return None, None
+        return profile_name, get_profile_dir(profile_name)
+    except Exception as exc:
+        logger.warning("Gateway profile route resolution failed: %s", exc)
+        return None, None
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -8420,6 +8503,19 @@ class GatewayRunner:
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
                             sanitized_env["HERMES_COMMAND_NAME"] = command
                             sanitized_env["HERMES_COMMAND_ARGS"] = user_args
+                            # Safe origin metadata for detached quick-command workers.
+                            # This lets launcher-style commands complete asynchronously
+                            # and deliver back to the same chat/topic without exposing
+                            # credentials in the subprocess env.
+                            try:
+                                _src = event.source
+                                if _src is not None:
+                                    sanitized_env["HERMES_ORIGIN_PLATFORM"] = getattr(_src.platform, "value", str(_src.platform))
+                                    sanitized_env["HERMES_ORIGIN_CHAT_ID"] = str(_src.chat_id or "")
+                                    sanitized_env["HERMES_ORIGIN_THREAD_ID"] = str(_src.thread_id or "")
+                                    sanitized_env["HERMES_ORIGIN_USER_ID"] = str(_src.user_id or "")
+                            except Exception:
+                                pass
                             proc = await asyncio.create_subprocess_shell(
                                 run_cmd,
                                 stdout=asyncio.subprocess.PIPE,
@@ -17124,6 +17220,19 @@ class GatewayRunner:
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
+        routed_profile_name, routed_profile_home = _resolve_gateway_profile_route(user_config, source)
+        if routed_profile_home is not None:
+            profile_config = _load_config_from_home(routed_profile_home)
+            if profile_config:
+                user_config = profile_config
+            logger.info(
+                "Gateway profile route active: platform=%s chat=%s thread=%s profile=%s home=%s",
+                getattr(getattr(source, "platform", None), "value", source.platform),
+                getattr(source, "chat_id", None),
+                getattr(source, "thread_id", None),
+                routed_profile_name,
+                routed_profile_home,
+            )
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -17828,6 +17937,20 @@ class GatewayRunner:
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
             _reload_runtime_env_preserving_config_authority()
+            _profile_home_token = None
+            if routed_profile_home is not None:
+                try:
+                    from hermes_constants import set_hermes_home_override
+                    _profile_home_token = set_hermes_home_override(routed_profile_home)
+                    load_hermes_dotenv(
+                        hermes_home=Path(routed_profile_home),
+                        project_env=Path(__file__).resolve().parents[1] / '.env',
+                    )
+                    _profile_agent_cfg = (user_config.get("agent") or {}) if isinstance(user_config, dict) else {}
+                    if isinstance(_profile_agent_cfg, dict) and "max_turns" in _profile_agent_cfg:
+                        os.environ["HERMES_MAX_ITERATIONS"] = str(_profile_agent_cfg["max_turns"])
+                except Exception as _profile_env_exc:
+                    logger.warning("Gateway profile route env setup failed for %s: %s", routed_profile_home, _profile_env_exc)
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -17840,6 +17963,12 @@ class GatewayRunner:
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                if _profile_home_token is not None:
+                    try:
+                        from hermes_constants import reset_hermes_home_override
+                        reset_hermes_home_override(_profile_home_token)
+                    except Exception:
+                        pass
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
@@ -18435,6 +18564,12 @@ class GatewayRunner:
                     _conversation_kwargs["persist_user_message"] = message
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
+                if _profile_home_token is not None:
+                    try:
+                        from hermes_constants import reset_hermes_home_override
+                        reset_hermes_home_override(_profile_home_token)
+                    except Exception:
+                        pass
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
