@@ -1,0 +1,3 @@
+[submodule "skills/chip-travel-agent"]
+	path = skills/chip-travel-agent
+	url = https://github.com/human20team/chip-travel-agent.git
