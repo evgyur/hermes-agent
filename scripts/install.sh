@@ -1155,6 +1155,19 @@ clone_repo() {
         git checkout --detach "$INSTALL_COMMIT"
     fi
 
+    if [ -f .gitmodules ]; then
+        log_info "Initializing bundled skill submodules..."
+        if git submodule update --init \
+            skills/chip-browser-relay \
+            skills/chip-travel-agent \
+            skills/server-doctor-public \
+            skills/shaw; then
+            log_success "Bundled skill submodules ready"
+        else
+            log_warn "Some bundled skill submodules failed to initialize; continuing without optional operator skills"
+        fi
+    fi
+
     log_success "Repository ready"
 }
 

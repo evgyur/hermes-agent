@@ -29,6 +29,19 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if [ -f .gitmodules ]; then
+    echo "→ Initializing bundled skill submodules..."
+    if git submodule update --init \
+        skills/chip-browser-relay \
+        skills/chip-travel-agent \
+        skills/server-doctor-public \
+        skills/shaw; then
+        echo "✓ Bundled skill submodules ready"
+    else
+        echo "⚠ Some bundled skill submodules failed to initialize; continuing without optional operator skills"
+    fi
+fi
+
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
