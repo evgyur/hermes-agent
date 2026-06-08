@@ -6,7 +6,10 @@ Mirrors test_telegram_approval_buttons.py for the new ``send_clarify`` and
 
 import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -48,7 +51,9 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.platforms.telegram import TelegramAdapter
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import GatewayRunner
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 def _make_adapter(extra=None):
@@ -57,6 +62,44 @@ def _make_adapter(extra=None):
     adapter._bot = AsyncMock()
     adapter._app = MagicMock()
     return adapter
+
+
+@pytest.fixture()
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+
+
+def _make_goal_runner(adapter: TelegramAdapter, source: SessionSource):
+    session_key = build_session_key(source)
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id=f"clarify-button-goal-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type=source.chat_type,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test-token")},
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._queued_events = {}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = session_key
+    adapter._message_handler = runner._handle_message
+    return SimpleNamespace(runner=runner, session=session_entry, session_key=session_key)
 
 
 def _clear_clarify_state():
@@ -290,6 +333,7 @@ class TestTelegramClarifyCallback:
         query.data = "cl:cidGone:0"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.text = "Pick"
         query.from_user = MagicMock()
         query.from_user.id = "777"
         query.from_user.first_name = "Tester"
@@ -305,6 +349,170 @@ class TestTelegramClarifyCallback:
         query.answer.assert_called_once()
         # Should NOT resolve anything
         assert "already" in query.answer.call_args[1]["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_stale_supergoal_start_button_dispatches_goal_message(self):
+        adapter = _make_adapter()
+        handled = []
+
+        async def _handler(event):
+            handled.append(event)
+            return "ok"
+
+        adapter._message_handler = _handler
+        query = AsyncMock()
+        query.data = "cl:gone:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.chat.full_name = "Tester"
+        query.message.message_id = 44
+        query.message.message_thread_id = None
+        query.message.text = (
+            "Одобрение SuperGoal\n\n"
+            "SUPERGOAL_GOAL_BODY: Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+            "1. Start now\n2. Adjust assumption"
+        )
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.from_user.full_name = "Tester User"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        query.answer.assert_called_once()
+        assert "Starting" in query.answer.call_args[1]["text"]
+        assert len(handled) == 1
+        assert handled[0].text == "/goal Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
+        assert handled[0].source.chat_id == "12345"
+
+    @pytest.mark.asyncio
+    async def test_live_supergoal_start_button_queues_goal_after_clarify(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register("cidSG", "sk-sg", "Pick", ["Start now", "Adjust"])
+        adapter._clarify_state["cidSG"] = "sk-sg"
+
+        query = AsyncMock()
+        query.data = "cl:cidSG:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.chat.full_name = "Tester"
+        query.message.message_id = 45
+        query.message.message_thread_id = None
+        query.message.text = (
+            "Одобрение SuperGoal\n\n"
+            "SUPERGOAL_GOAL_BODY: Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+            "1. Start now\n2. Adjust assumption"
+        )
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.from_user.full_name = "Tester User"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        assert adapter._pending_messages["sk-sg"].text == (
+            "/goal Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
+        )
+        with cm._lock:
+            entry = cm._entries.get("cidSG")
+        assert entry is not None
+        assert entry.response == "Start now"
+
+    def test_supergroup_topic_callback_uses_group_session_key_shape(self):
+        adapter = _make_adapter()
+
+        query = SimpleNamespace()
+        query.message = MagicMock()
+        query.message.chat_id = -1003971448755
+        query.message.chat.type = "supergroup"
+        query.message.chat.title = "Sigurd // Dev"
+        query.message.message_id = 16624
+        query.message.message_thread_id = 1858
+        query.from_user = MagicMock()
+        query.from_user.id = "617744661"
+        query.from_user.full_name = 'Evgeny "Chip"'
+
+        event = adapter._build_supergoal_callback_event(query, "Run `.supergoal/demo`.")
+
+        assert event is not None
+        assert event.source.chat_type == "group"
+        assert event.source.thread_id == "1858"
+        assert build_session_key(event.source) == "agent:main:telegram:group:-1003971448755:1858"
+
+    @pytest.mark.asyncio
+    async def test_live_supergoal_start_button_starts_goal_via_bound_runner(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="777",
+            chat_id="12345",
+            user_name="Tester User",
+            chat_type="dm",
+        )
+        bound = _make_goal_runner(adapter, source)
+        cm.register("cidSGRun", bound.session_key, "Pick", ["Start now", "Adjust"])
+        adapter._clarify_state["cidSGRun"] = bound.session_key
+
+        query = AsyncMock()
+        query.data = "cl:cidSGRun:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.chat.full_name = "Tester"
+        query.message.message_id = 46
+        query.message.message_thread_id = None
+        query.message.text = (
+            "Одобрение SuperGoal\n\n"
+            "SUPERGOAL_GOAL_BODY: Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+            "1. Start now\n2. Adjust assumption"
+        )
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.from_user.full_name = "Tester User"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        state = GoalManager(bound.session.session_id).state
+        assert state is not None
+        assert state.status == "active"
+        assert state.goal == "Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
+        assert adapter._pending_messages[bound.session_key].text == state.goal
+        assert not adapter._pending_messages[bound.session_key].text.startswith("/goal")
+        assert bound.runner._session_reasoning_overrides[bound.session_key]["effort"] == "xhigh"
+
+        with cm._lock:
+            entry = cm._entries.get("cidSGRun")
+        assert entry is not None
+        assert entry.response == "Start now"
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self):

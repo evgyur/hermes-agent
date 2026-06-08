@@ -128,3 +128,150 @@ async def test_goal_status_reply_does_not_replace_goal(hermes_home, runner):
     assert "existing goal" in response
     assert "This text must not replace" not in response
     assert GoalManager(runner.session.session_id).state.goal == "existing goal"
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_strips_supergoal_body_prefix_and_sets_high(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4",
+        reply_to_message_id="body-1",
+        reply_to_text=(
+            "SUPERGOAL_GOAL_BODY: Execute all phases from "
+            "/tmp/project/.supergoal/ROADMAP.md and finish with SUPERGOAL_RUN_COMPLETE."
+        ),
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert state is not None
+    assert state.goal.startswith("Execute all phases")
+    assert "SUPERGOAL_GOAL_BODY" not in state.goal
+    assert "Goal set" in response
+    override = runner.runner._session_reasoning_overrides[runner.session.session_key]
+    assert override["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_to_supergoal_plan_extracts_artifact_goal(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4b",
+        reply_to_message_id="plan-1",
+        reply_to_text=(
+            "План Supergoal такой:\n\n"
+            "MEDIA:/home/hermes/workspace/human20-app-prod/.supergoal/"
+            "h20-auth-telegram-prod-perfect/ROADMAP.md\n"
+            "MEDIA:/home/hermes/workspace/human20-app-prod/.supergoal/"
+            "h20-auth-telegram-prod-perfect/THINKING.md\n\n"
+            "Artifacts:\n"
+            "  Progress: `.supergoal/h20-auth-telegram-prod-perfect/STATE.md`\n"
+            "  Phase specs: `.supergoal/h20-auth-telegram-prod-perfect/phases/phase-0..7.md`\n"
+        ),
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal.startswith("Execute the Supergoal from project root")
+    assert "/home/hermes/workspace/human20-app-prod/.supergoal/h20-auth-telegram-prod-perfect/ROADMAP.md" in state.goal
+    assert "План Supergoal" not in state.goal
+    assert runner.runner._session_reasoning_overrides[runner.session.session_key]["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_to_long_non_supergoal_report_is_not_goal(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4c",
+        reply_to_message_id="report-1",
+        reply_to_text="Обычный длинный отчёт без goal body. " * 80,
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    assert "No active goal" in response
+    assert runner.adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_to_status_line_is_not_reused_as_goal(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-5",
+        reply_to_message_id="status-1",
+        reply_to_text='✓ Goal done (1/20 turns): "Execute all phases"',
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    assert "No active goal" in response
+    assert runner.adapter._pending_messages == {}
+
+
+def test_pasted_supergoal_handoff_extracts_body_without_followup_text(runner):
+    pasted = (
+        "Кнопки вот — ты нажал Start now\n\n"
+        "SUPERGOAL_GOAL_BODY: From the project root, run `.supergoal/demo` "
+        "and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+        "Теперь reply на это сообщение ровно:\n\n"
+        "/goal\n\n"
+        "Не копируй длинный текст."
+    )
+
+    body = runner.runner._goal_text_from_pasted_supergoal_handoff(pasted)
+
+    assert body == (
+        "From the project root, run `.supergoal/demo` "
+        "and finish with SUPERGOAL_RUN_COMPLETE."
+    )
+    assert runner.runner._is_supergoal_dispatch(body)
+
+
+def test_pasted_supergoal_handoff_requires_goal_line(runner):
+    pasted = "SUPERGOAL_GOAL_BODY: Discuss `.supergoal/demo` but do not start yet."
+
+    assert runner.runner._goal_text_from_pasted_supergoal_handoff(pasted) == ""
+
+
+@pytest.mark.asyncio
+async def test_assistant_supergoal_body_auto_dispatches_official_goal(hermes_home, runner):
+    session_entry = runner.session
+    response = (
+        "Pre-flight green.\n\n"
+        "SUPERGOAL_GOAL_BODY: From project root, execute `.supergoal/demo` "
+        "and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+        "This should start automatically after Start now."
+    )
+
+    did_dispatch = await runner.runner._auto_dispatch_supergoal_from_response(
+        session_entry=session_entry,
+        source=runner.source,
+        final_response=response,
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_entry.session_id).state
+    assert did_dispatch is True
+    assert state is not None
+    assert state.status == "active"
+    assert state.goal.startswith("From project root")
+    assert "SUPERGOAL_GOAL_BODY" not in state.goal
+    assert runner.adapter._pending_messages[session_entry.session_key].text == state.goal
+    assert runner.runner._session_reasoning_overrides[session_entry.session_key]["effort"] == "xhigh"

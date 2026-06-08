@@ -883,7 +883,8 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
     adapter.handle_message = AsyncMock()
 
-    scheduled = runner._schedule_resume_pending_sessions()
+    with patch.dict("os.environ", {"HERMES_GATEWAY_STARTUP_AUTO_RESUME": "1"}):
+        scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
     assert scheduled == 1
@@ -897,6 +898,40 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_disabled_by_default_waits_for_real_user_message():
+    """Default startup must not synthesize a Telegram turn after restart.
+
+    The session remains resume_pending and will recover on the next real user
+    message, avoiding duplicate-looking unsolicited replies after systemd
+    restarts the gateway.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict("os.environ", {}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.resume_pending is True
 
 
 @pytest.mark.asyncio

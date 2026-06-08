@@ -175,6 +175,48 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert reason == "not yet"
 
+    def test_supergoal_requires_terminal_markers_before_judge(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "generic done"}')
+                )
+            ]
+        )
+        goal = "Run phases, then print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "Phase 0 done, continuing")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_with_terminal_markers_can_reach_judge(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "markers present"}')
+                )
+            ]
+        )
+        goal = "Run phases, then print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = "AUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE"
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert reason == "markers present"
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence

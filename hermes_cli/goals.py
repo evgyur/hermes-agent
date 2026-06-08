@@ -401,6 +401,18 @@ def judge_goal(
         # No substantive reply this turn — almost certainly not done yet.
         return "continue", "empty response (nothing to evaluate)", False
 
+    # Supergoal chains are transcript-marker driven.  A generic assistant
+    # sentence, a `/goal status` notice, or a partial phase summary must never
+    # satisfy them.  This deterministic guard runs before the auxiliary judge
+    # so a weak/over-lenient judge cannot mark a 6-phase run done after one
+    # turn just because the response contained words like "done".
+    goal_upper = goal.upper()
+    response_upper = last_response.upper()
+    if "SUPERGOAL_RUN_COMPLETE" in goal_upper and "SUPERGOAL_RUN_COMPLETE" not in response_upper:
+        return "continue", "missing SUPERGOAL_RUN_COMPLETE terminal marker", False
+    if "AUDIT_COMPLETE" in goal_upper and "AUDIT_COMPLETE" not in response_upper:
+        return "continue", "missing AUDIT_COMPLETE terminal marker", False
+
     try:
         from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
     except Exception as exc:

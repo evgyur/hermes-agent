@@ -46,6 +46,10 @@ def _make_message(
     reply_to_caption=None,
     reply_to_id=42,
     quote_text=None,
+    entities=None,
+    caption_entities=None,
+    reply_to_entities=None,
+    reply_to_caption_entities=None,
 ):
     chat = SimpleNamespace(id=111, type="private", title=None, full_name="Alice")
     user = SimpleNamespace(id=42, full_name="Alice")
@@ -56,6 +60,8 @@ def _make_message(
             message_id=reply_to_id,
             text=reply_to_text,
             caption=reply_to_caption,
+            entities=reply_to_entities or [],
+            caption_entities=reply_to_caption_entities or [],
         )
 
     quote = None
@@ -66,6 +72,9 @@ def _make_message(
         chat=chat,
         from_user=user,
         text=text,
+        caption=None,
+        entities=entities or [],
+        caption_entities=caption_entities or [],
         message_thread_id=None,
         message_id=1001,
         reply_to_message=reply_to_message,
@@ -142,3 +151,38 @@ def test_empty_quote_text_falls_back_to_full_reply():
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
     assert event.reply_to_text == "Prior message body"
+
+
+def test_text_link_entities_are_injected_into_event_text():
+    """Hidden Telegram text_url links must be visible to the agent."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_message(
+        text="Watch this\n\nYouTube",
+        entities=[
+            SimpleNamespace(type="text_link", offset=12, length=7, url="https://youtu.be/a4gEZKwQxxQ")
+        ],
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.text == "Watch this\n\nYouTube\n\n[Telegram links]\n- YouTube: https://youtu.be/a4gEZKwQxxQ"
+
+
+def test_reply_to_text_link_entities_are_injected_into_reply_context():
+    """Reply context should preserve hidden links from the message above."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_message(
+        text="/summ",
+        reply_to_text="Video description\n\nYouTube",
+        reply_to_entities=[
+            SimpleNamespace(type="MessageEntityTextUrl", offset=19, length=7, url="https://youtu.be/a4gEZKwQxxQ")
+        ],
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.reply_to_text == "Video description\n\nYouTube\n\n[Telegram links]\n- YouTube: https://youtu.be/a4gEZKwQxxQ"

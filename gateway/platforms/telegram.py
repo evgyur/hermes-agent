@@ -15,8 +15,10 @@ import os
 import subprocess
 import tempfile
 import html as _html
+import hashlib
 import re
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -575,6 +577,105 @@ class TelegramAdapter(BasePlatformAdapter):
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
 
+    def _is_transcribe_route_chat(self, chat_id: Any) -> bool:
+        """Return True when a chat is configured as a Telegram transcribe route."""
+        routes = self.config.extra.get("transcribe_routes") or []
+        if isinstance(routes, (str, int)):
+            routes = [{"chat_id": routes, "enabled": True}]
+        if not isinstance(routes, list):
+            return False
+        target = str(chat_id)
+        for route in routes:
+            if isinstance(route, dict):
+                if route.get("enabled", True) is False:
+                    continue
+                if str(route.get("chat_id")) == target:
+                    return True
+            elif str(route) == target:
+                return True
+        return False
+
+    def _telegram_chip_media_download_sync(self, chat_id: Any, message_id: Any, ext: str) -> str:
+        """Download an exact Telegram message media through the local telegram-chip API."""
+        safe_ext = ext if ext.startswith(".") and len(ext) <= 12 else ".bin"
+        safe_chat = re.sub(r"[^0-9A-Za-z_-]+", "_", str(chat_id))
+        out_path = f"/var/tmp/hermes_tgchip_{safe_chat}_{message_id}_{uuid.uuid4().hex[:10]}{safe_ext}"
+        url = (
+            "http://127.0.0.1:8080/chats/"
+            + urllib.parse.quote(str(chat_id), safe="")
+            + f"/messages/{message_id}/media?"
+            + urllib.parse.urlencode({"output_path": out_path})
+        )
+        raw = urllib.request.urlopen(url, timeout=300).read().decode("utf-8")
+        obj = json.loads(raw)
+        if not obj.get("success"):
+            raise RuntimeError(obj.get("error") or raw[:300])
+        data = obj.get("data")
+        if isinstance(data, str):
+            try:
+                data_obj = json.loads(data)
+            except Exception:
+                data_obj = {}
+        elif isinstance(data, dict):
+            data_obj = data
+        else:
+            data_obj = {}
+        path = str(data_obj.get("path") or out_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        return path
+
+    async def _recover_transcribe_route_media_via_telegram_chip(
+        self,
+        msg: Any,
+        event: MessageEvent,
+        *,
+        ext: str,
+        mime_type: str,
+        message_type: MessageType,
+        reason: str,
+    ) -> bool:
+        """Recover oversized transcribe-route media when Bot API getFile fails."""
+        chat_id = getattr(getattr(msg, "chat", None), "id", None)
+        message_id = getattr(msg, "message_id", None)
+        if chat_id is None or message_id is None:
+            return False
+        if not self._is_transcribe_route_chat(chat_id):
+            return False
+        try:
+            path = await asyncio.to_thread(
+                self._telegram_chip_media_download_sync,
+                chat_id,
+                message_id,
+                ext,
+            )
+            event.media_urls = [path]
+            event.media_types = [mime_type]
+            event.message_type = message_type
+            if not event.text:
+                event.text = (
+                    "[Telegram transcribe-route media recovered via telegram-chip. "
+                    "Transcribe this file now and return the transcript first.]"
+                )
+            logger.info(
+                "[Telegram] Recovered transcribe-route media via telegram-chip: chat=%s message=%s path=%s reason=%s",
+                chat_id,
+                message_id,
+                path,
+                reason,
+            )
+            return True
+        except Exception as recover_error:
+            logger.warning(
+                "[Telegram] Failed telegram-chip recovery for transcribe-route media: chat=%s message=%s reason=%s error=%s",
+                chat_id,
+                message_id,
+                reason,
+                recover_error,
+                exc_info=True,
+            )
+            return False
+
     def _load_inline_preview_guard(self) -> Dict[str, Any]:
         """Load per-chat guard against Hermes-bot `/tg` previews.
 
@@ -850,6 +951,110 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         pending = self._pending_external_preview_echo_fingerprints(chat_id)
         return bool(pending and _tg_preview_echo_fingerprint(visible_text) in pending)
+
+    @staticmethod
+    def _self_echo_normalize(text: Optional[str]) -> str:
+        """Return a stable text form for outbound-response echo detection.
+
+        Telegram Business/userbot bridges can re-deliver a message we just sent
+        as if it was authored by the human account. Those echoes often lose
+        Markdown formatting and may include Telegram's compact reply preview.
+        Normalise both sides before comparing.
+        """
+        value = str(text or "")
+        value = re.sub(r'^\[Replying to: "(?:.|\n)*?"\]\s*', "", value).strip()
+        try:
+            value = strip_markdown(value)
+        except Exception:
+            pass
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    @classmethod
+    def _self_echo_fingerprint(cls, text: Optional[str]) -> str:
+        return hashlib.sha256(cls._self_echo_normalize(text).encode("utf-8")).hexdigest()
+
+    def _remember_recent_outbound_text(self, chat_id: str, content: str) -> None:
+        """Remember a just-sent response so reflected userbot echoes are ignored."""
+        normalized = self._self_echo_normalize(content)
+        if not normalized:
+            return
+        store = getattr(self, "_recent_outbound_text_echoes", None)
+        if store is None:
+            store = {}
+            self._recent_outbound_text_echoes = store
+        now = time.time()
+        expires_at = now + float(os.getenv("TELEGRAM_SELF_ECHO_TTL_SECONDS", "900") or 900)
+        key = str(chat_id)
+        entries = [item for item in store.get(key, []) if item[0] > now]
+        entries.append((expires_at, normalized, self._self_echo_fingerprint(normalized)))
+        store[key] = entries[-50:]
+
+    def _is_recent_outbound_text_echo(self, message: "Message") -> bool:
+        """True if this incoming text is a reflected copy of our own response."""
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        normalized = self._self_echo_normalize(visible_text)
+        if not chat_id or not normalized:
+            return False
+
+        now = time.time()
+        store = getattr(self, "_recent_outbound_text_echoes", None) or {}
+        entries = [item for item in store.get(chat_id, []) if item[0] > now]
+        if entries:
+            store[chat_id] = entries
+
+        incoming_hash = self._self_echo_fingerprint(normalized)
+        for _expires_at, sent_text, sent_hash in entries:
+            if incoming_hash == sent_hash:
+                return True
+            # Markdown stripping and Telegram reply previews can leave tiny
+            # differences. Only suppress near-whole-message echoes; a real user
+            # follow-up with extra instructions should still pass through.
+            if sent_text in normalized and len(normalized) <= len(sent_text) + 24:
+                return True
+            if normalized in sent_text and len(sent_text) <= len(normalized) + 24:
+                return True
+        return False
+
+    @staticmethod
+    def _recent_visible_context_key(event: MessageEvent) -> tuple[str, str]:
+        source = event.source
+        return (str(getattr(source, "chat_id", "") or ""), str(getattr(source, "thread_id", "") or ""))
+
+    def _attach_recent_visible_context(self, event: MessageEvent) -> None:
+        """Attach a short same-chat/topic recent-context block to an event."""
+        store = getattr(self, "_recent_visible_messages", None) or {}
+        entries = list(store.get(self._recent_visible_context_key(event), []))[-8:]
+        current_id = str(event.message_id or "")
+        rows = []
+        for item in entries:
+            msg_id = str(item.get("message_id") or "")
+            text = str(item.get("text") or "").strip()
+            if not text or (current_id and msg_id == current_id):
+                continue
+            rows.append(f"- ID {msg_id} | {text[:500]}")
+        if rows:
+            event.recent_context = "## Recent visible Telegram context\n\n" + "\n".join(rows)
+
+    def _record_recent_visible_message(self, event: MessageEvent) -> None:
+        """Remember a visible Telegram message for future same-topic turns."""
+        text = str(event.text or "").strip()
+        if not text:
+            return
+        store = getattr(self, "_recent_visible_messages", None)
+        if store is None:
+            store = {}
+            self._recent_visible_messages = store
+        key = self._recent_visible_context_key(event)
+        entries = list(store.get(key, []))
+        entries.append({"message_id": str(event.message_id or ""), "text": re.sub(r"\s+", " ", text)})
+        store[key] = entries[-20:]
+
+    def _prepare_recent_visible_context(self, event: MessageEvent) -> MessageEvent:
+        self._attach_recent_visible_context(event)
+        self._record_recent_visible_message(event)
+        return event
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -2229,6 +2434,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             guard_result = await self._inline_preview_guard_send_result(chat_id, content, metadata)
             if guard_result is not None:
+                if guard_result.success:
+                    self._remember_recent_outbound_text(chat_id, content)
                 return guard_result
             guard_replacement = self._inline_preview_guard_replacement(chat_id, content, metadata)
             if guard_replacement:
@@ -2461,6 +2668,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # Typing failures are non-fatal
 
+            self._remember_recent_outbound_text(chat_id, content)
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -3900,6 +4108,70 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await query.answer(text="Unknown gptprof action.")
 
+    @staticmethod
+    def _extract_supergoal_body_from_callback_text(text: str) -> str:
+        """Extract a durable Supergoal goal body embedded in a button prompt."""
+        raw = str(text or "")
+        marker = "SUPERGOAL_GOAL_BODY:"
+        if marker not in raw:
+            return ""
+        body = raw.split(marker, 1)[1].strip()
+        stop_markers = (
+            "\n\n1. ",
+            "\n\nКнопки",
+            "\n\nChoices",
+            "\n\nStart chain",
+        )
+        for stop in stop_markers:
+            idx = body.find(stop)
+            if idx != -1:
+                body = body[:idx].strip()
+                break
+        return body.strip("` \n\t")
+
+    def _build_supergoal_callback_event(self, query: Any, goal_body: str) -> Optional[MessageEvent]:
+        """Build a synthetic `/goal` message from a Telegram button callback."""
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        if query_message is None or query_chat is None:
+            return None
+
+        chat_type_raw = getattr(query_chat, "type", None)
+        chat_type_value = str(getattr(chat_type_raw, "value", chat_type_raw) or "").lower()
+        if chat_type_value == "private":
+            chat_type = "dm"
+        elif chat_type_value == "supergroup":
+            # Keep callback sources aligned with normal message ingestion.
+            # Telegram topics are represented as chat_type="group" + thread_id
+            # elsewhere in this adapter; using "forum" here fragments the
+            # session key and starts /goal in an invisible sibling session.
+            chat_type = "group"
+        elif chat_type_value in {"group", "channel"}:
+            chat_type = chat_type_value
+        else:
+            chat_type = "dm"
+
+        user = getattr(query, "from_user", None)
+        source = self.build_source(
+            chat_id=str(getattr(query_message, "chat_id", getattr(query_chat, "id", ""))),
+            chat_name=getattr(query_chat, "title", None) or getattr(query_chat, "full_name", None),
+            chat_type=chat_type,
+            user_id=str(getattr(user, "id", "")) if user is not None else None,
+            user_name=getattr(user, "full_name", None) or getattr(user, "first_name", None),
+            thread_id=(
+                str(getattr(query_message, "message_thread_id"))
+                if getattr(query_message, "message_thread_id", None) is not None else None
+            ),
+            message_id=str(getattr(query_message, "message_id", "")),
+        )
+        return MessageEvent(
+            text=f"/goal {goal_body}",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=query_message,
+            message_id=str(getattr(query_message, "message_id", "")),
+        )
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -4215,7 +4487,35 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 session_key = self._clarify_state.get(clarify_id)
+                embedded_supergoal_body = self._extract_supergoal_body_from_callback_text(
+                    getattr(query.message, "text", "") if query.message else ""
+                )
                 if not session_key:
+                    # Durable Supergoal fallback: clarify state is in-memory and
+                    # can expire or disappear on gateway restart while Telegram
+                    # keeps showing old buttons. If the prompt embeds the official
+                    # Supergoal body and the user clicked Start/choice 1, synthesize
+                    # the same `/goal <body>` command instead of dead-ending.
+                    if choice_token == "0" and embedded_supergoal_body:
+                        event = self._build_supergoal_callback_event(query, embedded_supergoal_body)
+                        if event is not None:
+                            await query.answer(text="Starting SuperGoal…")
+                            try:
+                                await query.edit_message_text(
+                                    text=f"❓ {_html.escape(query.message.text or '')}\n\n<b>SuperGoal:</b> starting via /goal",
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=None,
+                                )
+                            except Exception:
+                                pass
+                            handler = getattr(self, "_message_handler", None)
+                            if callable(handler):
+                                maybe_result = handler(event)
+                                if asyncio.iscoroutine(maybe_result):
+                                    await maybe_result
+                            else:
+                                await self.handle_message(event)
+                            return
                     await query.answer(text="This prompt has already been resolved.")
                     return
 
@@ -4269,6 +4569,40 @@ class TelegramAdapter(BasePlatformAdapter):
                     # the agent at least sees an intentional response
                     # rather than nothing.
                     resolved_text = f"choice {idx + 1}"
+
+                # Durable Supergoal start: for a prompt that embeds an official
+                # `SUPERGOAL_GOAL_BODY`, clicking choice 1 should enqueue the
+                # real `/goal <body>` command. We still resolve the clarify so
+                # the current agent turn unblocks; the queued command runs next
+                # through the standard GatewayRunner / GoalManager path.
+                if idx == 0 and embedded_supergoal_body:
+                    event = self._build_supergoal_callback_event(query, embedded_supergoal_body)
+                    if event is not None:
+                        started = False
+                        try:
+                            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                            start_goal = getattr(runner, "_start_goal_from_callback_event", None)
+                            if callable(start_goal):
+                                maybe_started = start_goal(event)
+                                if asyncio.iscoroutine(maybe_started):
+                                    maybe_started = await maybe_started
+                                started = bool(maybe_started)
+                        except Exception:
+                            logger.debug("Supergoal callback direct /goal start failed", exc_info=True)
+
+                        if not started:
+                            pending = getattr(self, "_pending_messages", None)
+                            if isinstance(pending, dict):
+                                if session_key not in pending:
+                                    pending[session_key] = event
+                                else:
+                                    try:
+                                        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                                        enqueue = getattr(runner, "_enqueue_fifo", None)
+                                        if callable(enqueue):
+                                            enqueue(session_key, event, self)
+                                    except Exception:
+                                        logger.debug("Supergoal callback FIFO enqueue failed", exc_info=True)
 
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)
@@ -6077,6 +6411,14 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if self._is_recent_outbound_text_echo(msg):
+            logger.info(
+                "[%s] Ignoring reflected outbound Telegram text echo: chat=%s msg=%s",
+                self.name,
+                getattr(getattr(msg, "chat", None), "id", "unknown"),
+                getattr(msg, "message_id", "unknown"),
+            )
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -6100,6 +6442,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._prepare_recent_visible_context(event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6140,6 +6483,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._prepare_recent_visible_context(event)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -6232,6 +6576,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            event = self._prepare_recent_visible_context(event)
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -6263,6 +6608,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
+            event = self._prepare_recent_visible_context(event)
             await self.handle_message(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
@@ -6316,6 +6662,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
+            event = self._prepare_recent_visible_context(event)
             await self.handle_message(event)
             return
 
@@ -6373,9 +6720,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/mp3"]
+                if not event.text and self._is_transcribe_route_chat(msg.chat.id):
+                    event.text = (
+                        "[Telegram transcribe-route media recovered via telegram-chip. "
+                        "Transcribe this file now and return the transcript first.]"
+                    )
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
+                await self._recover_transcribe_route_media_via_telegram_chip(
+                    msg,
+                    event,
+                    ext=".mp3",
+                    mime_type="audio/mpeg",
+                    message_type=MessageType.AUDIO,
+                    reason=str(e),
+                )
 
         elif msg.video:
             try:
@@ -6393,6 +6753,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[Telegram] Cached user video at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache video: %s", e, exc_info=True)
+                await self._recover_transcribe_route_media_via_telegram_chip(
+                    msg,
+                    event,
+                    ext=".mp4",
+                    mime_type="video/mp4",
+                    message_type=MessageType.VIDEO,
+                    reason=str(e),
+                )
 
         # Download document files to cache for agent processing
         elif msg.document:
@@ -6419,12 +6787,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Check file size early so image documents cannot bypass the
                 # document size limit by taking the image path.
                 if not doc.file_size or doc.file_size > self._max_doc_bytes:
+                    recovered = False
+                    doc_kind_mime = doc_mime or SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
+                    doc_message_type = MessageType.DOCUMENT
+                    if doc_kind_mime.startswith("audio/") or ext in {".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".opus"}:
+                        doc_message_type = MessageType.AUDIO
+                        doc_kind_mime = doc_kind_mime if doc_kind_mime.startswith("audio/") else "audio/mpeg"
+                    elif doc_kind_mime.startswith("video/") or ext in SUPPORTED_VIDEO_TYPES:
+                        doc_message_type = MessageType.VIDEO
+                        doc_kind_mime = doc_kind_mime if doc_kind_mime.startswith("video/") else SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")
+                    if ext or doc_kind_mime.startswith(("audio/", "video/")):
+                        recovered = await self._recover_transcribe_route_media_via_telegram_chip(
+                            msg,
+                            event,
+                            ext=ext or (".mp4" if doc_message_type == MessageType.VIDEO else ".mp3" if doc_message_type == MessageType.AUDIO else ".bin"),
+                            mime_type=doc_kind_mime,
+                            message_type=doc_message_type,
+                            reason=f"document too large or size unknown: {doc.file_size}",
+                        )
+                    if recovered:
+                        event = self._prepare_recent_visible_context(event)
+                        await self.handle_message(event)
+                        return
                     limit_mb = self._max_doc_bytes // (1024 * 1024)
                     event.text = (
                         "The document is too large or its size could not be verified. "
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    event = self._prepare_recent_visible_context(event)
                     await self.handle_message(event)
                     return
 
@@ -6443,6 +6834,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
+                        event = self._prepare_recent_visible_context(event)
                         await self.handle_message(event)
                         return
 
@@ -6479,6 +6871,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
+                    event = self._prepare_recent_visible_context(event)
                     await self.handle_message(event)
                     return
 
@@ -6496,6 +6889,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                    event = self._prepare_recent_visible_context(event)
                     await self.handle_message(event)
                     return
 
@@ -6535,6 +6929,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
+        event = self._prepare_recent_visible_context(event)
         await self.handle_message(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
@@ -6567,6 +6962,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
+                event = self._prepare_recent_visible_context(event)
                 await self.handle_message(event)
         except asyncio.CancelledError:
             return
@@ -6739,6 +7135,58 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, cache_key, thread_id,
             )
 
+    @staticmethod
+    def _inject_telegram_text_links(text: str, entities: Optional[List[Any]]) -> str:
+        """Append hidden Telegram text-link URLs to text sent to the agent.
+
+        Telegram can render a label like ``YouTube`` while the actual URL lives
+        only in ``MessageEntityTextUrl`` / Bot API ``text_link`` metadata. If we
+        pass only ``message.text`` to the LLM, the agent sees a label with no URL
+        and asks the user to resend a link that was already present. Keep the
+        visible text intact and add a compact link appendix.
+        """
+        if not text or not entities:
+            return text
+
+        links: List[tuple[str, str]] = []
+        seen: Set[tuple[str, str]] = set()
+        for entity in entities:
+            url = getattr(entity, "url", None)
+            if not url or url in text:
+                continue
+            entity_type = str(getattr(entity, "type", "")).lower()
+            if not any(marker in entity_type for marker in ("text_link", "texturl")):
+                continue
+            try:
+                offset = int(getattr(entity, "offset", 0) or 0)
+                length = int(getattr(entity, "length", 0) or 0)
+            except (TypeError, ValueError):
+                offset = 0
+                length = 0
+            label = text[offset: offset + length].strip() if length > 0 else "link"
+            label = label or "link"
+            key = (label, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(key)
+
+        if not links:
+            return text
+        appendix = "\n".join(f"- {label}: {url}" for label, url in links)
+        return f"{text.rstrip()}\n\n[Telegram links]\n{appendix}"
+
+    @classmethod
+    def _message_text_with_hidden_links(cls, message: Any) -> str:
+        """Return message text/caption with hidden text-link entity URLs exposed."""
+        text = getattr(message, "text", None)
+        if text:
+            return cls._inject_telegram_text_links(text, getattr(message, "entities", None))
+        caption = getattr(message, "caption", None)
+        if caption:
+            return cls._inject_telegram_text_links(caption, getattr(message, "caption_entities", None))
+        return ""
+
     def _build_message_event(
         self,
         message: Message,
@@ -6866,11 +7314,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if quote_text:
                 reply_to_text = quote_text
             else:
-                reply_to_text = (
-                    message.reply_to_message.text
-                    or message.reply_to_message.caption
-                    or None
-                )
+                reply_to_text = self._message_text_with_hidden_links(message.reply_to_message) or None
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
@@ -6882,7 +7326,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=self._message_text_with_hidden_links(message),
             message_type=msg_type,
             source=source,
             raw_message=message,

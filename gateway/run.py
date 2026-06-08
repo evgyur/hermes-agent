@@ -1229,6 +1229,22 @@ from gateway.restart import (
 )
 
 
+def _append_recent_context_prompt(context_prompt: str, event: Any) -> str:
+    """Append ephemeral same-chat/platform context to the system prompt.
+
+    Adapters may attach a short recent-context block to ``MessageEvent`` so the
+    agent can answer follow-ups like "what about the message above?" without
+    polluting persisted transcript history or the user message text.
+    """
+    recent_context = str(getattr(event, "recent_context", "") or "").strip()
+    if not recent_context:
+        return context_prompt
+    base = str(context_prompt or "").rstrip()
+    if not base:
+        return recent_context
+    return f"{base}\n\n{recent_context}"
+
+
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -4364,26 +4380,33 @@ class GatewayRunner:
         return True
 
     # Drain-timeout reasons are set by _stop_impl() before interrupting an
-    # actually running agent during graceful gateway restart/shutdown.  Those
-    # are safe to synthesize at startup: they represent the exact task that was
-    # active when the gateway went down.
+    # actually running agent during graceful gateway restart/shutdown.  These
+    # sessions remain resumable, but startup must not synthesize a new Telegram
+    # turn by default: it can look like Hermes is duplicating the user's last
+    # request after a restart.  The safer UX is to wait for the next real user
+    # message, where the existing resume_pending branch injects the recovery
+    # system note into that turn.
     _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout"})
 
     def _schedule_resume_pending_sessions(self) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
+        """Optionally auto-continue fresh restart-interrupted sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
         ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        injects a reason-aware recovery system note on the next real user turn.
+        By default we do NOT create an internal empty Telegram event at startup,
+        because that produces unsolicited/duplicate-looking messages after
+        service restarts. Operators who explicitly want the old behaviour can
+        opt in with ``HERMES_GATEWAY_STARTUP_AUTO_RESUME=1``.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or on the next gateway startup.
+        ``resume_pending`` and can resume on the next real user message.
         """
+        if os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() not in {"1", "true", "yes", "on"}:
+            logger.info("Startup auto-resume disabled; pending sessions will wait for the next real user message")
+            return 0
+
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -8212,6 +8235,23 @@ class GatewayRunner:
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
+        # Telegram-safe Supergoal fallback: if the user pasted the whole
+        # assistant handoff message instead of replying with `/goal`, convert
+        # that paste into the same `/goal <body>` dispatch. This keeps the
+        # official GoalManager path and avoids sending the long text to the LLM
+        # as an ordinary chat turn.
+        if not command:
+            pasted_goal = self._goal_text_from_pasted_supergoal_handoff(event.text)
+            if pasted_goal:
+                try:
+                    event = dataclasses.replace(event, text=f"/goal {pasted_goal}")
+                except Exception:
+                    event.text = f"/goal {pasted_goal}"
+                command = event.get_command()
+                _cmd_def = _resolve_cmd(command) if command else None
+                canonical = _cmd_def.name if _cmd_def else command
+                logger.info("Detected pasted Supergoal handoff; dispatching as /goal")
+
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
         # Preserve built-in precedence; aliases only need early handling when
@@ -8522,7 +8562,12 @@ class GatewayRunner:
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            timeout_raw = qcmd.get("timeout_seconds", 30)
+                            try:
+                                timeout_seconds = max(1.0, float(timeout_raw))
+                            except (TypeError, ValueError):
+                                timeout_seconds = 30.0
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
                             output = (stdout or stderr).decode().strip()
                             # Redact any remaining sensitive patterns in output
                             if output:
@@ -8530,7 +8575,7 @@ class GatewayRunner:
                                 output = redact_sensitive_text(output)
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
+                            return "Quick command timed out."
                         except Exception as e:
                             return f"Quick command error: {e}"
                     else:
@@ -8703,11 +8748,17 @@ class GatewayRunner:
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
-                        await self._post_turn_goal_continuation(
+                        _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
                         )
+                        if not _auto_dispatched:
+                            await self._post_turn_goal_continuation(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
@@ -8860,11 +8911,18 @@ class GatewayRunner:
                 _display = _parts[2] if len(_parts) >= 3 else _basename
                 _display = re.sub(r'[^\w.\- ]', '_', _display)
                 _agent_path = _to_agent_path(_apath)
-                _note = (
-                    f"[The user sent an audio file attachment: '{_display}'. "
-                    f"It is saved at: {_agent_path}. "
-                    f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
-                )
+                if "transcribe-route media recovered via telegram-chip" in message_text:
+                    _note = (
+                        f"[The user sent an audio file attachment: '{_display}'. "
+                        f"It is saved at: {_agent_path}. "
+                        f"Transcribe this file now and return the transcript first.]"
+                    )
+                else:
+                    _note = (
+                        f"[The user sent an audio file attachment: '{_display}'. "
+                        f"It is saved at: {_agent_path}. "
+                        f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
+                    )
                 message_text = f"{_note}\n\n{message_text}"
 
         if event.media_urls and event.message_type == MessageType.DOCUMENT:
@@ -9134,6 +9192,7 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        context_prompt = _append_recent_context_prompt(context_prompt, event)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -11873,6 +11932,220 @@ class GatewayRunner:
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    @staticmethod
+    def _goal_text_from_supergoal_artifacts(raw: str) -> str:
+        """Build a canonical Supergoal goal from a replied-to plan summary.
+
+        Users often reply `/goal` to the human-readable Supergoal plan instead
+        of the exact `SUPERGOAL_GOAL_BODY` line.  Treat visible `.supergoal`
+        artifact paths as an intentional dispatch, but do not use the entire
+        assistant report as the goal body.
+        """
+        text = str(raw or "")
+        if ".supergoal/" not in text:
+            return ""
+
+        roots: list[tuple[str, str]] = []
+
+        def _add_root(root: str) -> None:
+            root = str(root or "").strip().strip("`'\".,);]")
+            if not root or ".supergoal/" not in root:
+                return
+            project_root = ""
+            if "/.supergoal/" in root:
+                project_root = root.split("/.supergoal/", 1)[0]
+            item = (root, project_root)
+            if item not in roots:
+                roots.append(item)
+
+        for match in re.finditer(r"(?:MEDIA:)?((?:/[^\s`\"'<>]+|\.supergoal/[^\s`\"'<>]+))", text):
+            path = match.group(1).strip().strip("`'\".,);]")
+            if ".supergoal/" not in path:
+                continue
+            root = path
+            for marker in ("/PROTOCOL.md", "/ROADMAP.md", "/STATE.md", "/THINKING.md", "/phases/"):
+                idx = root.find(marker)
+                if idx != -1:
+                    root = root[:idx]
+                    break
+            _add_root(root)
+
+        for pattern in (
+            r"Supergoal root:\s*`?([^`\s]+)",
+            r"Phase specs:\s*`?([^`\s]+?)/phases(?:/|`|\s|$)",
+            r"Progress:\s*`?([^`\s]+?)/STATE\.md",
+            r"Roadmap:\s*`?([^`\s]+?)/ROADMAP\.md",
+        ):
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                _add_root(match.group(1))
+
+        if not roots:
+            return ""
+
+        root, project_root = roots[0]
+        prefix = (
+            f"Execute the Supergoal from project root `{project_root}`."
+            if project_root
+            else "Execute the Supergoal from the project root."
+        )
+        return (
+            f"{prefix} Use `{root}/PROTOCOL.md`, `{root}/ROADMAP.md`, "
+            f"`{root}/STATE.md`, and `{root}/phases/phase-*.md`. "
+            "Start from STATE.md current phase. Execute phases sequentially. "
+            "For every phase, print SUPERGOAL_PHASE_START, "
+            "SUPERGOAL_PHASE_VERIFY, and SUPERGOAL_PHASE_DONE. Run the final "
+            "audit and finish only after AUDIT_COMPLETE and "
+            "SUPERGOAL_RUN_COMPLETE."
+        )
+
+    @staticmethod
+    def _goal_text_from_reply_context(event: "MessageEvent") -> str:
+        """Extract a goal body from replied-to text for bare gateway `/goal`.
+
+        Telegram-safe Supergoal dispatch sends a long assistant message prefixed
+        with `SUPERGOAL_GOAL_BODY:` and the user replies with `/goal`.  Do not
+        treat prior `/goal` status notices as new goals — replying to
+        `✓ Goal done (...)` was the source of a false one-turn completion loop.
+        """
+        raw = str(getattr(event, "reply_to_text", "") or "").strip()
+        if not raw:
+            return ""
+
+        # Status/notice lines are not goal bodies.  This covers exact gateway
+        # notices and truncated Telegram quotes that start with the same prefix.
+        lowered = raw.lower()
+        status_prefixes = (
+            "✓ goal done",
+            "✓ goal achieved",
+            "⊙ goal ",
+            "⏸ goal ",
+            "goal done (",
+            "goal achieved:",
+        )
+        if lowered.startswith(status_prefixes):
+            return ""
+
+        marker = "SUPERGOAL_GOAL_BODY:"
+        if raw.startswith(marker):
+            raw = raw[len(marker):].strip()
+        else:
+            supergoal_from_artifacts = GatewayRunner._goal_text_from_supergoal_artifacts(raw)
+            if supergoal_from_artifacts:
+                return supergoal_from_artifacts
+
+            # A bare `/goal` reply to a long assistant report should not turn
+            # that whole report into a standing goal.  Supergoal plans are
+            # handled above via explicit markers/artifact paths; generic long
+            # objectives should be sent as `/goal <text>` so intent is clear.
+            if len(raw) > 1200:
+                return ""
+
+        # Fallback if the user replies to a plain `/goal "..."` line.
+        if raw.startswith("/goal"):
+            raw = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
+            if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+                raw = raw[1:-1].strip()
+
+        return raw
+
+    @staticmethod
+    def _extract_supergoal_body(text: str) -> str:
+        """Extract only the goal body after `SUPERGOAL_GOAL_BODY:`."""
+        raw = str(text or "").strip()
+        marker = "SUPERGOAL_GOAL_BODY:"
+        if marker not in raw:
+            return ""
+        body = raw.split(marker, 1)[1].strip()
+        stop_markers = (
+            "\n\nТеперь ",
+            "\n\nReply to ",
+            "\n\nFallback plain-text line:",
+            "\n\nНе копируй",
+            "\n\nДа, ",
+            "\n\nOnce you ",
+        )
+        for stop in stop_markers:
+            idx = body.find(stop)
+            if idx != -1:
+                body = body[:idx].strip()
+                break
+        if body.startswith("`") and body.endswith("`") and len(body) > 2:
+            body = body[1:-1].strip()
+        return body
+
+    @staticmethod
+    def _goal_text_from_pasted_supergoal_handoff(text: str) -> str:
+        """Extract a Supergoal body from an accidentally pasted handoff.
+
+        Telegram users often copy the whole assistant handoff message instead of
+        replying with `/goal`.  If the pasted text contains a
+        `SUPERGOAL_GOAL_BODY:` section and a standalone `/goal` instruction,
+        treat it as the explicit goal dispatch the user intended.
+        """
+        raw = str(text or "").strip()
+        marker = "SUPERGOAL_GOAL_BODY:"
+        if marker not in raw:
+            return ""
+
+        # Require a visible `/goal` line so random discussion of a Supergoal body
+        # does not silently start a standing goal.
+        has_goal_line = False
+        for line in raw.splitlines():
+            if line.strip() == "/goal" or line.strip().startswith("/goal "):
+                has_goal_line = True
+                break
+        if not has_goal_line:
+            return ""
+
+        return GatewayRunner._extract_supergoal_body(raw)
+
+    @staticmethod
+    def _is_supergoal_dispatch(goal_text: str, *, from_reply: bool = False) -> bool:
+        """Return True for Supergoal-style long autonomous coding dispatches."""
+        text = str(goal_text or "")
+        if (
+            ".supergoal/" in text
+            or "SUPERGOAL_PHASE" in text
+            or "SUPERGOAL_RUN_COMPLETE" in text
+        ):
+            return True
+        return text.startswith("SUPERGOAL_GOAL_BODY:")
+
+    async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
+        """Start `/goal` from an inline-button callback without replaying a slash command.
+
+        Clarify buttons are clicked while the planning agent is still blocked
+        inside the `clarify` tool. Queueing a synthetic `/goal ...` message for
+        the next turn is fragile because the post-run safety net intentionally
+        discards queued slash commands before they can be fed to the model. For
+        Supergoal's "button 1 starts goal" contract, call the official
+        GoalManager path directly and enqueue the first goal body turn.
+        """
+        if event is None or event.get_command() != "goal":
+            return False
+        goal_text = (event.get_command_args() or "").strip()
+        if not goal_text:
+            return False
+
+        try:
+            response = await self._handle_goal_command(event)
+        except Exception as exc:
+            logger.warning("Supergoal callback: failed to start /goal: %s", exc, exc_info=True)
+            return False
+
+        try:
+            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            state = getattr(mgr, "state", None) if mgr is not None else None
+            started = bool(state and getattr(state, "status", "") == "active" and state.goal == goal_text)
+        except Exception:
+            started = False
+
+        if started:
+            logger.info("Supergoal callback: started official /goal from button press")
+        else:
+            logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
+        return started
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 
@@ -11885,6 +12158,16 @@ class GatewayRunner:
         continuation hook then takes over from there.
         """
         args = (event.get_command_args() or "").strip()
+        # Gateway convenience: a bare `/goal` sent as a reply uses the replied-to
+        # text as the goal body. This avoids fragile Telegram copy/paste for
+        # long Supergoal dispatches. Explicit subcommands (`/goal status`, etc.)
+        # still win and never read reply context.
+        goal_from_reply = False
+        if not args:
+            reply_goal = self._goal_text_from_reply_context(event)
+            if reply_goal:
+                args = reply_goal
+                goal_from_reply = True
         lower = args.lower()
 
         mgr, session_entry = self._get_goal_manager_for_event(event)
@@ -11935,6 +12218,16 @@ class GatewayRunner:
         # starts making progress. The post-turn hook takes over after.
         adapter = self.adapters.get(event.source.platform) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
+        if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
+            try:
+                from hermes_constants import parse_reasoning_effort
+
+                reasoning_cfg = parse_reasoning_effort("xhigh")
+                if reasoning_cfg:
+                    self._set_session_reasoning_override(_quick_key, reasoning_cfg)
+                    logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
+            except Exception as exc:
+                logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
         if adapter and _quick_key:
             try:
                 kickoff_event = MessageEvent(
@@ -12062,6 +12355,73 @@ class GatewayRunner:
                 logger.debug("goal continuation: post-delivery callback registration failed: %s", exc)
 
         await _deliver()
+
+    async def _auto_dispatch_supergoal_from_response(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        final_response: str,
+    ) -> bool:
+        """Start an official /goal run when the assistant emits a Supergoal body.
+
+        This is the button-safe path: after a clarify button returns "Start now",
+        the assistant can emit `SUPERGOAL_GOAL_BODY: ...` and the gateway turns
+        that response into the same GoalManager + kickoff queue used by `/goal`.
+        """
+        goal_text = self._extract_supergoal_body(final_response)
+        if not goal_text:
+            return False
+        if not self._is_supergoal_dispatch(goal_text):
+            return False
+
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("supergoal auto-dispatch: goals module unavailable: %s", exc)
+            return False
+
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return False
+
+        max_turns = self._goal_max_turns_from_config()
+        try:
+            state = GoalManager(session_id=sid, default_max_turns=max_turns).set(goal_text)
+        except Exception as exc:
+            logger.warning("supergoal auto-dispatch: failed to set goal: %s", exc)
+            return False
+
+        try:
+            _quick_key = self._session_key_for_source(source)
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_cfg = parse_reasoning_effort("xhigh")
+            if _quick_key and reasoning_cfg:
+                self._set_session_reasoning_override(_quick_key, reasoning_cfg)
+        except Exception as exc:
+            logger.debug("supergoal auto-dispatch: high reasoning override failed: %s", exc)
+
+        if source is None:
+            return False
+
+        try:
+            adapter = self.adapters.get(source.platform)
+            _quick_key = self._session_key_for_source(source)
+            if adapter and _quick_key:
+                kickoff_event = MessageEvent(
+                    text=state.goal,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                logger.info("supergoal auto-dispatch: queued official /goal kickoff for %s", _quick_key)
+                return True
+        except Exception as exc:
+            logger.warning("supergoal auto-dispatch: kickoff enqueue failed: %s", exc)
+        return False
 
     async def _post_turn_goal_continuation(
         self,

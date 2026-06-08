@@ -913,6 +913,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if plat == Platform.TELEGRAM and "auto_skill_routes" in platform_cfg:
                     bridged["auto_skill_routes"] = platform_cfg["auto_skill_routes"]
+                if plat == Platform.TELEGRAM and "transcribe_routes" in platform_cfg:
+                    bridged["transcribe_routes"] = platform_cfg["transcribe_routes"]
                 if plat == Platform.TELEGRAM and "inline_preview_guard" in platform_cfg:
                     bridged["inline_preview_guard"] = platform_cfg["inline_preview_guard"]
                 enabled_was_explicit = "enabled" in platform_cfg
