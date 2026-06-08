@@ -3,7 +3,7 @@
 	url = https://github.com/human20team/chip-travel-agent.git
 [submodule "skills/shaw"]
 	path = skills/shaw
-	url = https://github.com/evgyur/shaw-hermes.git
+	url = https://github.com/human20team/shaw-hermes.git
 [submodule "skills/server-doctor-public"]
 	path = skills/server-doctor-public
 	url = https://github.com/evgyur/server-doctor-public.git
