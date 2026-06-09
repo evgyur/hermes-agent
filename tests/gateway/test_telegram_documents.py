@@ -105,7 +105,10 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.from_user = MagicMock()
     msg.from_user.id = 1
     msg.from_user.full_name = "Test User"
+    msg.from_user.is_bot = False
     msg.message_thread_id = None
+    msg.business_connection_id = None
+    msg.quote = None
     msg.reply_to_message = SimpleNamespace(
         from_user=SimpleNamespace(id=999),
         text=None,
@@ -119,6 +122,8 @@ def _make_update(msg):
     """Wrap a message in a mock Update."""
     update = MagicMock()
     update.message = msg
+    update.effective_message = msg
+    update.update_id = 123
     return update
 
 
@@ -134,7 +139,7 @@ def _make_video(file_obj=None):
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="fake-token")
+    config = PlatformConfig(enabled=True, token="fake-token", extra={"private_chats": "100,1"})
     a = TelegramAdapter(config)
     # Capture events instead of processing them
     a.handle_message = AsyncMock()
@@ -237,6 +242,65 @@ class TestDocumentDownloadBlock:
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
         assert "# Title" in event.text
+
+    @pytest.mark.asyncio
+    async def test_goal_reply_to_markdown_document_hydrates_reply_context(self, adapter):
+        content = (
+            b"# Roadmap\n\n"
+            b"SUPERGOAL_GOAL_BODY: Run `.supergoal/demo` and finish with "
+            b"AUDIT_COMPLETE + SUPERGOAL_RUN_COMPLETE."
+        )
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="ROADMAP.md",
+            mime_type="text/markdown",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message()
+        msg.text = "/goal"
+        msg.reply_to_message = SimpleNamespace(
+            document=doc,
+            text=None,
+            caption=None,
+            message_id=99,
+            entities=None,
+            caption_entities=None,
+        )
+        event = MessageEvent(text="/goal", message_type=MessageType.COMMAND, reply_to_message_id="99")
+
+        await adapter._hydrate_reply_to_document_text(event, msg)
+
+        assert event.reply_to_text is not None
+        assert event.reply_to_text.startswith("[Content of replied-to ROADMAP.md]:")
+        assert "SUPERGOAL_GOAL_BODY" in event.reply_to_text
+        assert event.text == "/goal"
+
+    @pytest.mark.asyncio
+    async def test_reply_document_hydration_ignores_large_markdown(self, adapter):
+        content = b"# Too big"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="ROADMAP.md",
+            mime_type="text/markdown",
+            file_size=101 * 1024,
+            file_obj=file_obj,
+        )
+        msg = _make_message()
+        msg.reply_to_message = SimpleNamespace(
+            document=doc,
+            text=None,
+            caption=None,
+            message_id=99,
+            entities=None,
+            caption_entities=None,
+        )
+        event = MessageEvent(text="/goal", message_type=MessageType.COMMAND, reply_to_message_id="99")
+
+        await adapter._hydrate_reply_to_document_text(event, msg)
+
+        assert event.reply_to_text is None
+        assert event.text == "/goal"
 
     @pytest.mark.asyncio
     async def test_supported_html_injects_content(self, adapter):

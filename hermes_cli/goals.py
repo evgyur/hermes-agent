@@ -144,7 +144,7 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
-    status: str = "active"          # active | paused | done | cleared
+    status: str = "active"          # active | paused | done | cleared | blocked
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
@@ -204,6 +204,7 @@ def _meta_key(session_id: str) -> str:
 
 
 _DB_CACHE: Dict[str, Any] = {}
+_MIGRATABLE_GOAL_STATUSES = {"active", "paused", "blocked"}
 
 
 def _get_session_db() -> Optional[Any]:
@@ -236,11 +237,11 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
+def _load_goal_exact(session_id: str, db: Optional[Any] = None) -> Optional[GoalState]:
+    """Load only ``goal:<session_id>`` without compression-lineage fallback."""
     if not session_id:
         return None
-    db = _get_session_db()
+    db = db or _get_session_db()
     if db is None:
         return None
     try:
@@ -255,6 +256,105 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
+
+
+def _session_row(db: Any, session_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort direct read of the sessions row for compression lineage."""
+    try:
+        with db._lock:  # noqa: SLF001 - SessionDB exposes no narrow helper here.
+            row = db._conn.execute(  # noqa: SLF001
+                "SELECT id, parent_session_id, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("GoalManager: session row lookup failed for %s: %s", session_id, exc)
+        return None
+    if row is None:
+        return None
+    try:
+        return dict(row)
+    except Exception:
+        return {
+            "id": row[0],
+            "parent_session_id": row[1],
+            "end_reason": row[2],
+        }
+
+
+def migrate_goal_to_session(old_session_id: str, new_session_id: str) -> bool:
+    """Move an active goal across a context-compression session split.
+
+    Session compression rotates the transcript from parent -> child while the
+    user's standing goal is stored separately in ``state_meta`` under
+    ``goal:<session_id>``. Without migrating that key, the next gateway turn
+    lands in the compressed child and the official /goal loop silently stops.
+
+    Returns True when a migratable goal was copied to the new session. The old
+    key is marked ``cleared`` after the copy so stale continuations tied to the
+    parent cannot keep running in the wrong session.
+    """
+    old_session_id = str(old_session_id or "")
+    new_session_id = str(new_session_id or "")
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return False
+    db = _get_session_db()
+    if db is None:
+        return False
+
+    state = _load_goal_exact(old_session_id, db=db)
+    if state is None or state.status not in _MIGRATABLE_GOAL_STATUSES:
+        return False
+    existing = _load_goal_exact(new_session_id, db=db)
+    if existing is not None and existing.status != "cleared":
+        return False
+
+    # Copy by JSON round-trip so mutating the old row below cannot alter the
+    # child state object we just saved.
+    migrated = GoalState.from_json(state.to_json())
+    save_goal(new_session_id, migrated)
+
+    state.status = "cleared"
+    state.last_reason = f"migrated to {new_session_id} after context compression"
+    save_goal(old_session_id, state)
+    logger.info("GoalManager: migrated goal %s -> %s", old_session_id, new_session_id)
+    return True
+
+
+def _migrate_goal_from_compression_ancestor(session_id: str, db: Any) -> Optional[GoalState]:
+    """If ``session_id`` is a compression child, inherit the nearest active goal."""
+    current = str(session_id or "")
+    seen = {current}
+    for _ in range(32):
+        row = _session_row(db, current)
+        parent_id = str((row or {}).get("parent_session_id") or "")
+        if not parent_id or parent_id in seen:
+            return None
+        parent_row = _session_row(db, parent_id)
+        # Only inherit across real context-compression splits. Branch/resume/new
+        # sessions must not accidentally pick up a stale goal from a parent.
+        if (parent_row or {}).get("end_reason") != "compression":
+            return None
+        parent_goal = _load_goal_exact(parent_id, db=db)
+        if parent_goal is not None and parent_goal.status in _MIGRATABLE_GOAL_STATUSES:
+            if migrate_goal_to_session(parent_id, session_id):
+                return _load_goal_exact(session_id, db=db)
+            return None
+        seen.add(parent_id)
+        current = parent_id
+    return None
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session, following compression lineage if needed."""
+    state = _load_goal_exact(session_id)
+    if state is not None:
+        return state
+    if not session_id:
+        return None
+    db = _get_session_db()
+    if db is None:
+        return None
+    return _migrate_goal_from_compression_ancestor(session_id, db)
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
@@ -290,6 +390,54 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "… [truncated]"
+
+
+def _non_fenced_lines(text: str) -> List[str]:
+    """Return lines outside markdown fences.
+
+    Goal completion markers are transcript blocks, not examples.  A handoff
+    message may include ``SUPERGOAL_RUN_COMPLETE`` inside a fallback command or
+    code sample; those mentions must not satisfy the `/goal` judge.
+    """
+    lines: List[str] = []
+    in_fence = False
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            lines.append(line)
+    return lines
+
+
+def _has_standalone_marker(text: str, marker: str) -> bool:
+    """True only when ``marker`` appears as its own transcript line."""
+    target = marker.strip().upper()
+    if not target:
+        return False
+    for line in _non_fenced_lines(text):
+        cleaned = line.strip().strip("`*_ ")
+        cleaned = cleaned.rstrip(':.,;!?)"]}').upper()
+        if cleaned == target:
+            return True
+    return False
+
+
+def _looks_like_supergoal_goal(goal: str) -> bool:
+    text = str(goal or "")
+    upper = text.upper()
+    return (
+        "SUPERGOAL_RUN_COMPLETE" in upper
+        or "SUPERGOAL_PHASE" in upper
+        or ".supergoal/" in text.lower()
+        or ("PROTOCOL.MD" in upper and "ROADMAP.MD" in upper)
+    )
+
+
+def _is_supergoal_handoff_reason(reason: str) -> bool:
+    upper = str(reason or "").upper()
+    return "FAILURE_HANDOFF" in upper or "AUDIT_HANDOFF" in upper
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -402,16 +550,21 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False
 
     # Supergoal chains are transcript-marker driven.  A generic assistant
-    # sentence, a `/goal status` notice, or a partial phase summary must never
-    # satisfy them.  This deterministic guard runs before the auxiliary judge
-    # so a weak/over-lenient judge cannot mark a 6-phase run done after one
-    # turn just because the response contained words like "done".
+    # sentence, a `/goal status` notice, a handoff/fallback command, or a
+    # partial phase summary must never satisfy them.  This deterministic guard
+    # runs before the auxiliary judge so a weak/over-lenient judge cannot mark
+    # a 6-phase run done after one turn just because the response mentioned
+    # marker names in prose.
     goal_upper = goal.upper()
-    response_upper = last_response.upper()
-    if "SUPERGOAL_RUN_COMPLETE" in goal_upper and "SUPERGOAL_RUN_COMPLETE" not in response_upper:
-        return "continue", "missing SUPERGOAL_RUN_COMPLETE terminal marker", False
-    if "AUDIT_COMPLETE" in goal_upper and "AUDIT_COMPLETE" not in response_upper:
-        return "continue", "missing AUDIT_COMPLETE terminal marker", False
+    if _looks_like_supergoal_goal(goal):
+        if _has_standalone_marker(last_response, "FAILURE_HANDOFF"):
+            return "done", "supergoal stopped with FAILURE_HANDOFF", False
+        if _has_standalone_marker(last_response, "AUDIT_HANDOFF"):
+            return "done", "supergoal stopped with AUDIT_HANDOFF", False
+        if "SUPERGOAL_RUN_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "SUPERGOAL_RUN_COMPLETE"):
+            return "continue", "missing standalone SUPERGOAL_RUN_COMPLETE terminal marker", False
+        if "AUDIT_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "AUDIT_COMPLETE"):
+            return "continue", "missing standalone AUDIT_COMPLETE terminal marker", False
 
     try:
         from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
@@ -525,6 +678,9 @@ class GoalManager:
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {turns}{sub}{extra}): {s.goal}"
+        if s.status == "blocked":
+            extra = f" — {s.last_reason}" if s.last_reason else ""
+            return f"⏸ Goal blocked ({turns}{sub}{extra}): {s.goal}"
         if s.status == "done":
             return f"✓ Goal done ({turns}{sub}): {s.goal}"
         return f"Goal ({s.status}, {turns}{sub}): {s.goal}"
@@ -679,8 +835,18 @@ class GoalManager:
             state.consecutive_parse_failures = 0
 
         if verdict == "done":
-            state.status = "done"
+            is_handoff = _is_supergoal_handoff_reason(reason)
+            state.status = "blocked" if is_handoff else "done"
             save_goal(self.session_id, state)
+            if is_handoff:
+                return {
+                    "status": "blocked",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "done",
+                    "reason": reason,
+                    "message": f"⏸ Goal stopped: {reason}",
+                }
             return {
                 "status": "done",
                 "should_continue": False,

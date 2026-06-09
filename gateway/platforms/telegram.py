@@ -86,10 +86,12 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    cache_media_bytes,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
+    TEXT_DOCUMENT_EXTENSIONS,
     utf16_len,
 )
 from gateway.platforms.helpers import strip_markdown
@@ -115,6 +117,8 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+_SUPERGOAL_REPLY_DOCUMENT_MAX_BYTES = 100 * 1024
 
 
 MAX_COMMANDS_PER_SCOPE = 30
@@ -5729,12 +5733,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_business_ignored_user_ids(self) -> set[str]:
+        raw = self._telegram_business_config().get("ignore_user_ids")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_BUSINESS_IGNORE_USER_IDS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _message_matches_business_trigger(self, message: Message) -> bool:
         if not self._telegram_business_enabled():
             return False
 
         user = getattr(message, "from_user", None)
         user_id = str(getattr(user, "id", "") or "")
+        if user_id and user_id in self._telegram_business_ignored_user_ids():
+            return False
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
         free_response = self._telegram_business_free_response_chats()
         if user_id in free_response or chat_id in free_response:
@@ -6427,6 +6441,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._hydrate_reply_to_document_text(event, msg)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
@@ -6441,6 +6456,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._hydrate_reply_to_document_text(event, msg)
         event = self._apply_telegram_group_observe_attribution(event)
         event = self._prepare_recent_visible_context(event)
         await self.handle_message(event)
@@ -6905,7 +6921,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                if ext in TEXT_DOCUMENT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
                         display_name = original_filename or f"document{ext}"
@@ -7186,6 +7202,102 @@ class TelegramAdapter(BasePlatformAdapter):
         if caption:
             return cls._inject_telegram_text_links(caption, getattr(message, "caption_entities", None))
         return ""
+
+    async def _hydrate_reply_to_document_text(self, event: MessageEvent, message: Any) -> None:
+        """Cache replied document media and expose safe text content.
+
+        This preserves the existing "reply to a document and run /summ" path
+        while also making bare `/goal` replies to SuperGoal `.md` files work:
+        the command text stays `/goal`, and the replied document body is added
+        to `reply_to_text` for GoalManager extraction.
+        """
+        replied = getattr(message, "reply_to_message", None)
+        doc = getattr(replied, "document", None) if replied is not None else None
+        if doc is None:
+            return
+
+        filename = getattr(doc, "file_name", "") or ""
+        mime_type = (getattr(doc, "mime_type", "") or "").lower()
+        ext = os.path.splitext(filename)[1].lower()
+        if not ext and mime_type:
+            mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+            ext = mime_to_ext.get(mime_type, "")
+
+        size = None
+        try:
+            size = getattr(doc, "file_size", None)
+            size_int = int(size) if size is not None else None
+        except (TypeError, ValueError):
+            size_int = None
+        if size_int is None or size_int > self._max_doc_bytes:
+            logger.info(
+                "[Telegram] Skipping replied document hydration: %s bytes for %s",
+                size,
+                filename or mime_type or "unknown",
+            )
+            return
+
+        try:
+            file_obj = await doc.get_file()
+            raw_bytes = bytes(await file_obj.download_as_bytearray())
+        except Exception as exc:
+            logger.warning("[Telegram] Failed to download replied document: %s", exc, exc_info=True)
+            return
+
+        if len(raw_bytes) > self._max_doc_bytes:
+            logger.info(
+                "[Telegram] Skipping replied document hydration after download: %s bytes for %s",
+                len(raw_bytes),
+                filename or mime_type or "unknown",
+            )
+            return
+
+        cached = cache_media_bytes(raw_bytes, filename=filename, mime_type=mime_type, default_kind="document")
+        if cached is not None:
+            event.media_urls = list(event.media_urls or []) + [cached.path]
+            event.media_types = list(event.media_types or []) + [cached.media_type]
+            if cached.kind == "image":
+                event.message_type = MessageType.PHOTO
+            elif cached.kind == "video":
+                event.message_type = MessageType.VIDEO
+            elif cached.kind == "audio":
+                event.message_type = MessageType.AUDIO
+            else:
+                event.message_type = MessageType.DOCUMENT
+
+        is_text_document = ext in TEXT_DOCUMENT_EXTENSIONS or mime_type.startswith("text/")
+        if (
+            not is_text_document
+            or size_int is None
+            or size_int > _SUPERGOAL_REPLY_DOCUMENT_MAX_BYTES
+            or len(raw_bytes) > _SUPERGOAL_REPLY_DOCUMENT_MAX_BYTES
+        ):
+            return
+
+        try:
+            text = raw_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            logger.warning("[Telegram] Replied text document is not valid UTF-8: %s", filename or mime_type)
+            return
+
+        display_name = re.sub(r'[^\w.\- ]', '_', filename or f"document{ext or '.txt'}")
+        doc_text = f"[Content of replied-to {display_name}]:\n{text}"
+
+        # Bare `/goal` replies must stay command-only. GoalManager reads the
+        # replied document from `reply_to_text`; appending the document body to
+        # `event.text` makes Bot API command parsing treat the whole file as
+        # `/goal <args>` and bypasses SuperGoal body extraction.
+        command_text = (event.text or "").strip()
+        is_bare_goal_reply = bool(re.fullmatch(r"/goal(?:@[A-Za-z0-9_]+)?", command_text))
+        if not is_bare_goal_reply:
+            if event.text:
+                event.text = f"{event.text}\n\n{doc_text}"
+            else:
+                event.text = doc_text
+        if event.reply_to_text:
+            event.reply_to_text = f"{event.reply_to_text}\n\n{doc_text}"
+        else:
+            event.reply_to_text = doc_text
 
     def _build_message_event(
         self,

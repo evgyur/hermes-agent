@@ -8543,6 +8543,12 @@ class GatewayRunner:
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
                             sanitized_env["HERMES_COMMAND_NAME"] = command
                             sanitized_env["HERMES_COMMAND_ARGS"] = user_args
+                            # Expose reply context to quick-command helpers.  This lets
+                            # commands like /saymm work when the user replies to a
+                            # message without typing explicit args, while keeping the
+                            # command shell argv empty unless append_args is used.
+                            sanitized_env["HERMES_REPLY_TO_TEXT"] = str(getattr(event, "reply_to_text", "") or "")
+                            sanitized_env["HERMES_REPLY_TO_MESSAGE_ID"] = str(getattr(event, "reply_to_message_id", "") or "")
                             # Safe origin metadata for detached quick-command workers.
                             # This lets launcher-style commands complete asynchronously
                             # and deliver back to the same chat/topic without exposing
@@ -9795,6 +9801,19 @@ class GatewayRunner:
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+                old_session_id = session_entry.session_id
+                new_session_id = agent_result["session_id"]
+                try:
+                    from hermes_cli.goals import migrate_goal_to_session
+
+                    migrate_goal_to_session(old_session_id, new_session_id)
+                except Exception as _goal_migrate_exc:
+                    logger.debug(
+                        "goal migration after agent-result compression failed %s -> %s: %s",
+                        old_session_id,
+                        new_session_id,
+                        _goal_migrate_exc,
+                    )
                 session_entry.session_id = agent_result["session_id"]
                 self.session_store._save()
                 self._sync_telegram_topic_binding(
@@ -12026,8 +12045,8 @@ class GatewayRunner:
             return ""
 
         marker = "SUPERGOAL_GOAL_BODY:"
-        if raw.startswith(marker):
-            raw = raw[len(marker):].strip()
+        if marker in raw:
+            raw = GatewayRunner._extract_supergoal_body(raw)
         else:
             supergoal_from_artifacts = GatewayRunner._goal_text_from_supergoal_artifacts(raw)
             if supergoal_from_artifacts:
@@ -12056,19 +12075,27 @@ class GatewayRunner:
         if marker not in raw:
             return ""
         body = raw.split(marker, 1)[1].strip()
-        stop_markers = (
-            "\n\nТеперь ",
-            "\n\nReply to ",
-            "\n\nFallback plain-text line:",
-            "\n\nНе копируй",
-            "\n\nДа, ",
-            "\n\nOnce you ",
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        stop_patterns = (
+            r"(?im)^\s*DONE_CONDITION\s*:",
+            r"(?im)^\s*OPERATOR_ACTION\s*:",
+            r"(?im)^\s*NOTES\s*:",
+            r"(?im)^\s*ARTIFACTS\s*:",
+            r"(?im)^\s*ФАЙЛЫ\s*:",
+            r"(?im)^\s*КНОПКИ\b",
+            r"(?m)^\s*##\s+",
+            r"(?m)^\s*Теперь\b",
+            r"(?m)^\s*Reply to\b",
+            r"(?m)^\s*Fallback plain-text line\s*:",
+            r"(?m)^\s*Не копируй\b",
+            r"(?m)^\s*Не стартовал\b",
+            r"(?m)^\s*Сейчас только\b",
+            r"(?m)^\s*Да,\s+",
+            r"(?m)^\s*Once you\b",
         )
-        for stop in stop_markers:
-            idx = body.find(stop)
-            if idx != -1:
-                body = body[:idx].strip()
-                break
+        cut_points = [match.start() for pattern in stop_patterns if (match := re.search(pattern, body))]
+        if cut_points:
+            body = body[: min(cut_points)].strip()
         if body.startswith("`") and body.endswith("`") and len(body) > 2:
             body = body[1:-1].strip()
         return body
@@ -12169,6 +12196,11 @@ class GatewayRunner:
                 args = reply_goal
                 goal_from_reply = True
         lower = args.lower()
+        if args and "SUPERGOAL_GOAL_BODY:" in args:
+            extracted = self._extract_supergoal_body(args)
+            if extracted:
+                args = extracted
+                lower = args.lower()
 
         mgr, session_entry = self._get_goal_manager_for_event(event)
         if mgr is None:
@@ -12365,10 +12397,12 @@ class GatewayRunner:
     ) -> bool:
         """Start an official /goal run when the assistant emits a Supergoal body.
 
-        This is the button-safe path: after a clarify button returns "Start now",
-        the assistant can emit `SUPERGOAL_GOAL_BODY: ...` and the gateway turns
-        that response into the same GoalManager + kickoff queue used by `/goal`.
+        This is the button-safe path for explicit internal starts only.  A
+        normal assistant handoff that merely prints `SUPERGOAL_GOAL_BODY:` must
+        not start `/goal` by itself; Chip expects to reply with `/goal`.
         """
+        if "SUPERGOAL_AUTODISPATCH: true" not in str(final_response or ""):
+            return False
         goal_text = self._extract_supergoal_body(final_response)
         if not goal_text:
             return False
@@ -19028,15 +19062,27 @@ class GatewayRunner:
             # the compressed transcript, not the stale pre-compression one.
             agent = agent_holder[0]
             _session_was_split = False
-            if agent and session_key and hasattr(agent, 'session_id') and agent.session_id != session_id:
+            _agent_session_id = getattr(agent, "session_id", None) if agent else None
+            if agent and session_key and _agent_session_id and _agent_session_id != session_id:
                 _session_was_split = True
                 logger.info(
                     "Session split detected: %s → %s (compression)",
-                    session_id, agent.session_id,
+                    session_id, _agent_session_id,
                 )
+                try:
+                    from hermes_cli.goals import migrate_goal_to_session
+
+                    migrate_goal_to_session(session_id, _agent_session_id)
+                except Exception as _goal_migrate_exc:
+                    logger.debug(
+                        "goal migration after session split failed %s -> %s: %s",
+                        session_id,
+                        _agent_session_id,
+                        _goal_migrate_exc,
+                    )
                 entry = self.session_store._entries.get(session_key)
                 if entry:
-                    entry.session_id = agent.session_id
+                    entry.session_id = _agent_session_id
                     self.session_store._save()
 
                 # If this is a Telegram DM and source.thread_id was lost during
@@ -19054,7 +19100,7 @@ class GatewayRunner:
                 ):
                     try:
                         _binding = self._session_db.get_telegram_topic_binding_by_session(
-                            session_id=agent.session_id,
+                            session_id=_agent_session_id,
                         )
                         if _binding and _binding.get("thread_id"):
                             source.thread_id = str(_binding["thread_id"])
@@ -19062,7 +19108,7 @@ class GatewayRunner:
                                 "Restored source.thread_id=%s from binding after session split %s → %s",
                                 source.thread_id,
                                 session_id,
-                                agent.session_id,
+                                _agent_session_id,
                             )
                     except Exception:
                         logger.debug(

@@ -525,6 +525,22 @@ def test_business_dm_dispatch_requires_trigger():
     ) is True
 
 
+def test_business_dm_ignored_user_id_suppresses_reflected_human_account_echo():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_user_ids": ["617744661"],
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, echo from delegated human account", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, real customer", from_user_id=111)
+    ) is True
+
+
 def test_business_message_source_keeps_business_connection_id():
     adapter = _make_adapter(require_mention=False)
     message = _business_dm_message("Sigurd, ping", from_user_id=95948382)

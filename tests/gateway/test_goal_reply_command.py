@@ -140,7 +140,8 @@ async def test_bare_goal_reply_strips_supergoal_body_prefix_and_sets_high(hermes
         reply_to_message_id="body-1",
         reply_to_text=(
             "SUPERGOAL_GOAL_BODY: Execute all phases from "
-            "/tmp/project/.supergoal/ROADMAP.md and finish with SUPERGOAL_RUN_COMPLETE."
+            "/tmp/project/.supergoal/ROADMAP.md and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+            "Не стартовал за тебя. Сейчас только выдал файлы."
         ),
     )
 
@@ -152,9 +153,169 @@ async def test_bare_goal_reply_strips_supergoal_body_prefix_and_sets_high(hermes
     assert state is not None
     assert state.goal.startswith("Execute all phases")
     assert "SUPERGOAL_GOAL_BODY" not in state.goal
+    assert "Не стартовал" not in state.goal
     assert "Goal set" in response
     override = runner.runner._session_reasoning_overrides[runner.session.session_key]
     assert override["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_extracts_supergoal_body_when_marker_is_inside_report(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4a",
+        reply_to_message_id="body-report-1",
+        reply_to_text=(
+            "Файлы готовы, ниже тело для запуска.\n\n"
+            "SUPERGOAL_GOAL_BODY: From project root, execute `.supergoal/demo` "
+            "and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
+            "Не стартовал за тебя. Сейчас только выдал файлы."
+        ),
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal == "From project root, execute `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
+    assert "Файлы готовы" not in state.goal
+    assert "Не стартовал" not in state.goal
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_extracts_supergoal_body_from_replied_markdown_document_text(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4doc",
+        reply_to_message_id="roadmap-md-1",
+        reply_to_text=(
+            "[Content of replied document ROADMAP.md]:\n"
+            "# Roadmap\n\n"
+            "SUPERGOAL_GOAL_BODY: From project root, execute `.supergoal/demo` "
+            "and finish with AUDIT_COMPLETE + SUPERGOAL_RUN_COMPLETE.\n\n"
+            "## Artifacts\n"
+            "Roadmap: `.supergoal/ROADMAP.md`"
+        ),
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal == (
+        "From project root, execute `.supergoal/demo` "
+        "and finish with AUDIT_COMPLETE + SUPERGOAL_RUN_COMPLETE."
+    )
+    assert "Artifacts" not in state.goal
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_extracts_supergoal_body_from_launch_goal_markdown(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4launch",
+        reply_to_message_id="launch-md-1",
+        reply_to_text=(
+            "[Content of replied-to LAUNCH_GOAL.md]:\n"
+            "# Human20 Auth Perfect -- SuperGoal launch\n\n"
+            "SUPERGOAL_GOAL_BODY:\n"
+            "Execute SuperGoal demo from /tmp/project using .supergoal/demo/PROTOCOL.md, "
+            "ROADMAP.md, STATE.md, and phases/phase-0.md..phase-7.md. Run exactly one "
+            "numbered phase per turn and finish with AUDIT_COMPLETE then SUPERGOAL_RUN_COMPLETE.\n\n"
+            "DONE_CONDITION:\n"
+            "Done when SUPERGOAL_RUN_COMPLETE appears in the transcript.\n\n"
+            "OPERATOR_ACTION:\n"
+            "Reply to this file in Telegram with exactly: /goal\n\n"
+            "NOTES:\n"
+            "- This file is a launch artifact only.\n"
+            "- It does not autostart by being posted."
+        ),
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal == (
+        "Execute SuperGoal demo from /tmp/project using .supergoal/demo/PROTOCOL.md, "
+        "ROADMAP.md, STATE.md, and phases/phase-0.md..phase-7.md. Run exactly one "
+        "numbered phase per turn and finish with AUDIT_COMPLETE then SUPERGOAL_RUN_COMPLETE."
+    )
+    assert "DONE_CONDITION" not in state.goal
+    assert "OPERATOR_ACTION" not in state.goal
+    assert "NOTES" not in state.goal
+    assert runner.runner._session_reasoning_overrides[runner.session.session_key]["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_goal_args_with_hydrated_launch_markdown_extracts_supergoal_body(hermes_home, runner):
+    event = MessageEvent(
+        text=(
+            "/goal\n\n"
+            "[Content of replied-to LAUNCH_GOAL.md]:\n"
+            "# Human20 Auth Perfect -- SuperGoal launch\n\n"
+            "SUPERGOAL_GOAL_BODY:\r\n"
+            "Execute SuperGoal demo from /tmp/project using .supergoal/demo/PROTOCOL.md.\r\n"
+            "DONE_CONDITION:\r\n"
+            "Done when SUPERGOAL_RUN_COMPLETE appears.\r\n\r\n"
+            "NOTES:\r\n"
+            "- This file is a launch artifact only."
+        ),
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4launch-args",
+        reply_to_message_id="launch-md-args-1",
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal == "Execute SuperGoal demo from /tmp/project using .supergoal/demo/PROTOCOL.md."
+    assert "[Content of replied-to" not in state.goal
+    assert "DONE_CONDITION" not in state.goal
+    assert "NOTES" not in state.goal
+
+
+def test_extract_supergoal_body_cuts_earliest_section_without_blank_line(runner):
+    text = (
+        "SUPERGOAL_GOAL_BODY:\n"
+        "Run the thing.\n"
+        "NOTES:\n"
+        "This must be stripped.\n\n"
+        "DONE_CONDITION:\n"
+        "Too late."
+    )
+
+    body = runner.runner._extract_supergoal_body(text)
+
+    assert body == "Run the thing."
+
+
+def test_extract_supergoal_body_normalizes_crlf_and_strips_launch_tails(runner):
+    text = "SUPERGOAL_GOAL_BODY:\r\nRun it.\r\n\r\nDONE_CONDITION:\r\nDone."
+
+    body = runner.runner._extract_supergoal_body(text)
+
+    assert body == "Run it."
 
 
 @pytest.mark.asyncio
@@ -250,13 +411,36 @@ def test_pasted_supergoal_handoff_requires_goal_line(runner):
 
 
 @pytest.mark.asyncio
-async def test_assistant_supergoal_body_auto_dispatches_official_goal(hermes_home, runner):
+async def test_assistant_supergoal_body_without_autodispatch_sentinel_does_not_start_goal(hermes_home, runner):
     session_entry = runner.session
     response = (
         "Pre-flight green.\n\n"
         "SUPERGOAL_GOAL_BODY: From project root, execute `.supergoal/demo` "
         "and finish with SUPERGOAL_RUN_COMPLETE.\n\n"
         "This should start automatically after Start now."
+    )
+
+    did_dispatch = await runner.runner._auto_dispatch_supergoal_from_response(
+        session_entry=session_entry,
+        source=runner.source,
+        final_response=response,
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_entry.session_id).state
+    assert did_dispatch is False
+    assert state is None
+    assert runner.adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_assistant_supergoal_body_with_autodispatch_sentinel_starts_goal(hermes_home, runner):
+    session_entry = runner.session
+    response = (
+        "SUPERGOAL_AUTODISPATCH: true\n\n"
+        "SUPERGOAL_GOAL_BODY: From project root, execute `.supergoal/demo` "
+        "and finish with SUPERGOAL_RUN_COMPLETE."
     )
 
     did_dispatch = await runner.runner._auto_dispatch_supergoal_from_response(

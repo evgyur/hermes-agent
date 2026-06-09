@@ -196,6 +196,75 @@ class TestJudgeGoal:
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_inline_marker_mentions_do_not_satisfy_guard(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "too lenient"}')
+                )
+            ]
+        )
+        goal = "Run phases; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = (
+            "Reply with this fallback command:\n"
+            "/goal Run the plan; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "continue"
+        assert "standalone SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_markers_inside_code_fence_do_not_satisfy_guard(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "too lenient"}')
+                )
+            ]
+        )
+        goal = "Run phases; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = "Example only:\n```\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n```"
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "continue"
+        assert "standalone SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_failure_handoff_stops_without_aux_judge(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                )
+            ]
+        )
+        goal = "Run phases; on missing credentials use FAILURE_HANDOFF; finish after SUPERGOAL_RUN_COMPLETE."
+        response = "FAILURE_HANDOFF\nSTATE.md updated to BLOCKED."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert "FAILURE_HANDOFF" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_with_terminal_markers_can_reach_judge(self):
         from hermes_cli import goals
 
@@ -310,6 +379,67 @@ class TestGoalManager:
         assert decision["continuation_prompt"] is None
         assert mgr.state.status == "done"
         assert mgr.state.turns_used == 1
+
+    def test_evaluate_after_turn_supergoal_handoff_is_blocked_not_achieved(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-sid-blocked")
+        mgr.set("Run Supergoal and stop with FAILURE_HANDOFF if credentials are missing.")
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("done", "supergoal stopped with FAILURE_HANDOFF", False),
+        ):
+            decision = mgr.evaluate_after_turn("FAILURE_HANDOFF")
+
+        assert decision["verdict"] == "done"
+        assert decision["status"] == "blocked"
+        assert decision["should_continue"] is False
+        assert decision["continuation_prompt"] is None
+        assert "Goal stopped" in decision["message"]
+        assert "Goal achieved" not in decision["message"]
+        assert mgr.state is not None
+        assert mgr.state.status == "blocked"
+        assert "Goal blocked" in mgr.status_line()
+
+    def test_active_goal_migrates_to_compression_child(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session("goal-parent", source="telegram")
+        db.create_session("goal-child", source="telegram", parent_session_id="goal-parent")
+        db.end_session("goal-parent", "compression")
+
+        parent = GoalManager(session_id="goal-parent")
+        parent.set("ship through the official goal loop")
+
+        child = GoalManager(session_id="goal-child")
+
+        assert child.state is not None
+        assert child.state.status == "active"
+        assert child.state.goal == "ship through the official goal loop"
+        parent_state = GoalManager(session_id="goal-parent").state
+        assert parent_state is not None
+        assert parent_state.status == "cleared"
+
+    def test_goal_does_not_migrate_across_non_compression_parent(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session("branch-parent", source="telegram")
+        db.create_session("branch-child", source="telegram", parent_session_id="branch-parent")
+        db.end_session("branch-parent", "branch")
+
+        GoalManager(session_id="branch-parent").set("do not inherit this")
+
+        assert GoalManager(session_id="branch-child").state is None
+        parent_state = GoalManager(session_id="branch-parent").state
+        assert parent_state is not None
+        assert parent_state.status == "active"
 
     def test_evaluate_after_turn_continue_under_budget(self, hermes_home):
         from hermes_cli import goals
