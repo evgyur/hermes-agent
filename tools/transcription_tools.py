@@ -1134,7 +1134,19 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            segment_items = []
+            transcript_parts = []
+            for segment in segments:
+                text = segment.text.strip()
+                if text:
+                    transcript_parts.append(text)
+                segment_items.append({
+                    "start": getattr(segment, "start", None),
+                    "end": getattr(segment, "end", None),
+                    "text": text,
+                    "speaker": getattr(segment, "speaker", None),
+                })
+            transcript = " ".join(transcript_parts)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
             # AFTER the model loaded successfully.  Evict the broken cached
@@ -1154,14 +1166,26 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            segment_items = []
+            transcript_parts = []
+            for segment in segments:
+                text = segment.text.strip()
+                if text:
+                    transcript_parts.append(text)
+                segment_items.append({
+                    "start": getattr(segment, "start", None),
+                    "end": getattr(segment, "end", None),
+                    "text": text,
+                    "speaker": getattr(segment, "speaker", None),
+                })
+            transcript = " ".join(transcript_parts)
 
         logger.info(
             "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
             Path(file_path).name, model_name, info.language, info.duration,
         )
 
-        return {"success": True, "transcript": transcript, "provider": "local"}
+        return {"success": True, "transcript": transcript, "provider": "local", "segments": segment_items}
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
@@ -1284,17 +1308,26 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text",
-                )
+                try:
+                    transcription = client.audio.transcriptions.create(
+                        model=model_name,
+                        file=audio_file,
+                        response_format="verbose_json",
+                    )
+                except Exception:
+                    audio_file.seek(0)
+                    transcription = client.audio.transcriptions.create(
+                        model=model_name,
+                        file=audio_file,
+                        response_format="text",
+                    )
 
-            transcript_text = str(transcription).strip()
+            transcript_text = _extract_transcript_text(transcription)
+            segments = _extract_transcript_segments(transcription)
             logger.info("Transcribed %s via Groq API (%s, %d chars)",
                          Path(file_path).name, model_name, len(transcript_text))
 
-            return {"success": True, "transcript": transcript_text, "provider": "groq"}
+            return {"success": True, "transcript": transcript_text, "provider": "groq", "segments": segments}
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -1770,6 +1803,39 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
         f"{managed_gateway.gateway_origin.rstrip('/')}/", "v1"
     )
 
+
+
+
+def _extract_transcript_segments(transcription: Any) -> list[dict[str, Any]]:
+    """Normalize provider segment/word timing payloads to simple dicts."""
+    raw_segments = None
+    if isinstance(transcription, dict):
+        raw_segments = transcription.get("segments") or transcription.get("words")
+    elif hasattr(transcription, "segments"):
+        raw_segments = getattr(transcription, "segments")
+    elif hasattr(transcription, "words"):
+        raw_segments = getattr(transcription, "words")
+
+    if not raw_segments:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw_segments:
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("word") or ""
+            start = item.get("start")
+            end = item.get("end")
+            speaker = item.get("speaker") or item.get("speaker_id")
+        else:
+            text = getattr(item, "text", None) or getattr(item, "word", "")
+            start = getattr(item, "start", None)
+            end = getattr(item, "end", None)
+            speaker = getattr(item, "speaker", None) or getattr(item, "speaker_id", None)
+        text = str(text or "").strip()
+        if not text:
+            continue
+        normalized.append({"start": start, "end": end, "text": text, "speaker": speaker})
+    return normalized
 
 def _extract_transcript_text(transcription: Any) -> str:
     """Normalize text and JSON transcription responses to a plain string."""

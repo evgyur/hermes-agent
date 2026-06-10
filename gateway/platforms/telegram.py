@@ -629,6 +629,143 @@ class TelegramAdapter(BasePlatformAdapter):
             raise FileNotFoundError(path)
         return path
 
+    def _extract_audio_for_transcribe_sync(self, media_path: str) -> str:
+        """Extract a small mono MP3 for STT from a recovered video/audio container."""
+        src = Path(media_path)
+        if not src.exists():
+            raise FileNotFoundError(media_path)
+        out_path = str(src.with_suffix(".transcribe.mp3"))
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+            "-b:a", "32k", out_path,
+        ]
+        subprocess.run(cmd, check=True, timeout=300)
+        if not os.path.exists(out_path):
+            raise FileNotFoundError(out_path)
+        return out_path
+
+    _TME_C_LINK_RE = re.compile(r"https?://t\.me/c/(?P<chat>\d+)(?:/\d+)?/(?P<message>\d+)(?:\?[^\s]+)?", re.IGNORECASE)
+
+    @classmethod
+    def _extract_private_tme_c_links(cls, text: str | None) -> list[tuple[str, int]]:
+        """Extract private Telegram t.me/c links as full chat id + final message id."""
+        out: list[tuple[str, int]] = []
+        if not text:
+            return out
+        for match in cls._TME_C_LINK_RE.finditer(text):
+            try:
+                out.append((f"-100{match.group('chat')}", int(match.group('message'))))
+            except Exception:
+                continue
+        return out
+
+    def _telegram_chip_fetch_message_sync(self, chat_id: Any, message_id: Any) -> dict:
+        """Fetch exact message metadata through the local telegram-chip API."""
+        url = (
+            "http://127.0.0.1:8080/chats/"
+            + urllib.parse.quote(str(chat_id), safe="")
+            + f"/messages/{message_id}"
+        )
+        raw = urllib.request.urlopen(url, timeout=30).read().decode("utf-8")
+        obj = json.loads(raw)
+        if not obj.get("success"):
+            raise RuntimeError(obj.get("error") or raw[:300])
+        data = obj.get("data")
+        if isinstance(data, str):
+            return json.loads(data)
+        if isinstance(data, dict):
+            return data
+        raise RuntimeError(f"Unexpected telegram-chip message payload: {type(data).__name__}")
+
+    async def _recover_transcribe_route_tme_link_via_telegram_chip(
+        self,
+        event: MessageEvent,
+        current_chat_id: Any,
+    ) -> bool:
+        """Recover media from private t.me/c links posted into transcribe-route chats.
+
+        Bot API events only expose the link text; the linked media may live in a
+        different private group/topic. For configured transcription dropboxes,
+        resolve the link through the shared telegram-chip runtime and attach the
+        downloaded media to the event before the LLM runs.
+        """
+        if not self._is_transcribe_route_chat(current_chat_id):
+            return False
+        links = self._extract_private_tme_c_links(event.text)
+        if not links:
+            return False
+        errors: list[str] = []
+        for linked_chat_id, linked_message_id in links:
+            try:
+                meta = await asyncio.to_thread(
+                    self._telegram_chip_fetch_message_sync,
+                    linked_chat_id,
+                    linked_message_id,
+                )
+                if not meta.get("has_media"):
+                    event.text = (
+                        f"[Telegram private link was fetched via telegram-chip: "
+                        f"chat={linked_chat_id} message={linked_message_id}; no media found. "
+                        f"Visible text: {meta.get('text') or ''}]\n\n{event.text or ''}"
+                    ).strip()
+                    continue
+                media_type = str(meta.get("media_type") or "")
+                ext = ".mp4" if "Document" in media_type or "Video" in media_type else ".mp3" if "Audio" in media_type else ".bin"
+                path = await asyncio.to_thread(
+                    self._telegram_chip_media_download_sync,
+                    linked_chat_id,
+                    linked_message_id,
+                    ext,
+                )
+                if path.lower().endswith((".mp4", ".mov", ".mkv", ".webm")):
+                    audio_path = await asyncio.to_thread(self._extract_audio_for_transcribe_sync, path)
+                    path = audio_path
+                    mime_type = "audio/mpeg"
+                    msg_type = MessageType.VOICE
+                elif path.lower().endswith((".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".opus")):
+                    mime_type = "audio/mpeg"
+                    msg_type = MessageType.VOICE
+                else:
+                    mime_type = "application/octet-stream"
+                    msg_type = MessageType.DOCUMENT
+                event.media_urls = [path]
+                event.media_types = [mime_type]
+                event.message_type = msg_type
+                event.text = (
+                    "[Telegram private t.me/c media recovered via telegram-chip. "
+                    f"Source: chat={linked_chat_id} message={linked_message_id}. "
+                    f"Recovered local file path: {path}. "
+                    "Transcribe this recovered file now. The gateway will send the transcript file; "
+                    "return only a concise Russian /summ-style summary for the second file. "
+                    "Do not include the full transcript in the chat response.]"
+                )
+                logger.info(
+                    "[Telegram] Recovered transcribe-route private link media via telegram-chip: "
+                    "source_chat=%s source_message=%s path=%s",
+                    linked_chat_id,
+                    linked_message_id,
+                    path,
+                )
+                return True
+            except Exception as exc:
+                errors.append(f"{linked_chat_id}/{linked_message_id}: {exc}")
+                logger.warning(
+                    "[Telegram] Failed private t.me/c telegram-chip recovery: source_chat=%s source_message=%s error=%s",
+                    linked_chat_id,
+                    linked_message_id,
+                    exc,
+                    exc_info=True,
+                )
+        if errors:
+            event.text = (
+                "[Telegram private t.me/c recovery through telegram-chip was attempted and failed: "
+                + "; ".join(errors[:3])
+                + "]\n\n"
+                + (event.text or "")
+            )
+        return False
+
     async def _recover_transcribe_route_media_via_telegram_chip(
         self,
         msg: Any,
@@ -653,13 +790,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id,
                 ext,
             )
+            if message_type == MessageType.VIDEO or str(mime_type).startswith("video/"):
+                path = await asyncio.to_thread(self._extract_audio_for_transcribe_sync, path)
+                mime_type = "audio/mpeg"
+                message_type = MessageType.VOICE
+            elif message_type == MessageType.AUDIO or str(mime_type).startswith("audio/"):
+                message_type = MessageType.VOICE
             event.media_urls = [path]
             event.media_types = [mime_type]
             event.message_type = message_type
             if not event.text:
                 event.text = (
                     "[Telegram transcribe-route media recovered via telegram-chip. "
-                    "Transcribe this file now and return the transcript first.]"
+                    f"Recovered local file path: {path}. "
+                    "Transcribe this file now. The gateway will send transcript and summary as files; "
+                    "return only a concise Russian /summ-style summary.]"
                 )
             logger.info(
                 "[Telegram] Recovered transcribe-route media via telegram-chip: chat=%s message=%s path=%s reason=%s",
@@ -6442,6 +6587,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._hydrate_reply_to_document_text(event, msg)
+        await self._recover_transcribe_route_tme_link_via_telegram_chip(event, msg.chat.id)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 

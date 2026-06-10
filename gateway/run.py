@@ -8835,17 +8835,27 @@ class GatewayRunner:
         if event.media_urls:
             image_paths = []
             audio_paths = []
+            _media_adapter = self.adapters.get(source.platform)
+            _route_check = getattr(_media_adapter, "_is_transcribe_route_chat", None) if _media_adapter is not None else None
+            _is_tg_transcribe_media = bool(callable(_route_check) and _route_check(source.chat_id))
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
                     image_paths.append(path)
-                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
-                # MessageType.VOICE = voice message (Opus/OGG) — always STT
+                # Normal chats do not auto-STT ordinary audio attachments because users
+                # may be sharing a file, not asking for transcription. Dedicated
+                # transcribe-route chats are different: any audio attachment is the task.
                 if event.message_type == MessageType.AUDIO:
-                    audio_file_paths.append(path)
+                    if _is_tg_transcribe_media or mtype.startswith("audio/"):
+                        audio_paths.append(path)
+                    else:
+                        audio_file_paths.append(path)
                 elif event.message_type == MessageType.VOICE or (
                     mtype.startswith("audio/")
-                    and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
+                    and (
+                        _is_tg_transcribe_media
+                        or event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
+                    )
                 ):
                     audio_paths.append(path)
 
@@ -8875,10 +8885,60 @@ class GatewayRunner:
                     )
 
             if audio_paths:
+                try:
+                    _ack_adapter = self.adapters.get(source.platform)
+                    _ack_is_transcribe = False
+                    if _ack_adapter is not None:
+                        _route_check = getattr(_ack_adapter, "_is_transcribe_route_chat", None)
+                        if callable(_route_check):
+                            _ack_is_transcribe = bool(_route_check(source.chat_id))
+                    if _ack_is_transcribe and _ack_adapter is not None:
+                        await _ack_adapter.send(
+                            source.chat_id,
+                            "Принял. Достаю медиа и транскрибирую. В конце пришлю 2 файла: транскрипт с таймкодами и /summ-саммари на русском.",
+                            reply_to=self._reply_anchor_for_event(event),
+                            metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                        )
+                except Exception as exc:
+                    logger.debug("Transcribe-route ack send skipped: %s", exc)
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
+                # Transcription dropbox contract: after STT, immediately attach the
+                # raw transcript as a Telegram document. This is deterministic and
+                # does not depend on the LLM remembering to call write_file or to
+                # emit a MEDIA: directive in its final text.
+                try:
+                    _transcribe_adapter = self.adapters.get(source.platform)
+                    _is_tg_transcribe = False
+                    if _transcribe_adapter is not None:
+                        _route_check = getattr(_transcribe_adapter, "_is_transcribe_route_chat", None)
+                        if callable(_route_check):
+                            _is_tg_transcribe = bool(_route_check(source.chat_id))
+                    if _is_tg_transcribe and _transcribe_adapter is not None:
+                        _txt_paths = re.findall(r"\[Transcript text file was written to: ([^\]\n]+)\]", message_text or "")
+                        if _txt_paths and hasattr(_transcribe_adapter, "send_document"):
+                            _meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                            for _idx, _txt_path in enumerate(_txt_paths, 1):
+                                if os.path.exists(_txt_path):
+                                    _name = os.path.basename(_txt_path)
+                                    _cap = "Транскрипт с таймкодами .txt" if len(_txt_paths) == 1 else f"Транскрипт с таймкодами .txt ({_idx}/{len(_txt_paths)})"
+                                    await _transcribe_adapter.send_document(
+                                        source.chat_id,
+                                        _txt_path,
+                                        caption=_cap,
+                                        file_name=_name,
+                                        reply_to=self._reply_anchor_for_event(event),
+                                        metadata=_meta,
+                                    )
+                                    logger.info(
+                                        "Transcribe-route transcript document sent: chat=%s path=%s",
+                                        source.chat_id,
+                                        _txt_path,
+                                    )
+                except Exception as exc:
+                    logger.warning("Transcribe-route transcript document send failed: %s", exc, exc_info=True)
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",
@@ -10091,6 +10151,36 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
+            try:
+                _summary_adapter = self.adapters.get(source.platform)
+                _summary_is_transcribe = False
+                if _summary_adapter is not None:
+                    _route_check = getattr(_summary_adapter, "_is_transcribe_route_chat", None)
+                    if callable(_route_check):
+                        _summary_is_transcribe = bool(_route_check(source.chat_id))
+                if _summary_is_transcribe and "[Transcript text file was written to:" in (message_text or ""):
+                    _txt_paths = re.findall(r"\[Transcript text file was written to: ([^\]\n]+)\]", message_text or "")
+                    _meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _txt_paths and response and _summary_adapter is not None and hasattr(_summary_adapter, "send_document"):
+                        _summary_path = self._write_transcribe_route_summary_file(_txt_paths[0], response)
+                        if _summary_path and os.path.exists(_summary_path):
+                            await _summary_adapter.send_document(
+                                source.chat_id,
+                                _summary_path,
+                                caption="/summ — саммари на русском .md",
+                                file_name=os.path.basename(_summary_path),
+                                reply_to=self._reply_anchor_for_event(event),
+                                metadata=_meta,
+                            )
+                            logger.info(
+                                "Transcribe-route summary document sent: chat=%s path=%s",
+                                source.chat_id,
+                                _summary_path,
+                            )
+                            return None
+            except Exception as exc:
+                logger.warning("Transcribe-route summary document send failed: %s", exc, exc_info=True)
+
             if agent_result.get("already_sent") and not agent_result.get("failed"):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
@@ -16355,6 +16445,86 @@ class GatewayRunner:
             return prefix
         return user_text
 
+
+    def _format_stt_timestamp(self, value) -> str:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds < 0:
+            seconds = 0.0
+        total = int(seconds)
+        ms = int(round((seconds - total) * 1000))
+        h, rem = divmod(total, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    def _stt_speaker_label(self, raw_speaker, default_index: int = 1) -> str:
+        if raw_speaker is None or str(raw_speaker).strip() == "":
+            return f"Спикер {default_index}"
+        value = str(raw_speaker).strip()
+        digits = re.findall(r"\d+", value)
+        if digits:
+            try:
+                num = int(digits[-1])
+                low = value.lower()
+                # Many diarizers emit zero-based labels like speaker_0/spk_0;
+                # human-facing files should start at Спикер 1. Labels like
+                # "Speaker 1" are already one-based and should stay as-is.
+                if re.search(r"(?:speaker|spk)[_-]\d+$", low):
+                    num += 1
+                elif num == 0:
+                    num = 1
+                return f"Спикер {num}"
+            except Exception:
+                pass
+        if value.lower().startswith(("speaker", "spk")):
+            return value.replace("speaker", "Спикер").replace("Speaker", "Спикер")
+        return value
+
+    def _format_timecoded_transcript(self, audio_path: str, result: Dict[str, Any]) -> str:
+        transcript = str(result.get("transcript") or "").strip()
+        segments = result.get("segments") or []
+        provider = str(result.get("provider") or "unknown")
+        lines = [
+            "Транскрипт с таймкодами",
+            f"Источник: {os.path.basename(audio_path)}",
+            f"STT: {provider}",
+            "Формат: [start–end] Спикер N: текст",
+            "",
+        ]
+        if segments:
+            has_speaker_data = any(seg.get("speaker") not in (None, "") for seg in segments if isinstance(seg, dict))
+            if not has_speaker_data:
+                lines.append("Примечание: STT не вернул diarization, поэтому речь помечена как Спикер 1.")
+                lines.append("")
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                text = str(seg.get("text") or "").strip()
+                if not text:
+                    continue
+                start = self._format_stt_timestamp(seg.get("start"))
+                end = self._format_stt_timestamp(seg.get("end"))
+                speaker = self._stt_speaker_label(seg.get("speaker"), 1)
+                lines.append(f"[{start}–{end}] {speaker}: {text}")
+        elif transcript:
+            lines.append("Примечание: STT не вернул сегменты/таймкоды, поэтому ниже один блок от 00:00.")
+            lines.append("")
+            lines.append(f"[00:00] Спикер 1: {transcript}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _write_transcribe_route_summary_file(self, transcript_path: str, response: str) -> Optional[str]:
+        text = (response or "").strip()
+        if not text:
+            return None
+        path = Path(transcript_path).with_suffix(Path(transcript_path).suffix + ".summary.md")
+        content = "# /summ — саммари на русском\n\n" + text + "\n"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -16401,10 +16571,21 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
-                    enriched_parts.append(
+                    transcript_path = None
+                    try:
+                        src = Path(path)
+                        transcript_path = str(src.with_suffix(src.suffix + ".transcript-timecoded.txt"))
+                        transcript_body = self._format_timecoded_transcript(path, result)
+                        Path(transcript_path).write_text(transcript_body, encoding="utf-8")
+                    except Exception as exc:
+                        logger.warning("Could not write STT transcript sidecar for %s: %s", path, exc)
+                    note = (
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
                     )
+                    if transcript_path:
+                        note += f"\n[Transcript text file was written to: {transcript_path}]"
+                    enriched_parts.append(note)
                 else:
                     error = result.get("error", "unknown error")
                     if (
