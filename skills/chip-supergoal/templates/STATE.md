@@ -25,6 +25,18 @@ Updated by each phase as it runs. Cleared at the start of the next phase, so thi
 - Lint: —
 - Tests: —
 
+## Live status snapshot
+
+Human-readable status rendering fields. These are for `SUPERGOAL_STATUS` only; `Current phase`, `Phase progress`, and the visible transcript markers remain authoritative.
+
+- Phase count: {{N}}
+- Current phase name: —
+- Phase status: pending
+- Last action: —
+- Last evidence: —
+- Last checks: build=—, typecheck=—, lint=—, tests=—
+- Failure attempt: 0
+
 ## Notable events
 
 Append-only log of anything noteworthy that happened during execution (assumption corrected mid-run, retry, manual intervention, etc.). Each phase writes a line here.
