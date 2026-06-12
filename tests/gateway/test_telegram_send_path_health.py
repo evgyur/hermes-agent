@@ -65,6 +65,33 @@ async def test_send_short_circuits_when_path_degraded():
 
 
 @pytest.mark.asyncio
+async def test_send_retries_without_business_connection_id_on_business_peer_invalid():
+    """Telegram can mark an inbound DM with a stale Business connection id.
+
+    If Bot API rejects the reply with Business_peer_invalid, retry the same
+    message as a normal bot DM instead of dropping the response.
+    """
+    adapter = _make_adapter()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=[Exception("Business_peer_invalid"), MagicMock(message_id=99)]
+    )
+
+    result = await adapter.send(
+        "6442556885",
+        "ОК",
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "99"
+    assert adapter._bot.send_message.await_count == 2
+    first_kwargs = adapter._bot.send_message.await_args_list[0].kwargs
+    second_kwargs = adapter._bot.send_message.await_args_list[1].kwargs
+    assert first_kwargs["business_connection_id"] == "biz-123"
+    assert "business_connection_id" not in second_kwargs
+
+
+@pytest.mark.asyncio
 async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     """_handle_polling_network_error sets the flag; a successful heartbeat
     probe in _verify_polling_after_reconnect clears it."""

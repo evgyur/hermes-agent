@@ -90,7 +90,8 @@ async def test_bare_goal_reply_uses_replied_to_text_as_goal(hermes_home, runner)
     assert state.goal == "Implement the approved Project Storm plan with tests."
 
     queued = runner.adapter._pending_messages[runner.session.session_key]
-    assert queued.text == state.goal
+    assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
+    assert state.goal in queued.text
     assert queued.source == runner.source
 
 
@@ -256,6 +257,10 @@ async def test_bare_goal_reply_extracts_supergoal_body_from_launch_goal_markdown
         "ROADMAP.md, STATE.md, and phases/phase-0.md..phase-7.md. Run exactly one "
         "numbered phase per turn and finish with AUDIT_COMPLETE then SUPERGOAL_RUN_COMPLETE."
     )
+    queued = runner.adapter._pending_messages[runner.session.session_key]
+    assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
+    assert state.goal in queued.text
+    assert not queued.text.startswith(state.goal)
     assert "DONE_CONDITION" not in state.goal
     assert "OPERATOR_ACTION" not in state.goal
     assert "NOTES" not in state.goal
@@ -457,5 +462,8 @@ async def test_assistant_supergoal_body_with_autodispatch_sentinel_starts_goal(h
     assert state.status == "active"
     assert state.goal.startswith("From project root")
     assert "SUPERGOAL_GOAL_BODY" not in state.goal
-    assert runner.adapter._pending_messages[session_entry.session_key].text == state.goal
+    queued = runner.adapter._pending_messages[session_entry.session_key]
+    assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
+    assert state.goal in queued.text
+    assert not queued.text.startswith(state.goal)
     assert runner.runner._session_reasoning_overrides[session_entry.session_key]["effort"] == "xhigh"

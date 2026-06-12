@@ -10127,8 +10127,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
-        # Queue the goal text as an immediate first turn so the agent
-        # starts making progress. The post-turn hook takes over after.
+        # Queue the canonical GoalManager continuation prompt as an immediate
+        # first turn so the agent sees that this is an official active /goal.
+        # Sending only the naked goal body makes SuperGoal agents reject their
+        # own kickoff as "body without /goal" in Telegram reply flows.
         adapter = self.adapters.get(event.source.platform) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
@@ -10143,8 +10145,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
         if adapter and _quick_key:
             try:
+                kickoff_text = mgr.next_continuation_prompt() or state.goal
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=kickoff_text,
                     message_type=MessageType.TEXT,
                     source=event.source,
                     message_id=event.message_id,
@@ -10302,7 +10305,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         max_turns = self._goal_max_turns_from_config()
         try:
-            state = GoalManager(session_id=sid, default_max_turns=max_turns).set(goal_text)
+            goal_mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+            state = goal_mgr.set(goal_text)
         except Exception as exc:
             logger.warning("supergoal auto-dispatch: failed to set goal: %s", exc)
             return False
@@ -10324,8 +10328,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self.adapters.get(source.platform)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
+                kickoff_text = goal_mgr.next_continuation_prompt() or state.goal
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=kickoff_text,
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,

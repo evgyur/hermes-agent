@@ -505,7 +505,10 @@ class TestTelegramClarifyCallback:
         assert state is not None
         assert state.status == "active"
         assert state.goal == "Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
-        assert adapter._pending_messages[bound.session_key].text == state.goal
+        queued = adapter._pending_messages[bound.session_key]
+        assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
+        assert state.goal in queued.text
+        assert not queued.text.startswith(state.goal)
         assert not adapter._pending_messages[bound.session_key].text.startswith("/goal")
         assert bound.runner._session_reasoning_overrides[bound.session_key]["effort"] == "xhigh"
 

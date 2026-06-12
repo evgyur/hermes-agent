@@ -497,6 +497,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._rich_message_chat_ids: Set[str] = self._coerce_str_set_extra("rich_message_chats")
+        self._rich_message_min_chars: int = self._coerce_int_extra("rich_message_min_chars", 500)
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
@@ -1608,6 +1610,39 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
+    def _coerce_int_extra(self, key: str, default: int = 0) -> int:
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_str_set_extra(self, key: str) -> Set[str]:
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            return set()
+        if isinstance(value, (str, int)):
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith("["):
+                    try:
+                        parsed = json.loads(stripped)
+                        if isinstance(parsed, list):
+                            value = parsed
+                        else:
+                            value = [stripped]
+                    except Exception:
+                        value = stripped.split(",")
+                else:
+                    value = stripped.split(",")
+            else:
+                value = str(value).split(",")
+        if not isinstance(value, (list, tuple, set)):
+            return set()
+        return {str(v).strip() for v in value if str(v).strip()}
+
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
             return {}
@@ -1622,6 +1657,125 @@ class TelegramAdapter(BasePlatformAdapter):
         if not business_connection_id:
             return {}
         return {"business_connection_id": str(business_connection_id)}
+
+    def _telegram_api_base_url(self) -> str:
+        """Return the Bot API method base URL, without the token suffix."""
+        base_url = str(self.config.extra.get("base_url") or "https://api.telegram.org/bot")
+        base_url = base_url.rstrip("/")
+        token = str(self.config.token or "")
+        if token and base_url.endswith(token):
+            return base_url[: -len(token)].rstrip("/")
+        return base_url
+
+    def _rich_markdown_from_content(self, content: str) -> str:
+        """Convert Hermes/chipline text into Telegram rich markdown."""
+        text = content.strip()
+        lines: list[str] = []
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            m = re.match(r"^\s*[➊➋➌➍➎➏➐➑➒➓]\s+(.+)$", line)
+            if m:
+                lines.append(f"## {m.group(1).strip()}")
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    def _should_use_rich_message(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        finalize: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not finalize:
+            return False
+        if str(chat_id) not in getattr(self, "_rich_message_chat_ids", set()):
+            return False
+        if not content or not content.strip():
+            return False
+        stripped = content.strip()
+        if "▉" in content or stripped.startswith(("MEDIA:", "Checking:", "Проверяю:")):
+            return False
+        if utf16_len(content) > 32768:
+            return False
+        if re.search(r"^\s*[➊➋➌➍➎➏➐➑➒➓]\s+", content, re.M):
+            return True
+        if "|" in content and re.search(r"^\s*\|.*\|\s*$", content, re.M):
+            return True
+        if "![" in content and "](http" in content:
+            return True
+        return len(stripped) >= getattr(self, "_rich_message_min_chars", 500)
+
+    async def _post_telegram_bot_api(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        token = str(self.config.token or "")
+        if not token:
+            raise RuntimeError("Telegram token is not configured")
+        url = f"{self._telegram_api_base_url()}{token}/{method}"
+
+        def _request() -> Dict[str, Any]:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        return await asyncio.to_thread(_request)
+
+    async def _send_rich_message(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to_id: Optional[int] = None,
+        thread_kwargs: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "rich_message": {"markdown": self._rich_markdown_from_content(content)},
+        }
+        if reply_to_id is not None:
+            payload["reply_parameters"] = {"message_id": int(reply_to_id)}
+        if thread_kwargs and thread_kwargs.get("message_thread_id") is not None:
+            payload["message_thread_id"] = int(thread_kwargs["message_thread_id"])
+        payload.update(self._business_connection_kwargs(metadata))
+        raw = await self._post_telegram_bot_api("sendRichMessage", payload)
+        if not raw.get("ok"):
+            raise RuntimeError(raw.get("description") or raw)
+        result = raw.get("result") or {}
+        return SendResult(
+            success=True,
+            message_id=str(result.get("message_id")) if result.get("message_id") is not None else None,
+            raw_response={"rich_message": True, "method": "sendRichMessage"},
+        )
+
+    async def _edit_rich_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "rich_message": {"markdown": self._rich_markdown_from_content(content)},
+        }
+        payload.update(self._business_connection_kwargs(metadata))
+        raw = await self._post_telegram_bot_api("editMessageText", payload)
+        if not raw.get("ok"):
+            raise RuntimeError(raw.get("description") or raw)
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response={"rich_message": True, "method": "editMessageText"},
+        )
 
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
@@ -2599,6 +2753,49 @@ class TelegramAdapter(BasePlatformAdapter):
             if guard_replacement:
                 content = guard_replacement
 
+            if self._should_use_rich_message(chat_id, content, finalize=True, metadata=metadata):
+                thread_id = self._metadata_thread_id(metadata)
+                metadata_reply_to = self._metadata_reply_to_message_id(metadata)
+                private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
+                reply_to_source = reply_to or (
+                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
+                )
+                if private_dm_topic_send:
+                    should_thread = reply_to_source is not None and self._reply_to_mode != "off"
+                else:
+                    should_thread = self._should_thread_reply(reply_to_source, 0)
+                reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+                if private_dm_topic_send and reply_to_id is None:
+                    return SendResult(
+                        success=False,
+                        error=self._dm_topic_missing_anchor_error(),
+                        retryable=False,
+                    )
+                thread_kwargs = self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+                try:
+                    result = await self._send_rich_message(
+                        chat_id,
+                        content,
+                        reply_to_id=reply_to_id,
+                        thread_kwargs=thread_kwargs,
+                        metadata=metadata,
+                    )
+                    if result.success:
+                        self._remember_recent_outbound_text(chat_id, content)
+                        return result
+                except Exception as rich_err:
+                    logger.warning(
+                        "[%s] sendRichMessage failed, falling back to sendMessage: %s",
+                        self.name,
+                        rich_err,
+                    )
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(
@@ -2677,7 +2874,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
+                business_kwargs_disabled = False
                 for _send_attempt in range(3):
+                    business_kwargs = {} if business_kwargs_disabled else self._business_connection_kwargs(metadata)
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -2687,13 +2886,21 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
-                                **self._business_connection_kwargs(metadata),
+                                **business_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
+                            md_err_lower = str(md_error).lower()
+                            if business_kwargs and "business_peer_invalid" in md_err_lower:
+                                logger.warning(
+                                    "[%s] Telegram business peer invalid, retrying reply without business_connection_id",
+                                    self.name,
+                                )
+                                business_kwargs_disabled = True
+                                continue
                             # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                            if "parse" in md_err_lower or "markdown" in md_err_lower:
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
@@ -2702,7 +2909,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
-                                    **self._business_connection_kwargs(metadata),
+                                    **business_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
@@ -2710,6 +2917,13 @@ class TelegramAdapter(BasePlatformAdapter):
                                 raise
                         break  # success
                     except _NetErr as send_err:
+                        if business_kwargs and "business_peer_invalid" in str(send_err).lower():
+                            logger.warning(
+                                "[%s] Telegram business peer invalid, retrying reply without business_connection_id",
+                                self.name,
+                            )
+                            business_kwargs_disabled = True
+                            continue
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle
@@ -2931,6 +3145,49 @@ class TelegramAdapter(BasePlatformAdapter):
                     **self._business_connection_kwargs(metadata),
                 )
                 return SendResult(success=True, message_id=message_id)
+
+            if self._should_use_rich_message(chat_id, content, finalize=finalize, metadata=metadata):
+                try:
+                    return await self._edit_rich_message(
+                        chat_id,
+                        message_id,
+                        content,
+                        metadata=metadata,
+                    )
+                except Exception as rich_err:
+                    if "not modified" in str(rich_err).lower():
+                        return SendResult(success=True, message_id=message_id)
+                    logger.warning(
+                        "[%s] editMessageText.rich_message failed, sending rich replacement instead of text fallback: %s",
+                        self.name,
+                        rich_err,
+                    )
+                    try:
+                        thread_id = self._metadata_thread_id(metadata)
+                        thread_kwargs = self._thread_kwargs_for_send(
+                            chat_id,
+                            thread_id,
+                            metadata,
+                            reply_to_message_id=None,
+                            reply_to_mode=self._reply_to_mode,
+                        )
+                        replacement = await self._send_rich_message(
+                            chat_id,
+                            content,
+                            thread_kwargs=thread_kwargs,
+                            metadata=metadata,
+                        )
+                        try:
+                            await self.delete_message(chat_id, message_id)
+                        except Exception:
+                            pass
+                        return replacement
+                    except Exception as replacement_err:
+                        logger.warning(
+                            "[%s] sendRichMessage replacement failed, falling back to text edit: %s",
+                            self.name,
+                            replacement_err,
+                        )
 
             formatted = self.format_message(content)
             try:
