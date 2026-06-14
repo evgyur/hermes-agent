@@ -16788,6 +16788,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?", _edit_err,
                         )
 
+            if (
+                not _is_empty_sentinel
+                and not response.get("already_sent")
+                and _sc is not None
+                and getattr(_sc, "already_sent", False)
+                and getattr(_sc, "message_id", None)
+                and adapter is not None
+                and hasattr(adapter, "register_post_delivery_callback")
+                and hasattr(getattr(_sc, "adapter", adapter), "delete_message")
+                and session_key
+            ):
+                # Streaming showed a partial preview, but final delivery was not
+                # confirmed (usually Telegram flood-control blocked the final
+                # edit). BasePlatformAdapter will now send the complete final
+                # response as a fresh message. Clean up the stale preview after
+                # that send lands so users do not see a frozen "... ▉" bubble
+                # above the real answer (#18219/#18220 regression).
+                _stale_stream_msg_id = str(getattr(_sc, "message_id"))
+                _stale_stream_adapter = getattr(_sc, "adapter", adapter)
+                _stale_stream_chat_id = source.chat_id
+                _stale_loop = asyncio.get_running_loop()
+
+                def _cleanup_stale_stream_preview() -> None:
+                    async def _delete_stale_preview() -> None:
+                        for _attempt in range(2):
+                            try:
+                                await _stale_stream_adapter.delete_message(
+                                    _stale_stream_chat_id,
+                                    _stale_stream_msg_id,
+                                )
+                                return
+                            except Exception as _delete_err:
+                                _retry_after = getattr(_delete_err, "retry_after", None)
+                                _err_s = str(_delete_err).lower()
+                                if _attempt == 0:
+                                    if _retry_after is not None:
+                                        _wait = float(_retry_after) + 0.5
+                                    elif "flood" in _err_s or "retry after" in _err_s:
+                                        _wait = 3.0
+                                    else:
+                                        _wait = 0.0
+                                    if 0.0 < _wait <= 60.0:
+                                        await asyncio.sleep(_wait)
+                                        continue
+                                logger.debug(
+                                    "Stale stream preview cleanup failed (%s): %s",
+                                    _stale_stream_msg_id,
+                                    _delete_err,
+                                )
+                                return
+
+                    try:
+                        asyncio.create_task(_delete_stale_preview())
+                    except RuntimeError:
+                        safe_schedule_threadsafe(
+                            _delete_stale_preview(),
+                            _stale_loop,
+                            logger=logger,
+                            log_message="Stale stream preview cleanup scheduling error",
+                        )
+
+                try:
+                    adapter.register_post_delivery_callback(
+                        session_key,
+                        _cleanup_stale_stream_preview,
+                        generation=run_generation,
+                    )
+                except Exception as _cleanup_reg_err:
+                    logger.debug(
+                        "Stale stream preview cleanup registration failed: %s",
+                        _cleanup_reg_err,
+                    )
+
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
         # breadcrumbs for the user to see what work happened. Only fires on
