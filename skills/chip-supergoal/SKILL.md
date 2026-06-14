@@ -253,15 +253,16 @@ Write the result into `THINKING.md` and summarize it in `ROADMAP.md` / Stage 6 w
 
 ---
 
-## Embedded RPD review system
+## Embedded RPD v2 review system
 
-chip-supergoal is independent from any external `/rpd` skill. Do not load or invoke another RPD skill to run this workflow. Use the embedded contract in `references/rpd-review-gates.md`.
+chip-supergoal is independent from any external `/rpd` skill. Do not load or invoke another RPD skill to run this workflow. Use the embedded hard contract in `references/rpd-review-gates.md`.
 
-RPD is a mutation gate, not a commentary layer:
+RPD v2 is a mutation gate, not a commentary layer:
 
-- Every RPD finding must either mutate `ROADMAP.md`, a phase spec, mandatory commands, acceptance criteria, or an audit-fix spec.
-- Or it must be marked `checked-holds` with evidence.
-- Free-floating concerns are invalid.
+- Every RPD finding must either mutate `ROADMAP.md`, `THINKING.md`, a phase spec, mandatory commands, acceptance criteria, or an audit-fix spec.
+- Or it must be marked `checked-holds` with an evidence tier.
+- Free-floating concerns, persona essays, and ungrounded “senior vibes” are invalid.
+- Material claims must mark evidence strength: `direct artifact`, `provided context`, `external/current source`, or `assumption` with a falsifier.
 
 RPD runs in two places owned by this planner and one place delegated to the generated `/goal` protocol:
 
@@ -269,7 +270,9 @@ RPD runs in two places owned by this planner and one place delegated to the gene
 2. **Inside generated `/goal`:** `RPD_PHASE_REVIEW` runs only for phase specs marked `RPD required: yes` or risky phases.
 3. **Inside generated `/goal`:** `RPD_FINAL_REVIEW` always runs after `AUDIT_VERIFY` and before `AUDIT_COMPLETE`.
 
-Risky phases include auth, authorization, payments, secrets, private data, database migrations, destructive data changes, production infra, gateway/routing/cron, recurring bugs, baseline-red recovery, and public launches.
+Risky phases include auth, authorization, payments, secrets, private data, database migrations, destructive data changes, production infra, gateway/routing/cron/model-provider routing, architecture/migration, recurring bugs, baseline-red recovery, public launches, and claimed completion after a risky run.
+
+For risky plans/phases/final audit, run the embedded **Senior Gate** from `references/rpd-review-gates.md`: severity `P0/P1/P2/P3`, evidence ledger, elegance/effectiveness, overengineering, and principal-review checks. Any new layer/fallback/agent/shim must pass the overengineering budget: necessity, simpler alternative rejected, removal condition.
 
 ---
 
@@ -352,22 +355,29 @@ Use the four personas in sequence, inheriting findings:
 
 Mandatory checks:
 
-- Every acceptance criterion must be falsifiable.
+- Every acceptance criterion must be falsifiable and mapped to a verification/evidence path.
+- Each material claim must carry an evidence tier: `direct artifact`, `provided context`, `external/current source`, or `assumption`.
 - Each phase must be independently verifiable.
 - Risky phases must declare `RPD required: yes` and a focused `RPD focus` value.
 - The weakest dependency chain must have a mitigation.
-- Any unverified assumption that materially changes the plan must become either a user question, a mandatory command, or an acceptance criterion.
+- Any unverified assumption that materially changes the plan must become either a user question, a mandatory command, an acceptance criterion, or a research gate.
+- The canonical source of truth must be identified for project state, runtime/config, generated SuperGoal artifacts, and docs.
+- New layers/fallbacks/agents/shims must pass the overengineering budget: necessity, simpler alternative rejected, removal condition.
+- Risky production/money/privacy/gateway/architecture plans must run Senior Gate with severity `P0/P1/P2/P3` and an evidence ledger.
+- If subagents are used, each must return a context receipt; stale/partial subagent findings cannot be treated as direct evidence.
 
-**Mutation rule:** every finding must either change `ROADMAP.md`, a `phase-N.md` file, mandatory commands, acceptance criteria, or be marked `checked-holds` with evidence. Do not print decorative concerns.
+**Mutation rule:** every finding must either change `ROADMAP.md`, `THINKING.md`, a `phase-N.md` file, mandatory commands, acceptance criteria, or be marked `checked-holds` with an evidence tier. Do not print decorative concerns.
 
 **Output:** record this block in `THINKING.md` and surface a compact version in the Stage 6 summary:
 
 ```text
 RPD_PLAN_REVIEW
-Pattern Hunter: <finding + evidence + mutation|checked-holds>
-Gonzo: <assumption + true|false|unverified + mutation|checked-holds>
-Devil's Advocate: <failure mode + mitigation mutation|checked-holds>
-Integrator: <touchpoints + split-brain risk + mutation|checked-holds>
+Pattern Hunter: <finding + evidence tier + mutation|checked-holds>
+Gonzo: <assumption + true|false|unverified + evidence tier + mutation|checked-holds>
+Devil's Advocate: <failure mode + evidence tier + mitigation mutation|checked-holds>
+Integrator: <touchpoints + canonical truth + split-brain risk + mutation|checked-holds>
+Senior Gate: <required|skipped with reason; P0/P1/P2/P3 findings or checked-holds>
+Overengineering budget: <new layers/fallbacks/agents/shims checked + mutations|checked-holds>
 Mutations applied: <list or none — checked-holds>
 Verdict: ready-for-review | revised-and-ready | blocked-needs-user-input
 ```
@@ -721,7 +731,7 @@ The skill itself is plan-only. It must not claim that execution completed; only 
 ## Done Criteria
 
 - [ ] Frontmatter has `name: chip-supergoal` and a trigger-rich description.
-- [ ] RPD behavior is embedded in this package via `references/rpd-review-gates.md` and `templates/PROTOCOL.md`.
+- [ ] RPD v2 behavior is embedded in this package via `references/rpd-review-gates.md` and `templates/PROTOCOL.md`, including evidence tiers, Senior Gate, overengineering budget, and anti-theater mutation rules.
 - [ ] `SKILL.md` does not require loading `chip/rpd`, `/rpd`, or any private operator skill.
 - [ ] All phase specs contain measurable acceptance criteria, mandatory commands, evidence requirements, and RPD metadata.
 - [ ] Substantial/risky plans include source-of-truth boundary, permission matrix, failure-mode matrix, and verification strategy, or a narrow skip reason.
@@ -734,7 +744,7 @@ The skill itself is plan-only. It must not claim that execution completed; only 
 
 - `references/architect-plus-lite.md` — lightweight contract-first planning gate for substantial/risky plans
 - `references/research-before-design.md` — research-before-design gate with skill `perplex` priority, RESEARCH.md schema, and existing-solutions gate
-- `references/rpd-review-gates.md` — embedded RPD mutation-gate contract used by plan review and generated `/goal` protocol
+- `references/rpd-review-gates.md` — embedded RPD v2 mutation-gate contract: evidence tiers, context discipline, Senior Gate, overengineering budget, and anti-theater rules used by plan review and generated `/goal` protocol
 - `references/planning-depth.md` — what makes a plan deep enough to deserve "Super"
 - `references/phase-design.md` — how to slice phases that auto-chain cleanly
 - `references/goal-format.md` — what `/goal` is on Claude Code + Codex, chip-supergoal's single-`/goal` shape, required transcript blocks

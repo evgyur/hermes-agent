@@ -20,15 +20,17 @@ Repeat across `/goal` continuations until `SUPERGOAL_RUN_COMPLETE` is printed. *
 11. On the next `/goal` continuation, repeat from step 1.
 12. When `Current phase: AUDIT`, run the **Final audit** below. Only after `AUDIT_COMPLETE`, print `SUPERGOAL_RUN_COMPLETE` with a 5-line summary. The `/goal` condition is satisfied at that point.
 
-## Embedded RPD gates
+## Embedded RPD v2 gates
 
-chip-supergoal embeds RPD directly. Do not load or invoke an external `/rpd` skill. Use this protocol.
+chip-supergoal embeds RPD directly. Do not load or invoke an external `/rpd` skill. Use this protocol and the copied `references/rpd-review-gates.md` contract.
 
-RPD is a mutation gate, not a commentary layer. Every finding must either mutate work/specs/commands/criteria/audit-fix specs, or be marked `checked-holds` with evidence.
+RPD is a mutation gate, not a commentary layer. Every finding must either mutate work/specs/commands/criteria/audit-fix specs, or be marked `checked-holds` with an evidence tier. Material claims must use one of: `direct artifact`, `provided context`, `external/current source`, or `assumption` with falsifier. Memory, stale phase text, and previous self-reports are not proof of current state.
+
+Run Senior Gate for risky phases/final completion involving production, money, privacy, credentials, auth/payments, gateway/routing/cron/model-provider routing, architecture/migration, public launch, recurring bugs, or claimed completion after a risky run. Any new layer/fallback/agent/shim must pass the overengineering budget: necessity, simpler alternative rejected, removal condition.
 
 ### RPD_PHASE_REVIEW
 
-Run after `SUPERGOAL_PHASE_VERIFY` and before `MEMORY_SAVED` when the phase spec declares `RPD required: yes` or touches a risky area: auth, payments, secrets, private data, database migrations, destructive data changes, production infra, gateway/routing/cron, recurring bugs, baseline-red recovery, or public launch.
+Run after `SUPERGOAL_PHASE_VERIFY` and before `MEMORY_SAVED` when the phase spec declares `RPD required: yes` or touches a risky area: auth, payments, secrets, private data, database migrations, destructive data changes, production infra, gateway/routing/cron/model-provider routing, architecture/migration, recurring bugs, baseline-red recovery, or public launch.
 
 Print:
 
@@ -36,14 +38,17 @@ Print:
 RPD_PHASE_REVIEW
 Phase: <N>
 Focus: <focus>
-Pattern: <finding + evidence + mutation|checked-holds>
-Assumption: <claim + true|false|unverified + mutation|checked-holds>
+Evidence map: <direct artifact / provided context / external source / assumption claims>
+Pattern: <finding + evidence tier + mutation|checked-holds>
+Assumption: <claim + true|false|unverified + evidence tier + mutation|checked-holds>
 Stress test: <failure mode + mitigation mutation|checked-holds>
-Integration: <touchpoints + split-brain risk + mutation|checked-holds>
+Integration: <touchpoints + canonical truth + split-brain risk + mutation|checked-holds>
+Senior Gate: <required|skipped with reason; findings + evidence ledger|checked-holds>
+Overengineering budget: <checked + mutations|checked-holds>
 Mutations applied before DONE: <list or none — checked-holds>
 ```
 
-If the review finds a gap, fix it before `SUPERGOAL_PHASE_DONE` and re-run affected mandatory commands or criteria.
+If the review finds a gap, fix it before `SUPERGOAL_PHASE_DONE` and re-run affected mandatory commands or criteria. If the gap cannot be fixed safely, keep the phase blocked.
 
 ### RPD_FINAL_REVIEW
 
@@ -53,14 +58,18 @@ Print:
 
 ```text
 RPD_FINAL_REVIEW
+Evidence map: <direct artifacts / trust-prior / assumptions>
 Pattern: <known/repeat failure class or checked-holds>
 Assumption: <completion claim still unverified, or checked-holds>
 Stress test: <path that can still break, or checked-holds>
-Integration: <unchecked downstream touchpoint, or checked-holds>
+Integration: <unchecked downstream touchpoint + canonical truth, or checked-holds>
+Senior Gate: <required|skipped with reason; P0/P1/P2/P3 findings + evidence ledger|checked-holds>
+Overengineering budget: <checked + mutations|checked-holds>
 Decision: complete | audit-fix-needed | handoff
 ```
 
 If decision is `audit-fix-needed`, write `.supergoal/phases/audit-rpd-fix-<round>.md`, execute it inline, and then rerun the audit round. If decision is `handoff`, print `AUDIT_HANDOFF`, update `STATE.md` to `BLOCKED`, and do not print `SUPERGOAL_RUN_COMPLETE`.
+
 
 ## Final audit (Stage 10 — runs after the last phase, before completion)
 
