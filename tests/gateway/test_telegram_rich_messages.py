@@ -472,6 +472,33 @@ def test_prefers_fresh_final_streaming_honors_rich_opt_out():
     assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
 
 
+def test_prefers_fresh_final_streaming_honors_private_chat_gate():
+    adapter = _make_adapter(extra={"rich_message_chats": '["-1003747790806"]'})
+
+    assert (
+        adapter.prefers_fresh_final_streaming(
+            RICH_CONTENT,
+            metadata={"thread_id": "1535"},
+            chat_id="-1003971448755",
+        )
+        is False
+    )
+    assert (
+        adapter.prefers_fresh_final_streaming(
+            RICH_CONTENT,
+            metadata={"thread_id": "1"},
+            chat_id="-1003747790806",
+        )
+        is True
+    )
+
+
+def test_prefers_fresh_final_streaming_requires_chat_id_when_private_gate_set():
+    adapter = _make_adapter(extra={"rich_message_chats": '["-1003747790806"]'})
+
+    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
+
+
 # ----------------------------------------------------------------------
 # streaming_overflow_limit: with rich on, the stream consumer may accumulate up
 # to the 32,768-char rich cap before splitting, so a reply that fits one

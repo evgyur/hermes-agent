@@ -1196,11 +1196,14 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self.metadata, chat_id=self.chat_id)
             except TypeError:
-                # Adapter / test double whose hook doesn't accept the metadata
-                # keyword — fall back to the positional-only form.
-                result = fn(text)
+                try:
+                    result = fn(text, metadata=self.metadata)
+                except TypeError:
+                    # Adapter / test double whose hook doesn't accept the metadata
+                    # keyword — fall back to the positional-only form.
+                    result = fn(text)
         except Exception as e:
             logger.debug("prefers_fresh_final_streaming check failed: %s", e)
             return False

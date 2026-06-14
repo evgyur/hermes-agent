@@ -1854,24 +1854,38 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def prefers_fresh_final_streaming(
-        self, content: str, metadata: Optional[Dict[str, Any]] = None
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Finalize rich-eligible streamed replies with a fresh sendRichMessage
         instead of Hermes' current MarkdownV2 edit path.
 
-        The final edit path has not yet been upgraded to Bot API 10.1's
-        ``rich_message`` edit parameter, so finalizing through edit would lose
-        rich constructs such as tables/task lists.  When the completed content
-        is rich-eligible, re-send it via ``sendRichMessage`` and delete the
-        preview (see ``gateway.stream_consumer._try_fresh_final``).
+        The private ``rich_message_chats`` gate must apply here too.  Otherwise
+        streamed replies in ordinary chats can be replaced by a fresh rich send
+        even though the normal send/edit path would have stayed on legacy
+        MarkdownV2.  Telegram currently may accept such rich sends while
+        exposing only a clipped visible text; deleting the streamed preview then
+        leaves the user with an answer cut off mid-sentence.
 
-        ``metadata`` is intentionally ignored: the preview was sent with
-        ``expect_edits=True`` (to stay on the editable path mid-stream), but the
-        FINAL answer is a brand-new message that should render rich.  Gating
-        otherwise matches :meth:`_should_attempt_rich`: rich not latched off,
-        content present and within the rich character limit, and the bot exposes
-        an async ``do_api_request``.
+        ``metadata`` is intentionally not passed to ``_should_attempt_rich``:
+        the preview was sent with ``expect_edits=True`` (to stay on the editable
+        path mid-stream), but the FINAL answer is a brand-new message.  Chat
+        routing/min-length gates still use metadata and chat_id.
         """
+        configured_chats = getattr(self, "_rich_message_chat_ids", set())
+        if configured_chats:
+            if chat_id is None:
+                return False
+            if not self._should_use_rich_message(
+                str(chat_id), content, finalize=True, metadata=metadata
+            ):
+                return False
+        elif chat_id is not None and not self._should_use_rich_message(
+            str(chat_id), content, finalize=True, metadata=metadata
+        ):
+            return False
         return self._should_attempt_rich(content)
 
     def streaming_overflow_limit(self) -> Optional[int]:
