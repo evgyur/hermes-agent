@@ -1059,6 +1059,37 @@ class TestFinalContentDeliveredGuard:
         )
         assert consumer._final_response_sent is True
 
+    def test_final_delivery_matches_full_streamed_payload_with_cursor(self):
+        """A final cleanup edit may fail after the complete text is visible with
+        only the cursor stuck on-screen; this is safe to suppress as delivered."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+        consumer._last_sent_text = "Полный ответ дошёл ▉"
+
+        assert consumer.final_delivery_matches("Полный ответ дошёл") is True
+
+    def test_final_delivery_mismatch_detects_partial_stream_prefix(self):
+        """If Telegram only shows a partial streamed prefix, the gateway must
+        not suppress the normal final send; it should send the complete answer
+        and clean up the stale preview."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+        consumer._last_sent_text = "Если не ▉"
+
+        assert consumer.final_delivery_matches(
+            "Если не получается через кнопку, открой настройки и создай заново."
+        ) is False
+
     @pytest.mark.asyncio
     async def test_fallback_partial_send_does_not_mark_final_sent(self):
         """When fallback final send delivers only some chunks before failing,

@@ -16756,7 +16756,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
+            _stream_delivery_matches_final = True
+            if _sc is not None and (_streamed or _content_delivered):
+                _matches_final = getattr(_sc, "final_delivery_matches", None)
+                if callable(_matches_final):
+                    try:
+                        _stream_delivery_matches_final = bool(_matches_final(_final))
+                    except Exception:
+                        logger.debug(
+                            "Stream final-delivery match check failed for session %s",
+                            session_key or "?",
+                            exc_info=True,
+                        )
+                        _stream_delivery_matches_final = True
+            if not _stream_delivery_matches_final:
+                logger.warning(
+                    "Stream final delivery mismatch for session %s: allowing normal final send "
+                    "(streamed=%s previewed=%s content_delivered=%s final_len=%d).",
+                    session_key or "?",
+                    _streamed,
+                    _previewed,
+                    _content_delivered,
+                    len(_final),
+                )
+            if (
+                not _is_empty_sentinel
+                and not _transformed
+                and (_previewed or ((_streamed or _content_delivered) and _stream_delivery_matches_final))
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
