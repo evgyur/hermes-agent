@@ -17,6 +17,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional
 
@@ -172,6 +173,46 @@ class GatewayAuthorizationMixin:
         if isinstance(sender_allow, (list, tuple, set)):
             return any(str(item).strip() for item in sender_allow)
         return False
+
+    def _telegram_per_chat_group_user_decision(self, source: SessionSource) -> Optional[bool]:
+        """Return an allow/deny decision for Telegram per-chat group sender allowlists.
+
+        ``TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS`` is a JSON object mapping chat IDs to
+        sender-user allowlists. When a chat is present in the map, it intentionally
+        narrows ``TELEGRAM_GROUP_ALLOWED_USERS`` for that chat: globally allowed
+        group senders are not automatically allowed in that one room.
+        """
+        if source.platform != Platform.TELEGRAM:
+            return None
+        if source.chat_type not in {"group", "forum"}:
+            return None
+        if not source.chat_id:
+            return None
+
+        raw = os.getenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", "").strip()
+        if not raw:
+            return None
+        try:
+            mapping = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(mapping, dict):
+            return None
+
+        chat_allow = mapping.get(str(source.chat_id))
+        if chat_allow is None:
+            return None
+        if isinstance(chat_allow, str):
+            allowed_ids = {part.strip() for part in chat_allow.split(",") if part.strip()}
+        elif isinstance(chat_allow, (list, tuple, set)):
+            allowed_ids = {str(part).strip() for part in chat_allow if str(part).strip()}
+        else:
+            return None
+        if not allowed_ids:
+            return False
+        if "*" in allowed_ids:
+            return True
+        return str(source.user_id or "") in allowed_ids
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -411,6 +452,12 @@ class GatewayAuthorizationMixin:
                     self._warned_telegram_group_users_legacy = True
                 if source.chat_id in legacy_chat_ids:
                     return True
+
+        # Telegram per-chat group sender allowlists intentionally narrow the
+        # global group sender allowlist for a configured room.
+        per_chat_group_decision = self._telegram_per_chat_group_user_decision(source)
+        if per_chat_group_decision is not None:
+            return per_chat_group_decision
 
         # Check if user is in any allowlist. In group/forum chats,
         # TELEGRAM_GROUP_ALLOWED_USERS is the scoped allowlist and should not
