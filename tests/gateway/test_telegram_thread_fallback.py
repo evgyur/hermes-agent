@@ -976,6 +976,72 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "bot_method_name", "path_kw", "filename", "payload"),
+    [
+        ("send_image_file", "send_photo", "image_path", "photo.png", b"png-data"),
+        ("send_document", "send_document", "file_path", "report.txt", b"report-data"),
+        ("send_video", "send_video", "video_path", "clip.mp4", b"video-data"),
+    ],
+)
+async def test_native_media_preserves_business_connection_id(
+    tmp_path,
+    method_name,
+    bot_method_name,
+    path_kw,
+    filename,
+    payload,
+):
+    """Business DMs need business_connection_id on native media sends.
+
+    Text replies already include it. Without it, Telegram rejects photos/files
+    in Business chats with "bot can't initiate conversation with a user" and
+    Hermes falls back to a useless local path text bubble.
+    """
+    adapter = _make_adapter()
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+    call_log = []
+
+    async def mock_send_media(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=790)
+
+    adapter._bot = SimpleNamespace(**{bot_method_name: mock_send_media})
+
+    result = await getattr(adapter, method_name)(
+        chat_id="244340834",
+        **{path_kw: str(media_path)},
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert result.success is True
+    assert call_log[0]["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
+async def test_media_group_preserves_business_connection_id(tmp_path):
+    adapter = _make_adapter()
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"png-data")
+    call_log = []
+
+    async def mock_send_media_group(**kwargs):
+        call_log.append(dict(kwargs))
+        return [SimpleNamespace(message_id=791)]
+
+    adapter._bot = SimpleNamespace(send_media_group=mock_send_media_group)
+
+    await adapter.send_multiple_images(
+        chat_id="244340834",
+        images=[(f"file://{image_path}", "caption")],
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert call_log[0]["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
 async def test_send_image_url_dm_topic_reply_not_found_retry_drops_thread_id(monkeypatch):
     adapter = _make_adapter()
     call_log = []

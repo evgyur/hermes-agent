@@ -5936,6 +5936,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "media": media,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_connection_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -5995,6 +5996,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_connection_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -6092,6 +6094,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_connection_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -6139,6 +6142,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
+                        **self._business_connection_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -6191,6 +6195,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
                     **photo_thread_kwargs,
+                    **self._business_connection_kwargs(metadata),
                     **self._notification_kwargs(metadata),
                 },
                 metadata,
@@ -6228,6 +6233,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         **upload_thread_kwargs,
+                        **self._business_connection_kwargs(metadata),
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
@@ -6275,6 +6281,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
                     **animation_thread_kwargs,
+                    **self._business_connection_kwargs(metadata),
                     **self._notification_kwargs(metadata),
                 },
                 metadata,
@@ -6599,6 +6606,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_free_response_topics(self) -> set[tuple[str, str]]:
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+        values = raw if isinstance(raw, list) else str(raw).split(",")
+        topics: set[tuple[str, str]] = set()
+        for value in values:
+            text = str(value).strip()
+            if not text or ":" not in text:
+                continue
+            chat_id, thread_id = text.rsplit(":", 1)
+            chat_id = chat_id.strip()
+            thread_id = thread_id.strip() or self._GENERAL_TOPIC_THREAD_ID
+            if chat_id and thread_id:
+                topics.add((chat_id, thread_id))
+        return topics
+
+    def _telegram_topic_is_free_response(self, chat_id: str, thread_id: Optional[int]) -> bool:
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return (str(chat_id), topic_id) in self._telegram_free_response_topics()
 
     @staticmethod
     def _telegram_chat_id_set(raw: Any) -> set[str]:
@@ -7327,6 +7355,8 @@ class TelegramAdapter(BasePlatformAdapter):
         guest_mention = self._is_guest_mention(message)
 
         if explicit_policy:
+            if self._telegram_topic_is_free_response(chat_id_str, thread_id):
+                return True
             if chat_id_str in private_chats:
                 return True
             if chat_id_str in public_chats:
@@ -7344,6 +7374,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return guest_mention
 
         if guest_mention:
+            return True
+        if self._telegram_topic_is_free_response(chat_id_str, thread_id):
             return True
         if chat_id_str in self._telegram_free_response_chats():
             return True
