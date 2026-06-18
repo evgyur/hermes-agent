@@ -12,6 +12,7 @@ def _make_adapter(
     require_mention=None,
     require_mention_chats=None,
     free_response_chats=None,
+    free_response_topics=None,
     private_chats=None,
     public_chats=None,
     mention_patterns=None,
@@ -35,6 +36,8 @@ def _make_adapter(
         extra["require_mention_chats"] = require_mention_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if private_chats is not None:
         extra["private_chats"] = private_chats
     else:
@@ -581,6 +584,28 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_free_response_topics_bypass_mention_requirement_only_for_that_topic():
+    adapter = _make_adapter(
+        require_mention=False,
+        require_mention_chats=["-200"],
+        private_chats=["617744661"],
+        public_chats=["-200"],
+        free_response_topics=["-200:777"],
+    )
+
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=777)) is True
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=778)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            thread_id=778,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("plain", chat_id=-201, thread_id=777)) is False
 
 
 def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():

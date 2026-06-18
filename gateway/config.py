@@ -945,10 +945,14 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if plat == Platform.TELEGRAM and "require_mention_chats" in platform_cfg:
                     bridged["require_mention_chats"] = platform_cfg["require_mention_chats"]
+                if plat == Platform.TELEGRAM and "free_response_topics" in platform_cfg:
+                    bridged["free_response_topics"] = platform_cfg["free_response_topics"]
                 if plat == Platform.TELEGRAM and "private_chats" in platform_cfg:
                     bridged["private_chats"] = platform_cfg["private_chats"]
                 if plat == Platform.TELEGRAM and "public_chats" in platform_cfg:
                     bridged["public_chats"] = platform_cfg["public_chats"]
+                if plat == Platform.TELEGRAM and "chip_history_recovery" in platform_cfg:
+                    bridged["chip_history_recovery"] = platform_cfg["chip_history_recovery"]
                 if plat == Platform.TELEGRAM and "suppress_tool_progress_chats" in platform_cfg:
                     bridged["suppress_tool_progress_chats"] = platform_cfg["suppress_tool_progress_chats"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
@@ -1114,6 +1118,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                frt = telegram_cfg.get("free_response_topics")
+                if frt is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+                    if isinstance(frt, list):
+                        frt = ",".join(str(v) for v in frt)
+                    os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(frt)
                 private_chats = telegram_cfg.get("private_chats")
                 if private_chats is not None and not os.getenv("TELEGRAM_PRIVATE_CHATS"):
                     if isinstance(private_chats, list):

@@ -40,6 +40,7 @@ What you'll see:
 | Command | What it does |
 |---|---|
 | `/goal <text>` | Set (or replace) the standing goal. Kicks off the first turn immediately so you don't need to send a separate message. |
+| Reply with bare `/goal` | On gateway platforms, use the replied-to message text as the standing goal. This is explicit operator intent, so long replied text is accepted; Supergoal markers/artifact paths are normalized before the goal starts. |
 | `/goal` or `/goal status` | Show the current goal, its status, and turns used. |
 | `/goal pause` | Stop the auto-continuation loop without clearing the goal. |
 | `/goal resume` | Resume the loop (resets the turn counter back to zero). |
@@ -99,6 +100,14 @@ While an agent is already running, `/goal status`, `/goal pause`, and `/goal cle
 ### Persistence
 
 Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, paused, or done).
+
+### Gateway restart recovery
+
+When the messaging gateway restarts or drains during an active goal, Hermes treats the goal state as the source of truth and resumes fresh, safe DM goals through the normal `GoalManager.next_continuation_prompt()` path in the same `session_id`. It does not replay a raw `/goal ...` command.
+
+Risky cases are deliberately **alert-only** instead of auto-replayed: shared/group chats, stale sessions, already-running agents, missing adapters, or transcripts ending in uncheckpointed side-effectful tool work such as terminal commands, file writes, message sends, cron changes, patches, memory writes, or skill edits.
+
+The legacy `HERMES_GATEWAY_STARTUP_AUTO_RESUME=1` opt-in still controls non-goal `resume_pending` startup replay. Active goal recovery is separate because its durable state already lives in `SessionDB.state_meta`.
 
 ### Prompt cache
 

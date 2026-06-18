@@ -37,11 +37,48 @@ _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 _IMAGE_CAPTION_LIMIT = 1024
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
+# Sigurd // TG is a post-production preview chat, not a SuperGoal review
+# surface. Keep this as a runtime backstop in addition to skill-level rules so
+# accidental MEDIA: attachments cannot leak .supergoal work packages there.
+_SUPERGOAL_BLOCKED_TELEGRAM_CHATS = frozenset({'-1003712304136'})
+_SUPERGOAL_REVIEW_FILENAMES = frozenset({'thinking.md', 'roadmap.md', 'launch_goal.md'})
+
+
+def _is_supergoal_review_artifact(path: str) -> bool:
+    raw = str(path or '')
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if 'supergoal' in lowered or '/.supergoal/' in lowered:
+        return True
+    try:
+        return Path(raw).name.lower() in _SUPERGOAL_REVIEW_FILENAMES
+    except Exception:
+        return False
+
 
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
+
+
+def _is_autodeliverable_bare_local_file(path: str) -> bool:
+    """Return True when a bare local path is safe to auto-upload.
+
+    Explicit MEDIA:<path> directives remain the supported way to deliver image
+    artifacts. Bare-path auto-delivery is conservative for images: model/tool
+    transcripts often contain historical PNG/JPG cache paths (image_generate
+    outputs, inbound screenshot cache paths, vision context), and those stale
+    paths can otherwise be re-uploaded on later text-only turns as Telegram
+    albums. Documents/archives stay auto-deliverable for the classic
+    "here is /tmp/report.pdf" convenience path; images require MEDIA or
+    markdown image syntax.
+    """
+    ext = Path(str(path)).suffix.lower()
+    if ext in _IMAGE_EXTS:
+        return False
+    return True
 
 
 def _caption_text_for_images(text_content: str, native_image_count: int) -> str | None:
@@ -107,10 +144,24 @@ def _reply_anchor_for_event(event) -> str | None:
     topic lanes prefer replying to the triggering user message so the answer
     stays attached to the active lane; synthetic/resumed sends fall back to
     ``direct_messages_topic_id`` metadata when no message id is available.
+
+    Telegram renders replies to photo/media messages with a large quoted media
+    preview above the bot's text. For text-only assistant answers this looks as
+    if Hermes re-sent old screenshots/images. Suppress the reply anchor for
+    normal Telegram media-bearing user turns; the media still reaches the agent
+    via ``event.media_urls``, but the final text is delivered as text only.
+    Keep Hermes-created DM-topic anchors because Telegram requires them for
+    reliable topic routing.
     """
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
     thread_id = getattr(source, "thread_id", None)
+    if (
+        platform == "telegram"
+        and getattr(event, "media_urls", None)
+        and not (thread_id and getattr(source, "chat_type", None) == "dm")
+    ):
+        return None
     if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
         # Reply to the triggering user message. Replying to Telegram's earlier
         # topic seed/anchor can render the bot response outside the active lane.
@@ -2913,13 +2964,23 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def filter_local_delivery_paths(file_paths) -> List[str]:
-        """Drop unsafe bare local file paths and normalize accepted paths."""
+        """Drop unsafe/noisy bare local file paths and normalize accepted paths.
+
+        Bare image paths are not auto-delivered. Use explicit MEDIA:<path> or
+        markdown image syntax for images. This prevents stale generated/cached
+        screenshots from being re-attached to unrelated later text replies.
+        """
         safe_paths: List[str] = []
         for file_path in file_paths or []:
             raw = str(file_path)
             safe_path = validate_media_delivery_path(raw)
-            if safe_path:
+            if safe_path and _is_autodeliverable_bare_local_file(safe_path):
                 safe_paths.append(safe_path)
+            elif safe_path:
+                logger.info(
+                    "Skipping bare local image auto-delivery; require MEDIA/image markdown: %s",
+                    _log_safe_path(raw),
+                )
             else:
                 logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
         return safe_paths
@@ -4274,6 +4335,21 @@ class BasePlatformAdapter(ABC):
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 media_files = self.filter_media_delivery_paths(media_files)
+                if (
+                    _platform_name(getattr(event.source, 'platform', self.name)) == 'telegram'
+                    and str(event.source.chat_id) in _SUPERGOAL_BLOCKED_TELEGRAM_CHATS
+                ):
+                    before = len(media_files)
+                    media_files = [
+                        item for item in media_files
+                        if not _is_supergoal_review_artifact(item[0] if isinstance(item, tuple) else item)
+                    ]
+                    dropped = before - len(media_files)
+                    if dropped:
+                        logger.warning(
+                            "[%s] blocked %d SuperGoal MEDIA attachment(s) to chat %s",
+                            self.name, dropped, event.source.chat_id,
+                        )
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -4293,6 +4369,18 @@ class BasePlatformAdapter(ABC):
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
+                    if (
+                        _platform_name(getattr(event.source, 'platform', self.name)) == 'telegram'
+                        and str(event.source.chat_id) in _SUPERGOAL_BLOCKED_TELEGRAM_CHATS
+                    ):
+                        before = len(local_files)
+                        local_files = [p for p in local_files if not _is_supergoal_review_artifact(p)]
+                        dropped = before - len(local_files)
+                        if dropped:
+                            logger.warning(
+                                "[%s] blocked %d SuperGoal local file attachment(s) to chat %s",
+                                self.name, dropped, event.source.chat_id,
+                            )
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 

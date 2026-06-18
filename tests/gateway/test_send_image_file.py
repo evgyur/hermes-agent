@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, _is_supergoal_review_artifact
 
 
 def _run(coro):
@@ -56,6 +56,14 @@ class TestExtractMediaImages:
         paths = [m[0] for m in media]
         assert "/audio.ogg" in paths
         assert "/screenshot.png" in paths
+
+    def test_supergoal_review_artifacts_identified_for_chat_guard(self):
+        assert _is_supergoal_review_artifact("/tmp/project/.supergoal/THINKING.md")
+        assert _is_supergoal_review_artifact("/tmp/ROADMAP.md")
+        assert _is_supergoal_review_artifact("/tmp/LAUNCH_GOAL.md")
+        assert _is_supergoal_review_artifact("/tmp/supergoal-review/notes.pdf")
+        assert not _is_supergoal_review_artifact("/tmp/tg_human20_cover.png")
+        assert not _is_supergoal_review_artifact("/tmp/ordinary_report.pdf")
 
 
 # ---------------------------------------------------------------------------

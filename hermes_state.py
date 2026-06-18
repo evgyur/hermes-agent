@@ -574,6 +574,29 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS gateway_message_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lookup_key TEXT UNIQUE,
+    platform TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    message_id TEXT,
+    user_id TEXT,
+    session_key TEXT,
+    session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    origin_type TEXT NOT NULL DEFAULT 'real_user',
+    received_at REAL NOT NULL,
+    dispatch_started_at REAL,
+    completed_at REAL,
+    drained_at REAL,
+    failed_at REAL,
+    updated_at REAL NOT NULL,
+    reason TEXT,
+    metadata TEXT,
+    snippet TEXT
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -586,6 +609,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup ON gateway_message_ledger(lookup_key);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session ON gateway_message_ledger(session_key, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_platform ON gateway_message_ledger(platform, chat_id, thread_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status ON gateway_message_ledger(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 
@@ -4061,6 +4088,328 @@ class SessionDB:
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
         return count
+
+    # ── Gateway message processing ledger ──
+
+    @staticmethod
+    def _gateway_ledger_lookup_key(
+        platform: Any,
+        chat_id: Any,
+        thread_id: Any = None,
+        message_id: Any = None,
+    ) -> Optional[str]:
+        """Stable lookup key for platform messages, or None when no message id."""
+        if platform is None or chat_id is None or message_id is None:
+            return None
+        msg = str(message_id).strip()
+        if not msg:
+            return None
+        return ":".join([
+            str(platform),
+            str(chat_id),
+            str(thread_id or ""),
+            msg,
+        ])
+
+    @staticmethod
+    def _gateway_ledger_row(row: Any) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        data = dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+        metadata = data.get("metadata")
+        if metadata:
+            try:
+                data["metadata"] = json.loads(metadata)
+            except Exception:
+                data["metadata"] = {}
+        else:
+            data["metadata"] = {}
+        return data
+
+    @staticmethod
+    def _gateway_ledger_metadata(metadata: Any) -> Optional[str]:
+        if metadata is None:
+            return None
+        try:
+            return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return json.dumps({"repr": repr(metadata)[:500]}, ensure_ascii=False)
+
+    @staticmethod
+    def _gateway_ledger_snippet(snippet: Any) -> Optional[str]:
+        if snippet is None:
+            return None
+        text = re.sub(r"\s+", " ", str(snippet)).strip()
+        if not text:
+            return None
+        return text[:240]
+
+    def record_gateway_message_received(
+        self,
+        *,
+        platform: Any,
+        chat_id: Any,
+        thread_id: Any = None,
+        message_id: Any = None,
+        user_id: Any = None,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        origin_type: str = "real_user",
+        reason: Optional[str] = None,
+        metadata: Any = None,
+        snippet: Any = None,
+        received_at: Optional[float] = None,
+    ) -> int:
+        """Insert or find a gateway message lifecycle ledger row.
+
+        The row stores routing/lifecycle metadata only. Callers must pass at
+        most a short redacted snippet; full message bodies already belong in
+        the normal transcript, not this recovery ledger.
+        """
+        now = float(received_at or time.time())
+        platform_s = str(platform) if platform is not None else None
+        chat_id_s = str(chat_id) if chat_id is not None else None
+        thread_id_s = str(thread_id) if thread_id is not None else None
+        message_id_s = str(message_id) if message_id is not None else None
+        user_id_s = str(user_id) if user_id is not None else None
+        lookup_key = self._gateway_ledger_lookup_key(
+            platform_s,
+            chat_id_s,
+            thread_id_s,
+            message_id_s,
+        )
+        metadata_json = self._gateway_ledger_metadata(metadata)
+        snippet_s = self._gateway_ledger_snippet(snippet)
+        origin = str(origin_type or "real_user")
+        reason_s = str(reason)[:500] if reason else None
+
+        def _do(conn):
+            if lookup_key:
+                existing = conn.execute(
+                    "SELECT id FROM gateway_message_ledger WHERE lookup_key = ?",
+                    (lookup_key,),
+                ).fetchone()
+                if existing is not None:
+                    row_id = int(existing["id"] if isinstance(existing, sqlite3.Row) else existing[0])
+                    conn.execute(
+                        """
+                        UPDATE gateway_message_ledger
+                        SET platform = COALESCE(platform, ?),
+                            chat_id = COALESCE(chat_id, ?),
+                            thread_id = COALESCE(thread_id, ?),
+                            message_id = COALESCE(message_id, ?),
+                            user_id = COALESCE(user_id, ?),
+                            session_key = COALESCE(?, session_key),
+                            session_id = COALESCE(?, session_id),
+                            origin_type = COALESCE(?, origin_type),
+                            reason = COALESCE(?, reason),
+                            metadata = COALESCE(?, metadata),
+                            snippet = COALESCE(?, snippet),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            platform_s,
+                            chat_id_s,
+                            thread_id_s,
+                            message_id_s,
+                            user_id_s,
+                            session_key,
+                            session_id,
+                            origin,
+                            reason_s,
+                            metadata_json,
+                            snippet_s,
+                            now,
+                            row_id,
+                        ),
+                    )
+                    return row_id
+
+            cursor = conn.execute(
+                """
+                INSERT INTO gateway_message_ledger (
+                    lookup_key, platform, chat_id, thread_id, message_id, user_id,
+                    session_key, session_id, status, origin_type, received_at,
+                    updated_at, reason, metadata, snippet
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lookup_key,
+                    platform_s,
+                    chat_id_s,
+                    thread_id_s,
+                    message_id_s,
+                    user_id_s,
+                    session_key,
+                    session_id,
+                    origin,
+                    now,
+                    now,
+                    reason_s,
+                    metadata_json,
+                    snippet_s,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def update_gateway_message_ledger(
+        self,
+        ledger_id: Optional[int] = None,
+        *,
+        platform: Any = None,
+        chat_id: Any = None,
+        thread_id: Any = None,
+        message_id: Any = None,
+        status: str,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Any = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Best-effort-friendly lifecycle update for one ledger row."""
+        status_s = str(status or "").strip()
+        if not status_s:
+            raise ValueError("status is required")
+        now = float(timestamp or time.time())
+        lookup_key = None
+        if ledger_id is None:
+            lookup_key = self._gateway_ledger_lookup_key(platform, chat_id, thread_id, message_id)
+            if lookup_key is None:
+                return False
+        metadata_json = self._gateway_ledger_metadata(metadata)
+        reason_s = str(reason)[:500] if reason else None
+        ts_columns = {
+            "in_progress": "dispatch_started_at",
+            "completed": "completed_at",
+            "failed": "failed_at",
+            "drained": "drained_at",
+        }
+        ts_col = ts_columns.get(status_s)
+
+        def _do(conn):
+            where = "id = ?" if ledger_id is not None else "lookup_key = ?"
+            ident = ledger_id if ledger_id is not None else lookup_key
+            row = conn.execute(
+                f"SELECT id FROM gateway_message_ledger WHERE {where}",
+                (ident,),
+            ).fetchone()
+            if row is None:
+                return False
+            assignments = [
+                "status = ?",
+                "session_key = COALESCE(?, session_key)",
+                "session_id = COALESCE(?, session_id)",
+                "reason = COALESCE(?, reason)",
+                "metadata = COALESCE(?, metadata)",
+                "updated_at = ?",
+            ]
+            params: list[Any] = [
+                status_s,
+                session_key,
+                session_id,
+                reason_s,
+                metadata_json,
+                now,
+            ]
+            if ts_col:
+                assignments.append(f"{ts_col} = COALESCE({ts_col}, ?)")
+                params.append(now)
+            params.append(ident)
+            conn.execute(
+                f"UPDATE gateway_message_ledger SET {', '.join(assignments)} WHERE {where}",
+                tuple(params),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def mark_gateway_session_messages_drained(
+        self,
+        session_key: str,
+        *,
+        reason: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Mark active ledger rows for a session as drained during shutdown."""
+        if not session_key:
+            return 0
+        now = float(timestamp or time.time())
+        reason_s = str(reason)[:500] if reason else None
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                UPDATE gateway_message_ledger
+                SET status = 'drained',
+                    drained_at = COALESCE(drained_at, ?),
+                    updated_at = ?,
+                    reason = COALESCE(?, reason)
+                WHERE session_key = ?
+                  AND status IN ('received', 'requeued', 'in_progress')
+                """,
+                (now, now, reason_s, session_key),
+            )
+            return int(cursor.rowcount or 0)
+
+        return self._execute_write(_do)
+
+    def get_gateway_message_ledger(self, ledger_id: int) -> Optional[Dict[str, Any]]:
+        if self._conn is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id = ?",
+                (ledger_id,),
+            ).fetchone()
+        return self._gateway_ledger_row(row)
+
+    def find_gateway_message_ledger(
+        self,
+        *,
+        platform: Any,
+        chat_id: Any,
+        thread_id: Any = None,
+        message_id: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        lookup_key = self._gateway_ledger_lookup_key(platform, chat_id, thread_id, message_id)
+        if lookup_key is None or self._conn is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE lookup_key = ?",
+                (lookup_key,),
+            ).fetchone()
+        return self._gateway_ledger_row(row)
+
+    def list_gateway_message_ledger_for_session(
+        self,
+        session_key: str,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        if not session_key or self._conn is None:
+            return []
+        safe_limit = max(1, min(int(limit or 20), 200))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM gateway_message_ledger
+                WHERE session_key = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (session_key, safe_limit),
+            ).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            parsed = self._gateway_ledger_row(row)
+            if parsed is not None:
+                results.append(parsed)
+        return results
 
     # ── Meta key/value (for scheduler bookkeeping) ──
 

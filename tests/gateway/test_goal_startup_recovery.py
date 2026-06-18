@@ -1,0 +1,300 @@
+"""Startup recovery tests for active /goal sessions.
+
+Phase 4 implements the target behavior mapped in Phase 1:
+
+- active GoalManager state is enough to recover a fresh standing goal at
+  gateway startup, even when legacy generic startup auto-resume is disabled;
+- recovery runs on the same session key/session id through the official
+  GoalManager continuation prompt;
+- paused/done/cleared goals fail closed;
+- side-effectful uncheckpointed tool tails are alert-only, not replayed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionEntry
+from hermes_cli.goals import GoalManager
+from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+
+
+def _goal_entry(*, session_id="goal-sid", status="active", resume_pending=True):
+    source = make_restart_source(chat_id="goal-chat")
+    now = datetime.now()
+    return SessionEntry(
+        session_key="agent:main:telegram:dm:goal-chat",
+        session_id=session_id,
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=resume_pending,
+        resume_reason="restart_timeout" if resume_pending else None,
+        last_resume_marked_at=now if resume_pending else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_goal_resume_pending_auto_resumes_without_global_flag(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="active-goal-sid")
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    GoalManager(session_id=entry.session_id).set("continue this active goal after restart")
+
+    with patch.dict("os.environ", {}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source == entry.origin
+    assert event.text.startswith("[Continuing toward your standing goal]\nGoal:")
+    assert "continue this active goal after restart" in event.text
+    assert entry.session_id == "active-goal-sid"
+    assert GoalManager(session_id=entry.session_id).is_active()
+
+
+@pytest.mark.asyncio
+async def test_legacy_generic_resume_still_requires_global_flag_when_no_goal(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="same-session-id")
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict("os.environ", {"HERMES_GATEWAY_STARTUP_AUTO_RESUME": "1"}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    assert entry.session_id == "same-session-id"
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source == entry.origin
+    assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_legacy_generic_resume_waits_without_flag_when_no_goal(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="generic-no-flag-sid")
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict("os.environ", {}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_paused_goal_resume_pending_does_not_auto_resume_even_when_generic_flag_enabled(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="paused-goal-sid")
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    mgr = GoalManager(session_id=entry.session_id)
+    mgr.set("do not resume while paused")
+    mgr.pause("user-paused")
+
+    with patch.dict("os.environ", {"HERMES_GATEWAY_STARTUP_AUTO_RESUME": "1"}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+
+
+def test_active_goal_without_resume_pending_uses_goalmanager_classifier(hermes_home):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="ledger-needed-sid", resume_pending=False)
+    runner.session_store._entries = {entry.session_key: entry}
+    GoalManager(session_id=entry.session_id).set("recover from a lost queued continuation")
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "auto_resume"
+    assert decision.session_id == entry.session_id
+    assert decision.reason == "active-goal-startup-recovery"
+    assert decision.prompt.startswith("[Continuing toward your standing goal]\nGoal:")
+    assert "recover from a lost queued continuation" in decision.prompt
+
+
+def test_private_telegram_group_generic_resume_does_not_need_global_flag(hermes_home):
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="-100private", chat_type="group", thread_id="1858")
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-100private:1858",
+        session_id="private-group-generic-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="shutdown_timeout",
+        last_resume_marked_at=now,
+    )
+
+    with patch.dict("os.environ", {"TELEGRAM_PRIVATE_CHATS": "-100private"}, clear=True):
+        decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "auto_resume"
+    assert decision.reason == "generic-resume-pending"
+
+
+def test_active_goal_private_group_uses_config_private_chats_without_env(hermes_home):
+    runner, _adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"private_chats": ["-100private"]},
+    )
+    source = make_restart_source(chat_id="-100private", chat_type="group", thread_id="1858")
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-100private:1858",
+        session_id="private-group-active-goal-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=False,
+        last_resume_marked_at=now,
+    )
+    GoalManager(session_id=entry.session_id).set("continue private workroom goal")
+
+    with patch.dict("os.environ", {}, clear=True):
+        decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "auto_resume"
+    assert decision.reason == "active-goal-startup-recovery"
+    assert "continue private workroom goal" in decision.prompt
+
+
+class _UnsafeChipHistoryResult:
+    records_checked = 10
+
+    @property
+    def missed_by_gateway(self):
+        return [type("C", (), {"status": "missed_by_gateway"})()]
+
+    @property
+    def requeue_candidates(self):
+        return []
+
+    @property
+    def alert_only(self):
+        return []
+
+
+def test_active_goal_startup_checks_chip_history_before_auto_resume(hermes_home, monkeypatch):
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="617744661", chat_type="dm")
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:617744661",
+        session_id="chip-history-active-goal-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=False,
+        last_resume_marked_at=now,
+    )
+    GoalManager(session_id=entry.session_id).set("continue after checking recent visible messages")
+    monkeypatch.setattr(runner, "_startup_chip_history_reconciliation", lambda _entry: _UnsafeChipHistoryResult())
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "alert_only"
+    assert "telegram-chip recent history requires operator review" in decision.reason
+    assert "missed_by_gateway" in decision.reason
+
+
+def test_public_telegram_group_generic_resume_still_waits_without_global_flag(hermes_home):
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="-100public", chat_type="group", thread_id="1858")
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-100public:1858",
+        session_id="public-group-generic-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="shutdown_timeout",
+        last_resume_marked_at=now,
+    )
+
+    with patch.dict("os.environ", {"TELEGRAM_PUBLIC_CHATS": "-100public"}, clear=True):
+        decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "skip"
+    assert decision.reason == "generic-auto-resume-disabled"
+
+
+class _RiskyToolTailDB:
+    def list_gateway_message_ledger_for_session(self, _session_key, *, limit=20):
+        return [{"status": "drained"}]
+
+    def get_messages(self, _session_id):
+        return [
+            {"role": "user", "content": "run a deploy"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"function": {"name": "terminal"}}],
+            },
+        ]
+
+
+@pytest.mark.asyncio
+async def test_uncheckpointed_side_effectful_tool_tail_is_alert_only(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="risky-tail-sid")
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = _RiskyToolTailDB()
+    adapter.handle_message = AsyncMock()
+    GoalManager(session_id=entry.session_id).set("recover safely without duplicating deploy")
+
+    with patch.dict("os.environ", {}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert adapter.sent
+    assert "auto-resume was withheld" in adapter.sent[-1]
+    decision = runner._classify_startup_goal_recovery(entry)
+    assert decision.status == "alert_only"
+    assert "terminal" in decision.reason

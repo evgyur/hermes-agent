@@ -2574,6 +2574,22 @@ def run_conversation(
                         agent._buffer_vprint(f"   📋 Details: {_err_body_str}")
                 agent._buffer_vprint(f"   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
 
+                # Streaming-unsupported errors are recoverable even when the
+                # provider reports them as HTTP 400. The streaming transport
+                # has already flipped agent._disable_streaming; immediately
+                # retry through the buffered chat-completions path instead of
+                # letting the generic non-retryable 4xx branch abort the turn.
+                if (
+                    getattr(agent, "_disable_streaming", False)
+                    and "stream" in error_msg
+                    and "not supported" in error_msg
+                ):
+                    agent._buffer_status(
+                        "⚠️ Provider does not support streaming for this model — "
+                        "retrying with buffered response..."
+                    )
+                    continue
+
                 # Actionable hint for OpenRouter "no tool endpoints" error.
                 # Buffered like the rest of the retry trace — surfaced only
                 # if every retry+fallback exhausts.  Avoids spamming users

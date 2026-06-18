@@ -1087,12 +1087,47 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
-    # Load config once for memory, skills, and compression sections
+    # Load config once for memory, skills, compression, and transport hints.
     try:
         from hermes_cli.config import load_config as _load_agent_config
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # Some OpenAI-compatible endpoints support chat completions but not SSE
+    # streaming. Let provider/model config opt out up-front so every new
+    # gateway session does not burn a failed stream=true request before
+    # falling back to buffered mode.
+    agent._disable_streaming = False
+    try:
+        _provider_cfg = cfg_get(_agent_cfg, "providers", str(agent.provider or ""), default={})
+        if not isinstance(_provider_cfg, dict):
+            _provider_cfg = {}
+        _provider_model_cfg = cfg_get(
+            _provider_cfg,
+            "models",
+            str(agent.model or ""),
+            default={},
+        )
+        if not isinstance(_provider_model_cfg, dict):
+            _provider_model_cfg = {}
+
+        def _streaming_disabled(section: Dict[str, Any]) -> bool:
+            return (
+                section.get("supports_streaming") is False
+                or section.get("streaming") is False
+                or bool(section.get("disable_streaming"))
+            )
+
+        if _streaming_disabled(_provider_cfg) or _streaming_disabled(_provider_model_cfg):
+            agent._disable_streaming = True
+        agent._provider_model_cfg = dict(_provider_model_cfg)
+        agent._provider_cfg = dict(_provider_cfg)
+    except Exception:
+        agent._disable_streaming = False
+        agent._provider_model_cfg = {}
+        agent._provider_cfg = {}
+
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
@@ -1315,10 +1350,24 @@ def init_agent(
     agent._aux_compression_context_length_config = _aux_context_config
 
     # Read explicit model output-token override from config when the
-    # caller did not pass one directly.
+    # caller did not pass one directly. Provider/model-specific entries win
+    # over the global model.max_tokens so custom metered gateways can cap
+    # expensive lanes without nerfing the user's primary model.
     _model_cfg = _agent_cfg.get("model", {})
-    if agent.max_tokens is None and isinstance(_model_cfg, dict):
-        _config_max_tokens = _model_cfg.get("max_tokens")
+    if agent.max_tokens is None:
+        _config_max_tokens = None
+        _config_max_tokens_source = None
+        _provider_model_cfg_for_tokens = getattr(agent, "_provider_model_cfg", {}) or {}
+        _provider_cfg_for_tokens = getattr(agent, "_provider_cfg", {}) or {}
+        if isinstance(_provider_model_cfg_for_tokens, dict) and _provider_model_cfg_for_tokens.get("max_tokens") is not None:
+            _config_max_tokens = _provider_model_cfg_for_tokens.get("max_tokens")
+            _config_max_tokens_source = f"providers.{agent.provider}.models.{agent.model}.max_tokens"
+        elif isinstance(_provider_cfg_for_tokens, dict) and _provider_cfg_for_tokens.get("max_tokens") is not None:
+            _config_max_tokens = _provider_cfg_for_tokens.get("max_tokens")
+            _config_max_tokens_source = f"providers.{agent.provider}.max_tokens"
+        elif isinstance(_model_cfg, dict) and _model_cfg.get("max_tokens") is not None:
+            _config_max_tokens = _model_cfg.get("max_tokens")
+            _config_max_tokens_source = "model.max_tokens"
         if _config_max_tokens is not None:
             try:
                 if isinstance(_config_max_tokens, bool):
@@ -1329,13 +1378,15 @@ def init_agent(
                 agent.max_tokens = _parsed_max_tokens
             except (TypeError, ValueError):
                 _ra().logger.warning(
-                    "Invalid model.max_tokens in config.yaml: %r — "
+                    "Invalid %s in config.yaml: %r — "
                     "must be a positive integer (e.g. 4096). "
                     "Falling back to provider default.",
+                    _config_max_tokens_source or "model.max_tokens",
                     _config_max_tokens,
                 )
                 print(
-                    f"\n⚠ Invalid model.max_tokens in config.yaml: {_config_max_tokens!r}\n"
+                    f"\n⚠ Invalid {_config_max_tokens_source or 'model.max_tokens'} "
+                    f"in config.yaml: {_config_max_tokens!r}\n"
                     f"  Must be a positive integer (e.g. 4096).\n"
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,

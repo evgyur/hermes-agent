@@ -357,20 +357,28 @@ async def test_bare_goal_reply_to_supergoal_plan_extracts_artifact_goal(hermes_h
 
 
 @pytest.mark.asyncio
-async def test_bare_goal_reply_to_long_non_supergoal_report_is_not_goal(hermes_home, runner):
+async def test_bare_goal_reply_to_long_non_supergoal_text_is_goal(hermes_home, runner):
+    long_goal = "Обычный длинный goal body без supergoal marker. " * 80
     event = MessageEvent(
         text="/goal",
         message_type=MessageType.TEXT,
         source=runner.source,
         message_id="cmd-4c",
         reply_to_message_id="report-1",
-        reply_to_text="Обычный длинный отчёт без goal body. " * 80,
+        reply_to_text=long_goal,
     )
 
     response = await runner.runner._handle_goal_command(event)
 
-    assert "No active goal" in response
-    assert runner.adapter._pending_messages == {}
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.status == "active"
+    assert state.goal == long_goal.strip()
+    queued = runner.adapter._pending_messages[runner.session.session_key]
+    assert state.goal in queued.text
 
 
 @pytest.mark.asyncio

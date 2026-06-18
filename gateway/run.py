@@ -68,6 +68,49 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_STARTUP_GOAL_RECOVERY_REASON = "active_goal_startup_recovery"
+_STARTUP_GOAL_RISKY_TOOLS = frozenset({
+    "terminal",
+    "send_message",
+    "cronjob",
+    "patch",
+    "write_file",
+    "skill_manage",
+    "memory",
+    "tool_call",
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class StartupGoalRecoveryDecision:
+    """Startup decision for a durable /goal session.
+
+    ``prompt`` deliberately stays out of hook/log payloads because it contains
+    the full standing goal.  The event scheduler may use it for the official
+    GoalManager continuation path, but observers only get compact metadata.
+    """
+
+    status: str  # auto_resume | alert_only | skip
+    session_key: str
+    session_id: str
+    reason: str
+    prompt: str = ""
+    goal_status: Optional[str] = None
+    resume_reason: Optional[str] = None
+    ledger_statuses: tuple[str, ...] = ()
+
+    def to_hook_payload(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "session_key": self.session_key,
+            "session_id": self.session_id,
+            "reason": self.reason,
+            "goal_status": self.goal_status,
+            "resume_reason": self.resume_reason,
+            "ledger_statuses": list(self.ledger_statuses),
+        }
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -876,6 +919,45 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+def _extract_deliverable_media_paths_from_tool_content(content: Any) -> List[str]:
+    """Extract local deliverable paths from a tool-result payload.
+
+    Tool history contains two media shapes:
+
+    * explicit ``MEDIA:/abs/file`` tags (TTS and model-authored directives), and
+    * JSON payloads from producer tools such as ``image_generate``:
+      ``{"success": true, "image": "/abs/file.png"}``.
+
+    The gateway uses the extracted paths both for current-turn delivery and for
+    history de-duplication. Treat JSON payload paths as historical media too;
+    otherwise a later text-only turn in a cached/compressed session can re-send
+    stale images that were generated several turns earlier.
+    """
+    text = str(content or "")
+    paths: List[str] = []
+
+    if "MEDIA:" in text:
+        for match in _TOOL_MEDIA_RE.finditer(text):
+            path = match.group(1).strip().rstrip('\",}')
+            if path:
+                paths.append(path)
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and payload.get("success"):
+        for field in _JSON_MEDIA_TOOL_PATH_FIELDS:
+            path = payload.get(field)
+            if (
+                isinstance(path, str)
+                and _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}")
+            ):
+                paths.append(path)
+
+    return paths
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -932,23 +1014,14 @@ def _collect_auto_append_media_tags(
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
         if tool_name == "image_generate" and "MEDIA:" not in content:
-            try:
-                payload = json.loads(content)
-            except Exception:
-                payload = None
-            if isinstance(payload, dict) and payload.get("success"):
-                for field in _JSON_MEDIA_TOOL_PATH_FIELDS:
-                    path = payload.get(field)
-                    if (isinstance(path, str)
-                            and _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}")
-                            and path not in history_media_paths):
-                        media_tags.append(f"MEDIA:{path}")
-                        break
+            for path in _extract_deliverable_media_paths_from_tool_content(content):
+                if path not in history_media_paths:
+                    media_tags.append(f"MEDIA:{path}")
+                    break
             continue
         if "MEDIA:" not in content:
             continue
-        for match in _TOOL_MEDIA_RE.finditer(content):
-            path = match.group(1).strip().rstrip('",}')
+        for path in _extract_deliverable_media_paths_from_tool_content(content):
             if path and path not in history_media_paths:
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
@@ -3446,6 +3519,193 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
+    def _gateway_ledger_origin_type(self, event: MessageEvent) -> str:
+        """Classify gateway ledger origin without storing full message bodies."""
+        if self._is_goal_continuation_event(event):
+            return "internal_goal"
+        if getattr(event, "internal", False):
+            if not (getattr(event, "text", "") or "").strip():
+                return "startup_recovery"
+            return "internal_goal"
+        return "real_user"
+
+    def _gateway_ledger_snippet(self, event: MessageEvent) -> Optional[str]:
+        """Short redacted snippet for operator recovery; never full text."""
+        origin_type = self._gateway_ledger_origin_type(event)
+        if origin_type == "internal_goal":
+            return "[internal goal continuation]"
+        if origin_type == "startup_recovery":
+            return "[startup recovery continuation]"
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            return None
+        try:
+            from agent.redact import redact_sensitive_text
+            text = redact_sensitive_text(text)
+        except Exception:
+            pass
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:160] if text else None
+
+    def _record_gateway_ledger_received(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[int]:
+        """Best-effort receive marker for the gateway message ledger."""
+        db = getattr(self, "_session_db", None)
+        source = getattr(event, "source", None)
+        if db is None or source is None:
+            return None
+        try:
+            ledger_id = db.record_gateway_message_received(
+                platform=getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                user_id=getattr(source, "user_id", None),
+                session_key=session_key,
+                session_id=session_id,
+                origin_type=self._gateway_ledger_origin_type(event),
+                reason=reason,
+                metadata={
+                    "message_type": getattr(getattr(event, "message_type", None), "value", str(getattr(event, "message_type", ""))),
+                    "platform_update_id": getattr(event, "platform_update_id", None),
+                    "internal": bool(getattr(event, "internal", False)),
+                },
+                snippet=self._gateway_ledger_snippet(event),
+            )
+            try:
+                setattr(event, "_hermes_gateway_ledger_id", ledger_id)
+            except Exception:
+                pass
+            return ledger_id
+        except Exception as exc:
+            logger.debug("gateway message ledger receive failed: %s", exc, exc_info=True)
+            return None
+
+    def _update_gateway_ledger(
+        self,
+        event: MessageEvent,
+        status: str,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Any = None,
+    ) -> bool:
+        """Best-effort ledger lifecycle update; never breaks dispatch."""
+        db = getattr(self, "_session_db", None)
+        source = getattr(event, "source", None)
+        if db is None or source is None:
+            return False
+        ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        try:
+            ok = db.update_gateway_message_ledger(
+                ledger_id=ledger_id,
+                platform=getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                status=status,
+                session_key=session_key,
+                session_id=session_id,
+                reason=reason,
+                metadata=metadata,
+            )
+            if not ok and ledger_id is None:
+                self._record_gateway_ledger_received(
+                    event,
+                    session_key=session_key,
+                    session_id=session_id,
+                    reason="late-ledger-create",
+                )
+                ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+                if ledger_id is not None:
+                    ok = db.update_gateway_message_ledger(
+                        ledger_id=ledger_id,
+                        status=status,
+                        session_key=session_key,
+                        session_id=session_id,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+            return bool(ok)
+        except Exception as exc:
+            logger.debug("gateway message ledger update failed: %s", exc, exc_info=True)
+            return False
+
+    def _mark_gateway_ledger_after_agent_result(
+        self,
+        event: MessageEvent,
+        agent_result: Any,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Mark a claimed turn completed/failed/drained without replay risk."""
+        if isinstance(agent_result, dict):
+            if _should_clear_resume_pending_after_turn(agent_result):
+                self._update_gateway_ledger(
+                    event,
+                    "completed",
+                    session_key=session_key,
+                    session_id=session_id or agent_result.get("session_id"),
+                    reason="turn-completed",
+                    metadata={"completed": True},
+                )
+                return
+            if agent_result.get("interrupted") or agent_result.get("partial"):
+                self._update_gateway_ledger(
+                    event,
+                    "drained",
+                    session_key=session_key,
+                    session_id=session_id or agent_result.get("session_id"),
+                    reason="turn-interrupted",
+                    metadata={
+                        "interrupted": bool(agent_result.get("interrupted")),
+                        "partial": bool(agent_result.get("partial")),
+                    },
+                )
+                return
+            if agent_result.get("failed") or agent_result.get("error"):
+                self._update_gateway_ledger(
+                    event,
+                    "failed",
+                    session_key=session_key,
+                    session_id=session_id or agent_result.get("session_id"),
+                    reason=str(agent_result.get("error") or "turn-failed")[:500],
+                    metadata={"failed": bool(agent_result.get("failed"))},
+                )
+                return
+            return
+        if isinstance(agent_result, str) and agent_result.strip():
+            self._update_gateway_ledger(
+                event,
+                "completed",
+                session_key=session_key,
+                session_id=session_id,
+                reason="turn-completed",
+                metadata={"completed": True},
+            )
+
+    def _mark_gateway_ledger_session_drained(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+    ) -> None:
+        db = getattr(self, "_session_db", None)
+        if db is None or not session_key:
+            return
+        try:
+            db.mark_gateway_session_messages_drained(session_key, reason=reason)
+        except Exception as exc:
+            logger.debug("gateway message ledger drain mark failed for %s: %s", session_key, exc, exc_info=True)
+
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
 
@@ -4844,7 +5104,450 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # request after a restart.  The safer UX is to wait for the next real user
     # message, where the existing resume_pending branch injects the recovery
     # system note into that turn.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout"})
+    _AUTO_RESUME_REASONS = frozenset({
+        "restart_timeout",
+        "shutdown_timeout",
+        _STARTUP_GOAL_RECOVERY_REASON,
+    })
+
+    @staticmethod
+    def _goal_tool_names_from_message(msg: Dict[str, Any]) -> List[str]:
+        names: List[str] = []
+        tool_name = msg.get("tool_name")
+        if tool_name:
+            names.append(str(tool_name))
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except Exception:
+                tool_calls = []
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                function = call.get("function")
+                if not name and isinstance(function, dict):
+                    name = function.get("name")
+                if name:
+                    names.append(str(name))
+        return names
+
+    def _uncheckpointed_goal_side_effect_risk(self, session_id: str) -> Optional[str]:
+        """Return an alert reason when the latest turn has risky open tool work.
+
+        Startup recovery may safely continue an active goal after a completed
+        assistant checkpoint.  It must not blindly synthesize a continuation on
+        top of an unclosed terminal/send/write-style tool tail, because that can
+        duplicate side effects after a gateway drain.
+        """
+        db = getattr(self, "_session_db", None)
+        if db is None or not session_id:
+            return None
+        try:
+            messages = db.get_messages(session_id)
+        except Exception as exc:
+            logger.debug("startup goal recovery: message risk lookup failed for %s: %s", session_id, exc)
+            return None
+        if not messages:
+            return None
+
+        checkpoint_idx = -1
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+                checkpoint_idx = idx
+        tail = messages[checkpoint_idx + 1:]
+        if not tail:
+            return None
+
+        for msg in tail:
+            role = msg.get("role")
+            names = self._goal_tool_names_from_message(msg)
+            risky_names = sorted({name for name in names if name in _STARTUP_GOAL_RISKY_TOOLS})
+            if role == "assistant" and msg.get("tool_calls"):
+                if risky_names:
+                    return f"uncheckpointed assistant tool call(s): {', '.join(risky_names)}"
+                return "uncheckpointed assistant tool call(s)"
+            if role == "tool":
+                if risky_names:
+                    return f"uncheckpointed tool result(s): {', '.join(risky_names)}"
+                # Tool result with no final assistant checkpoint is still not a
+                # clean active-goal boundary.  Read-only tools are lower risk,
+                # but alert-only keeps startup recovery from inventing state.
+                return "uncheckpointed tool result(s)"
+        return None
+
+    def _startup_goal_ledger_statuses(self, session_key: str) -> tuple[str, ...]:
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return ()
+        try:
+            rows = db.list_gateway_message_ledger_for_session(session_key, limit=8)
+        except Exception as exc:
+            logger.debug("startup goal recovery: ledger lookup failed for %s: %s", session_key, exc)
+            return ()
+        statuses: List[str] = []
+        for row in rows or []:
+            status = str((row or {}).get("status") or "").strip()
+            if status:
+                statuses.append(status)
+        return tuple(statuses)
+
+    def _telegram_policy_chat_ids(self, *, env_name: str, extra_key: str) -> set[str]:
+        """Return Telegram chat IDs from env plus live config extras.
+
+        Startup recovery can run before/after config→env bridges in tests and
+        in older long-lived gateway processes.  Reading both layers prevents a
+        configured private workroom from being treated as a public group and
+        stranding active goals after restart.
+        """
+        ids: set[str] = set()
+
+        def _add(raw: Any) -> None:
+            if raw is None:
+                return
+            if isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    _add(item)
+                return
+            for part in str(raw or "").split(","):
+                part = part.strip()
+                if part:
+                    ids.add(part)
+
+        _add(os.getenv(env_name, ""))
+        try:
+            platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg is not None else {}
+            if isinstance(extra, dict):
+                _add(extra.get(extra_key))
+        except Exception as exc:
+            logger.debug("startup recovery: telegram policy lookup failed for %s: %s", extra_key, exc)
+        return ids
+
+    def _startup_chip_history_config_mapping(self) -> Dict[str, Any]:
+        try:
+            platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg is not None else {}
+            raw = extra.get("chip_history_recovery") if isinstance(extra, dict) else None
+            if isinstance(raw, dict):
+                return {"telegram": {"chip_history_recovery": raw}}
+        except Exception as exc:
+            logger.debug("startup chip history recovery: config lookup failed: %s", exc)
+        return {}
+
+    def _startup_chip_history_reconciliation(self, entry: Any) -> Optional[Any]:
+        """Read recent telegram-chip history for a startup recovery candidate.
+
+        This is intentionally read-only.  It never replays Telegram messages;
+        it only blocks blind auto-resume when the recent visible history shows
+        missed or unsafe messages around a restart.
+        """
+        source = getattr(entry, "origin", None)
+        db = getattr(self, "_session_db", None)
+        if source is None or db is None:
+            return None
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return None
+        try:
+            from gateway.chip_history_recovery import (
+                TelegramChipHistoryConfig,
+                build_telegram_chip_history_client,
+                reconcile_chip_history_against_ledger,
+            )
+
+            cfg_map = self._startup_chip_history_config_mapping()
+            cfg = TelegramChipHistoryConfig.from_mapping(cfg_map)
+            if not cfg.enabled:
+                return None
+            client = build_telegram_chip_history_client(cfg_map)
+            result = reconcile_chip_history_against_ledger(
+                db,
+                client,
+                chat_id=getattr(source, "chat_id", ""),
+                thread_id=getattr(source, "thread_id", None),
+                platform="telegram",
+                limit=cfg.limit,
+                chip_user_id=cfg.chip_user_id,
+            )
+            if result.warning:
+                logger.warning("startup chip history recovery degraded for %s: %s", getattr(entry, "session_key", ""), result.warning)
+            return result
+        except Exception as exc:
+            logger.warning("startup chip history recovery failed for %s: %s", getattr(entry, "session_key", ""), exc)
+            return None
+
+    def _startup_recovery_source_is_trusted_private(self, source: Any) -> bool:
+        """Whether startup continuation may speak in this origin without a new user poke.
+
+        Telegram workrooms can be group/forum chats at the protocol level while
+        being private operator rooms in config.  Treat those configured private
+        chats like DMs for restart continuation; public/shared chats stay
+        alert-only to avoid surprising bystanders or duplicating side effects.
+        """
+        if source is None:
+            return False
+        if getattr(source, "chat_type", "dm") == "dm":
+            return True
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if not chat_id:
+            return False
+
+        private_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PRIVATE_CHATS",
+            extra_key="private_chats",
+        )
+        public_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PUBLIC_CHATS",
+            extra_key="public_chats",
+        )
+        if chat_id in public_ids:
+            return False
+        return chat_id in private_ids
+
+    def _startup_recovery_source_is_configured_private_workroom(self, source: Any) -> bool:
+        """Configured private Telegram workroom, excluding one-to-one DMs."""
+        if source is None:
+            return False
+        if getattr(source, "chat_type", "dm") == "dm":
+            return False
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if not chat_id:
+            return False
+        private_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PRIVATE_CHATS",
+            extra_key="private_chats",
+        )
+        public_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PUBLIC_CHATS",
+            extra_key="public_chats",
+        )
+        return chat_id in private_ids and chat_id not in public_ids
+
+    def _classify_startup_goal_recovery(
+        self,
+        entry: Any,
+        *,
+        platform: Any = None,
+        generic_auto_resume_enabled: Optional[bool] = None,
+    ) -> StartupGoalRecoveryDecision:
+        session_key = str(getattr(entry, "session_key", "") or "")
+        session_id = str(getattr(entry, "session_id", "") or "")
+        resume_reason = getattr(entry, "resume_reason", None)
+        ledger_statuses = self._startup_goal_ledger_statuses(session_key)
+
+        def _decision(status: str, reason: str, **extra: Any) -> StartupGoalRecoveryDecision:
+            return StartupGoalRecoveryDecision(
+                status=status,
+                session_key=session_key,
+                session_id=session_id,
+                reason=reason,
+                resume_reason=resume_reason,
+                ledger_statuses=ledger_statuses,
+                **extra,
+            )
+
+        if platform is not None and getattr(getattr(entry, "origin", None), "platform", None) != platform:
+            return _decision("skip", "platform-scope-mismatch")
+        if not session_key or not session_id:
+            return _decision("skip", "missing-session-identity")
+        if getattr(entry, "suspended", False):
+            return _decision("skip", "session-suspended")
+        source = getattr(entry, "origin", None)
+        if source is None:
+            return _decision("alert_only", "missing-session-origin")
+
+        goal_status: Optional[str] = None
+        goal_mgr = None
+        goal_state = None
+        try:
+            from hermes_cli.goals import GoalManager
+
+            goal_mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
+            goal_state = getattr(goal_mgr, "state", None)
+            goal_status = getattr(goal_state, "status", None) if goal_state is not None else None
+        except Exception as exc:
+            logger.debug("startup goal recovery: goal lookup failed for %s: %s", session_id, exc)
+
+        if goal_state is not None:
+            if goal_status != "active":
+                return _decision("skip", "goal-not-active", goal_status=goal_status)
+            if session_key in getattr(self, "_running_agents", {}):
+                return _decision("alert_only", "agent-already-running", goal_status=goal_status)
+            if not self._startup_recovery_source_is_trusted_private(source):
+                return _decision("alert_only", "active-goal-in-shared-chat", goal_status=goal_status)
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                return _decision("alert_only", "adapter-not-ready", goal_status=goal_status)
+
+            marker = (
+                getattr(entry, "last_resume_marked_at", None)
+                or getattr(entry, "updated_at", None)
+                or getattr(goal_state, "last_turn_at", 0)
+                or getattr(goal_state, "created_at", 0)
+            )
+            if not _is_fresh_gateway_interruption(
+                marker,
+                window_secs=_auto_continue_freshness_window(),
+            ):
+                return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
+
+            side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
+            if side_effect_risk:
+                return _decision("alert_only", side_effect_risk, goal_status=goal_status)
+
+            history_result = self._startup_chip_history_reconciliation(entry)
+            if history_result is not None:
+                unsafe = list(history_result.missed_by_gateway) + list(history_result.requeue_candidates) + list(history_result.alert_only)
+                if unsafe:
+                    reason_bits = sorted({str(item.status) for item in unsafe if getattr(item, "status", None)})
+                    reason = "telegram-chip recent history requires operator review"
+                    if reason_bits:
+                        reason += f": {', '.join(reason_bits)}"
+                    return _decision("alert_only", reason, goal_status=goal_status)
+                logger.info(
+                    "startup chip history recovery checked %s recent message(s) for %s",
+                    getattr(history_result, "records_checked", 0),
+                    session_key,
+                )
+
+            prompt = ""
+            try:
+                prompt = goal_mgr.next_continuation_prompt() if goal_mgr is not None else ""
+            except Exception as exc:
+                logger.debug("startup goal recovery: continuation prompt failed for %s: %s", session_id, exc)
+            if not prompt:
+                return _decision("alert_only", "active-goal-continuation-unavailable", goal_status=goal_status)
+            return _decision(
+                "auto_resume",
+                "active-goal-startup-recovery",
+                goal_status=goal_status,
+                prompt=prompt,
+            )
+
+        # Legacy non-goal resume_pending path stays opt-in for public/shared
+        # chats.  Chip's configured private Telegram workrooms are allowed to
+        # recover like DMs so gateway reloads do not strand in-progress work.
+        if generic_auto_resume_enabled is None:
+            generic_auto_resume_enabled = os.environ.get(
+                "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+            ).lower() in {"1", "true", "yes", "on"}
+        if not generic_auto_resume_enabled and not self._startup_recovery_source_is_configured_private_workroom(source):
+            return _decision("skip", "generic-auto-resume-disabled")
+        if not getattr(entry, "resume_pending", False):
+            return _decision("skip", "no-resume-pending")
+        if resume_reason not in self._AUTO_RESUME_REASONS:
+            return _decision("skip", "resume-reason-not-auto-resumable")
+        marker = getattr(entry, "last_resume_marked_at", None) or getattr(entry, "updated_at", None)
+        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
+            return _decision("skip", "resume-pending-stale")
+        if session_key in getattr(self, "_running_agents", {}):
+            return _decision("skip", "agent-already-running")
+        return _decision("auto_resume", "generic-resume-pending")
+
+    def _startup_goal_recovery_hook_payload(self, platform: Any = None) -> List[Dict[str, Any]]:
+        generic_enabled = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        try:
+            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                entries = list(self.session_store._entries.values())  # noqa: SLF001
+        except Exception as exc:
+            logger.debug("startup goal recovery: hook snapshot failed: %s", exc)
+            return []
+        payload: List[Dict[str, Any]] = []
+        for entry in entries:
+            decision = self._classify_startup_goal_recovery(
+                entry,
+                platform=platform,
+                generic_auto_resume_enabled=generic_enabled,
+            )
+            if decision.status != "skip":
+                payload.append(decision.to_hook_payload())
+        return payload
+
+    def _mark_active_goal_resume_pending(self, entry: Any) -> None:
+        if getattr(entry, "resume_pending", False):
+            return
+        marked = False
+        try:
+            marked = self.session_store.mark_resume_pending(  # type: ignore[attr-defined]
+                entry.session_key,
+                _STARTUP_GOAL_RECOVERY_REASON,
+            ) is True
+        except Exception as exc:
+            logger.debug("startup goal recovery: mark_resume_pending failed for %s: %s", entry.session_key, exc)
+        if marked:
+            return
+        try:
+            entry.resume_pending = True
+            entry.resume_reason = _STARTUP_GOAL_RECOVERY_REASON
+            entry.last_resume_marked_at = datetime.now()
+            save = getattr(self.session_store, "_save", None)
+            if callable(save):
+                save()
+        except Exception as exc:
+            logger.debug("startup goal recovery: local resume flag update failed for %s: %s", getattr(entry, "session_key", None), exc)
+
+    def _schedule_startup_goal_recovery_alert(self, decision: StartupGoalRecoveryDecision, source: Any) -> None:
+        alerted = getattr(self, "_startup_goal_recovery_alerted", None)
+        if alerted is None:
+            alerted = set()
+            self._startup_goal_recovery_alerted = alerted
+        key = (decision.session_key, decision.reason)
+        if key in alerted:
+            return
+        alerted.add(key)
+
+        if not self._startup_recovery_source_is_trusted_private(source):
+            logger.warning(
+                "Active /goal recovery withheld for %s (%s): %s",
+                decision.session_key,
+                getattr(source, "chat_type", "unknown"),
+                decision.reason,
+            )
+            return
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            logger.warning(
+                "Active /goal recovery withheld for %s: %s",
+                decision.session_key,
+                decision.reason,
+            )
+            return
+
+        async def _send() -> None:
+            try:
+                metadata = self._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            message = (
+                "⚠️ Active /goal was found after gateway startup, but auto-resume "
+                f"was withheld: {decision.reason}.\n"
+                "Send a new message or `/goal status` to inspect it."
+            )
+            try:
+                await adapter.send(source.chat_id, message, metadata=metadata)
+            except Exception as exc:
+                logger.warning("startup goal recovery alert send failed for %s: %s", decision.session_key, exc)
+
+        try:
+            task = asyncio.create_task(_send())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            logger.warning(
+                "Active /goal recovery withheld for %s: %s",
+                decision.session_key,
+                decision.reason,
+            )
 
     async def _run_startup_resume_event(
         self,
@@ -4935,84 +5638,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Optionally auto-continue fresh restart-interrupted sessions after startup.
+        """Auto-continue safe startup recovery candidates.
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next real user turn.
-        By default we do NOT create an internal empty Telegram event at startup,
-        because that produces unsolicited/duplicate-looking messages after
-        service restarts. Operators who explicitly want the old behaviour can
-        opt in with ``HERMES_GATEWAY_STARTUP_AUTO_RESUME=1``.
-
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and can resume on the next real user message.
-        When startup auto-resume is explicitly enabled, the reconnect watcher
-        may call this again scoped to that ``platform``.
-
-        ``platform`` (a ``Platform``) restricts the pass to sessions that
-        originated on that platform.  The reconnect path passes it so a
-        platform coming back online retries only its own sessions and never
-        re-touches another platform's in-flight recoveries.  Sessions whose
-        agent is already running are skipped regardless, so a session
-        scheduled at startup is never resumed a second time.
+        Legacy non-goal ``resume_pending`` startup replay still requires the
+        explicit ``HERMES_GATEWAY_STARTUP_AUTO_RESUME=1`` opt-in.  Active
+        ``/goal`` sessions are different: the standing objective already lives
+        in ``SessionDB.state_meta`` and the GoalManager is the canonical
+        continuation path, so fresh active goals may be resumed without that
+        global legacy flag.  Risky side-effectful tails are alert-only.
         """
-        if os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() not in {"1", "true", "yes", "on"}:
-            logger.info("Startup auto-resume disabled; pending sessions will wait for the next real user message")
-            return 0
+        generic_enabled = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        if not generic_enabled:
+            logger.info(
+                "Generic startup auto-resume disabled; active /goal recovery remains enabled"
+            )
 
-        window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
+                    if not getattr(entry, "suspended", False)
+                    and getattr(entry, "origin", None) is not None
+                    and (platform is None or getattr(entry.origin, "platform", None) == platform)
                 ]
         except Exception as exc:
-            logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
+            logger.warning("Failed to enumerate startup recovery sessions: %s", exc)
             return 0
 
-        now = datetime.now()
         scheduled = 0
+        alert_only = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
-
-            # Already being resumed (e.g. scheduled at startup and still
-            # in-flight) — don't synthesize a second continuation turn.
-            if entry.session_key in self._running_agents:
+            decision = self._classify_startup_goal_recovery(
+                entry,
+                platform=platform,
+                generic_auto_resume_enabled=generic_enabled,
+            )
+            if decision.status == "skip":
                 continue
 
             source = entry.origin
+            if decision.status == "alert_only":
+                alert_only += 1
+                self._schedule_startup_goal_recovery_alert(decision, source)
+                continue
+
             adapter = self.adapters.get(source.platform)
             if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
-                    entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
                 continue
 
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
-            # first await (where _process_message_background sets the real
-            # sentinel) sees the slot as occupied and queues behind it
-            # instead of spinning up a duplicate AIAgent (#45456).
+            # first await sees the slot as occupied and queues behind it.
             self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
             self._running_agents_ts[entry.session_key] = time.time()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            event_text = decision.prompt or ""
+            if decision.goal_status == "active":
+                self._mark_active_goal_resume_pending(entry)
+
             event = MessageEvent(
-                text="",
+                text=event_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -5032,8 +5720,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if scheduled:
             logger.info(
-                "Scheduled auto-resume for %d restart-interrupted session(s)",
+                "Scheduled startup recovery for %d session(s)",
                 scheduled,
+            )
+        if alert_only:
+            logger.warning(
+                "Startup recovery withheld for %d active /goal session(s); alert-only",
+                alert_only,
             )
         return scheduled
 
@@ -5488,8 +6181,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
+        startup_recovery_payload = []
+        try:
+            startup_recovery_payload = self._startup_goal_recovery_hook_payload()
+        except Exception:
+            logger.debug("startup goal recovery hook payload failed", exc_info=True)
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
+            "startup_goal_recovery": startup_recovery_payload,
         })
         
         if connected_count > 0:
@@ -6346,6 +7045,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                    self._mark_gateway_ledger_session_drained(
+                        _sk,
+                        reason=_resume_reason,
+                    )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -6846,12 +7549,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        self._record_gateway_ledger_received(event, reason="handle-message-entry")
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not getattr(event, "internal", False)
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            self._update_gateway_ledger(
+                event,
+                "requeued",
+                reason="startup-restore-queue",
+                metadata={"queue": "startup_restore"},
+            )
             self._queue_startup_restore_event(event)
             return None
 
@@ -6956,6 +7666,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        self._update_gateway_ledger(
+            event,
+            "received",
+            session_key=_quick_key,
+            reason="session-key-resolved",
+        )
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -8074,6 +8790,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        self._update_gateway_ledger(
+            event,
+            "in_progress",
+            session_key=_quick_key,
+            reason="active-session-claimed",
+            metadata={"run_generation": _run_generation},
+        )
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -8111,7 +8834,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+            self._mark_gateway_ledger_after_agent_result(
+                event,
+                _agent_result,
+                session_key=_quick_key,
+            )
             return _agent_result
+        except Exception as _agent_exc:
+            self._update_gateway_ledger(
+                event,
+                "failed",
+                session_key=_quick_key,
+                reason=f"agent-exception:{type(_agent_exc).__name__}",
+                metadata={"error": str(_agent_exc)[:300]},
+            )
+            raise
         finally:
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
@@ -8533,6 +9270,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        self._update_gateway_ledger(
+            event,
+            "in_progress",
+            session_key=session_key,
+            session_id=session_entry.session_id,
+            reason="session-entry-resolved",
+        )
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
@@ -10246,12 +10990,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if supergoal_from_artifacts:
                 return supergoal_from_artifacts
 
-            # A bare `/goal` reply to a long assistant report should not turn
-            # that whole report into a standing goal.  Supergoal plans are
-            # handled above via explicit markers/artifact paths; generic long
-            # objectives should be sent as `/goal <text>` so intent is clear.
-            if len(raw) > 1200:
-                return ""
+            # A bare `/goal` reply is explicit operator intent: the replied-to
+            # text is the goal body, even when it is long.  Supergoal plans are
+            # still normalized above via explicit markers/artifact paths, but
+            # generic replied text must not be discarded just because it exceeds
+            # an arbitrary quote length.
 
         # Fallback if the user replies to a plain `/goal "..."` line.
         if raw.startswith("/goal"):
@@ -14483,6 +15226,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     quiet_chats = telegram_cfg.get("suppress_tool_progress_chats") or []
                     quiet_ids = {str(chat_id) for chat_id in quiet_chats}
                     suppress_tool_status_for_chat = chat_id in quiet_ids
+
+                # Exact Telegram topic override. This keeps shared/public groups quiet
+                # by default while allowing tool-progress bubbles in a specific
+                # forum topic, e.g. "-1003770669948:5413".
+                thread_id = str(getattr(source, "thread_id", "") or "")
+                visible_topics = telegram_cfg.get("tool_progress_topics") or []
+                if isinstance(visible_topics, str):
+                    visible_topic_ids = {part.strip() for part in visible_topics.split(",") if part.strip()}
+                else:
+                    visible_topic_ids = {str(part).strip() for part in visible_topics if str(part).strip()}
+                if thread_id and (
+                    f"{chat_id}:{thread_id}" in visible_topic_ids or thread_id in visible_topic_ids
+                ):
+                    suppress_tool_status_for_chat = False
+
                 if tool_progress_enabled and suppress_tool_status_for_chat:
                     tool_progress_enabled = False
             except Exception:
@@ -15683,19 +16441,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _history_media_paths: set = set()
             for _hm in agent_history:
                 if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        _TOOL_MEDIA_RE = re.compile(
-                            r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
-                        )
-                        for _match in _TOOL_MEDIA_RE.finditer(_hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+                    for _p in _extract_deliverable_media_paths_from_tool_content(
+                        _hm.get("content", "")
+                    ):
+                        _history_media_paths.add(_p)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -15851,18 +16600,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _reason == "restart_timeout"
                     else "a gateway shutdown"
                     if _reason == "shutdown_timeout"
+                    else "active /goal startup recovery"
+                    if _reason == _STARTUP_GOAL_RECOVERY_REASON
                     else "a gateway interruption"
                 )
                 _persist_user_message_override = message
-                message = (
-                    f"[System note: A new message has arrived. The previous turn "
-                    f"was interrupted by {_reason_phrase}. "
-                    f"Address the user's NEW message below FIRST. "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history and focus on what the "
-                    f"user is asking now.]\n\n"
-                    + message
-                )
+                if self._is_goal_continuation_event(message):
+                    message = (
+                        f"[System note: The active /goal continuation below was scheduled "
+                        f"after {_reason_phrase}. Resume through the existing transcript and "
+                        f"verify before claiming completion. Do NOT blindly repeat "
+                        f"side-effectful tool calls from before the interruption.]\n\n"
+                        + message
+                    )
+                else:
+                    message = (
+                        f"[System note: A new message has arrived. The previous turn "
+                        f"was interrupted by {_reason_phrase}. "
+                        f"Address the user's NEW message below FIRST. "
+                        f"Do NOT re-execute old tool calls — skip any unfinished "
+                        f"work from the conversation history and focus on what the "
+                        f"user is asking now.]\n\n"
+                        + message
+                    )
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
                 message = (
