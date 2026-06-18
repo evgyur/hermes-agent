@@ -35,6 +35,7 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -281,6 +282,63 @@ def _session_row(db: Any, session_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def _compression_child_session_ids(db: Any, parent_session_id: str) -> List[str]:
+    """Return direct compression children for a session, best-effort."""
+    if not parent_session_id:
+        return []
+    try:
+        with db._lock:  # noqa: SLF001 - no public child-session helper.
+            rows = db._conn.execute(  # noqa: SLF001
+                "SELECT id FROM sessions WHERE parent_session_id = ?",
+                (parent_session_id,),
+            ).fetchall()
+    except Exception as exc:
+        logger.debug(
+            "GoalManager: compression child lookup failed for %s: %s",
+            parent_session_id,
+            exc,
+        )
+        return []
+    ids: List[str] = []
+    for row in rows or []:
+        try:
+            value = row["id"]
+        except Exception:
+            value = row[0] if row else ""
+        if value:
+            ids.append(str(value))
+    return ids
+
+
+def _clear_parent_goal_if_migrated_to_child(
+    session_id: str,
+    state: GoalState,
+    db: Any,
+) -> GoalState:
+    """Heal a stale parent goal row after compression migration.
+
+    The normal migration path copies parent -> child and marks the parent
+    cleared.  In tests and crashy real processes there may be two open DB
+    handles during the handoff; if the child already has the copied goal but
+    the parent row is still active, clear the parent lazily so future startup
+    recovery never sees two active goals for one compression lineage.
+    """
+    if state.status not in _MIGRATABLE_GOAL_STATUSES:
+        return state
+    row = _session_row(db, session_id)
+    if (row or {}).get("end_reason") != "compression":
+        return state
+    for child_id in _compression_child_session_ids(db, session_id):
+        child = _load_goal_exact(child_id, db=db)
+        if child is not None and child.status in _MIGRATABLE_GOAL_STATUSES:
+            if child.goal == state.goal:
+                state.status = "cleared"
+                state.last_reason = f"migrated to {child_id} after context compression"
+                save_goal(session_id, state)
+                return state
+    return state
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str) -> bool:
     """Move an active goal across a context-compression session split.
 
@@ -348,6 +406,9 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, following compression lineage if needed."""
     state = _load_goal_exact(session_id)
     if state is not None:
+        db = _get_session_db()
+        if db is not None:
+            state = _clear_parent_goal_if_migrated_to_child(session_id, state, db)
         return state
     if not session_id:
         return None
@@ -435,9 +496,107 @@ def _looks_like_supergoal_goal(goal: str) -> bool:
     )
 
 
+def _candidate_supergoal_roots(goal: str) -> List[Path]:
+    """Return plausible SuperGoal roots mentioned by a /goal body.
+
+    A stale GoalManager wrapper may contain malformed paths such as
+    ``<root>/.supergoal/AUDIT_HANDOFF.md/PROTOCOL.md``.  Normalize those
+    back to ``<root>``.  Order matters: the first root with a STATE file is
+    treated as canonical for this goal, so a new active root is not marked
+    done merely because the prompt also mentions an older completed rail.
+    """
+    text = str(goal or "")
+    roots: List[Path] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        raw = (raw or "").strip().strip("`'\"<>.,;)]")
+        if not raw or not raw.startswith("/"):
+            return
+        if "/.supergoal/" in raw:
+            raw = raw.split("/.supergoal/", 1)[0]
+        elif raw.endswith("/.supergoal"):
+            raw = raw[: -len("/.supergoal")]
+        path = Path(raw)
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            roots.append(path)
+
+    # Prefer explicit root wording when present.
+    for m in re.finditer(r"(?:project\s+root|supergoal\s+root|root)\s*[:=]?\s*`([^`]+)`", text, re.IGNORECASE):
+        add(m.group(1))
+
+    # Then all backticked absolute paths.
+    for m in re.finditer(r"`(/[^`]+)`", text):
+        add(m.group(1))
+
+    # Finally bare absolute paths that include .supergoal.
+    for m in re.finditer(r"(/\S*\.supergoal/\S+)", text):
+        add(m.group(1))
+
+    return roots
+
+
+def _supergoal_disk_completion_reason(goal: str) -> Optional[str]:
+    """Detect already-complete SuperGoals from disk before asking the judge.
+
+    If the canonical root's ``.supergoal/STATE.md`` already records terminal
+    completion, continuing the same /goal is a control-plane bug.  Marking it
+    done here prevents repeated synthetic continuation turns from reaching the
+    LLM and spamming ``COMPLETE — stop``.
+    """
+    for root in _candidate_supergoal_roots(goal):
+        state_path = root / ".supergoal" / "STATE.md"
+        if not state_path.exists() or not state_path.is_file():
+            continue
+        try:
+            state_text = state_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            logger.debug("supergoal completion check: could not read %s: %s", state_path, exc)
+            return None
+        upper = state_text.upper()
+        complete = (
+            "STATUS: COMPLETE" in upper
+            and "CURRENT PHASE: COMPLETE" in upper
+            and "AUDIT_COMPLETE" in upper
+            and "SUPERGOAL_RUN_COMPLETE" in upper
+        )
+        if complete:
+            return f"supergoal STATE.md already complete at {root}"
+        # First existing STATE.md is canonical for this goal.  Do not keep
+        # scanning older previous-rail paths that may also be mentioned.
+        return None
+    return None
+
+
 def _is_supergoal_handoff_reason(reason: str) -> bool:
     upper = str(reason or "").upper()
-    return "FAILURE_HANDOFF" in upper or "AUDIT_HANDOFF" in upper
+    return (
+        "FAILURE_HANDOFF" in upper
+        or "AUDIT_HANDOFF" in upper
+        or "BLOCKED_BY_APPROVAL" in upper
+    )
+
+
+def _is_supergoal_approval_blocker_response(text: str) -> bool:
+    """Detect an intentional SuperGoal approval gate stop.
+
+    SuperGoal goals often require terminal AUDIT markers, but approval-gated
+    phases must stop before those markers when a side effect needs human
+    approval. Without this deterministic guard, a judge can keep returning
+    CONTINUE just because SUPERGOAL_RUN_COMPLETE is absent, causing the same
+    approval phrase to be posted until the turn budget is exhausted.
+    """
+    upper = str(text or "").upper()
+    if "BLOCKED_BY_APPROVAL" not in upper:
+        return False
+    return (
+        "CURRENT PHASE" in upper
+        or "PHASE" in upper
+        or "APPROVAL" in upper
+        or "STATE.MD" in upper
+    )
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -557,10 +716,15 @@ def judge_goal(
     # marker names in prose.
     goal_upper = goal.upper()
     if _looks_like_supergoal_goal(goal):
+        disk_done_reason = _supergoal_disk_completion_reason(goal)
+        if disk_done_reason:
+            return "done", disk_done_reason, False
         if _has_standalone_marker(last_response, "FAILURE_HANDOFF"):
             return "done", "supergoal stopped with FAILURE_HANDOFF", False
         if _has_standalone_marker(last_response, "AUDIT_HANDOFF"):
             return "done", "supergoal stopped with AUDIT_HANDOFF", False
+        if _is_supergoal_approval_blocker_response(last_response):
+            return "done", "supergoal stopped with BLOCKED_BY_APPROVAL", False
         if "SUPERGOAL_RUN_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "SUPERGOAL_RUN_COMPLETE"):
             return "continue", "missing standalone SUPERGOAL_RUN_COMPLETE terminal marker", False
         if "AUDIT_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "AUDIT_COMPLETE"):

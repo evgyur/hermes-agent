@@ -265,6 +265,95 @@ class TestJudgeGoal:
         assert "FAILURE_HANDOFF" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_blocked_by_approval_stops_without_aux_judge(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                )
+            ]
+        )
+        goal = "Run phases; print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE only after all approved live actions."
+        response = (
+            "BLOCKED_BY_APPROVAL — phase 7.\n"
+            "STATE.md confirms Current phase: 7 and missing exact approval."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert "BLOCKED_BY_APPROVAL" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_completed_state_file_stops_without_aux_judge(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "done-supergoal"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\n"
+            "Status: COMPLETE\n"
+            "Current phase: complete\n\n"
+            "## Final markers\n"
+            "AUDIT_COMPLETE\n"
+            "SUPERGOAL_RUN_COMPLETE\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = (
+            f"Execute the Supergoal from project root `{root}`. "
+            f"Use `{root}/.supergoal/AUDIT_HANDOFF.md/PROTOCOL.md` and finish "
+            "only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "done"
+        assert "STATE.md already complete" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_incomplete_current_root_not_satisfied_by_previous_complete_root(self, tmp_path):
+        from hermes_cli import goals
+
+        current = tmp_path / "live-activation-supergoal"
+        old = tmp_path / "old-complete-supergoal"
+        for root, state in [
+            (
+                current,
+                "# STATE\nStatus: READY\nCurrent phase: 0\n",
+            ),
+            (
+                old,
+                "# STATE\nStatus: COMPLETE\nCurrent phase: complete\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
+            ),
+        ]:
+            sg = root / ".supergoal"
+            sg.mkdir(parents=True)
+            (sg / "STATE.md").write_text(state, encoding="utf-8")
+
+        fake_client = MagicMock()
+        goal = (
+            f"Implement `.supergoal/ROADMAP.md` in `{current}` from phase 0. "
+            f"Previous rail is `{old}`. Finish only after AUDIT_COMPLETE and "
+            "SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_with_terminal_markers_can_reach_judge(self):
         from hermes_cli import goals
 
@@ -403,6 +492,28 @@ class TestGoalManager:
         assert mgr.state is not None
         assert mgr.state.status == "blocked"
         assert "Goal blocked" in mgr.status_line()
+
+    def test_evaluate_after_turn_supergoal_approval_block_is_blocked(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-sid-approval-blocked")
+        mgr.set("Run Supergoal; stop with BLOCKED_BY_APPROVAL if approval is missing.")
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("done", "supergoal stopped with BLOCKED_BY_APPROVAL", False),
+        ):
+            decision = mgr.evaluate_after_turn("BLOCKED_BY_APPROVAL")
+
+        assert decision["verdict"] == "done"
+        assert decision["status"] == "blocked"
+        assert decision["should_continue"] is False
+        assert decision["continuation_prompt"] is None
+        assert mgr.state is not None
+        assert mgr.state.status == "blocked"
+        assert "BLOCKED_BY_APPROVAL" in (mgr.state.last_reason or "")
 
     def test_active_goal_migrates_to_compression_child(self, hermes_home):
         from hermes_cli.goals import GoalManager
