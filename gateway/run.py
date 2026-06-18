@@ -5399,8 +5399,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
 
             side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
-            if side_effect_risk:
-                return _decision("alert_only", side_effect_risk, goal_status=goal_status)
 
             history_result = self._startup_chip_history_reconciliation(entry)
             if history_result is not None:
@@ -5424,9 +5422,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("startup goal recovery: continuation prompt failed for %s: %s", session_id, exc)
             if not prompt:
                 return _decision("alert_only", "active-goal-continuation-unavailable", goal_status=goal_status)
+            if side_effect_risk:
+                prompt += (
+                    "\n\n[Startup recovery note]\n"
+                    "Gateway restarted while the prior turn had "
+                    f"{side_effect_risk}. Do not treat that as permission to "
+                    "repeat irreversible side effects blindly. Inspect persisted "
+                    "state/artifacts first, continue the active /goal from its "
+                    "canonical state file, and only redo idempotent or verified-safe steps."
+                )
             return _decision(
                 "auto_resume",
-                "active-goal-startup-recovery",
+                "active-goal-startup-recovery-with-open-tool-tail" if side_effect_risk else "active-goal-startup-recovery",
                 goal_status=goal_status,
                 prompt=prompt,
             )
@@ -5645,7 +5652,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``/goal`` sessions are different: the standing objective already lives
         in ``SessionDB.state_meta`` and the GoalManager is the canonical
         continuation path, so fresh active goals may be resumed without that
-        global legacy flag.  Risky side-effectful tails are alert-only.
+        global legacy flag.  Open tool tails add an in-band recovery note to
+        the synthetic goal turn instead of withholding active-goal recovery.
         """
         generic_enabled = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() in {
             "1", "true", "yes", "on"

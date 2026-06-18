@@ -7,7 +7,9 @@ Phase 4 implements the target behavior mapped in Phase 1:
 - recovery runs on the same session key/session id through the official
   GoalManager continuation prompt;
 - paused/done/cleared goals fail closed;
-- side-effectful uncheckpointed tool tails are alert-only, not replayed.
+- side-effectful uncheckpointed tool tails still auto-resume active goals,
+  with an explicit recovery note telling the agent to inspect state before
+  repeating side effects.
 """
 
 from __future__ import annotations
@@ -279,7 +281,7 @@ class _RiskyToolTailDB:
 
 
 @pytest.mark.asyncio
-async def test_uncheckpointed_side_effectful_tool_tail_is_alert_only(hermes_home):
+async def test_uncheckpointed_side_effectful_tool_tail_still_auto_resumes_goal(hermes_home):
     runner, adapter = make_restart_runner()
     entry = _goal_entry(session_id="risky-tail-sid")
     runner.session_store._entries = {entry.session_key: entry}
@@ -291,10 +293,15 @@ async def test_uncheckpointed_side_effectful_tool_tail_is_alert_only(hermes_home
         scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
-    assert scheduled == 0
-    adapter.handle_message.assert_not_called()
-    assert adapter.sent
-    assert "auto-resume was withheld" in adapter.sent[-1]
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    assert not adapter.sent
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert "recover safely without duplicating deploy" in event.text
+    assert "Startup recovery note" in event.text
+    assert "uncheckpointed assistant tool call(s): terminal" in event.text
     decision = runner._classify_startup_goal_recovery(entry)
-    assert decision.status == "alert_only"
-    assert "terminal" in decision.reason
+    assert decision.status == "auto_resume"
+    assert decision.reason == "active-goal-startup-recovery-with-open-tool-tail"
+    assert "terminal" in decision.prompt
