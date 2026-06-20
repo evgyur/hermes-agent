@@ -323,6 +323,22 @@ def test_extract_supergoal_body_normalizes_crlf_and_strips_launch_tails(runner):
     assert body == "Run it."
 
 
+def test_extract_supergoal_body_preserves_numbered_goal_body(runner):
+    text = (
+        "SUPERGOAL_GOAL_BODY:\n"
+        "1. Start from `.supergoal/STATE.md`.\n"
+        "2. Finish after SUPERGOAL_RUN_COMPLETE.\n\n"
+        "1. Start now"
+    )
+
+    body = runner.runner._extract_supergoal_body(text)
+
+    assert body == (
+        "1. Start from `.supergoal/STATE.md`.\n"
+        "2. Finish after SUPERGOAL_RUN_COMPLETE."
+    )
+
+
 @pytest.mark.asyncio
 async def test_bare_goal_reply_to_supergoal_plan_extracts_artifact_goal(hermes_home, runner):
     event = MessageEvent(
@@ -354,6 +370,60 @@ async def test_bare_goal_reply_to_supergoal_plan_extracts_artifact_goal(hermes_h
     assert "/home/hermes/workspace/human20-app-prod/.supergoal/h20-auth-telegram-prod-perfect/ROADMAP.md" in state.goal
     assert "План Supergoal" not in state.goal
     assert runner.runner._session_reasoning_overrides[runner.session.session_key]["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_to_relative_supergoal_state_extracts_artifact_goal(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4b-relative",
+        reply_to_message_id="plan-relative",
+        reply_to_text="Progress: `.supergoal/STATE.md`\nRoadmap: `.supergoal/ROADMAP.md`",
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal.startswith("Execute the Supergoal from the project root.")
+    assert "`.supergoal/PROTOCOL.md`" in state.goal
+    assert "`.supergoal/STATE.md`" in state.goal
+
+
+@pytest.mark.asyncio
+async def test_bare_goal_reply_to_absolute_supergoal_state_extracts_artifact_goal(hermes_home, runner):
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-4b-absolute-state",
+        reply_to_message_id="plan-absolute-state",
+        reply_to_text="Progress: `/tmp/project/.supergoal/STATE.md`",
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(runner.session.session_id).state
+    assert "Goal set" in response
+    assert state is not None
+    assert state.goal.startswith("Execute the Supergoal from project root `/tmp/project`.")
+    assert "`/tmp/project/.supergoal/STATE.md`" in state.goal
+
+
+def test_pasted_supergoal_body_plus_goal_status_does_not_autodispatch(runner):
+    pasted = (
+        "SUPERGOAL_GOAL_BODY: Discuss `.supergoal/demo` but do not start yet.\n\n"
+        "/goal status"
+    )
+
+    assert runner.runner._goal_text_from_pasted_supergoal_handoff(pasted) == ""
 
 
 @pytest.mark.asyncio

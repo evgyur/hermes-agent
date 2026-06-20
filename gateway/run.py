@@ -54,6 +54,7 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from gateway import goal_launch
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2532,6 +2533,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        # Sessions whose active /goal was started from a Telegram clarify
+        # callback while the planning turn is still running. The next post-turn
+        # hook for that same session must not judge the pre-goal planning answer
+        # as the first goal turn.
+        self._goal_callback_started_sessions = set()
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -3970,6 +3976,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+
+    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+        """Suppress one post-turn judge pass after a callback starts /goal."""
+        if not session_key:
+            return
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if sessions is None:
+            sessions = set()
+            self._goal_callback_started_sessions = sessions
+        sessions.add(session_key)
+
+    def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
+        """Return True once for sessions started by a clarify callback."""
+        if not session_key:
+            return False
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if not sessions or session_key not in sessions:
+            return False
+        sessions.discard(session_key)
+        return True
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -8829,12 +8855,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
-                        _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-                        if not _auto_dispatched:
+                        _auto_dispatched = False
+                        session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
+                        _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
+                        if _suppressed_callback_start:
+                            logger.info(
+                                "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
+                                session_key_for_goal,
+                            )
+                            await self._enqueue_goal_kickoff_prompt(
+                                session_entry=session_entry,
+                                source=source,
+                            )
+                        else:
+                            _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
+                        if not _auto_dispatched and not _suppressed_callback_start:
                             await self._post_turn_goal_continuation(
                                 session_entry=session_entry,
                                 source=source,
@@ -10887,7 +10926,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal manager unavailable: %s", exc)
             return None, None
         try:
-            session_entry = self.session_store.get_or_create_session(event.source)
+            forced_session_key = getattr(event, "_session_key_override", None)
+            session_entry = None
+            if forced_session_key:
+                try:
+                    ensure_loaded = getattr(self.session_store, "_ensure_loaded", None)
+                    if callable(ensure_loaded):
+                        ensure_loaded()
+                    entries = getattr(self.session_store, "_entries", None)
+                    if isinstance(entries, dict):
+                        session_entry = entries.get(forced_session_key)
+                except Exception as exc:
+                    logger.debug("goal manager: forced session lookup failed: %s", exc)
+                if session_entry is None:
+                    source_key = None
+                    try:
+                        generate = getattr(self.session_store, "_generate_session_key", None)
+                        if callable(generate):
+                            source_key = generate(event.source)
+                    except Exception:
+                        source_key = None
+                    if source_key == forced_session_key:
+                        session_entry = self.session_store.get_or_create_session(event.source)
+                    else:
+                        logger.debug("goal manager: forced session key not found: %s", forced_session_key)
+                        return None, None
+            else:
+                session_entry = self.session_store.get_or_create_session(event.source)
         except Exception as exc:
             logger.debug("goal manager: session lookup failed: %s", exc)
             return None, None
@@ -10899,189 +10964,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _goal_text_from_supergoal_artifacts(raw: str) -> str:
-        """Build a canonical Supergoal goal from a replied-to plan summary.
+        """Compatibility shim for gateway SuperGoal launch extraction.
 
-        Users often reply `/goal` to the human-readable Supergoal plan instead
-        of the exact `SUPERGOAL_GOAL_BODY` line.  Treat visible `.supergoal`
-        artifact paths as an intentional dispatch, but do not use the entire
-        assistant report as the goal body.
+        Extraction lives in ``gateway.goal_launch`` so this class keeps only the
+        adapter boundary; the returned text is still started by official
+        ``GoalManager`` code, not by a custom runner.
         """
-        text = str(raw or "")
-        if ".supergoal/" not in text:
-            return ""
-
-        roots: list[tuple[str, str]] = []
-
-        def _add_root(root: str) -> None:
-            root = str(root or "").strip().strip("`'\".,);]")
-            if not root or ".supergoal/" not in root:
-                return
-            project_root = ""
-            if "/.supergoal/" in root:
-                project_root = root.split("/.supergoal/", 1)[0]
-            item = (root, project_root)
-            if item not in roots:
-                roots.append(item)
-
-        for match in re.finditer(r"(?:MEDIA:)?((?:/[^\s`\"'<>]+|\.supergoal/[^\s`\"'<>]+))", text):
-            path = match.group(1).strip().strip("`'\".,);]")
-            if ".supergoal/" not in path:
-                continue
-            root = path
-            for marker in ("/PROTOCOL.md", "/ROADMAP.md", "/STATE.md", "/THINKING.md", "/phases/"):
-                idx = root.find(marker)
-                if idx != -1:
-                    root = root[:idx]
-                    break
-            _add_root(root)
-
-        for pattern in (
-            r"Supergoal root:\s*`?([^`\s]+)",
-            r"Phase specs:\s*`?([^`\s]+?)/phases(?:/|`|\s|$)",
-            r"Progress:\s*`?([^`\s]+?)/STATE\.md",
-            r"Roadmap:\s*`?([^`\s]+?)/ROADMAP\.md",
-        ):
-            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                _add_root(match.group(1))
-
-        if not roots:
-            return ""
-
-        root, project_root = roots[0]
-        prefix = (
-            f"Execute the Supergoal from project root `{project_root}`."
-            if project_root
-            else "Execute the Supergoal from the project root."
-        )
-        return (
-            f"{prefix} Use `{root}/PROTOCOL.md`, `{root}/ROADMAP.md`, "
-            f"`{root}/STATE.md`, and `{root}/phases/phase-*.md`. "
-            "Start from STATE.md current phase. Execute phases sequentially. "
-            "For every phase, print SUPERGOAL_PHASE_START, "
-            "SUPERGOAL_PHASE_VERIFY, and SUPERGOAL_PHASE_DONE. Run the final "
-            "audit and finish only after AUDIT_COMPLETE and "
-            "SUPERGOAL_RUN_COMPLETE."
-        )
+        return goal_launch.goal_text_from_supergoal_artifacts(raw)
 
     @staticmethod
     def _goal_text_from_reply_context(event: "MessageEvent") -> str:
-        """Extract a goal body from replied-to text for bare gateway `/goal`.
-
-        Telegram-safe Supergoal dispatch sends a long assistant message prefixed
-        with `SUPERGOAL_GOAL_BODY:` and the user replies with `/goal`.  Do not
-        treat prior `/goal` status notices as new goals — replying to
-        `✓ Goal done (...)` was the source of a false one-turn completion loop.
-        """
-        raw = str(getattr(event, "reply_to_text", "") or "").strip()
-        if not raw:
-            return ""
-
-        # Status/notice lines are not goal bodies.  This covers exact gateway
-        # notices and truncated Telegram quotes that start with the same prefix.
-        lowered = raw.lower()
-        status_prefixes = (
-            "✓ goal done",
-            "✓ goal achieved",
-            "⊙ goal ",
-            "⏸ goal ",
-            "goal done (",
-            "goal achieved:",
-        )
-        if lowered.startswith(status_prefixes):
-            return ""
-
-        marker = "SUPERGOAL_GOAL_BODY:"
-        if marker in raw:
-            raw = GatewayRunner._extract_supergoal_body(raw)
-        else:
-            supergoal_from_artifacts = GatewayRunner._goal_text_from_supergoal_artifacts(raw)
-            if supergoal_from_artifacts:
-                return supergoal_from_artifacts
-
-            # A bare `/goal` reply is explicit operator intent: the replied-to
-            # text is the goal body, even when it is long.  Supergoal plans are
-            # still normalized above via explicit markers/artifact paths, but
-            # generic replied text must not be discarded just because it exceeds
-            # an arbitrary quote length.
-
-        # Fallback if the user replies to a plain `/goal "..."` line.
-        if raw.startswith("/goal"):
-            raw = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
-            if len(raw) >= 2 and raw[0] == raw[-1] == '"':
-                raw = raw[1:-1].strip()
-
-        return raw
+        """Compatibility shim for bare `/goal` reply launch extraction."""
+        return goal_launch.goal_text_from_reply_context(getattr(event, "reply_to_text", ""))
 
     @staticmethod
     def _extract_supergoal_body(text: str) -> str:
-        """Extract only the goal body after `SUPERGOAL_GOAL_BODY:`."""
-        raw = str(text or "").strip()
-        marker = "SUPERGOAL_GOAL_BODY:"
-        if marker not in raw:
-            return ""
-        body = raw.split(marker, 1)[1].strip()
-        body = body.replace("\r\n", "\n").replace("\r", "\n")
-        stop_patterns = (
-            r"(?im)^\s*DONE_CONDITION\s*:",
-            r"(?im)^\s*OPERATOR_ACTION\s*:",
-            r"(?im)^\s*NOTES\s*:",
-            r"(?im)^\s*ARTIFACTS\s*:",
-            r"(?im)^\s*ФАЙЛЫ\s*:",
-            r"(?im)^\s*КНОПКИ\b",
-            r"(?m)^\s*##\s+",
-            r"(?m)^\s*Теперь\b",
-            r"(?m)^\s*Reply to\b",
-            r"(?m)^\s*Fallback plain-text line\s*:",
-            r"(?m)^\s*Не копируй\b",
-            r"(?m)^\s*Не стартовал\b",
-            r"(?m)^\s*Сейчас только\b",
-            r"(?m)^\s*Да,\s+",
-            r"(?m)^\s*Once you\b",
-        )
-        cut_points = [match.start() for pattern in stop_patterns if (match := re.search(pattern, body))]
-        if cut_points:
-            body = body[: min(cut_points)].strip()
-        if body.startswith("`") and body.endswith("`") and len(body) > 2:
-            body = body[1:-1].strip()
-        return body
+        """Compatibility shim for explicit SuperGoal body launch extraction."""
+        return goal_launch.extract_supergoal_body(text)
 
     @staticmethod
     def _goal_text_from_pasted_supergoal_handoff(text: str) -> str:
-        """Extract a Supergoal body from an accidentally pasted handoff.
-
-        Telegram users often copy the whole assistant handoff message instead of
-        replying with `/goal`.  If the pasted text contains a
-        `SUPERGOAL_GOAL_BODY:` section and a standalone `/goal` instruction,
-        treat it as the explicit goal dispatch the user intended.
-        """
-        raw = str(text or "").strip()
-        marker = "SUPERGOAL_GOAL_BODY:"
-        if marker not in raw:
-            return ""
-
-        # Require a visible `/goal` line so random discussion of a Supergoal body
-        # does not silently start a standing goal.
-        has_goal_line = False
-        for line in raw.splitlines():
-            if line.strip() == "/goal" or line.strip().startswith("/goal "):
-                has_goal_line = True
-                break
-        if not has_goal_line:
-            return ""
-
-        return GatewayRunner._extract_supergoal_body(raw)
+        """Compatibility shim for pasted SuperGoal handoff launch extraction."""
+        return goal_launch.goal_text_from_pasted_supergoal_handoff(text)
 
     @staticmethod
     def _is_supergoal_dispatch(goal_text: str, *, from_reply: bool = False) -> bool:
-        """Return True for Supergoal-style long autonomous coding dispatches."""
-        text = str(goal_text or "")
-        if (
-            ".supergoal/" in text
-            or "SUPERGOAL_PHASE" in text
-            or "SUPERGOAL_RUN_COMPLETE" in text
-        ):
+        """Return True for SuperGoal launch payloads, not execution state."""
+        return goal_launch.is_supergoal_dispatch(goal_text, from_reply=from_reply)
+
+    async def _enqueue_goal_kickoff_prompt(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        """Queue the first official GoalManager continuation without judging."""
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue: goals module unavailable: %s", exc)
+            return False
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid or source is None:
+            return False
+        try:
+            mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
+            if not mgr.is_active():
+                return False
+            prompt = mgr.next_continuation_prompt() or getattr(mgr.state, "goal", "")
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue: manager lookup failed: %s", exc)
+            return False
+        if not prompt:
+            return False
+        try:
+            adapter = self.adapters.get(source.platform)
+            session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
+            if not adapter or not session_key:
+                return False
+            kickoff_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=None,
+                channel_prompt=None,
+            )
+            self._enqueue_fifo(session_key, kickoff_event, adapter)
             return True
-        return text.startswith("SUPERGOAL_GOAL_BODY:")
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
+            return False
 
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
         """Start `/goal` from an inline-button callback without replaying a slash command.
@@ -11099,6 +11051,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not goal_text:
             return False
 
+        callback_session_key = getattr(event, "_session_key_override", None)
+        if not callback_session_key and getattr(event, "source", None) is not None:
+            try:
+                callback_session_key = self._session_key_for_source(event.source)
+            except Exception:
+                callback_session_key = None
+        running_agents = getattr(self, "_running_agents", {}) or {}
+        defer_kickoff = bool(callback_session_key and callback_session_key in running_agents)
+        if defer_kickoff:
+            setattr(event, "_defer_goal_kickoff_until_post_turn", True)
+
         try:
             response = await self._handle_goal_command(event)
         except Exception as exc:
@@ -11106,13 +11069,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         try:
-            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            mgr, session_entry = self._get_goal_manager_for_event(event)
             state = getattr(mgr, "state", None) if mgr is not None else None
             started = bool(state and getattr(state, "status", "") == "active" and state.goal == goal_text)
         except Exception:
+            session_entry = None
             started = False
 
         if started:
+            session_key = getattr(session_entry, "session_key", None) if session_entry is not None else None
+            if not session_key:
+                session_key = callback_session_key
+            if not session_key and getattr(event, "source", None) is not None:
+                try:
+                    session_key = self._session_key_for_source(event.source)
+                except Exception:
+                    session_key = None
+            if defer_kickoff:
+                self._mark_goal_callback_started_session(session_key)
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
@@ -11160,7 +11134,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return t("gateway.goal.no_goal_set")
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                _quick_key = getattr(session_entry, "session_key", None) or (
+                    self._session_key_for_source(event.source) if event.source else None
+                )
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
@@ -11178,7 +11154,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             mgr.clear()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                _quick_key = getattr(session_entry, "session_key", None) or (
+                    self._session_key_for_source(event.source) if event.source else None
+                )
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
@@ -11196,7 +11174,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sending only the naked goal body makes SuperGoal agents reject their
         # own kickoff as "body without /goal" in Telegram reply flows.
         adapter = self.adapters.get(event.source.platform) if event.source else None
-        _quick_key = self._session_key_for_source(event.source) if event.source else None
+        _quick_key = getattr(session_entry, "session_key", None) or (
+            self._session_key_for_source(event.source) if event.source else None
+        )
+        defer_kickoff = bool(getattr(event, "_defer_goal_kickoff_until_post_turn", False))
         if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
             try:
                 from hermes_constants import parse_reasoning_effort
@@ -11207,7 +11188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
             except Exception as exc:
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
-        if adapter and _quick_key:
+        if adapter and _quick_key and not defer_kickoff:
             try:
                 kickoff_text = mgr.next_continuation_prompt() or state.goal
                 kickoff_event = MessageEvent(

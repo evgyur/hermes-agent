@@ -77,6 +77,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway import goal_launch
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -5016,25 +5017,15 @@ class TelegramAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_supergoal_body_from_callback_text(text: str) -> str:
         """Extract a durable Supergoal goal body embedded in a button prompt."""
-        raw = str(text or "")
-        marker = "SUPERGOAL_GOAL_BODY:"
-        if marker not in raw:
-            return ""
-        body = raw.split(marker, 1)[1].strip()
-        stop_markers = (
-            "\n\n1. ",
-            "\n\nКнопки",
-            "\n\nChoices",
-            "\n\nStart chain",
-        )
-        for stop in stop_markers:
-            idx = body.find(stop)
-            if idx != -1:
-                body = body[:idx].strip()
-                break
-        return body.strip("` \n\t")
+        return goal_launch.extract_supergoal_body(text)
 
-    def _build_supergoal_callback_event(self, query: Any, goal_body: str) -> Optional[MessageEvent]:
+    def _build_supergoal_callback_event(
+        self,
+        query: Any,
+        goal_body: str,
+        *,
+        session_key: Optional[str] = None,
+    ) -> Optional[MessageEvent]:
         """Build a synthetic `/goal` message from a Telegram button callback."""
         query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
@@ -5069,13 +5060,19 @@ class TelegramAdapter(BasePlatformAdapter):
             ),
             message_id=str(getattr(query_message, "message_id", "")),
         )
-        return MessageEvent(
+        event = MessageEvent(
             text=f"/goal {goal_body}",
             message_type=MessageType.TEXT,
             source=source,
             raw_message=query_message,
             message_id=str(getattr(query_message, "message_id", "")),
         )
+        if session_key:
+            # Live clarify buttons are owned by the session that rendered the
+            # prompt, not necessarily by the authorized user who clicks it in a
+            # shared/group context. Preserve that owner for GoalManager lookup.
+            setattr(event, "_session_key_override", session_key)
+        return event
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
@@ -5476,12 +5473,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     resolved_text = f"choice {idx + 1}"
 
                 # Durable Supergoal start: for a prompt that embeds an official
-                # `SUPERGOAL_GOAL_BODY`, clicking choice 1 should enqueue the
-                # real `/goal <body>` command. We still resolve the clarify so
-                # the current agent turn unblocks; the queued command runs next
-                # through the standard GatewayRunner / GoalManager path.
+                # `SUPERGOAL_GOAL_BODY`, clicking choice 1 starts the real
+                # GoalManager goal immediately via GatewayRunner. We still
+                # resolve the clarify so the current agent turn unblocks, but
+                # the pre-goal planning answer is not judged as a goal turn.
                 if idx == 0 and embedded_supergoal_body:
-                    event = self._build_supergoal_callback_event(query, embedded_supergoal_body)
+                    event = self._build_supergoal_callback_event(
+                        query,
+                        embedded_supergoal_body,
+                        session_key=session_key,
+                    )
                     if event is not None:
                         started = False
                         try:
@@ -5496,18 +5497,10 @@ class TelegramAdapter(BasePlatformAdapter):
                             logger.debug("Supergoal callback direct /goal start failed", exc_info=True)
 
                         if not started:
-                            pending = getattr(self, "_pending_messages", None)
-                            if isinstance(pending, dict):
-                                if session_key not in pending:
-                                    pending[session_key] = event
-                                else:
-                                    try:
-                                        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-                                        enqueue = getattr(runner, "_enqueue_fifo", None)
-                                        if callable(enqueue):
-                                            enqueue(session_key, event, self)
-                                    except Exception:
-                                        logger.debug("Supergoal callback FIFO enqueue failed", exc_info=True)
+                            logger.warning(
+                                "Supergoal callback: direct /goal start was unavailable or failed; "
+                                "not queueing slash fallback because queued slash commands are discarded by design"
+                            )
 
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)

@@ -35,8 +35,12 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from hermes_cli.goal_policies import (
+    evaluate_structured_completion_guard,
+    is_structured_handoff_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -453,151 +457,9 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
-def _non_fenced_lines(text: str) -> List[str]:
-    """Return lines outside markdown fences.
-
-    Goal completion markers are transcript blocks, not examples.  A handoff
-    message may include ``SUPERGOAL_RUN_COMPLETE`` inside a fallback command or
-    code sample; those mentions must not satisfy the `/goal` judge.
-    """
-    lines: List[str] = []
-    in_fence = False
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
-            continue
-        if not in_fence:
-            lines.append(line)
-    return lines
-
-
-def _has_standalone_marker(text: str, marker: str) -> bool:
-    """True only when ``marker`` appears as its own transcript line."""
-    target = marker.strip().upper()
-    if not target:
-        return False
-    for line in _non_fenced_lines(text):
-        cleaned = line.strip().strip("`*_ ")
-        cleaned = cleaned.rstrip(':.,;!?)"]}').upper()
-        if cleaned == target:
-            return True
-    return False
-
-
-def _looks_like_supergoal_goal(goal: str) -> bool:
-    text = str(goal or "")
-    upper = text.upper()
-    return (
-        "SUPERGOAL_RUN_COMPLETE" in upper
-        or "SUPERGOAL_PHASE" in upper
-        or ".supergoal/" in text.lower()
-        or ("PROTOCOL.MD" in upper and "ROADMAP.MD" in upper)
-    )
-
-
-def _candidate_supergoal_roots(goal: str) -> List[Path]:
-    """Return plausible SuperGoal roots mentioned by a /goal body.
-
-    A stale GoalManager wrapper may contain malformed paths such as
-    ``<root>/.supergoal/AUDIT_HANDOFF.md/PROTOCOL.md``.  Normalize those
-    back to ``<root>``.  Order matters: the first root with a STATE file is
-    treated as canonical for this goal, so a new active root is not marked
-    done merely because the prompt also mentions an older completed rail.
-    """
-    text = str(goal or "")
-    roots: List[Path] = []
-    seen: set[str] = set()
-
-    def add(raw: str) -> None:
-        raw = (raw or "").strip().strip("`'\"<>.,;)]")
-        if not raw or not raw.startswith("/"):
-            return
-        if "/.supergoal/" in raw:
-            raw = raw.split("/.supergoal/", 1)[0]
-        elif raw.endswith("/.supergoal"):
-            raw = raw[: -len("/.supergoal")]
-        path = Path(raw)
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            roots.append(path)
-
-    # Prefer explicit root wording when present.
-    for m in re.finditer(r"(?:project\s+root|supergoal\s+root|root)\s*[:=]?\s*`([^`]+)`", text, re.IGNORECASE):
-        add(m.group(1))
-
-    # Then all backticked absolute paths.
-    for m in re.finditer(r"`(/[^`]+)`", text):
-        add(m.group(1))
-
-    # Finally bare absolute paths that include .supergoal.
-    for m in re.finditer(r"(/\S*\.supergoal/\S+)", text):
-        add(m.group(1))
-
-    return roots
-
-
-def _supergoal_disk_completion_reason(goal: str) -> Optional[str]:
-    """Detect already-complete SuperGoals from disk before asking the judge.
-
-    If the canonical root's ``.supergoal/STATE.md`` already records terminal
-    completion, continuing the same /goal is a control-plane bug.  Marking it
-    done here prevents repeated synthetic continuation turns from reaching the
-    LLM and spamming ``COMPLETE — stop``.
-    """
-    for root in _candidate_supergoal_roots(goal):
-        state_path = root / ".supergoal" / "STATE.md"
-        if not state_path.exists() or not state_path.is_file():
-            continue
-        try:
-            state_text = state_path.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
-            logger.debug("supergoal completion check: could not read %s: %s", state_path, exc)
-            return None
-        upper = state_text.upper()
-        complete = (
-            "STATUS: COMPLETE" in upper
-            and "CURRENT PHASE: COMPLETE" in upper
-            and "AUDIT_COMPLETE" in upper
-            and "SUPERGOAL_RUN_COMPLETE" in upper
-        )
-        if complete:
-            return f"supergoal STATE.md already complete at {root}"
-        # First existing STATE.md is canonical for this goal.  Do not keep
-        # scanning older previous-rail paths that may also be mentioned.
-        return None
-    return None
-
-
-def _is_supergoal_handoff_reason(reason: str) -> bool:
-    upper = str(reason or "").upper()
-    return (
-        "FAILURE_HANDOFF" in upper
-        or "AUDIT_HANDOFF" in upper
-        or "BLOCKED_BY_APPROVAL" in upper
-    )
-
-
-def _is_supergoal_approval_blocker_response(text: str) -> bool:
-    """Detect an intentional SuperGoal approval gate stop.
-
-    SuperGoal goals often require terminal AUDIT markers, but approval-gated
-    phases must stop before those markers when a side effect needs human
-    approval. Without this deterministic guard, a judge can keep returning
-    CONTINUE just because SUPERGOAL_RUN_COMPLETE is absent, causing the same
-    approval phrase to be posted until the turn budget is exhausted.
-    """
-    upper = str(text or "").upper()
-    if "BLOCKED_BY_APPROVAL" not in upper:
-        return False
-    return (
-        "CURRENT PHASE" in upper
-        or "PHASE" in upper
-        or "APPROVAL" in upper
-        or "STATE.MD" in upper
-    )
-
+# Structured completion marker/blocker policy lives in
+# hermes_cli.goal_policies so GoalManager can remain the engine while the
+# deterministic pre-judge contract stays testable and gateway-free.
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
@@ -708,27 +570,9 @@ def judge_goal(
         # No substantive reply this turn — almost certainly not done yet.
         return "continue", "empty response (nothing to evaluate)", False
 
-    # Supergoal chains are transcript-marker driven.  A generic assistant
-    # sentence, a `/goal status` notice, a handoff/fallback command, or a
-    # partial phase summary must never satisfy them.  This deterministic guard
-    # runs before the auxiliary judge so a weak/over-lenient judge cannot mark
-    # a 6-phase run done after one turn just because the response mentioned
-    # marker names in prose.
-    goal_upper = goal.upper()
-    if _looks_like_supergoal_goal(goal):
-        disk_done_reason = _supergoal_disk_completion_reason(goal)
-        if disk_done_reason:
-            return "done", disk_done_reason, False
-        if _has_standalone_marker(last_response, "FAILURE_HANDOFF"):
-            return "done", "supergoal stopped with FAILURE_HANDOFF", False
-        if _has_standalone_marker(last_response, "AUDIT_HANDOFF"):
-            return "done", "supergoal stopped with AUDIT_HANDOFF", False
-        if _is_supergoal_approval_blocker_response(last_response):
-            return "done", "supergoal stopped with BLOCKED_BY_APPROVAL", False
-        if "SUPERGOAL_RUN_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "SUPERGOAL_RUN_COMPLETE"):
-            return "continue", "missing standalone SUPERGOAL_RUN_COMPLETE terminal marker", False
-        if "AUDIT_COMPLETE" in goal_upper and not _has_standalone_marker(last_response, "AUDIT_COMPLETE"):
-            return "continue", "missing standalone AUDIT_COMPLETE terminal marker", False
+    structured_decision = evaluate_structured_completion_guard(goal, last_response)
+    if structured_decision is not None:
+        return structured_decision.verdict, structured_decision.reason, False
 
     try:
         from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
@@ -999,7 +843,7 @@ class GoalManager:
             state.consecutive_parse_failures = 0
 
         if verdict == "done":
-            is_handoff = _is_supergoal_handoff_reason(reason)
+            is_handoff = is_structured_handoff_reason(reason)
             state.status = "blocked" if is_handoff else "done"
             save_goal(self.session_id, state)
             if is_handoff:

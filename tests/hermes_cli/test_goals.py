@@ -265,6 +265,34 @@ class TestJudgeGoal:
         assert "FAILURE_HANDOFF" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("marker", "response"),
+        [
+            ("FAILURE_HANDOFF", "FAILURE_HANDOFF: missing provider credentials\nSTATE.md updated to BLOCKED."),
+            ("AUDIT_HANDOFF", "AUDIT_HANDOFF — deliverable gap remains\nSTATE.md updated to AUDIT."),
+        ],
+    )
+    def test_supergoal_handoff_prefix_stops_without_aux_judge(self, marker, response):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                )
+            ]
+        )
+        goal = f"Run phases; on blocker use {marker}; finish after SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert marker in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_blocked_by_approval_stops_without_aux_judge(self):
         from hermes_cli import goals
 
@@ -290,6 +318,34 @@ class TestJudgeGoal:
         assert "BLOCKED_BY_APPROVAL" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "I will not use BLOCKED_BY_APPROVAL unless approval is missing; continuing phase work.",
+            "Example only:\n```\nBLOCKED_BY_APPROVAL — phase 7\n```",
+        ],
+    )
+    def test_supergoal_blocked_by_approval_mentions_do_not_stop(self, response):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": true, "reason": "too lenient"}')
+                )
+            ]
+        )
+        goal = "Run phases; print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE after approval."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_completed_state_file_stops_without_aux_judge(self, tmp_path):
         from hermes_cli import goals
 
@@ -298,11 +354,9 @@ class TestJudgeGoal:
         sg.mkdir(parents=True)
         (sg / "STATE.md").write_text(
             "# STATE\n"
-            "Status: COMPLETE\n"
-            "Current phase: complete\n\n"
-            "## Final markers\n"
-            "AUDIT_COMPLETE\n"
-            "SUPERGOAL_RUN_COMPLETE\n",
+            "Status: DONE\n"
+            "Current phase: DONE\n"
+            "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
             encoding="utf-8",
         )
         fake_client = MagicMock()
@@ -318,6 +372,78 @@ class TestJudgeGoal:
             verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "done"
         assert "STATE.md already complete" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_terminal_state_without_final_markers_does_not_stop(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "malformed-supergoal"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\nStatus: DONE\nCurrent phase: DONE\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = (
+            f"Execute the Supergoal from project root `{root}`. "
+            "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_relative_state_file_completion_uses_current_root(self, tmp_path, monkeypatch):
+        from hermes_cli import goals
+
+        sg = tmp_path / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\nStatus: DONE\nCurrent phase: DONE\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        fake_client = MagicMock()
+        goal = "Use `.supergoal/STATE.md`; finish after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "done"
+        assert "STATE.md already complete" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_relative_state_does_not_steal_explicit_root(self, tmp_path, monkeypatch):
+        from hermes_cli import goals
+
+        cwd = tmp_path / "cwd"
+        current = tmp_path / "current"
+        for root, state in [
+            (cwd, "# STATE\nStatus: DONE\nCurrent phase: DONE\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n"),
+            (current, "# STATE\nStatus: READY\nCurrent phase: 0\n"),
+        ]:
+            sg = root / ".supergoal"
+            sg.mkdir(parents=True)
+            (sg / "STATE.md").write_text(state, encoding="utf-8")
+        monkeypatch.chdir(cwd)
+        fake_client = MagicMock()
+        goal = (
+            f"Implement `.supergoal/STATE.md` in `{current}`. "
+            "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
 
     def test_supergoal_incomplete_current_root_not_satisfied_by_previous_complete_root(self, tmp_path):
@@ -344,6 +470,41 @@ class TestJudgeGoal:
             f"Implement `.supergoal/ROADMAP.md` in `{current}` from phase 0. "
             f"Previous rail is `{old}`. Finish only after AUDIT_COMPLETE and "
             "SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+
+    def test_supergoal_explicit_root_wins_over_older_direct_completed_state_path(self, tmp_path):
+        from hermes_cli import goals
+
+        current = tmp_path / "current-supergoal"
+        old = tmp_path / "old-supergoal"
+        for root, state in [
+            (
+                current,
+                "# STATE\nStatus: READY\nCurrent phase: 0\n",
+            ),
+            (
+                old,
+                "# STATE\nStatus: COMPLETE\nCurrent phase: DONE\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
+            ),
+        ]:
+            sg = root / ".supergoal"
+            sg.mkdir(parents=True)
+            (sg / "STATE.md").write_text(state, encoding="utf-8")
+
+        fake_client = MagicMock()
+        goal = (
+            f"Previous rail: `{old}/.supergoal/STATE.md`. "
+            f"Execute the Supergoal from project root `{current}`. "
+            "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         )
         with patch(
             "agent.auxiliary_client.get_text_auxiliary_client",
