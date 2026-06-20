@@ -56,6 +56,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from gateway import goal_launch
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -3454,6 +3455,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Last voice-channel context delivered per session — the VC note is
         # injected only when the live state differs from this value.
         self._session_vc_last: Dict[str, str] = {}
+        # Sessions whose active /goal was started from a Telegram clarify
+        # callback while the planning turn is still running. The next post-turn
+        # hook for that same session must not judge the pre-goal planning answer
+        # as the first goal turn.
+        self._goal_callback_started_sessions = set()
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -5564,6 +5570,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_service_tier_overrides.pop(session_key, None)
         else:
             self._session_service_tier_overrides[session_key] = service_tier
+
+    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+        """Suppress one post-turn judge pass after a callback starts /goal."""
+        if not session_key:
+            return
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if sessions is None:
+            sessions = set()
+            self._goal_callback_started_sessions = sessions
+        sessions.add(session_key)
+
+    def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
+        """Return True once for sessions started by a clarify callback."""
+        if not session_key:
+            return False
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if not sessions or session_key not in sessions:
+            return False
+        sessions.discard(session_key)
+        return True
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -12381,11 +12407,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
+                        _auto_dispatched = False
+                        session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
+                        _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
+                        if _suppressed_callback_start:
+                            logger.info(
+                                "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
+                                session_key_for_goal,
+                            )
+                            await self._enqueue_goal_kickoff_prompt(
+                                session_entry=session_entry,
+                                source=source,
+                            )
+                        else:
+                            _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
+                        if not _auto_dispatched and not _suppressed_callback_start:
+                            await self._post_turn_goal_continuation(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
@@ -15160,7 +15205,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal manager unavailable: %s", exc)
             return None, None
         try:
-            session_entry = await self.async_session_store.get_or_create_session(event.source)
+            forced_session_key = getattr(event, "_session_key_override", None)
+            session_entry = None
+            if forced_session_key:
+                try:
+                    ensure_loaded = getattr(self.session_store, "_ensure_loaded", None)
+                    if callable(ensure_loaded):
+                        ensure_loaded()
+                    entries = getattr(self.session_store, "_entries", None)
+                    if isinstance(entries, dict):
+                        session_entry = entries.get(forced_session_key)
+                except Exception as exc:
+                    logger.debug("goal manager: forced session lookup failed: %s", exc)
+                if session_entry is None:
+                    source_key = None
+                    try:
+                        generate = getattr(self.session_store, "_generate_session_key", None)
+                        if callable(generate):
+                            source_key = generate(event.source)
+                    except Exception:
+                        source_key = None
+                    if source_key == forced_session_key:
+                        session_entry = await self.async_session_store.get_or_create_session(
+                            event.source
+                        )
+                    else:
+                        logger.debug("goal manager: forced session key not found: %s", forced_session_key)
+                        return None, None
+            else:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    event.source
+                )
         except Exception as exc:
             logger.debug("goal manager: session lookup failed: %s", exc)
             return None, None
@@ -15170,7 +15245,298 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    @staticmethod
+    def _goal_text_from_supergoal_artifacts(raw: str) -> str:
+        """Compatibility shim for gateway SuperGoal launch extraction.
 
+        Extraction lives in ``gateway.goal_launch`` so this class keeps only the
+        adapter boundary; the returned text is still started by official
+        ``GoalManager`` code, not by a custom runner.
+        """
+        return goal_launch.goal_text_from_supergoal_artifacts(raw)
+
+    @staticmethod
+    def _goal_text_from_reply_context(event: "MessageEvent") -> str:
+        """Compatibility shim for bare `/goal` reply launch extraction."""
+        return goal_launch.goal_text_from_reply_context(getattr(event, "reply_to_text", ""))
+
+    @staticmethod
+    def _extract_supergoal_body(text: str) -> str:
+        """Compatibility shim for explicit SuperGoal body launch extraction."""
+        return goal_launch.extract_supergoal_body(text)
+
+    @staticmethod
+    def _goal_text_from_pasted_supergoal_handoff(text: str) -> str:
+        """Compatibility shim for pasted SuperGoal handoff launch extraction."""
+        return goal_launch.goal_text_from_pasted_supergoal_handoff(text)
+
+    @staticmethod
+    def _is_supergoal_dispatch(goal_text: str, *, from_reply: bool = False) -> bool:
+        """Return True for SuperGoal launch payloads, not execution state."""
+        return goal_launch.is_supergoal_dispatch(goal_text, from_reply=from_reply)
+
+    async def _enqueue_goal_kickoff_prompt(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        """Queue the first official GoalManager continuation without judging."""
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue: goals module unavailable: %s", exc)
+            return False
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid or source is None:
+            return False
+        try:
+            mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
+            if not mgr.is_active():
+                return False
+            prompt = mgr.next_continuation_prompt() or getattr(mgr.state, "goal", "")
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue: manager lookup failed: %s", exc)
+            return False
+        if not prompt:
+            return False
+        try:
+            adapter = self.adapters.get(source.platform)
+            session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
+            if not adapter or not session_key:
+                return False
+            kickoff_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=None,
+                channel_prompt=None,
+            )
+            self._enqueue_fifo(session_key, kickoff_event, adapter)
+            return True
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
+            return False
+
+    async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
+        """Start `/goal` from an inline-button callback without replaying a slash command.
+
+        Clarify buttons are clicked while the planning agent is still blocked
+        inside the `clarify` tool. Queueing a synthetic `/goal ...` message for
+        the next turn is fragile because the post-run safety net intentionally
+        discards queued slash commands before they can be fed to the model. For
+        Supergoal's "button 1 starts goal" contract, call the official
+        GoalManager path directly and enqueue the first goal body turn.
+        """
+        if event is None or event.get_command() != "goal":
+            return False
+        goal_text = (event.get_command_args() or "").strip()
+        if not goal_text:
+            return False
+
+        callback_session_key = getattr(event, "_session_key_override", None)
+        if not callback_session_key and getattr(event, "source", None) is not None:
+            try:
+                callback_session_key = self._session_key_for_source(event.source)
+            except Exception:
+                callback_session_key = None
+        running_agents = getattr(self, "_running_agents", {}) or {}
+        defer_kickoff = bool(callback_session_key and callback_session_key in running_agents)
+        if defer_kickoff:
+            setattr(event, "_defer_goal_kickoff_until_post_turn", True)
+
+        try:
+            response = await self._handle_goal_command(event)
+        except Exception as exc:
+            logger.warning("Supergoal callback: failed to start /goal: %s", exc, exc_info=True)
+            return False
+
+        try:
+            mgr, session_entry = self._get_goal_manager_for_event(event)
+            state = getattr(mgr, "state", None) if mgr is not None else None
+            started = bool(state and getattr(state, "status", "") == "active" and state.goal == goal_text)
+        except Exception:
+            session_entry = None
+            started = False
+
+        if started:
+            session_key = getattr(session_entry, "session_key", None) if session_entry is not None else None
+            if not session_key:
+                session_key = callback_session_key
+            if not session_key and getattr(event, "source", None) is not None:
+                try:
+                    session_key = self._session_key_for_source(event.source)
+                except Exception:
+                    session_key = None
+            if defer_kickoff:
+                self._mark_goal_callback_started_session(session_key)
+            logger.info("Supergoal callback: started official /goal from button press")
+        else:
+            logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
+        return started
+
+    async def _handle_goal_command(self, event: "MessageEvent") -> str:
+        """Handle /goal for gateway platforms.
+
+        Subcommands: ``/goal`` / ``/goal status`` / ``/goal pause`` /
+        ``/goal resume`` / ``/goal clear``. Any other text becomes the
+        new goal.
+
+        Setting a new goal queues the goal text as the next turn so the
+        agent starts working on it immediately — the post-turn
+        continuation hook then takes over from there.
+        """
+        args = (event.get_command_args() or "").strip()
+        # Gateway convenience: a bare `/goal` sent as a reply uses the replied-to
+        # text as the goal body. This avoids fragile Telegram copy/paste for
+        # long Supergoal dispatches. Explicit subcommands (`/goal status`, etc.)
+        # still win and never read reply context.
+        goal_from_reply = False
+        if not args:
+            reply_goal = self._goal_text_from_reply_context(event)
+            if reply_goal:
+                args = reply_goal
+                goal_from_reply = True
+        lower = args.lower()
+        if args and "SUPERGOAL_GOAL_BODY:" in args:
+            extracted = self._extract_supergoal_body(args)
+            if extracted:
+                args = extracted
+                lower = args.lower()
+
+        mgr, session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+
+        if not args or lower == "status":
+            return mgr.status_line()
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return t("gateway.goal.no_goal_set")
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = getattr(session_entry, "session_key", None) or (
+                    self._session_key_for_source(event.source) if event.source else None
+                )
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal.paused", goal=state.goal)
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return t("gateway.goal.no_resume")
+            return t("gateway.goal.resumed", goal=state.goal)
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = getattr(session_entry, "session_key", None) or (
+                    self._session_key_for_source(event.source) if event.source else None
+                )
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(args)
+        except ValueError as exc:
+            return t("gateway.goal.invalid", error=str(exc))
+
+        # Queue the canonical GoalManager continuation prompt as an immediate
+        # first turn so the agent sees that this is an official active /goal.
+        # Sending only the naked goal body makes SuperGoal agents reject their
+        # own kickoff as "body without /goal" in Telegram reply flows.
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        _quick_key = getattr(session_entry, "session_key", None) or (
+            self._session_key_for_source(event.source) if event.source else None
+        )
+        defer_kickoff = bool(getattr(event, "_defer_goal_kickoff_until_post_turn", False))
+        if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
+            try:
+                from hermes_constants import parse_reasoning_effort
+
+                reasoning_cfg = parse_reasoning_effort("xhigh")
+                if reasoning_cfg:
+                    self._set_session_reasoning_override(_quick_key, reasoning_cfg)
+                    logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
+            except Exception as exc:
+                logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
+        if adapter and _quick_key and not defer_kickoff:
+            try:
+                kickoff_text = mgr.next_continuation_prompt() or state.goal
+                kickoff_event = MessageEvent(
+                    text=kickoff_text,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+            except Exception as exc:
+                logger.debug("goal kickoff enqueue failed: %s", exc)
+
+        return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+
+    async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
+        """Handle /subgoal for gateway platforms (mirror of CLI handler).
+
+        Subgoals are extra criteria appended to the active goal mid-loop.
+        They modify state read at the next turn boundary, so this is safe
+        to invoke while the agent is running.
+        """
+        args = (event.get_command_args() or "").strip()
+        mgr, _session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+        if not mgr.has_goal():
+            return "No active goal. Set one with /goal <text>."
+
+        # No args → list current subgoals.
+        if not args:
+            return f"{mgr.status_line()}\n{mgr.render_subgoals()}"
+
+        tokens = args.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if verb == "remove":
+            if not rest:
+                return "Usage: /subgoal remove <n>"
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                return "/subgoal remove: <n> must be an integer (1-based index)."
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                return f"/subgoal remove: {exc}"
+            return f"✓ Removed subgoal {idx}: {removed}"
+
+        if verb == "clear":
+            try:
+                prev = mgr.clear_subgoals()
+            except RuntimeError as exc:
+                return f"/subgoal clear: {exc}"
+            if prev:
+                return f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
+            return "No subgoals to clear."
+
+        try:
+            text = mgr.add_subgoal(args)
+        except (ValueError, RuntimeError) as exc:
+            return f"/subgoal: {exc}"
+        idx = len(mgr.state.subgoals) if mgr.state else 0
+        return f"✓ Added subgoal {idx}: {text}"
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
