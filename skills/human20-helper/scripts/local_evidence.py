@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
 from typing import Dict, List
 
-WORKSPACE = Path('/home/assistent/.openclaw/workspace')
-CONFIG = Path('/home/assistent/.openclaw/openclaw.json')
+
+def _default_workspace() -> Path:
+    return Path(os.environ.get('HERMES_WORKSPACE') or os.environ.get('OPENCLAW_WORKSPACE') or Path.home() / '.hermes' / 'workspace')
+
+
+def _default_config() -> Path:
+    return Path(os.environ.get('HERMES_CONFIG') or os.environ.get('OPENCLAW_CONFIG') or Path.home() / '.hermes' / 'config.yaml')
+
+
+WORKSPACE = _default_workspace()
+CONFIG = _default_config()
+PORTFOLIO_REMOTE_HINT = os.environ.get('HUMAN20_PORTFOLIO_REMOTE_HINT', '')
 
 EVIDENCE_EXPLAINERS: Dict[str, Dict[str, str]] = {
     'portfolio_project_exists': {'label': 'Найден проект portfolio-site', 'source': 'workspace/projects'},
@@ -14,11 +25,11 @@ EVIDENCE_EXPLAINERS: Dict[str, Dict[str, str]] = {
     'portfolio_vercel_traces': {'label': 'Есть следы деплоя/Vercel', 'source': 'workspace/files'},
     'portfolio_live_demo_link': {'label': 'Есть публичная ссылка на сайт', 'source': 'workspace/files'},
     'portfolio_chat_api': {'label': 'Найден chat API сайта', 'source': 'workspace/files'},
-    'minimax_configured': {'label': 'MiniMax настроен в конфиге', 'source': 'openclaw/config'},
+    'minimax_configured': {'label': 'MiniMax настроен в конфиге', 'source': 'agent/config'},
     'agents_md_exists': {'label': 'Файл AGENTS.md найден', 'source': 'workspace/files'},
     'webd_skill_exists': {'label': 'Навык webd найден', 'source': 'workspace/skills'},
-    'openclaw_config_exists': {'label': 'Конфиг OpenClaw найден', 'source': 'openclaw/config'},
-    'telegram_enabled': {'label': 'Telegram-канал включён', 'source': 'openclaw/config'},
+    'openclaw_config_exists': {'label': 'Конфиг агента найден', 'source': 'agent/config'},
+    'telegram_enabled': {'label': 'Telegram-канал включён', 'source': 'agent/config'},
     'persona_files_exist': {'label': 'Persona-файлы присутствуют', 'source': 'workspace/files'},
     'security_skill_exists': {'label': 'Навык security найден', 'source': 'workspace/skills'},
     'tg_skill_exists': {'label': 'Навык tg найден', 'source': 'workspace/skills'},
@@ -35,9 +46,12 @@ EVIDENCE_EXPLAINERS: Dict[str, Dict[str, str]] = {
 
 
 def load_config() -> Dict:
-    if not CONFIG.exists():
+    if not CONFIG.exists() or CONFIG.suffix.lower() not in {'.json'}:
         return {}
-    return json.loads(CONFIG.read_text())
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        return {}
 
 
 def evidence_flags() -> Dict[str, bool]:
@@ -49,7 +63,11 @@ def evidence_flags() -> Dict[str, bool]:
     flags['portfolio_project_exists'] = portfolio.exists()
     flags['portfolio_git_repo'] = (portfolio / '.git').exists()
     flags['portfolio_site_files'] = (portfolio / 'index.html').exists()
-    flags['portfolio_git_remote'] = (portfolio / '.git' / 'config').exists() and 'github.com:web3blind/portfolio-site.git' in (portfolio / '.git' / 'config').read_text(errors='ignore')
+    flags['portfolio_git_remote'] = (
+        bool(PORTFOLIO_REMOTE_HINT)
+        and (portfolio / '.git' / 'config').exists()
+        and PORTFOLIO_REMOTE_HINT in (portfolio / '.git' / 'config').read_text(errors='ignore')
+    )
     flags['portfolio_vercel_traces'] = (portfolio / 'deploy.md').exists() and 'api.vercel.com' in (portfolio / 'deploy.md').read_text(errors='ignore')
     flags['portfolio_live_demo_link'] = (portfolio / 'index.html').exists() and 'vercel.app' in (portfolio / 'index.html').read_text(errors='ignore')
     flags['portfolio_chat_api'] = (portfolio / 'api' / 'chat.js').exists()

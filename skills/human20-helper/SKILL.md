@@ -16,7 +16,7 @@ Current scope:
 - inspect workshop state and content;
 - find and recommend Human20 skills for a user's task;
 - read lesson detail/transcripts/homework/favorites/search results;
-- compare local OpenClaw state against lesson progression rules;
+- compare local agent workspace state against lesson progression rules;
 - guide the user through a test-safe trainer/orchestrator flow for lesson progression.
 
 The skill is intentionally public and contains no secrets. Configure access through local environment variables or a local `.env` file that is not committed.

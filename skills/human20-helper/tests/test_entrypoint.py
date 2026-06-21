@@ -47,7 +47,7 @@ class StubClient:
         if name == "get_workshop_chat_json":
             return {
                 "messageCount": 1,
-                "messages": [{"message_id": 1, "text": "OpenClaw works", "from": "Chip"}],
+                "messages": [{"message_id": 1, "text": "OpenClaw works", "from": "Example User"}],
             }
         if name == "get_content_detail":
             return {"item": {"title": "Lesson", "href": "/content/lesson-1"}, "attachments": []}
@@ -67,7 +67,7 @@ class StubClient:
                 "items": [
                     {
                         "slug": "telegram-chip",
-                        "title": "Telegram Chip",
+                        "title": "Telegram publishing",
                         "summary": "Помогает агенту работать с Telegram: читать чат, готовить дайджесты и искать сигналы.",
                         "tags": ["Telegram", "Автоматизация"],
                         "useCases": ["вести Telegram канал", "делать дайджест"],
@@ -92,7 +92,7 @@ class StubClient:
                         {
                             "skill": {
                                 "slug": "telegram-chip",
-                                "title": "Telegram Chip",
+                                "title": "Telegram publishing",
                                 "summary": "Помогает агенту работать с Telegram: читать чат, готовить дайджесты и искать сигналы.",
                                 "tags": ["Telegram", "Автоматизация"],
                                 "useCases": ["вести Telegram канал", "делать дайджест"],
@@ -139,7 +139,7 @@ class Human20HelperEntrypointTest(unittest.TestCase):
     def test_chat_search_returns_matches(self) -> None:
         result = entrypoint.chat_search(StubClient(), "openclaw")
         self.assertEqual(len(result["matches"]), 1)
-        self.assertEqual(result["matches"][0]["from"], "Chip")
+        self.assertEqual(result["matches"][0]["from"], "Example User")
 
     def test_skill_search_finds_catalog_matches(self) -> None:
         result = entrypoint.skill_search(StubClient(), "дайджест telegram")
@@ -166,7 +166,7 @@ class Human20HelperEntrypointTest(unittest.TestCase):
     def test_human_skill_recommendation_contains_links(self) -> None:
         result = entrypoint.recommend_skills(StubClient(), "какой скил подойдёт для telegram канала")
         text = entrypoint.build_human_skill_recommendation(result)
-        self.assertIn("Telegram Chip", text)
+        self.assertIn("Telegram publishing", text)
         self.assertIn("https://human20.app/content/skill-telegram-chip", text)
         self.assertIn("https://example.com/telegram-chip.zip", text)
 

@@ -8,7 +8,7 @@ Source of truth теперь находится прямо в `skills/human20-he
 ## Что делает текущая версия
 
 - читает структуру и guidance из Human20 через direct MCP session flow;
-- не зависит от проблемного OpenClaw MCP bridge;
+- не зависит от проблемного legacy MCP bridge;
 - ищет и рекомендует Human20-скилы по задаче пользователя;
 - локально сверяет прохождение уроков по workspace/config/memory/project evidence;
 - определяет следующий непройденный или не подтверждённый этап;
