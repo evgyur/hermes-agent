@@ -44,12 +44,36 @@ git add skills/<skill-name>
 git commit -m "chore(skills): update <skill-name>"
 ```
 
-## Clone with submodules
+## Clone / install with submodules
+
+A fresh clone contains only git pointers for submodule-backed skills until they are initialized. Do not advertise a submodule skill as ready unless `SKILL.md` exists inside that path.
+
+Default enhanced-user install — initialize the generally useful execution/ops skills:
 
 ```bash
-git clone --recurse-submodules https://github.com/human20team/hermes-agent-powerpack.git
-# or after a normal clone:
-git submodule update --init --recursive
+git clone https://github.com/human20team/hermes-agent-powerpack.git
+cd hermes-agent-powerpack
+git submodule update --init skills/shaw skills/server-doctor-public
+```
+
+Optional/operator skills — initialize only when the deployment needs these workflows:
+
+```bash
+git submodule update --init skills/chip-travel-agent skills/chip-browser-relay
+```
+
+Avoid `--recursive` by default: nested submodules can drag large corpora or private/operator-only material.
+
+Verify submodule content:
+
+```bash
+for p in skills/shaw skills/server-doctor-public skills/chip-travel-agent skills/chip-browser-relay; do
+  if [ -f "$p/SKILL.md" ]; then
+    echo "ok: $p"
+  else
+    echo "missing submodule content: $p"
+  fi
+done
 ```
 
 ## Hygiene
