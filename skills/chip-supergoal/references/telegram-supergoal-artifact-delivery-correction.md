@@ -4,7 +4,7 @@ Session lesson: Chip corrected a false-positive chat-boundary guard during a Pea
 
 ## Durable rule
 
-Do not infer that a Telegram thread is Sigurd // TG / `chiptg` just because the message is a reply in a group-style transcript or mentions Telegram. If the user/operator says this is the current SuperGoal/Dev/engineering chat, or explicitly says to attach artifacts here, treat that as the target clarification and deliver artifacts in the current chat.
+Do not infer that a Telegram thread is the post-production Telegram preview chat just because the message is a reply in a group-style transcript or mentions Telegram. If the user/operator says this is the current SuperGoal/Dev/engineering chat, or explicitly says to attach artifacts here, treat that as the target clarification and deliver artifacts in the current chat.
 
 ## Correct delivery sequence
 
@@ -19,13 +19,13 @@ Do not infer that a Telegram thread is Sigurd // TG / `chiptg` just because the 
 
 ## Guardrail
 
-The Sigurd // TG / `chiptg` block is narrow: it applies only when the chat is actually the post-production Telegram preview surface. It must not be used as a generic excuse to withhold SuperGoal artifacts from the current engineering chat.
+The the post-production Telegram preview chat block is narrow: it applies only when the chat is actually the post-production Telegram preview surface. It must not be used as a generic excuse to withhold SuperGoal artifacts from the current engineering chat.
 
 ## Anti-pattern caught
 
 Wrong:
 - Generate artifacts locally.
-- Refuse to attach them because of a guessed `chiptg` guard.
+- Refuse to attach them because of a guessed the post-production preview tool guard.
 - Later send only a zip.
 
 Right:
