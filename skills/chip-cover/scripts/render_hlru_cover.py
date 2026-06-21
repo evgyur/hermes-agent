@@ -55,15 +55,17 @@ def rounded_gradient_rect(base, box, radius, left_color, right_color, outline=No
         ImageDraw.Draw(base).rounded_rectangle((x1, y1, x2, y2), radius=radius, outline=outline, width=outline_width)
 
 
-def load_background(bg_arg: str | None, seed: str | None):
-    if not MANIFEST.exists():
-        raise SystemExit('Missing HLRU background manifest. Powerpack does not bundle ready-made cover backgrounds; set HLRU_ASSET_DIR to a directory containing backgrounds/manifest.json.')
-    manifest = json.loads(MANIFEST.read_text())
+def load_background(bg_arg: str | None, seed: str | None, manifest_path: Path):
+    if bg_arg and Path(bg_arg).exists():
+        return {'id': 'custom', 'name': Path(bg_arg).name, 'path': str(Path(bg_arg).resolve())}
+    if bg_arg in {'gradient', 'fallback'} or not manifest_path.exists():
+        return {'id': 'gradient', 'name': 'generated gradient fallback', 'path': ''}
+    manifest = json.loads(manifest_path.read_text())
     bgs = manifest['backgrounds']
     for bg in bgs:
         path = Path(bg['path'])
         if not path.is_absolute():
-            bg['path'] = str((MANIFEST.parent / path).resolve())
+            bg['path'] = str((manifest_path.parent / path).resolve())
     if bg_arg and bg_arg != 'random':
         wanted = bg_arg.zfill(2) if bg_arg.isdigit() else bg_arg
         for bg in bgs:
@@ -93,21 +95,39 @@ def parse_facts(raw: str):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Render @hyperliquid_ru_news cover with random prepared background')
+    p = argparse.ArgumentParser(description='Render HLRU-style market/community cover with configurable assets and CTA')
     p.add_argument('--title', required=True, help='Title lines separated by |, e.g. Cabal|запускает|фонды|на HyperEVM')
     p.add_argument('--highlight', type=int, default=2, help='0-based title line index to render emerald')
     p.add_argument('--facts', default='', help='Rows separated by |, each left=right')
-    p.add_argument('--background', default='random', help='random, id 01..20, or background name')
+    p.add_argument('--background', default='auto', help='auto/random, gradient/fallback, id/name from manifest, or explicit PNG path')
+    p.add_argument('--asset-dir', default=os.environ.get('HLRU_ASSET_DIR', str(DEFAULT_ASSET_DIR)), help='Optional brand asset directory')
+    p.add_argument('--logo', default=os.environ.get('HLRU_LOGO_PATH', ''), help='Optional logo PNG path; falls back to text brand label')
+    p.add_argument('--brand-label', default='РУССКОЯЗЫЧНОЕ КОМЬЮНИТИ HYPERLIQUID')
+    p.add_argument('--cta', default='Подписаться: @hyperliquid_ru_news')
+    p.add_argument('--secondary-cta', default='Чат: @hyperliquid_ru')
     p.add_argument('--seed', default=None, help='Optional deterministic random seed')
     p.add_argument('--out', default='/tmp/hlru_cover.png')
     args = p.parse_args()
 
-    bg = load_background(args.background, args.seed)
-    bg_path = Path(bg['path'])
-    if not bg_path.exists():
-        raise SystemExit(f'Missing background file: {bg_path}')
-
-    img = Image.open(bg_path).convert('RGB').resize((W, H), Image.LANCZOS)
+    asset_dir = Path(args.asset_dir)
+    manifest_path = asset_dir / 'backgrounds/manifest.json'
+    bg_arg = 'random' if args.background == 'auto' else args.background
+    bg = load_background(bg_arg, args.seed, manifest_path)
+    bg_path = Path(bg['path']) if bg.get('path') else None
+    if bg_path and bg_path.exists():
+        img = Image.open(bg_path).convert('RGB').resize((W, H), Image.LANCZOS)
+    else:
+        img = Image.new('RGB', (W, H), '#020806')
+        gd = ImageDraw.Draw(img)
+        for y0 in range(H):
+            t = y0 / H
+            gd.line((0, y0, W, y0), fill=(2, 8 + int(18*t), 6 + int(28*t)))
+        glow = Image.new('RGBA', (W, H), (0,0,0,0))
+        g = ImageDraw.Draw(glow)
+        g.ellipse((-220, 80, 620, 840), fill=(0,255,178,58))
+        g.ellipse((580, -160, 1280, 580), fill=(0,110,86,72))
+        g.ellipse((400, 620, 1280, 1300), fill=(12,255,187,36))
+        img = Image.alpha_composite(img.convert('RGBA'), glow.filter(ImageFilter.GaussianBlur(82))).convert('RGB')
     veil = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     vd = ImageDraw.Draw(veil)
     for x in range(0, 760):
@@ -117,15 +137,18 @@ def main():
     img = Image.alpha_composite(img.convert('RGBA'), veil)
     d = ImageDraw.Draw(img)
 
-    # full logo top-right, no generated-logo fakery
-    if not LOGO.exists():
-        raise SystemExit('Missing approved HLRU logo. Powerpack does not bundle private/channel logos; set HLRU_LOGO_PATH.')
-    logo = Image.open(LOGO).convert('RGBA')
-    logo.thumbnail((230, 210), Image.LANCZOS)
-    img.paste(logo, (810, 54), logo)
+    # full logo top-right when supplied; text fallback keeps the template usable after install
+    logo_path = Path(args.logo) if args.logo else asset_dir / 'hlru_logo.png'
+    if logo_path.exists():
+        logo = Image.open(logo_path).convert('RGBA')
+        logo.thumbnail((230, 210), Image.LANCZOS)
+        img.paste(logo, (810, 54), logo)
+    else:
+        fallback = fit(d, 'HLRU', F_BOLD, 190, 64, 34)
+        d.text((845, 74), 'HLRU', font=fallback, fill=GREEN)
     d = ImageDraw.Draw(img)
 
-    pill_text = 'РУССКОЯЗЫЧНОЕ КОМЬЮНИТИ HYPERLIQUID'
+    pill_text = args.brand_label
     top_f = fit(d, pill_text, F_UI, 668, 31, 24)
     tb = d.textbbox((0, 0), pill_text, font=top_f)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
@@ -170,17 +193,17 @@ def main():
     img = Image.alpha_composite(img, footer)
     d = ImageDraw.Draw(img)
     cta = font(F_UI, 29)
-    d.text((78, 934), 'Подписаться:', font=cta, fill=WHITE)
-    w = d.textbbox((0, 0), 'Подписаться:', font=cta)[2]
-    d.text((78 + w, 934), ' @hyperliquid_ru_news', font=cta, fill=GREEN)
-    d.text((78, 980), 'Чат:', font=cta, fill=WHITE)
-    w = d.textbbox((0, 0), 'Чат:', font=cta)[2]
-    d.text((78 + w, 980), ' @hyperliquid_ru', font=cta, fill=GREEN)
+    cta1 = args.cta
+    cta2 = args.secondary_cta
+    cta1_font = fit(d, cta1, F_UI, 900, 29, 20)
+    cta2_font = fit(d, cta2, F_UI, 900, 29, 20)
+    d.text((78, 934), cta1, font=cta1_font, fill=GREEN if '@' in cta1 else WHITE)
+    d.text((78, 980), cta2, font=cta2_font, fill=GREEN if '@' in cta2 or '.' in cta2 else WHITE)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     img.convert('RGB').save(out, quality=96)
-    print(json.dumps({'ok': True, 'out': str(out), 'background_id': bg['id'], 'background_name': bg['name'], 'background_path': bg['path']}, ensure_ascii=False))
+    print(json.dumps({'ok': True, 'out': str(out), 'background_id': bg['id'], 'background_name': bg['name'], 'background_path': bg.get('path', '')}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

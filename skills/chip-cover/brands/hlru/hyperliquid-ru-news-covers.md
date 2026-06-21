@@ -16,14 +16,14 @@ Use this when Chip asks for covers for the Russian Hyperliquid community / `@hyp
 - Main expressive headline may use a display/tech font such as Unbounded.
 - Secondary text must be calmer and more readable: Golos Text, IBM Plex Sans, Manrope, Inter/Onest-style sans. Avoid fonts that visually “shake”/drift in small Russian text.
 - For top/bottom service lines, use bolder clean sans; add only minimal shadow if needed.
-- Check mobile readability with vision QA. If Chip says the text is unreadable, fix typeface/size/contrast, not just color.
+- Check mobile readability with vision QA. If the operator says the text is unreadable, fix typeface/size/contrast, not just color.
 
 ## Top pill and logo rules
 
 - Top pill text: `РУССКОЯЗЫЧНОЕ КОМЬЮНИТИ HYPERLIQUID`.
 - Make it a filled pill with premium gradient, not an underline. Text must be uppercase and optically centered both horizontally and vertically.
 - Pill color should be deep emerald/teal, not a flat neon-green slab.
-- Logo belongs top-right unless Chip says otherwise.
+- Logo belongs top-right unless the operator says otherwise.
 - Logo container height must match the top pill height and align to the same top edge.
 - In a short 60–70px top bar, the full circular logo text is not readable; use the central `_RU`/compact lockup crop inside the top-right container.
 

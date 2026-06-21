@@ -1,6 +1,6 @@
 # Hyperliquid_ru_news Telegram cover system
 
-Use when Chip asks for covers for `@hyperliquid_ru_news` / `Hyperliquid_ru_news` / Russian-speaking Hyperliquid community, or asks to adapt the Human20 cover workflow to Hyperliquid.
+Use when the user/operator asks for covers for `@hyperliquid_ru_news` / `Hyperliquid_ru_news` / Russian-speaking Hyperliquid community, or asks to adapt the Human20 cover workflow to Hyperliquid.
 
 ## Brand direction
 
@@ -23,7 +23,7 @@ Use when Chip asks for covers for `@hyperliquid_ru_news` / `Hyperliquid_ru_news`
    - `Manrope` for Russian labels and CTA;
    - `JetBrains Mono` only for tiny technical labels if needed.
 
-## Layout rules from Chip corrections
+## Layout rules from operator corrections
 
 - Top area should contain only the enlarged brand line: `Русскоязычное комьюнити Hyperliquid`.
 - Put `Подписаться: @hyperliquid_ru_news` in the lower part, not under the top line.

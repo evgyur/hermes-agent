@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 W = H = 1080
-import os
-BRAND = Path(os.environ.get('HUMAN20_BRAND_DIR', ''))
-LOGO = BRAND / 'logos/png/h20-lockup-light-720.png'
-MARK = BRAND / 'logos/png/h20-mark-512.png'
-FONTS = BRAND / 'fonts'
+DEFAULT_BRAND_DIR = os.environ.get('HUMAN20_BRAND_DIR', '')
 
 
 def font(path: Path, size: int):
@@ -38,8 +35,12 @@ def fit_font(draw: ImageDraw.ImageDraw, text: str, font_path: Path, start_size: 
 
 
 def render(args: argparse.Namespace) -> Path:
-    geologica_path = FONTS / 'Geologica[CRSV,SHRP,slnt,wght].ttf'
-    onest_path = FONTS / 'Onest[wght].ttf'
+    brand = Path(args.brand_dir or DEFAULT_BRAND_DIR)
+    logo_path = Path(args.logo) if args.logo else brand / 'logos/png/h20-lockup-light-720.png'
+    mark_path = Path(args.mark) if args.mark else brand / 'logos/png/h20-mark-512.png'
+    fonts_dir = Path(args.fonts_dir) if args.fonts_dir else brand / 'fonts'
+    geologica_path = fonts_dir / 'Geologica[CRSV,SHRP,slnt,wght].ttf'
+    onest_path = fonts_dir / 'Onest[wght].ttf'
     Geo = lambda s: font(geologica_path, s) if geologica_path.exists() else fallback_font('DejaVuSans-Bold.ttf', s)
     Onest = lambda s: font(onest_path, s) if onest_path.exists() else fallback_font('DejaVuSans.ttf', s)
     Mono = lambda s: fallback_font('DejaVuSansMono.ttf', s)
@@ -59,8 +60,8 @@ def render(args: argparse.Namespace) -> Path:
     img = Image.alpha_composite(img, ov.filter(ImageFilter.GaussianBlur(76)))
     d = ImageDraw.Draw(img)
 
-    if LOGO.exists():
-        logo = Image.open(LOGO).convert('RGBA')
+    if logo_path.exists():
+        logo = Image.open(logo_path).convert('RGBA')
         logo.thumbnail((430, 108), Image.LANCZOS)
         img.alpha_composite(logo, (58, 48))
     else:
@@ -100,8 +101,8 @@ def render(args: argparse.Namespace) -> Path:
     card_top = min(card_top, 452)
     card_box = (58, card_top, 1022, card_top + 380)
     d.rounded_rectangle(card_box, radius=36, fill='#F8FAFC', outline='#7B8FFF', width=4)
-    if MARK.exists():
-        mark = Image.open(MARK).convert('RGBA')
+    if mark_path.exists():
+        mark = Image.open(mark_path).convert('RGBA')
         mark.thumbnail((86, 54), Image.LANCZOS)
         img.alpha_composite(mark, (88, card_top + 32))
         title_x = 190
@@ -146,12 +147,13 @@ def render(args: argparse.Namespace) -> Path:
             y += line_step
 
     d.rounded_rectangle((58, 858, 1022, 960), radius=34, fill='#6366F1')
-    cta = 'Подписаться: @human20'
-    cta_font = Geo(46)
+    cta = args.cta
+    cta_font = fit_font(d, cta, geologica_path if geologica_path.exists() else Path('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'), 46, 890, 28)
     d.text(((W - text_width(d, cta, cta_font)) // 2, 882), cta, font=cta_font, fill='#FFFFFF')
 
-    d.text((58, 1002), 'Человек 2.0 · Среда внедрения ИИ', font=Onest(28), fill='#D9DFF2')
-    d.text((783, 1002), 'human20.app', font=Onest(28), fill='#D9DFF2')
+    d.text((58, 1002), args.footer, font=Onest(28), fill='#D9DFF2')
+    url_font = fit_font(d, args.url, onest_path if onest_path.exists() else Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'), 28, 260, 18)
+    d.text((W - 58 - text_width(d, args.url, url_font), 1002), args.url, font=url_font, fill='#D9DFF2')
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +169,13 @@ def main() -> int:
     p.add_argument('--card-title', required=True)
     p.add_argument('--chips', default='Human20|AI|Практика')
     p.add_argument('--code', action='append', default=[], help='Line text optionally suffixed with |error|success|neutral|muted')
+    p.add_argument('--brand-dir', default=DEFAULT_BRAND_DIR, help='Optional brand asset root. Defaults to HUMAN20_BRAND_DIR when set.')
+    p.add_argument('--logo', default='', help='Optional lockup/logo PNG path. Falls back to text logo when absent.')
+    p.add_argument('--mark', default='', help='Optional small mark PNG path for the card header.')
+    p.add_argument('--fonts-dir', default='', help='Optional directory with Geologica/Onest fonts.')
+    p.add_argument('--cta', default='Подписаться: @human20')
+    p.add_argument('--footer', default='Человек 2.0 · Среда внедрения ИИ')
+    p.add_argument('--url', default='human20.app')
     p.add_argument('--output', default='/tmp/tg_human20_cover.png')
     args = p.parse_args()
     out = render(args)

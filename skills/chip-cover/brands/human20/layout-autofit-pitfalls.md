@@ -74,4 +74,4 @@ Vision QA must explicitly check:
 - badge text centered horizontally and vertically;
 - all four code lines fully inside the black box;
 - no fourth-line crop/overflow;
-- CTA exactly `Подписаться: @human20`.
+- default CTA `Подписаться: @human20` unless the user overrides it.

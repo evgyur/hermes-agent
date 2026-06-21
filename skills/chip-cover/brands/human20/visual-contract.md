@@ -7,7 +7,7 @@ This reference captures the approved cover family from the Hermes hotfix post.
 - Canvas: square 1080×1080 PNG.
 - Background: dark navy/black gradient with indigo glow.
 - Logo: official Human20 lockup in the top-left from the runtime-supplied brand asset directory.
-- CTA: large bottom button with exact text `Подписаться: @human20`.
+- CTA: large bottom button; default text `Подписаться: @human20`, override for copied brand packs.
 - Footer: `Человек 2.0 · Среда внедрения ИИ` and `human20.app`.
 
 ## Variable elements

@@ -46,4 +46,4 @@ python3 scripts/render_hlru_cover.py \
 
 ## QA
 
-Real HLRU/channel logo visible; no `_RU` placeholder misuse; CTA exactly `Подписаться: @hyperliquid_ru_news` unless user overrides; market/usefulness hook; no fake numbers/charts; no casino/clickbait look; readable on phone; final dimensions correct.
+Real HLRU/channel logo visible; no `_RU` placeholder misuse; default CTA `Подписаться: @hyperliquid_ru_news`, override for copied brand packs unless user overrides; market/usefulness hook; no fake numbers/charts; no casino/clickbait look; readable on phone; final dimensions correct.
