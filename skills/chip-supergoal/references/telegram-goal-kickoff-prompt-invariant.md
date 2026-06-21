@@ -12,7 +12,7 @@ Failure shape:
 2. Gateway extracts/stores the clean goal body in GoalManager.
 3. Gateway queues the raw `state.goal` as the immediate kickoff message.
 4. The agent sees a naked body like `From repo root ... execute the SuperGoal ...`, not the official `[Continuing toward your standing goal]` wrapper.
-5. SuperGoal discipline then rejects the kickoff as "body without command" or tells Chip it did not start, even though GoalManager state exists.
+5. SuperGoal discipline then rejects the kickoff as "body without command" or tells the operator it did not start, even though GoalManager state exists.
 
 ## Durable invariant
 
@@ -55,7 +55,7 @@ Also run `py_compile` on touched gateway/tests files.
 
 ## Live proof
 
-A green unit test is not enough for Chip-facing Telegram fixes. Before claiming live repair:
+A green unit test is not enough for operator-facing Telegram fixes. Before claiming live repair:
 
 - identify active gateway service/PID/checkouts;
 - restart safely after the user-visible response, not inline from the same gateway turn;

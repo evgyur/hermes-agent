@@ -4,7 +4,7 @@ Use when the user/operator asks for `/rpd` / xhigh review of a freshly created S
 
 ## Problem pattern
 
-A plan can be directionally right but still fail the SuperGoal quality bar because phase specs keep generic acceptance criteria. If `/rpd` mutates the plan, the launch artifact must be refreshed too; otherwise Chip may start an older body that does not mention the review evidence or mutated criteria.
+A plan can be directionally right but still fail the SuperGoal quality bar because phase specs keep generic acceptance criteria. If `/rpd` mutates the plan, the launch artifact must be refreshed too; otherwise the operator may start an older body that does not mention the review evidence or mutated criteria.
 
 ## Required workflow
 

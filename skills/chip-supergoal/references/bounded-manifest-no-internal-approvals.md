@@ -50,7 +50,7 @@ Separate surfaces and classify them explicitly:
 - stale endpoint drift such as `/auth/authenticate` 404;
 - browser-signature/Cloudflare 403 separately from auth failure.
 
-This prevents a future agent from treating API drift or browser-signature blocks as a reason to ask Chip for another approval.
+This prevents a future agent from treating API drift or browser-signature blocks as a reason to ask the operator for another approval.
 
 ## Tests to require
 - valid manifest passes;

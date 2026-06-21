@@ -16,7 +16,7 @@ This reference captures the approved cover family from the Hermes hotfix post.
 - Headline: 1–2 lines in Russian, large and phone-readable.
 - Subtitle: optional technical/product context.
 - Card title: source/repo/product name.
-- Chips: 2–4 short labels.
+- the operators: 2–4 short labels.
 - Code/product lines: 2–4 lines with tones `error`, `success`, `neutral`, `muted`.
 
 ## QA failure examples

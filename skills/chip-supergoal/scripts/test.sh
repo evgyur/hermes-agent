@@ -39,7 +39,7 @@ for required in \
 done
 pass "install layout contains required assets"
 
-# Private-boundary scan. This installed skill is a private Chip operator
+# Private-boundary scan. This installed skill is a private operator
 # overlay, so proper names in references are allowed. Raw credentials,
 # private keys, JWT-like values, and unredacted token assignments are not.
 python3 - <<'PY'

@@ -1,12 +1,12 @@
 # Hyperliquid_ru_news Telegram cover style
 
-Use this when Chip asks for covers for the Russian Hyperliquid community / `@hyperliquid_ru_news`, or asks to adapt the Human20-cover workflow to Hyperliquid.
+Use this when the operator asks for covers for the Russian Hyperliquid community / `@hyperliquid_ru_news`, or asks to adapt the Human20-cover workflow to Hyperliquid.
 
 ## Visual direction
 
 - Aim for premium crypto/editorial design, not dashboard UI assembled from boxes.
 - Best base for `/tg hlru`: use the prepared random pool first: skill-local `assets/hyperliquid_ru/backgrounds/manifest.json` with 20 black/emerald PNGs. Render through `scripts/render_hlru_cover.py --background random`. Detail/reference: `references/hyperliquid-ru-random-cover-pool.md`.
-- Generate a fresh `/design` / GPT-Image 2 background only if Chip asks for a new direction or the 20-image pool is exhausted/rejected.
+- Generate a fresh `/design` / GPT-Image 2 background only if the operator asks for a new direction or the 20-image pool is exhausted/rejected.
 - Palette: matte black / graphite base with deep emerald → teal accents. Avoid flat bright green fills that look cheap.
 - Background should have negative space on the left and a high-end abstract liquidity/topographic/glass shape on the right.
 - Avoid generated background cards/panels that are cropped at the bottom. If the generated base has bottom UI junk, regenerate a cleaner base instead of fighting it with overlays.

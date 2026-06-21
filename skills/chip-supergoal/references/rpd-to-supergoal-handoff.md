@@ -1,10 +1,10 @@
 # RPD → SuperGoal handoff
 
-Use this when Chip invokes `/rpd` or asks for xhigh/senior review, then immediately says “Create supergoal” / “сделай SG” in reply to the review.
+Use this when the operator invokes `/rpd` or asks for xhigh/senior review, then immediately says “Create supergoal” / “сделай SG” in reply to the review.
 
 ## Lesson
 
-Treat the quoted RPD verdict as the source task for the SuperGoal package. Do not ask Chip to restate the task when the reply context already names the decision, risks, and next action.
+Treat the quoted RPD verdict as the source task for the SuperGoal package. Do not ask the operator to restate the task when the reply context already names the decision, risks, and next action.
 
 ## Required flow
 

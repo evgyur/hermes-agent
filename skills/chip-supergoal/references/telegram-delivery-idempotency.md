@@ -1,4 +1,4 @@
-# Telegram delivery idempotency for Chip SuperGoals
+# Telegram delivery idempotency for operator SuperGoals
 
 ## Trigger
 
@@ -6,7 +6,7 @@ Use when a SuperGoal/ТЗ package sends review/final artifacts to Telegram, espe
 
 ## Lesson
 
-Chip wants mandatory file delivery, but not duplicate delivery. A blocking delivery gate must be **idempotent**: retries should prove prior delivery instead of resending the same files.
+the operator wants mandatory file delivery, but not duplicate delivery. A blocking delivery gate must be **idempotent**: retries should prove prior delivery instead of resending the same files.
 
 ## Required pattern
 
@@ -23,7 +23,7 @@ Chip wants mandatory file delivery, but not duplicate delivery. A blocking deliv
    - `manual_fallback=true` if a direct tool/send fallback was used.
 3. Before retrying, compare current artifact paths + sizes + SHA-256 + target against the receipt.
 4. If they match, exit cleanly with `skipped_duplicate_send=true`; do **not** resend.
-5. Resend only when Chip explicitly asks, using a force flag such as `SUPERGOAL_FORCE_RESEND=1`.
+5. Resend only when the operator explicitly asks, using a force flag such as `SUPERGOAL_FORCE_RESEND=1`.
 
 ## Pitfall
 

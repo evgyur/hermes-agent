@@ -1,6 +1,6 @@
 # Manual provider resource adoption in production SuperGoals
 
-Use this when a SuperGoal planned to create a paid/provider resource, but Chip creates it manually in the provider UI after the automated create path is blocked (for example provider capacity `409 no_free_node`).
+Use this when a SuperGoal planned to create a paid/provider resource, but the operator creates it manually in the provider UI after the automated create path is blocked (for example provider capacity `409 no_free_node`).
 
 ## Rule
 
@@ -22,7 +22,7 @@ Do not keep retrying creation and do not create a second resource. Rewrite or pa
    - duplicate count: exactly one candidate
    - old production resource/IP/DNS still unchanged
 4. Only after adoption passes may the executor continue to SSH/hardening/storage/migration phases.
-5. If the manual resource differs from the approved spec or price, fail closed and ask Chip; do not silently accept a “close enough” tariff.
+5. If the manual resource differs from the approved spec or price, fail closed and ask the operator; do not silently accept a “close enough” tariff.
 
 ## Provider secret pitfall
 
@@ -54,6 +54,6 @@ secrets: not persisted
 ## Anti-patterns
 
 - Treating a screenshot alone as proof after the resource exists.
-- Retrying POST/create after Chip has manually created the resource.
+- Retrying POST/create after the operator has manually created the resource.
 - Continuing with a weaker/more expensive shape without explicit approval.
 - Reporting a provider API response verbatim when it includes `root_pass`, token, password, access key, or secret fields.

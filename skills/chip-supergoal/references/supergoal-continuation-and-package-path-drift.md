@@ -14,7 +14,7 @@ Check disk state first:
 
 If compression or gateway state created a new active `goal:<session>` row for that completed root, close that stale active row as `done` with a disk-backed reason. This prevents auto-resume from re-injecting the stale wrapper.
 
-Do not restart a completed root unless Chip explicitly names a new root or a new goal.
+Do not restart a completed root unless the operator explicitly names a new root or a new goal.
 
 ## Package path drift
 

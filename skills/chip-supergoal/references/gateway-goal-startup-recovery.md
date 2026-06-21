@@ -1,4 +1,4 @@
-# Gateway `/goal` startup recovery + Chip message reconciliation
+# Gateway `/goal` startup recovery + the operator message reconciliation
 
 Use when planning or executing a SuperGoal that fixes Hermes gateway restart/drain behavior, `/goal` continuation, or missed Telegram messages.
 
@@ -10,7 +10,7 @@ Correct split:
 
 - Core gateway/GoalManager recovery owns auto-resume, session identity, FIFO/startup restore, and safety policy.
 - Gateway startup hook/checklist may scan/report, but should not bypass the official session/GoalManager path.
-- `telegram-chip` is the privileged Chip chat-history source; Bot API history limitations are not a blocker for Chip-owned chats.
+- `telegram-chip` is the privileged operator chat-history source; Bot API history limitations are not a blocker for operator-owned chats.
 
 ## Required design shape
 
@@ -22,8 +22,8 @@ Correct split:
    - received / in_progress / completed / failed / drained / requeued / alert_only.
    - platform, chat_id, thread_id, message_id, session_key, session_id, timestamps.
    - short redacted snippets only; never persist full chat history just for recovery.
-3. Reconcile Chip messages via `telegram-chip` only as optional read-only truth:
-   - recent Chip messages with no ledger row => missed_by_gateway.
+3. Reconcile operator messages via `telegram-chip` only as optional read-only truth:
+   - recent operator messages with no ledger row => missed_by_gateway.
    - ledger `received` but no `in_progress` => safe requeue candidate.
    - ledger `in_progress`/`drained` with possible tool side effects => alert-only.
    - ledger `completed` => ignore.
@@ -33,7 +33,7 @@ Correct split:
    - adapter FIFO/startup restore queue.
    - no raw synthetic `/goal ...` command replay.
 5. Fail closed on side effects:
-   - safe/fresh Chip DM goals can auto-resume.
+   - safe/fresh the operator DM goals can auto-resume.
    - group/public/risky in-progress turns alert only.
    - paused/done/cleared/stale goals never auto-resume.
 

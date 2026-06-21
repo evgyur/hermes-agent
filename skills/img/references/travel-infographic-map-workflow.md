@@ -15,7 +15,7 @@ Use when the user asks for a generated travel map, bucket-list poster, route map
    - connector/route lines do not cross label text;
    - enough contrast on mobile.
 6. If QA finds label/line issues, repair deterministically and re-QA. Common fix: draw leader lines and markers **before** text panels, then draw panels/text on top so labels remain clean.
-7. Deliver only the final image unless Chip asks for the prompt/source.
+7. Deliver only the final image unless the operator asks for the prompt/source.
 
 ## Pitfalls
 

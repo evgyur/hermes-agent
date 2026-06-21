@@ -8,7 +8,7 @@ A Dev-history review over 2026-06-12..2026-06-19 found recurring failure classes
 
 - `/goal` did not reliably continue to completion after gateway restarts or open tool-tail interruptions.
 - Agents sometimes executed phases manually or stopped with a report instead of launching/continuing through `/goal` from `STATE.md`.
-- SuperGoal review artifacts were not always delivered as native Telegram files even when Chip explicitly required them.
+- SuperGoal review artifacts were not always delivered as native Telegram files even when the operator explicitly required them.
 - Approval UX became unusable when safe-lane work was split into repeated unnecessary approval prompts, while money/DNS/secrets/destructive production still require exact bounded approval.
 - Agents asked for data that already existed in local overlays, repo docs, session history, or Telegram history.
 - Repo/skill delivery was sometimes reported before push, remote HEAD verification, or clean status.
@@ -38,7 +38,7 @@ When generating or updating a SuperGoal package:
 
 ## Retrieval-before-ask order
 
-Before asking Chip for a value he says already exists:
+Before asking the operator for a value he says already exists:
 
 1. current `.supergoal/` files and project docs/runbooks;
 2. local ignored overlays (`.env*`, `*.local`, credential manifests) without printing secrets;

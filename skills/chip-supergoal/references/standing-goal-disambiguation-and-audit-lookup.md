@@ -1,10 +1,10 @@
 # Standing-goal disambiguation and audit lookup
 
-Use this reference when Chip replies to a `/goal`/SuperGoal handoff, asks whether an older goal is complete, or multiple similarly named SuperGoals exist.
+Use this reference when the operator replies to a `/goal`/SuperGoal handoff, asks whether an older goal is complete, or multiple similarly named SuperGoals exist.
 
 ## Problem pattern
 
-Chip may have several related goal roots in flight, for example:
+the operator may have several related goal roots in flight, for example:
 
 - a safe-lane skill/guardrail SuperGoal (`polymarket-privy-supergoal`);
 - a later live/runtime execution rail SuperGoal (`polymarket-privy-live-rail-supergoal`);

@@ -1,10 +1,10 @@
 # Reply-to-MD Goal launch pattern
 
-Use this when Chip wants a SuperGoal plan to be launchable by replying to an assistant Markdown message.
+Use this when the operator wants a SuperGoal plan to be launchable by replying to an assistant Markdown message.
 
 ## Durable lesson
 
-Chip does not want a SuperGoal handoff that merely says “copy this `/goal ...` command” or asks whether to send it. He wants the assistant’s Markdown reply itself to be a launch manifest that can be replied to with `/goal` / GoalManager flow.
+the operator does not want a SuperGoal handoff that merely says “copy this `/goal ...` command” or asks whether to send it. He wants the assistant’s Markdown reply itself to be a launch manifest that can be replied to with `/goal` / GoalManager flow.
 
 ## Correct handoff shape
 
@@ -16,11 +16,11 @@ Goal: Implement `.supergoal/ROADMAP.md` in `<workdir>` from phase 0 through fina
 Completion requires AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.
 ```
 
-Do not wrap this in “if you want, send this”, and do not make Chip copy a command manually. Keep any status/attachments compact, then provide the raw `Goal:` manifest as the launchable Markdown body or attached `LAUNCH_GOAL.md`.
+Do not wrap this in “if you want, send this”, and do not make the operator copy a command manually. Keep any status/attachments compact, then provide the raw `Goal:` manifest as the launchable Markdown body or attached `LAUNCH_GOAL.md`.
 
-## If Chip replies “?” / “Жду supergoal” after `No active goal`
+## If the operator replies “?” / “Жду supergoal” after `No active goal`
 
-Treat it as a failed handoff UX, not as confusion from Chip.
+Treat it as a failed handoff UX, not as confusion from the operator.
 
 1. Re-read the current `.supergoal/LAUNCH_GOAL.md` / `STATE.md` if needed.
 2. Emit or continue the launch manifest/phase execution directly.
@@ -28,4 +28,4 @@ Treat it as a failed handoff UX, not as confusion from Chip.
 
 ## Pitfall
 
-A fenced code block containing `/goal ...` is useful for humans, but it is not the preferred final handoff for Chip. The preferred object is a clean Markdown `Goal:` manifest that can itself become the replied-to goal content.
+A fenced code block containing `/goal ...` is useful for humans, but it is not the preferred final handoff for the operator. The preferred object is a clean Markdown `Goal:` manifest that can itself become the replied-to goal content.

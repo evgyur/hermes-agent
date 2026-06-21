@@ -1,6 +1,6 @@
 # Standing-goal continuous execution and restart recovery
 
-Session lesson: Chip strongly expects a launched SuperGoal to run from its current `STATE.md` phase through final audit without stopping at phase summaries. `SUPERGOAL_TURN_YIELD` means persist state and continue, not stop.
+Session lesson: the operator strongly expects a launched SuperGoal to run from its current `STATE.md` phase through final audit without stopping at phase summaries. `SUPERGOAL_TURN_YIELD` means persist state and continue, not stop.
 
 ## Execution rule
 
@@ -31,7 +31,7 @@ Do not replay completed phases; preserve them as evidence.
 
 ## Gateway restart auto-resume pattern
 
-Active `/goal` sessions must auto-resume after gateway restart even if the last persisted conversation tail contains uncheckpointed assistant tool calls. Withholding creates the exact failure mode Chip objected to: goal stalls and asks for manual poke.
+Active `/goal` sessions must auto-resume after gateway restart even if the last persisted conversation tail contains uncheckpointed assistant tool calls. Withholding creates the exact failure mode the operator objected to: goal stalls and asks for manual poke.
 
 Safer behavior:
 

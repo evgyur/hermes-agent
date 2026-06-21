@@ -4,7 +4,7 @@ Use this reference from `chip-supergoal` phases that drain an old/source product
 
 ## Hard boundary
 
-A drain phase may stop/disable old host workloads, but must not perform provider-side destructive or billable mutations without explicit Chip approval:
+A drain phase may stop/disable old host workloads, but must not perform provider-side destructive or billable mutations without explicit the operator approval:
 
 - no server delete;
 - no paid snapshot;
@@ -78,7 +78,7 @@ Use `docker compose stop`, not `down`, when stopping old database stacks before 
 
 ## Delete approval gate
 
-After the drain phase, run a separate provider-approval phase before any final decommission audit. This phase is **GET-only** against the provider and should end in `READY_FOR_DELETE_APPROVAL` when Chip has not yet approved deletion.
+After the drain phase, run a separate provider-approval phase before any final decommission audit. This phase is **GET-only** against the provider and should end in `READY_FOR_DELETE_APPROVAL` when the operator has not yet approved deletion.
 
 Record an approval package with:
 
@@ -94,13 +94,13 @@ Record an approval package with:
 State handling:
 
 - Mark the approval phase done.
-- Set `STATE.md` status to `READY_FOR_DELETE_APPROVAL` and current phase to final audit blocked/pending explicit Chip provider choice.
+- Set `STATE.md` status to `READY_FOR_DELETE_APPROVAL` and current phase to final audit blocked/pending explicit the operator provider choice.
 - Do **not** print `AUDIT_COMPLETE` or `SUPERGOAL_RUN_COMPLETE` while only provider approval remains.
-- If Chip later chooses retain/delete/snapshot-then-delete, the final audit phase can execute only that approved provider path and then re-run DNS, public smoke, backup inspectability, and inventory/docs cleanup.
+- If the operator later chooses retain/delete/snapshot-then-delete, the final audit phase can execute only that approved provider path and then re-run DNS, public smoke, backup inspectability, and inventory/docs cleanup.
 
 ### Retained/off approval path
 
-When Chip approves “snapshot then power off/retain, do not delete,” treat that as a valid Phase 8 completion path, not a blocker:
+When the operator approves “snapshot then power off/retain, do not delete,” treat that as a valid Phase 8 completion path, not a blocker:
 
 1. Make a full offsite backup before provider shutdown. For Restic/Storage Box paths, prefer a cold full-server snapshot from the drained old host that includes `/` with `--one-file-system`, excluding only pseudo/volatile/cache mounts (`/dev`, `/proc`, `/sys`, `/run`, `/tmp`, restic cache, etc.). Do not reuse a narrower daily app backup if it excludes database volumes and the user asked for “Supabase целиком / весь сервер”.
 2. Tag the snapshot with the approved retention horizon, e.g. `retain-until-YYYY-MM-DD`, plus old-host/full-scope tags. Include a manifest file in the snapshot stating server id/name, host, IP, scope, retention date, and purpose.
@@ -111,4 +111,4 @@ When Chip approves “snapshot then power off/retain, do not delete,” treat th
 
 ## Rollback wording
 
-After old app/Supabase/nginx are stopped, say plainly that warm rollback is reduced/closed. The recovery path is verified backups/restic plus preserved old disk state until explicit delete approval. After provider deletion, old-host service rollback disappears; recovery depends on current-new backups/restic/mirrors or an optional provider disk backup if Chip approved one first.
+After old app/Supabase/nginx are stopped, say plainly that warm rollback is reduced/closed. The recovery path is verified backups/restic plus preserved old disk state until explicit delete approval. After provider deletion, old-host service rollback disappears; recovery depends on current-new backups/restic/mirrors or an optional provider disk backup if the operator approved one first.

@@ -1,6 +1,6 @@
 # Telegram `.md` SuperGoal launch UX
 
-Use when creating or troubleshooting a SuperGoal launch in Telegram where Chip reviews `.md` artifacts and starts execution with reply `/goal`.
+Use when creating or troubleshooting a SuperGoal launch in Telegram where the operator reviews `.md` artifacts and starts execution with reply `/goal`.
 
 ## Human-facing artifact rule
 
@@ -8,7 +8,7 @@ Default to exactly three files:
 
 1. `THINKING.md` — reasoning and trade-offs.
 2. `ROADMAP.md` — phase plan and acceptance shape.
-3. `LAUNCH_GOAL.md` — the only file Chip replies to with `/goal`.
+3. `LAUNCH_GOAL.md` — the only file the operator replies to with `/goal`.
 
 Do not dump `PROTOCOL.md`, `STATE.md`, individual `phase-N.md` files, reports, repo maps, or archives into chat unless the user/operator asks. Those are internal/source-of-truth artifacts on disk, not the review UI.
 
@@ -65,7 +65,7 @@ If the stored goal contains `[Content of replied-to ...]`, `DONE_CONDITION`, `OP
 
 ## Verification checklist
 
-Before telling Chip to reply `/goal` again:
+Before telling the operator to reply `/goal` again:
 
 - Gateway is restarted after the extraction patch.
 - Visible Telegram `group:<chat_id>:<thread_id>` session has no active bogus goal.
@@ -75,6 +75,6 @@ Before telling Chip to reply `/goal` again:
 ## Bad UX to avoid
 
 - Sending a dozen `.md` files into Telegram.
-- Making Chip copy a long `/goal "..."` line.
+- Making the operator copy a long `/goal "..."` line.
 - Treating the whole replied file as the goal.
 - Saying the launch worked just because Telegram printed a GoalManager status notice; inspect the stored goal body in the visible group session.

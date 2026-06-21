@@ -1,6 +1,6 @@
 # Telegram SuperGoal artifact delivery correction
 
-Session lesson: Chip corrected a false-positive chat-boundary guard during a Pear SuperGoal planning run.
+Session lesson: the operator corrected a false-positive chat-boundary guard during a Pear SuperGoal planning run.
 
 ## Durable rule
 

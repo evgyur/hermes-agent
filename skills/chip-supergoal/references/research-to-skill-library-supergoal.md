@@ -42,7 +42,7 @@ Use this when the user/operator asks to turn a research/top-N improvement list i
 For zero-indexed phase files, avoid ambiguous user-facing wording.
 
 - Good: `Total phases: 6`, files `phase-0.md` through `phase-5.md`, metadata `Phase: 0 of 5`.
-- In summaries, say “6 phases, indexed 0–5” so Chip does not read `0 of 5` as five total phases.
+- In summaries, say “6 phases, indexed 0–5” so the operator does not read `0 of 5` as five total phases.
 
 ## Done criteria
 

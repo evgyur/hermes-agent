@@ -91,7 +91,7 @@ Server-doctor/update-runbook side:
 
 ## Final proof before retrying `/goal`
 
-After restart and before asking Chip to retry, verify:
+After restart and before asking the operator to retry, verify:
 
 ```text
 gateway ActiveState=active

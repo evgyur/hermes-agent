@@ -1,6 +1,6 @@
 # No-internal-approval standing-goal execution
 
-Use this when Chip continues an existing SuperGoal and explicitly says to run “без апрувалов внутри” / without internal approval prompts.
+Use this when the operator continues an existing SuperGoal and explicitly says to run “без апрувалов внутри” / without internal approval prompts.
 
 ## Pattern
 

@@ -6,7 +6,7 @@ When the user/operator asks for SuperGoal/ТЗ files, the planning-stage package
 2. `ROADMAP.md`
 3. `LAUNCH_GOAL.md`
 
-Do not rely on “I’ll send later”, archive-only delivery, or pasted text. If the delivery is missing, Chip will reasonably say “не вижу файлов”.
+Do not rely on “I’ll send later”, archive-only delivery, or pasted text. If the delivery is missing, the operator will reasonably say “не вижу файлов”.
 
 ## Required implementation pattern
 

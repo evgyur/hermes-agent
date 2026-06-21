@@ -1,10 +1,10 @@
 # Standing-goal final audit completion
 
-Use when Chip sends a SuperGoal continuation that says to finish through final audit, or the current/last phase spec itself requires `AUDIT_COMPLETE` / `SUPERGOAL_RUN_COMPLETE`.
+Use when the operator sends a SuperGoal continuation that says to finish through final audit, or the current/last phase spec itself requires `AUDIT_COMPLETE` / `SUPERGOAL_RUN_COMPLETE`.
 
 ## Lesson
 
-Do not stop at a normal phase-yield if the declared finish line includes final audit and the remaining audit steps are safe. Chip expects the run to continue through the declared completion markers without internal micro-approval prompts.
+Do not stop at a normal phase-yield if the declared finish line includes final audit and the remaining audit steps are safe. the operator expects the run to continue through the declared completion markers without internal micro-approval prompts.
 
 ## Required behavior
 

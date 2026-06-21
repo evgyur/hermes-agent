@@ -9,7 +9,7 @@ A gateway log line like `Supergoal callback: started official /goal from button 
 - visible topic session: `agent:main:telegram:group:<chat_id>:<thread_id>`
 - invisible sibling session: `agent:main:telegram:forum:<chat_id>:<thread_id>`
 
-If GoalManager state is written under the `forum` key, Chip will not see the standing-goal continuation in the actual topic session even though the log says the callback started.
+If GoalManager state is written under the `forum` key, the operator will not see the standing-goal continuation in the actual topic session even though the log says the callback started.
 
 ## Required proof before claiming goal started
 

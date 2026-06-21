@@ -4,7 +4,7 @@ Use when the user/operator says `Make supergoal`, `делай`, or replies to an
 
 ## Problem captured
 
-A stale standing-goal wrapper and a separate operational bug can dominate the visible transcript. In one session, `Make supergoal` was incorrectly interpreted as “make a SuperGoal for GoalManager spam,” while Chip’s intended thread was “make the Polymarket/chip-privy skill/runtime goal.” This produced a wrong SuperGoal artifact and user correction: `Не на это` / `Мы хотели сделать скил Polymarket` / `А потом ты все сломал`.
+A stale standing-goal wrapper and a separate operational bug can dominate the visible transcript. In one session, `Make supergoal` was incorrectly interpreted as “make a SuperGoal for GoalManager spam,” while the operator’s intended thread was “make the Polymarket/chip-privy skill/runtime goal.” This produced a wrong SuperGoal artifact and user correction: `Не на это` / `Мы хотели сделать скил Polymarket` / `А потом ты все сломал`.
 
 ## Rule
 
@@ -13,8 +13,8 @@ Before creating a SuperGoal, anchor the request to the **semantic object of the 
 ## Required sequence
 
 1. Inspect the latest human message and reply target:
-   - If Chip replies to `Make supergoal`, treat it as “create the SuperGoal for the plan/topic immediately above that message,” not as a fresh brainstorm.
-   - If Chip then corrects with `не на это`, stop the wrong thread immediately.
+   - If the operator replies to `Make supergoal`, treat it as “create the SuperGoal for the plan/topic immediately above that message,” not as a fresh brainstorm.
+   - If the operator then corrects with `не на это`, stop the wrong thread immediately.
 2. Resolve the target object explicitly before writing files:
    - target skill/repo/project;
    - intended outcome;

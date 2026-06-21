@@ -1,6 +1,6 @@
 # Target-poster face swap with identity reference
 
-Use when Chip says “вот эта фото круче”, “ничего не меняй, только моё лицо”, “вставь моё лицо”, or asks to preserve an existing poster/composition while replacing a person’s face.
+Use when the operator says “вот эта фото круче”, “ничего не меняй, только моё лицо”, “вставь моё лицо”, or asks to preserve an existing poster/composition while replacing a person’s face.
 
 ## Core rule
 
@@ -45,4 +45,4 @@ If QA says gaze is still frontal or the person looks generic, do not deliver. Re
 
 ## Fallback warning
 
-Do not silently use FAL/Nano Banana fallback for this class. It may preserve style but often drifts identity. Only use fallback if Chip explicitly accepts possible likeness drift.
+Do not silently use FAL/Nano Banana fallback for this class. It may preserve style but often drifts identity. Only use fallback if the operator explicitly accepts possible likeness drift.

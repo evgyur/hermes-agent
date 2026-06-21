@@ -128,7 +128,7 @@ Do not deliver pretty-but-wrong text.
 - Generate QR codes locally with high error correction.
 - Verify placement, no overlap/cropping, and QR scannability when feasible.
 
-Operator-specific example: when Chip explicitly asks to place real company logos on an editorial/news cover, execute with official/sourceable logos unless the request would mislead, forge endorsement, phish, or impersonate.
+Operator-specific example: when the operator explicitly asks to place real company logos on an editorial/news cover, execute with official/sourceable logos unless the request would mislead, forge endorsement, phish, or impersonate.
 
 ## Cover handoff contract
 

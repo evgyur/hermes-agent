@@ -2,11 +2,11 @@
 
 ## Trigger
 
-Use when Chip is planning a Polymarket/Privy SuperGoal and refers to previously listed “non-goals” such as live trading, wallet/deposit-wallet creation, signing, CLOB key derivation, pUSD approvals/wrap/unwrap/funding/withdrawal, order submit/cancel/claim/redeem, authenticated requests, geofence, or release/push.
+Use when the operator is planning a Polymarket/Privy SuperGoal and refers to previously listed “non-goals” such as live trading, wallet/deposit-wallet creation, signing, CLOB key derivation, pUSD approvals/wrap/unwrap/funding/withdrawal, order submit/cancel/claim/redeem, authenticated requests, geofence, or release/push.
 
 ## Lesson
 
-Do not automatically convert “non-goals” into “forbidden/out-goals”. In this session Chip clarified: “I mean make them our goals” / “We need that”. The intended correction was to make the actual live money capabilities first-class implementation goals, while translating unsafe literal forms into controlled internal equivalents.
+Do not automatically convert “non-goals” into “forbidden/out-goals”. In this session the operator clarified: “I mean make them our goals” / “We need that”. The intended correction was to make the actual live money capabilities first-class implementation goals, while translating unsafe literal forms into controlled internal equivalents.
 
 ## Correct framing
 
@@ -18,7 +18,7 @@ Do not automatically convert “non-goals” into “forbidden/out-goals”. In 
 - Authenticated Polymarket/CLOB requests: goal through typed internal adapters.
 - Secrets: goal is server-side overlay/KMS/Privy, never chat/log/file exposure.
 - Geofence: goal is compliant official gate, not bypass.
-- Release/push: goal is private/controlled release unless Chip separately approves public push.
+- Release/push: goal is private/controlled release unless the operator separately approves public push.
 
 ## Pitfall
 

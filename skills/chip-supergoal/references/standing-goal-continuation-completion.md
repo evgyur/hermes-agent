@@ -1,6 +1,6 @@
 # Standing-goal continuation and completion handling
 
-Use this when Chip replies with `[Continuing toward your standing goal]` or a pasted `LAUNCH_GOAL.md` prompt.
+Use this when the operator replies with `[Continuing toward your standing goal]` or a pasted `LAUNCH_GOAL.md` prompt.
 
 ## Rule
 
@@ -43,7 +43,7 @@ Bad behavior:
 Phase 0 done. Next: Phase 1. Stop.
 ```
 
-This makes Chip manually push the goal again and reads as the goal loop being broken.
+This makes the operator manually push the goal again and reads as the goal loop being broken.
 
 Correct behavior:
 
@@ -55,7 +55,7 @@ Only stop at complete or blocker.
 
 ## Repeated continuation after completion
 
-If Chip sends the same continuation prompt after completion, answer compactly:
+If the operator sends the same continuation prompt after completion, answer compactly:
 
 ```text
 Goal complete. Stop.

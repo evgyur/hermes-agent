@@ -1,6 +1,6 @@
 # Research report → SuperGoal planning pattern
 
-Use when Chip replies with “Make supergoal” / “Сделай supergoal” after a research/top-N improvement report.
+Use when the operator replies with “Make supergoal” / “Сделай supergoal” after a research/top-N improvement report.
 
 ## Durable pattern
 

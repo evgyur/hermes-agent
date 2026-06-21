@@ -2,7 +2,7 @@
 
 ## Trigger
 
-Use this when Supergoal approval buttons appear to work in Telegram (`Start now` clicked, callback logs show GoalManager started) but Chip does not see a visible `/goal` start or continuation in the topic.
+Use this when Supergoal approval buttons appear to work in Telegram (`Start now` clicked, callback logs show GoalManager started) but the operator does not see a visible `/goal` start or continuation in the topic.
 
 ## Durable lesson
 
@@ -72,13 +72,13 @@ Also keep the live button test that asserts the queued kickoff text is the raw g
 
 ## User-facing rule
 
-If Chip reports “button worked but goal did not start,” do not argue from logs. Treat it as a session-key visibility bug until proven otherwise. Verify where the goal state was written before claiming success.
+If the operator reports “button worked but goal did not start,” do not argue from logs. Treat it as a session-key visibility bug until proven otherwise. Verify where the goal state was written before claiming success.
 
 For the preferred non-button flow, the contract is:
 
 1. Assistant creates/updates `.supergoal/` files and sends a human handoff message containing `SUPERGOAL_GOAL_BODY:`.
 2. Assistant does **not** auto-start merely because it printed that marker.
-3. Chip replies to that exact assistant message with bare `/goal`.
+3. the operator replies to that exact assistant message with bare `/goal`.
 4. Gateway extracts only the marker payload from the replied message, sets official GoalManager state in the visible `group:<chat_id>:<thread_id>` session, queues the first kickoff without a leading `/goal`, and sets xhigh reasoning.
 5. Supergoal terminal markers must be standalone non-fenced lines. Marker mentions inside fallback commands or prose are examples, not completion.
 6. If execution reaches `FAILURE_HANDOFF` / `AUDIT_HANDOFF`, the status should be blocked/stopped, not `Goal achieved`.

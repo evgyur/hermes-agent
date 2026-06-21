@@ -1,6 +1,6 @@
 # Goal identity and audit lookup for overlapping SuperGoals
 
-Use this when Chip references a `LAUNCH_GOAL.md`, asks “этот goal закончен?”, or several similar SuperGoals exist for the same domain.
+Use this when the operator references a `LAUNCH_GOAL.md`, asks “этот goal закончен?”, or several similar SuperGoals exist for the same domain.
 
 ## Problem pattern
 

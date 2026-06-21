@@ -2,7 +2,7 @@
 
 Use this when a SuperGoal run changes Hermes gateway/GoalManager code and the live Telegram gateway must restart before a button/reply `/goal` proof is valid.
 
-For restart/drain fixes that must resume active `/goal` sessions or reconcile missed Chip Telegram messages, also read `references/gateway-goal-startup-recovery.md` before planning. That reference captures the core lesson: recovery belongs in gateway/GoalManager state-machine code, with startup hooks only as watchdog/reporting, and `telegram-chip` is the read-only Chip chat-history source.
+For restart/drain fixes that must resume active `/goal` sessions or reconcile missed operator Telegram messages, also read `references/gateway-goal-startup-recovery.md` before planning. That reference captures the core lesson: recovery belongs in gateway/GoalManager state-machine code, with startup hooks only as watchdog/reporting, and `telegram-chip` is the read-only operator chat-history source.
 
 ## Why
 

@@ -18,7 +18,7 @@ Convert the plan from preview-only/readiness into a live-activation rail, while 
 
 ## Planning pitfall
 
-Do not label these as `out-goals` unless Chip explicitly means forbidden outcomes. In this pattern, the roadmap should use sections like:
+Do not label these as `out-goals` unless the operator explicitly means forbidden outcomes. In this pattern, the roadmap should use sections like:
 
 - `Our goals`
 - `Capability goals`

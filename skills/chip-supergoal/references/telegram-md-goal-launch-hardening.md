@@ -61,7 +61,7 @@ The stored GoalManager goal must contain only `<canonical body>`. It must not co
 
 Extractor must handle CRLF and no blank line before tail sections; use multiline stop patterns, not exact `\n\nTOKEN:` string search.
 
-## Verification before telling Chip to retry
+## Verification before telling the operator to retry
 
 Before saying “reply `/goal` now”, verify:
 
@@ -74,7 +74,7 @@ extracted body has no wrapper/tails
 focused tests for reply command + document hydration pass
 ```
 
-After Chip replies `/goal`, proof is the visible `group:<chat_id>:<thread_id>` GoalManager state with:
+After the operator replies `/goal`, proof is the visible `group:<chat_id>:<thread_id>` GoalManager state with:
 
 ```text
 status == active

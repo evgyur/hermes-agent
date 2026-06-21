@@ -1,6 +1,6 @@
 # chip-supergoal
 
-Private Chip/Hermes SuperGoal planner skill. It creates a disk-backed `.supergoal/` package and one explicit `/goal` handoff for non-trivial software work.
+Private Hermes/Powerpack SuperGoal planner skill. It creates a disk-backed `.supergoal/` package and one explicit `/goal` handoff for non-trivial software work.
 
 `chip-supergoal` writes:
 
@@ -31,4 +31,4 @@ bash scripts/test.sh
 
 ## Privacy boundary
 
-This installed package is a private Chip operator overlay, not a public-safe distribution. Tests scan for raw credential/private-key/JWT style leaks and contract regressions; public publication would require a separate sanitization pass.
+This installed package is a private operator overlay, not a public-safe distribution. Tests scan for raw credential/private-key/JWT style leaks and contract regressions; public publication would require a separate sanitization pass.
