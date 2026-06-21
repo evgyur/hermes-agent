@@ -25,8 +25,8 @@ The `/goal` evaluator reads the visible transcript, not only files. A phase is n
 - Do not mark the phase complete a second time in `STATE.md` unless the missing bookkeeping needs an event line.
 - Do not invent command output. Quote only evidence already captured in report/logs or rerun a safe verifier if evidence is missing.
 - Do not chain into the next numbered phase after emitting missing markers. One phase/bookkeeping unit per turn still holds.
-- Do not ask the user to send `/goal` again if the standing-goal wrapper is active.
+- Do not ask Chip to send `/goal` again if the standing-goal wrapper is active.
 
 ## Good visible wording
 
-`SUPERGOAL_PHASE_VERIFY` should say explicitly that this is transcript bookkeeping for an already-recorded phase, then list the evidence paths and pass/fail criteria. This makes the evaluator and the user see why no new product edits happened in this turn.
+`SUPERGOAL_PHASE_VERIFY` should say explicitly that this is transcript bookkeeping for an already-recorded phase, then list the evidence paths and pass/fail criteria. This makes the evaluator and Chip see why no new product edits happened in this turn.

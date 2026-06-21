@@ -1,29 +1,19 @@
 # chip-supergoal
 
-Public-safe Hermes skill for plan-only autonomous software delivery planning.
+Private Chip/Hermes SuperGoal planner skill. It creates a disk-backed `.supergoal/` package and one explicit `/goal` handoff for non-trivial software work.
 
 `chip-supergoal` writes:
+
 - `.supergoal/THINKING.md`
 - `.supergoal/RESEARCH.md` when current research is required
 - `.supergoal/ROADMAP.md`
 - `.supergoal/STATE.md`
-- `.supergoal/phases/phase-N.md`
 - `.supergoal/PROTOCOL.md`
-- one CLI/client-safe `/goal` handoff
+- `.supergoal/LAUNCH_GOAL.md`
+- `.supergoal/phases/phase-N.md`
+- helper scripts and delivery receipts when required
 
-The skill is independent from `/rpd`: the RPD review pattern is embedded directly in `references/rpd-review-gates.md` and in the generated execution protocol.
-
-## Install
-
-This is a multi-file skill. Do **not** install from a raw `SKILL.md` URL; that would omit required `scripts/`, `templates/`, and `references/` assets.
-
-Use a full-directory install method supported by your Hermes setup, or clone/copy this directory into `$HERMES_HOME/skills/chip-supergoal`:
-
-```bash
-git clone <public-repo-url> "$HERMES_HOME/skills/chip-supergoal"
-```
-
-Then reload skills if your runtime caches slash commands.
+The skill is independent from external `/rpd`: the RPD/Senior review pattern is embedded in `references/rpd-review-gates.md` and in the generated execution protocol.
 
 ## Use
 
@@ -31,7 +21,7 @@ Then reload skills if your runtime caches slash commands.
 /chip-supergoal Build or refactor X end-to-end
 ```
 
-The skill does not execute the project work itself. It creates the plan and prints a `/goal` handoff. The future `/goal` session executes from the generated files.
+The skill does not execute implementation phases. It plans, writes artifacts, reviews the plan, and emits a launch body. The later `/goal` session executes from the generated files.
 
 ## Verify
 
@@ -39,6 +29,6 @@ The skill does not execute the project work itself. It creates the plan and prin
 bash scripts/test.sh
 ```
 
-## Privacy
+## Privacy boundary
 
-This repository intentionally contains no operator secrets, chat IDs, local runtime state, credentials, or private infrastructure details.
+This installed package is a private Chip operator overlay, not a public-safe distribution. Tests scan for raw credential/private-key/JWT style leaks and contract regressions; public publication would require a separate sanitization pass.

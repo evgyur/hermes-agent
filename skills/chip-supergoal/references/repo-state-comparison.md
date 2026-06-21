@@ -25,20 +25,20 @@ comparison must be **baseline → working tree**, not **baseline → HEAD**.
 |------|-----|----------|
 | Tracked changes | `git diff <baseline>` (single revision — **no** `..HEAD`) | committed, staged, unstaged, **and** deleted tracked files |
 | Untracked files | `git ls-files --others --exclude-standard` | brand-new deliverables never `git add`-ed |
-| Invalid/unavailable baseline | filesystem existence (`-e`, `git ls-files`) | `no-git` sentinel, bogus sha, or non-repo dir |
+| Invalid/unavailable baseline | fail closed inside git; filesystem existence only outside git | bogus SHA becomes an audit gap; non-git workspaces degrade honestly |
 
 `git diff <baseline>` (a single revision argument) diffs the **working tree** against the
 baseline commit, so it already folds in staged + unstaged changes *and* any commits made after
 the baseline. Untracked files are diff-invisible, so they are detected **separately** and on
-purpose. When the baseline cannot be resolved to a commit, every check degrades to "does the
-path exist now?" — coverage drops to existence-only, which the audit should surface honestly.
+purpose. When the baseline cannot be resolved to a commit inside a git repository, the helper fails closed with `invalid baseline` so audit does not certify ungrounded work. Only non-git workspaces degrade to existence-only checks, and the audit should surface that reduced coverage honestly.
 
 **Ignored files are intentionally out of scope of untracked detection.** `--exclude-standard`
 honours `.gitignore`, so a `.gitignore`'d file is *not* reported as an untracked deliverable and
 its body is *not* fed to the cleanliness greps via `added-lines`. This is deliberate — ignored
 paths are usually ephemeral build output or logs, not shipping artifacts. Two consequences worth
-knowing: (a) an ignored deliverable still reads `present` via the existence fallback (it exists
-on disk), just not flagged `untracked new file`; (b) debug output that lives *only* in an ignored
+knowing: (a) an ignored deliverable inside a git repo is not proof of work from this run; if it
+exists unchanged relative to the baseline, the helper returns `unchanged — existed before baseline`
+with exit 3 unless the roadmap marks it pre-existing/verification-only; (b) debug output that lives *only* in an ignored
 file escapes the cleanliness count — if a phase legitimately ships such output and wants it
 inspected, declare a `Cleanliness override:` in the phase spec rather than relying on the greps.
 
@@ -46,19 +46,20 @@ inspected, declare a `Cleanliness override:` in the phase spec rather than relyi
 
 Don't hand-type the git incantations — the single-revision-vs-range distinction is exactly the
 bug this exists to prevent. Use the helper, which encapsulates the table above and never mutates
-the repo or index. At Stage 7 it is copied next to `PROTOCOL.md` into `.supergoal/`, so the
-`/goal` session invokes it as `bash .supergoal/repo-state.sh`.
+the repo or index. At Stage 7 it is copied under `.supergoal/scripts/`, so the
+`/goal` session invokes it as `bash .supergoal/scripts/repo-state.sh`.
 
 ```
-bash .supergoal/repo-state.sh deliverable   <baseline> <path>
-    -> "present — <evidence>" (exit 0) | "missing" (exit 1)
-       evidence distinguishes: changed vs baseline / untracked new file /
-       exists-unchanged / baseline-unavailable
+bash .supergoal/scripts/repo-state.sh deliverable   <baseline> <path>
+    -> "present — <evidence>" (exit 0) | "missing"/"deleted" (exit 1) |
+       "invalid baseline" (exit 2) | "unchanged — existed before baseline" (exit 3)
+       present evidence distinguishes: changed vs baseline / untracked new file /
+       exists on disk only in non-git fallback mode
 
-bash .supergoal/repo-state.sh changed-files <baseline>
+bash .supergoal/scripts/repo-state.sh changed-files <baseline>
     -> newline-delimited paths changed since baseline (tracked + untracked + deleted)
 
-bash .supergoal/repo-state.sh added-lines   <baseline>
+bash .supergoal/scripts/repo-state.sh added-lines   <baseline>
     -> every added/new line since baseline: tracked-diff '+' lines plus the full body
        of each untracked file. Pipe to grep for cleanliness counts.
 ```
@@ -70,7 +71,7 @@ Quote path arguments — deliverable paths may contain spaces.
 For each `**Deliverables:**` bullet that names a path/glob:
 
 ```
-bash .supergoal/repo-state.sh deliverable "$(baseline)" "<path>"
+bash .supergoal/scripts/repo-state.sh deliverable "$(baseline)" "<path>"
 ```
 
 `missing`/`deleted` (exit 1), `invalid baseline` (exit 2), or `unchanged pre-existing` (exit 3) → `AUDIT_GAP: phase <N> deliverable "<bullet>" not proven as delivered by this run`, unless the roadmap explicitly marks that deliverable as pre-existing / verification-only.
@@ -78,7 +79,7 @@ bash .supergoal/repo-state.sh deliverable "$(baseline)" "<path>"
 ### Per-phase cleanliness check
 
 ```
-bash .supergoal/repo-state.sh added-lines "$(baseline)" > /tmp/sg-added
+bash .supergoal/scripts/repo-state.sh added-lines "$(baseline)" > /tmp/sg-added
 grep -cE 'console\.log|console\.error' /tmp/sg-added   # JS/TS debug prints (adjust per stack)
 grep -cE '\b(TODO|FIXME|XXX)\b'        /tmp/sg-added   # session TODO/FIXME added
 # dead imports: inspect added import lines for usage in their file
@@ -92,8 +93,10 @@ never-committed file are caught too — the case the old `..HEAD` grep missed en
 The transcript markers (`SUPERGOAL_PHASE_VERIFY` cleanliness section, `AUDIT_VERIFY`
 `Deliverables:` block, `AUDIT_GAP`, `AUDIT_COMPLETE`) and the 3-strike semantics are unchanged.
 Only the *source of truth* moved from a commit range to the complete working tree, and untracked
-detection was added. A deliverable that merely exists unchanged still reads as `present`, exactly
-as the old `ls`/`git ls-files` fallback did.
+detection was added. A deliverable that merely exists unchanged is no longer proof that this run
+shipped it: the helper returns `unchanged — existed before baseline` with exit 3, and final audit
+must treat that as a gap unless the roadmap explicitly marks the deliverable as pre-existing /
+verification-only.
 
 ## Line endings (cross-platform)
 

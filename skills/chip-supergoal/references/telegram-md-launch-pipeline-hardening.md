@@ -1,4 +1,6 @@
-# Telegram `.md` launch pipeline hardening
+# Telegram .md launch pipeline hardening
+
+See also `references/telegram-review-file-delivery-gate.md`: Chip's current default expectation is that the three human-facing SuperGoal planning files (`THINKING.md`, `ROADMAP.md`, `LAUNCH_GOAL.md`) are sent as native Telegram files with the TЗ/review package before any start/dispatch prompt. Delivery must be scripted and receipt-backed, not dependent on agent memory.
 
 Use this reference when building or repairing SuperGoal launch through Telegram files/buttons.
 
@@ -7,7 +9,7 @@ Use this reference when building or repairing SuperGoal launch through Telegram 
 - Human-facing launch pack defaults to exactly three native files: `THINKING.md`, `ROADMAP.md`, `LAUNCH_GOAL.md`.
 - Only `LAUNCH_GOAL.md` may contain `SUPERGOAL_GOAL_BODY:`.
 - `THINKING.md`, `ROADMAP.md`, `STATE.md`, `PROTOCOL.md`, `phases/*`, and reports are review/state artifacts, not launch targets.
-- the user replies `/goal` only to `LAUNCH_GOAL.md` unless an explicit button launch path is implemented and verified.
+- Chip replies `/goal` only to `LAUNCH_GOAL.md` unless an explicit button launch path is implemented and verified.
 - Posting a file or printing `SUPERGOAL_GOAL_BODY:` is not enough to start execution. Autodispatch requires an explicit internal sentinel such as `SUPERGOAL_AUTODISPATCH: true`.
 
 ## Gateway invariants
@@ -42,4 +44,4 @@ Before claiming live goal-loop proof or continuing a phase:
 
 ## User-facing discipline
 
-If the user calls out instability in the launch rail, stop promising. Run Shaw-style review over the whole pipeline: Telegram hydration, extraction, GoalManager state, compression migration, restart proof, artifacts/skill docs, and tests. Fix guardrails first, then relaunch.
+If Chip calls out instability in the launch rail, stop promising. Run Shaw-style review over the whole pipeline: Telegram hydration, extraction, GoalManager state, compression migration, restart proof, artifacts/skill docs, and tests. Fix guardrails first, then relaunch.

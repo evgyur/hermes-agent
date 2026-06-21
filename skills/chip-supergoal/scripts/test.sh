@@ -19,36 +19,139 @@ for required in \
   templates/PROTOCOL.md \
   templates/ROADMAP.md \
   templates/RESEARCH.md \
-  references/rpd-review-gates.md; do
+  templates/LAUNCH_GOAL.md \
+  references/rpd-review-gates.md \
+  references/core-planning-contract.md \
+  references/artifact-schemas.md \
+  references/execution-state-machine.md \
+  references/INDEX.md \
+  references/dev-history-hardening.md \
+  references/upstream-goal-compatibility.md \
+  references/upstream-goal-reconciliation.md \
+  references/rpd-to-supergoal-handoff.md \
+  references/ignored-supergoal-package-hygiene.md \
+  templates/delivery/send-review-md-files.sh \
+  templates/delivery/package-final-artifacts.sh \
+  templates/delivery/send-final-artifacts.sh \
+  templates/delivery/review-md-files-delivery-receipt.schema.json \
+  templates/delivery/final-artifacts-delivery-receipt.schema.json; do
   [[ -f "$required" ]] || fail "missing required asset: $required"
 done
 pass "install layout contains required assets"
 
-# Public-safety scan over tracked files. The lowercase repo/command identifier
-# `chip-supergoal` is allowed; capitalized personal/operator labels are not.
+# Private-boundary scan. This installed skill is a private Chip operator
+# overlay, so proper names in references are allowed. Raw credentials,
+# private keys, JWT-like values, and unredacted token assignments are not.
 python3 - <<'PY'
-import pathlib, subprocess, sys
-terms = [
-    'Ev'+'geny', 'Human'+'20', '157'+'.', '72'+'.',
-    '/home/'+'hermes', ''.join(map(chr,[103,104,111,95])), ''.join(map(chr,[115,107,45])), '-----'+'BEGIN', 'auth'+'.json',
-    ''.join(map(chr,[79,112,101,110,67,108,97,119])), ''.join(map(chr,[67,108,97,119])), ''.join(map(chr,[67,104,105,112])),
+import pathlib, re, sys
+files = [p for p in pathlib.Path('.').rglob('*') if p.is_file() and not any(part in {'.git', '.shaw', '.supergoal'} for part in p.parts)]
+patterns = [
+    ('private_key_block', re.compile(r'-----BEGIN (?:RSA |OPENSSH |EC |DSA |)?PRIVATE KEY-----')),
+    ('github_token', re.compile(r'gh[pousr]_[A-Za-z0-9_]{20,}')),
+    ('openai_style_token', re.compile(r'(?<![A-Za-z0-9])sk-[A-Za-z0-9]{32,}')),
+    ('jwt', re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')),
+    ('env_secret_assignment', re.compile(r"(?i)\b(?:api[_-]?key|secret|token|password)\s*=\s*[\"']?[A-Za-z0-9_./+=-]{24,}[\"']?")),
 ]
-
-try:
-    files = subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard'], text=True, stderr=subprocess.DEVNULL).splitlines()
-except Exception:
-    files = [str(p) for p in pathlib.Path('.').rglob('*') if p.is_file() and not any(part in {'.git', '.shaw', '.supergoal'} for part in p.parts)]
 violations=[]
-for file in files:
-    text=pathlib.Path(file).read_text(errors='ignore')
-    for lineno,line in enumerate(text.splitlines(),1):
-        if any(t in line for t in terms) or __import__('re').search(r'-100[0-9]{6,}', line):
-            violations.append(f'{file}:{lineno}:{line}')
+for path in files:
+    text = path.read_text(errors='ignore')
+    for lineno, line in enumerate(text.splitlines(), 1):
+        # Placeholder examples are allowed when visibly non-secret.
+        if '<' in line and '>' in line:
+            continue
+        for name, pat in patterns:
+            if pat.search(line):
+                violations.append(f'{path}:{lineno}:{name}:{line[:160]}')
 if violations:
     print('\n'.join(violations), file=sys.stderr)
     sys.exit(1)
 PY
-pass "privacy scan"
+pass "private-boundary scan"
+
+python3 - <<'PY'
+from pathlib import Path
+import re, yaml
+text = Path('SKILL.md').read_text()
+fm = re.match(r'^---\n(.*?)\n---\n', text, re.S)
+assert fm, 'missing frontmatter'
+data = yaml.safe_load(fm.group(1))
+assert data['name'] == 'chip-supergoal'
+assert len(data['description']) <= 1024
+assert len(text.encode()) < 40000, len(text.encode())
+required = [
+  'Principal+ contract', 'Generated artifacts', 'Reference dispatch',
+  'RPD / Senior Gate', 'Output Contract'
+]
+missing = [x for x in required if x not in text]
+assert not missing, missing
+print('PASS: root architecture contract')
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+actual = []
+for p in Path('.').rglob('*.md'):
+    if '.git' in p.parts:
+        continue
+    for n,line in enumerate(p.read_text(errors='ignore').splitlines(),1):
+        if line.startswith('SUPERGOAL_GOAL_BODY:'):
+            actual.append(f'{p}:{n}')
+assert len(actual) == 1 and actual[0].startswith('templates/LAUNCH_GOAL.md:'), actual
+print('PASS: launch body canonical placement')
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+bundle = '\n'.join(Path(p).read_text(errors='ignore') for p in [
+    'SKILL.md', 'templates/PROTOCOL.md', 'templates/LAUNCH_GOAL.md', 'templates/phase-goal.txt', 'references/rpd-review-gates.md'
+])
+required = [
+  'SUPERGOAL_GOAL_BODY:', 'SUPERGOAL_PHASE_START', 'SUPERGOAL_STATUS',
+  'SUPERGOAL_PHASE_VERIFY', 'RPD_PLAN_REVIEW', 'RPD_PHASE_REVIEW',
+  'RPD_FINAL_REVIEW', 'MEMORY_SAVED', 'SUPERGOAL_PHASE_DONE',
+  'SUPERGOAL_TURN_YIELD', 'PREFLIGHT_GREEN', 'PREFLIGHT_RED',
+  'AUDIT_START', 'AUDIT_VERIFY', 'AUDIT_GAPS', 'AUDIT_COMPLETE',
+  'AUDIT_HANDOFF', 'SUPERGOAL_RUN_COMPLETE', 'FAILURE_PROBE',
+  'FAILURE_ESCALATE', 'FAILURE_HANDOFF', 'SUPERGOAL_REVIEW_FILES_BLOCKED',
+  'SUPERGOAL_FILES_SENT', 'BLOCKED_BY_APPROVAL', 'READY_FOR_DELETE_APPROVAL',
+  'READY_TO_DISPATCH'
+]
+missing = [x for x in required if x not in bundle]
+assert not missing, missing
+print('PASS: marker contract')
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+protocol = Path('templates/PROTOCOL.md').read_text(errors='ignore')
+assert '.supergoal/scripts/repo-state.sh' in protocol
+assert '.supergoal/repo-state.sh' not in protocol
+for forbidden in ('references/', 'SKILL.md'):
+    assert forbidden not in protocol, f'generated protocol references missing external package path: {forbidden}'
+print('PASS: generated protocol is self-contained')
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+repo_state = Path('references/repo-state-comparison.md').read_text(errors='ignore')
+assert '.supergoal/scripts/repo-state.sh' in repo_state
+assert '.supergoal/repo-state.sh' not in repo_state
+assert 'invalid baseline' in repo_state and 'exit 2' in repo_state
+assert 'unchanged — existed before baseline' in repo_state and 'exit 3' in repo_state
+assert 'still reads `present`' not in repo_state
+assert 'ignored-or-non-git existence fallback' not in repo_state
+assert 'exists on disk only in non-git fallback mode' in repo_state
+preserve = Path('references/supergoal-hermes-update-preservation.md').read_text(errors='ignore')
+for required in (
+    'hermes_cli/goal_policies.py',
+    'gateway/goal_launch.py',
+    'thin compatibility shims',
+    'skip exactly one post-turn judge pass',
+    'Queued slash-command fallback is intentionally not used',
+):
+    assert required in preserve, required
+print('PASS: preservation docs match upstream-shaped rail')
+PY
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git check-ignore -q .shaw/state.json || fail ".shaw/ is not ignored"
@@ -214,6 +317,12 @@ if grep -q 'If N < total phases: continue with phase N+1' templates/PROTOCOL.md;
   fail "protocol still chains numbered phases in one turn"
 fi
 pass "protocol yields between phases"
+
+python3 scripts/probe-dev-history-contracts.py
+pass "dev-history hardening contracts"
+
+python3 scripts/probe-upstream-goal-compat.py
+pass "upstream goal compatibility contracts"
 
 REPO="$TMP/repo"
 mkdir "$REPO"

@@ -18,15 +18,15 @@ For the final numbered phase, set `Current phase: AUDIT` rather than chaining in
 
 ## Failure mode this prevents
 
-A prior the product Supergoal run completed several phases in one turn, then hit a tool-calling limit before deploy/final audit. The product code was not the issue; the execution pipeline was. The fix was protocol-level: yield between phases instead of chaining them.
+A prior Human20 Supergoal run completed several phases in one turn, then hit a tool-calling limit before deploy/final audit. The product code was not the issue; the execution pipeline was. The fix was protocol-level: yield between phases instead of chaining them.
 
 ## Operator pitfall
 
-If the user says “I asked you to fix the supergoal-goal pipeline,” do not go fix the product repo’s CI/test pipeline. Scope to the Supergoal execution machinery and the loaded `chip-supergoal` skill/artifacts.
+If the user/operator says “I asked you to fix the supergoal-goal pipeline,” do not go fix the product repo’s CI/test pipeline. Scope to the Supergoal execution machinery and the loaded `chip-supergoal` skill/artifacts.
 
 ## Resuming / finishing an existing plan
 
-When the user asks to “make a Supergoal to finish that plan” or otherwise finish a partially completed Supergoal, do not re-plan from zero and do not continue manual execution. Instead:
+When the user/operator asks to “make a Supergoal to finish that plan” or otherwise finish a partially completed Supergoal, do not re-plan from zero and do not continue manual execution. Instead:
 
 1. Read the existing `.supergoal/<goal>/STATE.md`.
 2. Preserve completed phases exactly as listed in `Completed phases:`.

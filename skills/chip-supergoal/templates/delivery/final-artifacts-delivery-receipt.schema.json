@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["ok", "sent", "kind", "target", "archive", "hash"],
+  "properties": {
+    "ok": {"const": true},
+    "sent": {"const": true},
+    "kind": {"const": "final-artifacts"},
+    "target": {"type": "string", "minLength": 1},
+    "archive": {"type": "string", "minLength": 1},
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

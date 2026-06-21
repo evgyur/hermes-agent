@@ -1,6 +1,6 @@
 # Telegram `/goal` live verification
 
-Use this when the user says he did not see a Supergoal/`/goal` start in a Telegram topic, or when testing the `Start now` clarify-button pipeline.
+Use this when the user/operator says he did not see a Supergoal/`/goal` start in a Telegram topic, or when testing the `Start now` clarify-button pipeline.
 
 ## The failure pattern
 
@@ -9,7 +9,7 @@ A gateway log line like `Supergoal callback: started official /goal from button 
 - visible topic session: `agent:main:telegram:group:<chat_id>:<thread_id>`
 - invisible sibling session: `agent:main:telegram:forum:<chat_id>:<thread_id>`
 
-If GoalManager state is written under the `forum` key, the user will not see the standing-goal continuation in the actual topic session even though the log says the callback started.
+If GoalManager state is written under the `forum` key, Chip will not see the standing-goal continuation in the actual topic session even though the log says the callback started.
 
 ## Required proof before claiming goal started
 
@@ -40,7 +40,7 @@ Required proof after restart:
 
 ## If goal is active in the wrong sibling session
 
-Do not tell the user to press the button again or paste another giant `/goal` body. Repair the state:
+Do not tell the user/operator to press the button again or paste another giant `/goal` body. Repair the state:
 
 1. Load the goal from the wrong `forum` session id.
 2. Save the same `GoalState` under the visible `group` session id.
@@ -50,16 +50,16 @@ Do not tell the user to press the button again or paste another giant `/goal` bo
 
 ## Telegram-chip caveat
 
-`telegram-chip` is useful for verifying the userCR identity, reading exact messages, and sending explicit test messages, but a userbot-send response is not sufficient E2E proof that the Hermes gateway accepted and processed the message. After sending through `telegram-chip`, verify a matching inbound gateway log and/or GoalManager state in the visible session. If no inbound log appears, report that honestly and repair/verify through the gateway state instead of pretending E2E passed.
+`telegram-chip` is useful for verifying delivery account identity, reading exact messages, and sending explicit test messages, but a userbot-send response is not sufficient E2E proof that the Hermes gateway accepted and processed the message. After sending through `telegram-chip`, verify a matching inbound gateway log and/or GoalManager state in the visible session. If no inbound log appears, report that honestly and repair/verify through the gateway state instead of pretending E2E passed.
 
 ## Minimal verification snippet
 
 ```python
 import json, pathlib, sys
-sys.path.insert(0, '<hermes-agent-install>')
+sys.path.insert(0, os.environ.get('HERMES_AGENT_DIR', '<hermes-agent-install>'))
 from hermes_cli.goals import load_goal
 
-sessions = json.loads(pathlib.Path('/home/<user>/.hermes/sessions/sessions.json').read_text())
+sessions = json.loads(pathlib.Path(os.environ.get('HERMES_HOME', '~/.hermes')).expanduser() / 'sessions' / 'sessions.json'.read_text())
 visible_key = 'agent:main:telegram:group:<chat_id>:<thread_id>'
 forum_key = 'agent:main:telegram:forum:<chat_id>:<thread_id>'
 for key in [visible_key, forum_key]:

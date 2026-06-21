@@ -13,7 +13,7 @@ A rendered login button is only frontend evidence. OAuth readiness requires back
 - For custom provider IDs, hit the exact authorize path or app-owned bridge route. Treat `provider is not enabled` / `Provider <id> could not be found` as an audit gap.
 - If the provider is intentionally unavailable, require fail-closed UI: hide the button and leave a non-secret diagnostic in the report/state.
 
-## the product/Yandex example
+## Human20/Yandex example
 
 Yandex did not work as plain `custom:yandex` on self-hosted Supabase. The robust pattern was an app-owned bridge:
 

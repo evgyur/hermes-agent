@@ -18,11 +18,11 @@ Probe the visible Telegram topic session, not a sibling forum/session key:
 
 ```python
 import json, pathlib, sys
-sys.path.insert(0, '<hermes-agent-install>')
+sys.path.insert(0, os.environ.get('HERMES_AGENT_DIR', '<hermes-agent-install>'))
 from hermes_state import SessionDB
 from hermes_cli.goals import GoalManager, load_goal
 
-sessions = json.loads(pathlib.Path('/home/<user>/.hermes/sessions/sessions.json').read_text())
+sessions = json.loads(pathlib.Path(os.environ.get('HERMES_HOME', '~/.hermes')).expanduser() / 'sessions' / 'sessions.json'.read_text())
 key = 'agent:main:telegram:group:<chat_id>:<thread_id>'
 sid = sessions[key]['session_id']
 tip = SessionDB().get_compression_tip(sid) or sid
@@ -45,12 +45,12 @@ sudo systemd-run \
   --unit="hermes-gateway-restart-proof-$(date +%Y%m%d%H%M%S)" \
   --description="Delayed Hermes gateway restart proof" \
   --collect \
-  /bin/bash -lc 'sleep 20; exec <hermes-agent-install>/venv/bin/python /home/<user>/.hermes/scripts/hermes_gateway_restart_probe.py'
+  /bin/bash -lc 'sleep 20; exec <hermes-agent-install>/venv/bin/python <hermes-home>/scripts/hermes_gateway_restart_probe.py'
 ```
 
 The proof script should:
 
-- set `HERMES_HOME=/home/<user>/.hermes` for subprocess probes;
+- set `HERMES_HOME=<hermes-home>` for subprocess probes;
 - log under `~/.hermes/logs/`, not `/tmp`; root may fail to overwrite a user-owned `/tmp` log on systems with `fs.protected_regular`;
 - capture old PID, restart `hermes-gateway`, wait for a fresh active PID;
 - verify `migrate_goal_to_session` is importable from the active checkout;

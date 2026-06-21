@@ -51,7 +51,7 @@ For reset-password recovery links, preserve `next` and set `email_flow=recovery`
 ## Theme and heading guardrails
 
 - Prefer `var(--el-*)` colors/surfaces for changed auth UI.
-- Search touched auth files for `text-red-500`, `text-emerald-600`, `bg-white/`, `bg-green-50`, and visible `the product` product copy. Replace with tokenized surfaces and `Человек 2.0` unless the literal bot/account name is intended.
+- Search touched auth files for `text-red-500`, `text-emerald-600`, `bg-white/`, `bg-green-50`, and visible `Human20` product copy. Replace with tokenized surfaces and `Человек 2.0` unless the literal bot/account name is intended.
 - Provider brand buttons may keep provider colors if contrast is explicit and documented.
 - Check heading structure: no duplicated shell title plus page `<h1>`. Standalone Card `h2` is fine when there is no shell title/hero duplicate.
 

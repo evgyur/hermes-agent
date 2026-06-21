@@ -2,6 +2,8 @@
 
 Use this when a SuperGoal run changes Hermes gateway/GoalManager code and the live Telegram gateway must restart before a button/reply `/goal` proof is valid.
 
+For restart/drain fixes that must resume active `/goal` sessions or reconcile missed Chip Telegram messages, also read `references/gateway-goal-startup-recovery.md` before planning. That reference captures the core lesson: recovery belongs in gateway/GoalManager state-machine code, with startup hooks only as watchdog/reporting, and `telegram-chip` is the read-only Chip chat-history source.
+
 ## Why
 
 Running `hermes gateway run --replace` or restarting the service inside the live Telegram turn can kill the same assistant response. The safe pattern is: deliver the current answer first, schedule a detached restart, then send a compact proof message after the gateway is back.
@@ -32,7 +34,7 @@ sudo systemd-run \
   --description="Delayed Hermes gateway restart + Telegram proof" \
   --on-active=20s \
   --collect \
-  <hermes-agent-install>/venv/bin/python /home/<user>/.hermes/scripts/<probe>.py
+  <hermes-agent-install>/venv/bin/python <hermes-home>/scripts/<probe>.py
 ```
 
 5. Final reply should state only:

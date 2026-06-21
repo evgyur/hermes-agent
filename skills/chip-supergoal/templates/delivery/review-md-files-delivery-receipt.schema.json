@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "required": ["ok", "sent", "kind", "target", "files", "hashes", "message_ids"],
+  "properties": {
+    "ok": {"const": true},
+    "sent": {"const": true},
+    "kind": {"const": "review-md-files"},
+    "target": {"type": "string", "minLength": 1},
+    "files": {"type": "array", "items": {"type": "string"}, "contains": {"const": "LAUNCH_GOAL.md"}},
+    "hashes": {"type": "object"},
+    "message_ids": {"type": "array"}
+  }
+}

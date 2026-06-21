@@ -29,7 +29,7 @@ Send exactly three human-facing files by default:
 
 1. `THINKING.md` — reasoning/review.
 2. `ROADMAP.md` — execution map, review-only.
-3. `LAUNCH_GOAL.md` — the only document the user should reply `/goal` to.
+3. `LAUNCH_GOAL.md` — the only document the user/operator should reply `/goal` to.
 
 Keep `SUPERGOAL_GOAL_BODY:` out of `THINKING.md`, `ROADMAP.md`, `STATE.md`, `PROTOCOL.md`, phase specs, and reports. Those files are internal/review artifacts, not launch surfaces.
 
@@ -38,7 +38,7 @@ Keep `SUPERGOAL_GOAL_BODY:` out of `THINKING.md`, `ROADMAP.md`, `STATE.md`, `PRO
 `LAUNCH_GOAL.md` may contain sections after the body:
 
 ```text
-SUPERGOAL_GOAL_BODY:
+> SUPERGOAL_GOAL_BODY:
 <canonical body>
 
 DONE_CONDITION:
@@ -61,7 +61,7 @@ The stored GoalManager goal must contain only `<canonical body>`. It must not co
 
 Extractor must handle CRLF and no blank line before tail sections; use multiline stop patterns, not exact `\n\nTOKEN:` string search.
 
-## Verification before telling the user to retry
+## Verification before telling Chip to retry
 
 Before saying “reply `/goal` now”, verify:
 
@@ -74,7 +74,7 @@ extracted body has no wrapper/tails
 focused tests for reply command + document hydration pass
 ```
 
-After the user replies `/goal`, proof is the visible `group:<chat_id>:<thread_id>` GoalManager state with:
+After Chip replies `/goal`, proof is the visible `group:<chat_id>:<thread_id>` GoalManager state with:
 
 ```text
 status == active

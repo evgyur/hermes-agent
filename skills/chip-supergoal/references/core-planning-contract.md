@@ -1,0 +1,84 @@
+# Core planning contract
+
+This reference expands the root Stage 0-7 workflow. The root is the public controller; this file holds operational detail.
+
+## Stage 0 — context and resume
+
+- Resolve the live `skill_dir` from `skill_view`/runtime discovery before trusting hard-coded paths.
+- Detect whether the task is a new SuperGoal or a continuation from an existing `.supergoal/STATE.md`.
+- Preload durable memory and session context only when relevant to the user/task.
+- Detect available tools/skills: research, GitHub, browser, MCP/context docs, terminal, file tools, Telegram delivery.
+- For repo-backed work, capture repo root, git status, baseline ref, package manager, and obvious test/build commands.
+
+## Stage 1 — intake
+
+Brownfield: inspect first and ask at most 0-2 batched questions for gaps tools cannot answer.
+
+Greenfield: ask enough batched questions to cover platform, stack, UX direction, audience, integrations, data, deployment, security, and done criteria. Do not over-interview when assumptions are safe to record.
+
+## Stage 2 — recon
+
+Run the included scripts where applicable:
+
+```bash
+bash "$SUPERGOAL_DIR/scripts/detect-stack.sh" > "$SUPERGOAL_ROOT/context.md"
+bash "$SUPERGOAL_DIR/scripts/summarize-repo.sh" > "$SUPERGOAL_ROOT/repo-map.md"
+```
+
+For greenfield/non-repo work:
+
+```bash
+bash "$SUPERGOAL_DIR/scripts/detect-env.sh" > "$SUPERGOAL_ROOT/context.md"
+```
+
+Print a five-line summary: stack, package manager, build/test/lint commands, notable modules, risky areas.
+
+## Stage 3 — think before writing
+
+Write `THINKING.md` before `ROADMAP.md` with:
+
+- goals and non-goals
+- constraints and permissions
+- top 3 risks with mitigation
+- non-obvious dependencies/order
+- assumptions accepted vs blockers
+- memory hits applied
+- tools/skills/research sources used
+- build-vs-buy / existing-solution verdict when relevant
+
+If current facts shape architecture, write `RESEARCH.md` too.
+
+## Stage 4 — decompose
+
+Phase count is derived from the task. No fixed cap. Each phase must leave the project in a verifiable state and have independent acceptance criteria.
+
+## Stage 5 — write files
+
+Write/update:
+
+- `THINKING.md`
+- optional `RESEARCH.md`
+- `ROADMAP.md`
+- `STATE.md`
+- `PROTOCOL.md`
+- `LAUNCH_GOAL.md`
+- `phases/phase-N.md`
+- copied helper scripts
+
+Validate every phase with `scripts/validate-phase.sh`.
+
+## Stage 6 — embedded plan review
+
+Run `RPD_PLAN_REVIEW` from `references/rpd-review-gates.md`. Every material finding must mutate an artifact or be recorded `checked-holds` with evidence tier.
+
+Then show a compact review summary and wait for explicit go/no-go.
+
+## Stage 6.5 — preflight
+
+Run the cheapest real checks that prove the plan can launch safely: required files, phase validation, baseline commands, repo status, delivery configuration, and approval blockers.
+
+Print `PREFLIGHT_GREEN` only with evidence. Print `PREFLIGHT_RED` with a concrete blocker and next move.
+
+## Stage 7 — dispatch
+
+Emit `READY_TO_DISPATCH` plus a launch card/file. Stop. Do not start phase 1 in the planner session.

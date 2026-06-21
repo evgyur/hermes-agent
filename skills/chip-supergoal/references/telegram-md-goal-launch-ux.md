@@ -1,6 +1,6 @@
 # Telegram `.md` SuperGoal launch UX
 
-Use when creating or troubleshooting a SuperGoal launch in Telegram where the user reviews `.md` artifacts and starts execution with reply `/goal`.
+Use when creating or troubleshooting a SuperGoal launch in Telegram where Chip reviews `.md` artifacts and starts execution with reply `/goal`.
 
 ## Human-facing artifact rule
 
@@ -8,9 +8,9 @@ Default to exactly three files:
 
 1. `THINKING.md` — reasoning and trade-offs.
 2. `ROADMAP.md` — phase plan and acceptance shape.
-3. `LAUNCH_GOAL.md` — the only file the user replies to with `/goal`.
+3. `LAUNCH_GOAL.md` — the only file Chip replies to with `/goal`.
 
-Do not dump `PROTOCOL.md`, `STATE.md`, individual `phase-N.md` files, reports, repo maps, or archives into chat unless the user asks. Those are internal/source-of-truth artifacts on disk, not the review UI.
+Do not dump `PROTOCOL.md`, `STATE.md`, individual `phase-N.md` files, reports, repo maps, or archives into chat unless the user/operator asks. Those are internal/source-of-truth artifacts on disk, not the review UI.
 
 ## `LAUNCH_GOAL.md` shape
 
@@ -19,7 +19,7 @@ Keep the file short and explicit:
 ```md
 # <Run name> — SuperGoal launch
 
-SUPERGOAL_GOAL_BODY:
+> SUPERGOAL_GOAL_BODY:
 <raw GoalManager body only; one concise execution condition that points at .supergoal/... files>
 
 DONE_CONDITION:
@@ -42,7 +42,7 @@ When Telegram hydrates a replied document, `event.reply_to_text` may look like:
 [Content of replied-to LAUNCH_GOAL.md]:
 # ...
 
-SUPERGOAL_GOAL_BODY:
+> SUPERGOAL_GOAL_BODY:
 Execute SuperGoal ...
 
 DONE_CONDITION:
@@ -65,7 +65,7 @@ If the stored goal contains `[Content of replied-to ...]`, `DONE_CONDITION`, `OP
 
 ## Verification checklist
 
-Before telling the user to reply `/goal` again:
+Before telling Chip to reply `/goal` again:
 
 - Gateway is restarted after the extraction patch.
 - Visible Telegram `group:<chat_id>:<thread_id>` session has no active bogus goal.
@@ -75,6 +75,6 @@ Before telling the user to reply `/goal` again:
 ## Bad UX to avoid
 
 - Sending a dozen `.md` files into Telegram.
-- Making the user copy a long `/goal "..."` line.
+- Making Chip copy a long `/goal "..."` line.
 - Treating the whole replied file as the goal.
 - Saying the launch worked just because Telegram printed a GoalManager status notice; inspect the stored goal body in the visible group session.
