@@ -1,6 +1,6 @@
 # Travel infographic map workflow
 
-Use when Chip asks for a generated travel map, bucket-list poster, route map, or “same style as this travel infographic” with exact places/labels.
+Use when the user asks for a generated travel map, bucket-list poster, route map, or “same style as this travel infographic” with exact places/labels.
 
 ## Pattern
 

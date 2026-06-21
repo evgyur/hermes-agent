@@ -1,6 +1,6 @@
 ---
 name: img
-description: "Canonical image generation, reference-image editing, deterministic overlays, exact text/logo/QR composition, and production image QA for Chip/Hermes. Use for /img, image generation/editing, posters, infographics, covers, reference-image edits, exact text overlays, QR/logo insertion, and visual prompt refinement. For branded cover systems, route visual planning through chip-cover first, then use img as the rendering/composition engine."
+description: "Canonical image generation, reference-image editing, deterministic overlays, exact text/logo/QR composition, and production image QA for Hermes/Powerpack users. Use for /img, image generation/editing, posters, infographics, covers, reference-image edits, exact text overlays, QR/logo insertion, and visual prompt refinement. For branded cover systems, route visual planning through chip-cover first, then use img as the rendering/composition engine."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -18,7 +18,7 @@ metadata:
 
 # img — Canonical Image Engine
 
-`img` is the canonical image generation and editing engine for Chip/Hermes.
+`img` is the canonical image generation and editing engine for Hermes/Powerpack users.
 
 It absorbs the former `chip-img` production rules. `chip-img` is now only a compatibility alias.
 
@@ -128,7 +128,7 @@ Do not deliver pretty-but-wrong text.
 - Generate QR codes locally with high error correction.
 - Verify placement, no overlap/cropping, and QR scannability when feasible.
 
-Chip-specific rule: when Chip explicitly asks to place real company logos on an editorial/news cover, execute with official/sourceable logos unless the request would mislead, forge endorsement, phish, or impersonate.
+Operator-specific example: when Chip explicitly asks to place real company logos on an editorial/news cover, execute with official/sourceable logos unless the request would mislead, forge endorsement, phish, or impersonate.
 
 ## Cover handoff contract
 

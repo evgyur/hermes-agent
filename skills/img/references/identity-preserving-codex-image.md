@@ -1,6 +1,6 @@
 # Identity-preserving GPT-Image-2 generation via Codex
 
-Use this when Chip sends a face/photo reference and says the generated person must be the same person / “1 в 1 лицо” / “это я”.
+Use this when the user sends a face/photo reference and says the generated person must be the same person / “1 в 1 лицо” / “это я”.
 
 ## Lesson
 
@@ -13,10 +13,10 @@ For identity-critical edits/generations, send the original image as an actual `i
 Use Codex OAuth token + Cloudflare-compatible headers from Hermes internals:
 
 ```python
-import base64, sys
+import base64, os, sys
 from pathlib import Path
 from openai import OpenAI
-sys.path.insert(0, '/opt/hermes-agent')
+sys.path.insert(0, os.environ.get('HERMES_AGENT_DIR', '<hermes-agent-install>'))
 from agent.auxiliary_client import _read_codex_access_token, _codex_cloudflare_headers
 
 token = _read_codex_access_token()

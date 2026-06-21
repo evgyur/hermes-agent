@@ -1,10 +1,10 @@
 # Travel map / place-list infographic workflow
 
-Use when Chip asks to generate a travel map, bucket-list map, city map, cafe/place map, or a poster “in this style” from a reference image.
+Use when the user asks to generate a travel map, bucket-list map, city map, cafe/place map, or a poster “in this style” from a reference image.
 
 ## Core pattern
 
-1. Treat the reference image as **style/layout direction only** unless Chip explicitly asks to edit/copy it.
+1. Treat the reference image as **style/layout direction only** unless the user explicitly asks to edit/copy it.
 2. Generate a clean illustrated base with the image model:
    - ask for no readable text, no labels, no numbers, no logos, no watermark, no social overlay;
    - reserve whitespace for deterministic labels/legend;
@@ -32,12 +32,12 @@ Use when Chip asks to generate a travel map, bucket-list map, city map, cafe/pla
    - translate accidental English filler into Russian when the user asked for Russian.
 6. Deliver only the final image, with one short sentence.
 
-## Chip-specific preferences
+## Operator preference examples
 
-- For travel maps, Chip likes the polished illustrated bucket-list style, but wants practical place data, not fake generic landmarks.
-- If he asks for “чисто <city>”, explicitly exclude neighboring itinerary regions from the generation prompt and QA the final labels for leakage.
-- Prefer Russian legends/descriptions when Chip asks in Russian. Place names can stay in English/Vietnamese; explanations should be Russian.
-- Map labels may be short only if Chip did not ask for exact consistency. If he asks “на карте цифры с номерами и названиями”, make the map names match the legend names.
+- For travel maps, some operators like the polished illustrated bucket-list style, but want practical place data, not fake generic landmarks.
+- If the user asks for “чисто <city>”, explicitly exclude neighboring itinerary regions from the generation prompt and QA the final labels for leakage.
+- Prefer Russian legends/descriptions when the user asks in Russian. Place names can stay in English/Vietnamese; explanations should be Russian.
+- Map labels may be short only if the user did not ask for exact consistency. If the user asks “на карте цифры с номерами и названиями”, make the map names match the legend names.
 
 ## Prompt template for base generation
 

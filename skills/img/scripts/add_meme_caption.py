@@ -3,7 +3,7 @@
 
 Usage:
   python3 scripts/add_meme_caption.py input.jpg output.jpg \
-    --text "МОЙ OPENCLAW ПОСЛЕ 1500 ЧАСОВ РАБОТЫ НАД НИМ" \
+    --text "МОЙ HERMES ПОСЛЕ 1500 ЧАСОВ РАБОТЫ НАД НИМ" \
     --position top
 """
 from __future__ import annotations

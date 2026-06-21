@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministically place a brand logo and QR code onto an existing poster.
 
-Use when Chip asks to insert an exact official logo and a scannable QR into reserved slots.
+Use when the user asks to insert an exact official logo and a scannable QR into reserved slots.
 This avoids generative-image drift/fake QR artifacts and preserves the original poster pixels.
 
 Example:

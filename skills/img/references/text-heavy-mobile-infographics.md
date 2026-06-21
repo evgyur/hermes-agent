@@ -1,6 +1,6 @@
 # Text-heavy mobile infographics
 
-Use this reference when Chip asks for a readable poster/cheat sheet/memo for a phone or foldable screen, especially with Russian text.
+Use this reference when the user asks for a readable poster/cheat sheet/memo for a phone or foldable screen, especially with Russian text.
 
 ## Pattern that worked
 
@@ -23,7 +23,7 @@ Use this reference when Chip asks for a readable poster/cheat sheet/memo for a p
 
 ## Honor Magic V5 / Honor foldable inner screen
 
-For a request like “формат под мой телефон”, “формат под внутренний экран Honor Flip/V5”, or a correction after a wrong poster format, use Chip's known target unless he names another device:
+For a request like “формат под мой телефон”, “формат под внутренний экран Honor Flip/V5”, or a correction after a wrong poster format, use the configured target unless he names another device:
 
 - `2172 × 2352 px`
 - light background if he says “на светлом фоне” — do not adapt a dark poster by merely brightening it; rebuild the composition in light mode

@@ -1,10 +1,10 @@
 # Mascot reference-image text integration workflow
 
-Use this when Chip iterates on a generated mascot/logo/icon and asks to add brand text, a badge, display text, engraving, or several stylistic variants.
+Use this when the user iterates on a generated mascot/logo/icon and asks to add brand text, a badge, display text, engraving, or several stylistic variants.
 
 ## Lesson from Human20 mascot session
 
-Chip rejected a deterministic PIL overlay even though it was positioned and QA-read as an engraving: it still looked “налепил на картинку”. For mascot/icon work where the text must feel physically part of the object, use the reference-image `img` generation path, not a post-composited overlay.
+An operator rejected a deterministic PIL overlay even though it was positioned and QA-read as an engraving: it still looked “налепил на картинку”. For mascot/icon work where the text must feel physically part of the object, use the reference-image `img` generation path, not a post-composited overlay.
 
 ## Preferred workflow
 

@@ -6,7 +6,7 @@ Auth behavior:
 
 - `image_gen.provider: openai-codex` routes through OpenAI Codex / ChatGPT OAuth.
 - `image_gen.model: gpt-image-2-medium` selects the GPT-image-2 medium tier.
-- Do not use fal.ai, `FAL_KEY`, Nano Banana, or paid OpenAI API-key fallback for Chip's Sigurd // Img chat.
+- Do not use fal.ai, `FAL_KEY`, Nano Banana, or paid OpenAI API-key fallback as a deployment-specific default.
 
 Expected configured section:
 

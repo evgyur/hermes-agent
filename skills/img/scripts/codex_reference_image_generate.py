@@ -18,17 +18,33 @@ import argparse
 import base64
 import json
 import mimetypes
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import requests
 
-sys.path.insert(0, os.environ.get("HERMES_AGENT_DIR", "/opt/hermes-agent"))
-from agent.auxiliary_client import (  # noqa: E402
+def _add_hermes_agent_to_path() -> None:
+    agent_dir = os.environ.get("HERMES_AGENT_DIR")
+    if agent_dir:
+        sys.path.insert(0, agent_dir)
+        return
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "agent" / "auxiliary_client.py").exists():
+            sys.path.insert(0, str(parent))
+            return
+
+
+_add_hermes_agent_to_path()
+try:
+    from agent.auxiliary_client import (  # noqa: E402
     _codex_cloudflare_headers,
     _read_codex_access_token,
 )
+except ModuleNotFoundError as exc:
+    raise SystemExit("Set HERMES_AGENT_DIR to your Hermes Agent checkout or run this script from inside the Hermes repo.") from exc
 
 
 def _data_url(path: Path) -> str:

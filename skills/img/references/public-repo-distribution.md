@@ -1,6 +1,6 @@
 # Public repo distribution for chip-img
 
-Use when Chip asks to push/publish the image skill.
+Use when the user asks to push/publish the image skill.
 
 ## Canonical repo
 
