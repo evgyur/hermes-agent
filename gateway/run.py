@@ -5396,6 +5396,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.goals import GoalManager
 
             goal_mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
+            reconcile = getattr(goal_mgr, "reconcile_structured_completion_from_state", None)
+            if callable(reconcile):
+                reconcile()
             goal_state = getattr(goal_mgr, "state", None)
             goal_status = getattr(goal_state, "status", None) if goal_state is not None else None
         except Exception as exc:

@@ -374,6 +374,34 @@ class TestJudgeGoal:
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_status_snapshot_completed_state_file_stops_without_aux_judge(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "done-supergoal-snapshot"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE — demo\n"
+            "Current phase: DONE\n"
+            "Status snapshot: DONE — all phases and final audit complete\n"
+            "Phase 5 complete; AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE ready.\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = (
+            f"From `{root}`, execute `{root}/.supergoal/PROTOCOL.md`, "
+            f"`{root}/.supergoal/ROADMAP.md`, and `{root}/.supergoal/STATE.md`. "
+            "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "Goal complete: yes. Останавливаюсь.")
+        assert verdict == "done"
+        assert "STATE.md already complete" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_terminal_state_without_final_markers_does_not_stop(self, tmp_path):
         from hermes_cli import goals
 
@@ -564,6 +592,31 @@ class TestGoalManager:
         assert mgr.is_active()
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
+
+    def test_goal_manager_reconciles_done_supergoal_before_continuation(self, hermes_home, tmp_path):
+        from hermes_cli.goals import GoalManager
+
+        root = tmp_path / "completed-package"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\n"
+            "Current phase: DONE\n"
+            "Status snapshot: DONE — all phases and final audit complete\n"
+            "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
+            encoding="utf-8",
+        )
+        mgr = GoalManager(session_id="already-done-supergoal")
+        mgr.set(
+            f"From `{root}`, execute `{root}/.supergoal/STATE.md`; "
+            "finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+
+        assert mgr.next_continuation_prompt() is None
+        assert mgr.state is not None
+        assert mgr.state.status == "done"
+        assert "STATE.md already complete" in (mgr.state.last_reason or "")
+        assert not GoalManager(session_id="already-done-supergoal").is_active()
 
     def test_set_rejects_empty(self, hermes_home):
         from hermes_cli.goals import GoalManager

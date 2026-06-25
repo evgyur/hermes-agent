@@ -146,6 +146,35 @@ def test_active_goal_without_resume_pending_uses_goalmanager_classifier(hermes_h
     assert "recover from a lost queued continuation" in decision.prompt
 
 
+def test_completed_supergoal_state_is_not_auto_resumed_at_startup(hermes_home, tmp_path):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="completed-supergoal-sid", resume_pending=False)
+    runner.session_store._entries = {entry.session_key: entry}
+    root = tmp_path / "done-root"
+    sg = root / ".supergoal"
+    sg.mkdir(parents=True)
+    (sg / "STATE.md").write_text(
+        "# STATE\n"
+        "Current phase: DONE\n"
+        "Status snapshot: DONE — all phases and final audit complete\n"
+        "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
+        encoding="utf-8",
+    )
+    GoalManager(session_id=entry.session_id).set(
+        f"From `{root}`, execute `{root}/.supergoal/STATE.md`; "
+        "finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+    )
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "skip"
+    assert decision.reason == "goal-not-active"
+    assert decision.goal_status == "done"
+    state = GoalManager(session_id=entry.session_id).state
+    assert state is not None
+    assert state.status == "done"
+
+
 def test_private_telegram_group_generic_resume_does_not_need_global_flag(hermes_home):
     runner, _adapter = make_restart_runner()
     source = make_restart_source(chat_id="-100private", chat_type="group", thread_id="1858")

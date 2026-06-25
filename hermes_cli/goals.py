@@ -670,6 +670,7 @@ class GoalManager:
         return self._state
 
     def is_active(self) -> bool:
+        self.reconcile_structured_completion_from_state()
         return self._state is not None and self._state.status == "active"
 
     def has_goal(self) -> bool:
@@ -743,6 +744,39 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
+
+    def reconcile_structured_completion_from_state(self) -> Optional[Dict[str, Any]]:
+        """Close active structured goals whose disk state is already terminal.
+
+        SuperGoal wrappers can survive a restart or a weak final response even
+        after the package's own ``.supergoal/STATE.md`` records completion. In
+        that case generating another continuation prompt is a control-plane bug,
+        so reconcile persisted GoalManager state before prompting the LLM again.
+        """
+        state = self._state
+        if state is None or state.status != "active":
+            return None
+        decision = evaluate_structured_completion_guard(state.goal, "")
+        if decision is None or decision.verdict != "done":
+            return None
+        is_handoff = is_structured_handoff_reason(decision.reason)
+        state.status = "blocked" if is_handoff else "done"
+        state.last_verdict = "done"
+        state.last_reason = decision.reason
+        state.last_turn_at = time.time()
+        save_goal(self.session_id, state)
+        return {
+            "status": state.status,
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "done",
+            "reason": decision.reason,
+            "message": (
+                f"⏸ Goal stopped: {decision.reason}"
+                if is_handoff
+                else f"✓ Goal achieved: {decision.reason}"
+            ),
+        }
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -823,6 +857,10 @@ class GoalManager:
                 "reason": "no active goal",
                 "message": "",
             }
+
+        reconciled = self.reconcile_structured_completion_from_state()
+        if reconciled is not None:
+            return reconciled
 
         # Count the turn that just finished.
         state.turns_used += 1
@@ -924,6 +962,8 @@ class GoalManager:
 
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
+            return None
+        if self.reconcile_structured_completion_from_state() is not None:
             return None
         if self._state.subgoals:
             return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(

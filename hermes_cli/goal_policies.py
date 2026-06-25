@@ -179,16 +179,23 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
             logger.debug("structured completion check: could not read %s: %s", state_path, exc)
             return None
 
-        def _label_value(label: str) -> str:
-            match = re.search(
-                rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*:\s*(.+?)\s*$",
-                state_text,
-            )
-            return match.group(1).strip().strip("`*_ ").upper() if match else ""
+        def _label_value(*labels: str) -> str:
+            for label in labels:
+                match = re.search(
+                    rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*:\s*(.+?)\s*$",
+                    state_text,
+                )
+                if match:
+                    return match.group(1).strip().strip("`*_ ").upper()
+            return ""
 
-        status_value = _label_value("Status")
+        def _is_terminal_value(value: str) -> bool:
+            value = (value or "").strip().upper()
+            return value in {"COMPLETE", "DONE"} or value.startswith(("COMPLETE ", "COMPLETE —", "DONE ", "DONE —"))
+
+        status_value = _label_value("Status", "Status snapshot")
         phase_value = _label_value("Current phase")
-        terminal_status = status_value in {"COMPLETE", "DONE"} and phase_value in {"COMPLETE", "DONE"}
+        terminal_status = _is_terminal_value(status_value) and _is_terminal_value(phase_value)
         markers_recorded = "AUDIT_COMPLETE" in state_text.upper() and "SUPERGOAL_RUN_COMPLETE" in state_text.upper()
         if terminal_status and markers_recorded:
             return f"supergoal STATE.md already complete at {label_root}"
