@@ -45,15 +45,25 @@ def _non_fenced_lines(text: str) -> List[str]:
     return lines
 
 
+def _normalize_marker_line(line: str) -> str:
+    """Normalize markdown transcript syntax around an intentional marker line."""
+    cleaned = str(line or "").strip()
+    # Allow markers rendered as headings, blockquotes, or list/task bullets:
+    # `## AUDIT_COMPLETE`, `> AUDIT_COMPLETE`, `- [x] AUDIT_COMPLETE`.
+    cleaned = re.sub(r"^(?:>\s*)+", "", cleaned)
+    cleaned = re.sub(r"^#{1,6}\s+", "", cleaned)
+    cleaned = re.sub(r"^(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?", "", cleaned)
+    cleaned = cleaned.strip().strip("`*_ ")
+    return cleaned.rstrip(':.,;!?)"]}').upper()
+
+
 def has_standalone_marker(text: str, marker: str) -> bool:
     """Return True only when ``marker`` appears as its own transcript line."""
     target = marker.strip().upper()
     if not target:
         return False
     for line in _non_fenced_lines(text):
-        cleaned = line.strip().strip("`*_ ")
-        cleaned = cleaned.rstrip(':.,;!?)"]}').upper()
-        if cleaned == target:
+        if _normalize_marker_line(line) == target:
             return True
     return False
 
@@ -71,8 +81,7 @@ def has_standalone_marker_prefix(text: str, marker: str) -> bool:
         return False
     pattern = re.compile(rf"^{re.escape(target)}\b", re.IGNORECASE)
     for line in _non_fenced_lines(text):
-        cleaned = line.strip().strip("`*_ ")
-        if pattern.match(cleaned):
+        if pattern.match(_normalize_marker_line(line)):
             return True
     return False
 
@@ -214,25 +223,44 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
             value = (value or "").strip().upper()
             return value in {"COMPLETE", "DONE"} or value.startswith(("COMPLETE ", "COMPLETE —", "DONE ", "DONE —"))
 
+        def _audit_markers_recorded_in(text: str) -> bool:
+            return has_standalone_marker(text, "AUDIT_COMPLETE") and has_standalone_marker(
+                text,
+                "SUPERGOAL_RUN_COMPLETE",
+            )
+
         def _audit_markers_recorded() -> bool:
-            if "AUDIT_COMPLETE" in state_text.upper() and "SUPERGOAL_RUN_COMPLETE" in state_text.upper():
+            if _audit_markers_recorded_in(state_text):
                 return True
             # Newer packages keep final markers in reports/final-audit.md and
             # STATE.md only points at that report.  If Current phase is already
             # terminal, consult the canonical final-audit report before letting
             # GoalManager synthesize another continuation turn.
+            canonical_root = state_path.parent.parent if state_path.parent.name == ".supergoal" else label_root
+            allowed_base = canonical_root / ".supergoal"
             candidates = [state_path.parent / "reports" / "final-audit.md"]
             for match in re.finditer(r"`?([^`\n]*final-audit\.md)`?", state_text, re.IGNORECASE):
                 raw = match.group(1).strip().strip("`'\"<>").rstrip(".,;)]")
                 if not raw:
                     continue
                 path = Path(raw)
-                if not path.is_absolute():
-                    path = state_path.parent / path
+                # Completion proof must stay inside the canonical SuperGoal package.
+                # Absolute external paths can point at stale/unrelated audits and
+                # must not satisfy this goal's disk-completion guard.
+                if path.is_absolute():
+                    continue
+                path = state_path.parent / path
                 candidates.append(path)
             seen: set[str] = set()
             for audit_path in candidates:
-                key = str(audit_path)
+                try:
+                    resolved = audit_path.resolve(strict=False)
+                    allowed = allowed_base.resolve(strict=False)
+                    if allowed not in (resolved, *resolved.parents):
+                        continue
+                except Exception:
+                    continue
+                key = str(resolved)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -240,8 +268,7 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
                     audit_text = audit_path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
-                audit_upper = audit_text.upper()
-                if "AUDIT_COMPLETE" in audit_upper and "SUPERGOAL_RUN_COMPLETE" in audit_upper:
+                if _audit_markers_recorded_in(audit_text):
                     return True
             return False
 

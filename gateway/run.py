@@ -5276,6 +5276,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         if getattr(source, "platform", None) != Platform.TELEGRAM:
             return None
+        # Telegram-chip reads private DM history through Chip's user account,
+        # while the gateway ledger records Bot API update IDs.  In 1:1 Telegram
+        # chats those message_id spaces are not comparable, so treating a
+        # telegram-chip-only DM record as ``missed_by_gateway`` is a false
+        # blocker that strands active /goal after every controlled restart.
+        # The Bot API will deliver real pending DM updates on startup; keep the
+        # extra telegram-chip reconciliation for groups/topics where message IDs
+        # are stable across viewers.
+        if getattr(source, "chat_type", "dm") == "dm":
+            return None
         try:
             from gateway.chip_history_recovery import (
                 TelegramChipHistoryConfig,
@@ -5429,7 +5439,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
 
-            history_result = self._startup_chip_history_reconciliation(entry)
+            history_result = None
+            # Telegram DMs have different message_id spaces between Chip's
+            # telegram-chip user client and the bot's Bot API ledger.  Calling
+            # reconciliation here would fabricate ``missed_by_gateway`` rows and
+            # falsely withhold active /goal startup recovery.
+            if getattr(source, "chat_type", "dm") != "dm":
+                history_result = self._startup_chip_history_reconciliation(entry)
             if history_result is not None:
                 unsafe = list(history_result.missed_by_gateway) + list(history_result.requeue_candidates) + list(history_result.alert_only)
                 if unsafe:
@@ -5668,8 +5684,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(result), result, result.__traceback__),
                     )
         self._startup_restore_tasks = []
-        drained = await self._drain_startup_restore_queue()
+        # Release the startup gate before the final drain.  Otherwise a fresh
+        # inbound message can append to the queue after the drain observes it
+        # empty but before `_startup_restore_in_progress` flips false, stranding
+        # that message forever.
         self._startup_restore_in_progress = False
+        drained = await self._drain_startup_restore_queue()
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -8849,39 +8869,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = self.session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        _auto_dispatched = False
-                        session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
-                        _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
-                        if _suppressed_callback_start:
-                            logger.info(
-                                "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
-                                session_key_for_goal,
-                            )
-                            await self._enqueue_goal_kickoff_prompt(
-                                session_entry=session_entry,
-                                source=source,
-                            )
-                        else:
-                            _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
-                                session_entry=session_entry,
-                                source=source,
-                                final_response=_final_text,
-                            )
-                        if not _auto_dispatched and not _suppressed_callback_start:
-                            await self._post_turn_goal_continuation(
-                                session_entry=session_entry,
-                                source=source,
-                                final_response=_final_text,
-                            )
+                if not _final_text:
+                    _final_text = str(getattr(event, "_hermes_final_response", "") or "")
+                try:
+                    session_entry = self.session_store.get_or_create_session(source)
+                except Exception:
+                    session_entry = None
+                if session_entry is not None:
+                    _auto_dispatched = False
+                    session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
+                    _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
+                    if _suppressed_callback_start:
+                        logger.info(
+                            "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
+                            session_key_for_goal,
+                        )
+                        await self._enqueue_goal_kickoff_prompt(
+                            session_entry=session_entry,
+                            source=source,
+                        )
+                    elif _final_text.strip():
+                        _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
+                            session_entry=session_entry,
+                            source=source,
+                            final_response=_final_text,
+                        )
+                    # Skip content-dependent judging for empty responses
+                    # (interrupted / errored), but still consume callback-start
+                    # markers above so button-started goals always get their
+                    # first kickoff even when the planning answer was streamed.
+                    if _final_text.strip() and not _auto_dispatched and not _suppressed_callback_start:
+                        await self._post_turn_goal_continuation(
+                            session_entry=session_entry,
+                            source=source,
+                            final_response=_final_text,
+                        )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             self._mark_gateway_ledger_after_agent_result(
@@ -10440,6 +10462,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Transcribe-route summary document send failed: %s", exc, exc_info=True)
 
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                try:
+                    setattr(event, "_hermes_final_response", response)
+                except Exception:
+                    pass
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
@@ -11031,6 +11057,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 message_id=None,
                 channel_prompt=None,
+                internal=True,
             )
             self._enqueue_fifo(session_key, kickoff_event, adapter)
             return True
@@ -11150,6 +11177,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            try:
+                if event.source is not None:
+                    await self._enqueue_goal_kickoff_prompt(
+                        session_entry=session_entry,
+                        source=event.source,
+                    )
+            except Exception as exc:
+                logger.debug("goal resume: continuation enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -11162,6 +11197,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
+                if _quick_key:
+                    self._set_session_reasoning_override(_quick_key, None)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
@@ -11200,6 +11237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -11383,6 +11421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
                 logger.info("supergoal auto-dispatch: queued official /goal kickoff for %s", _quick_key)
@@ -11455,6 +11494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:

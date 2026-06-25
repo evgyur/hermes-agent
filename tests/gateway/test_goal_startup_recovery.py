@@ -157,7 +157,8 @@ def test_completed_supergoal_state_is_not_auto_resumed_at_startup(hermes_home, t
         "# STATE\n"
         "Current phase: DONE\n"
         "Status snapshot: DONE — all phases and final audit complete\n"
-        "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
+        "AUDIT_COMPLETE\n"
+        "SUPERGOAL_RUN_COMPLETE\n",
         encoding="utf-8",
     )
     GoalManager(session_id=entry.session_id).set(
@@ -245,13 +246,13 @@ class _UnsafeChipHistoryResult:
         return []
 
 
-def test_active_goal_startup_checks_chip_history_before_auto_resume(hermes_home, monkeypatch):
+def test_active_goal_dm_skips_telegram_chip_history_id_mismatch(hermes_home, monkeypatch):
     runner, _adapter = make_restart_runner()
     source = make_restart_source(chat_id="617744661", chat_type="dm")
     now = datetime.now()
     entry = SessionEntry(
         session_key="agent:main:telegram:dm:617744661",
-        session_id="chip-history-active-goal-sid",
+        session_id="chip-dm-active-goal-sid",
         created_at=now,
         updated_at=now,
         origin=source,
@@ -260,7 +261,37 @@ def test_active_goal_startup_checks_chip_history_before_auto_resume(hermes_home,
         resume_pending=False,
         last_resume_marked_at=now,
     )
+    GoalManager(session_id=entry.session_id).set("continue DM goal despite telegram-chip bot/user id mismatch")
+
+    def _should_not_run(_entry):
+        raise AssertionError("telegram-chip reconciliation must not run for Telegram DMs")
+
+    monkeypatch.setattr(runner, "_startup_chip_history_reconciliation", _should_not_run)
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "auto_resume"
+    assert decision.reason == "active-goal-startup-recovery"
+    assert "continue DM goal" in decision.prompt
+
+
+def test_active_goal_startup_checks_chip_history_before_auto_resume(hermes_home, monkeypatch):
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="-100private", chat_type="group", thread_id="1858")
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-100private:1858",
+        session_id="chip-history-active-goal-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=False,
+        last_resume_marked_at=now,
+    )
     GoalManager(session_id=entry.session_id).set("continue after checking recent visible messages")
+    monkeypatch.setenv("TELEGRAM_PRIVATE_CHATS", "-100private")
     monkeypatch.setattr(runner, "_startup_chip_history_reconciliation", lambda _entry: _UnsafeChipHistoryResult())
 
     decision = runner._classify_startup_goal_recovery(entry)

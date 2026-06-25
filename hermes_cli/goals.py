@@ -572,7 +572,13 @@ def judge_goal(
 
     structured_decision = evaluate_structured_completion_guard(goal, last_response)
     if structured_decision is not None:
-        return structured_decision.verdict, structured_decision.reason, False
+        clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+        # User-added subgoals are extra completion criteria.  A deterministic
+        # SuperGoal terminal marker proves the base goal contract, but it cannot
+        # prove arbitrary later /subgoal text.  Let the subgoal-aware judge make
+        # the final call instead of silently bypassing those criteria.
+        if structured_decision.verdict != "done" or not clean_subgoals:
+            return structured_decision.verdict, structured_decision.reason, False
 
     try:
         from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
@@ -754,7 +760,7 @@ class GoalManager:
         so reconcile persisted GoalManager state before prompting the LLM again.
         """
         state = self._state
-        if state is None or state.status != "active":
+        if state is None or state.status != "active" or state.subgoals:
             return None
         decision = evaluate_structured_completion_guard(state.goal, "")
         if decision is None or decision.verdict != "done":

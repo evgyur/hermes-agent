@@ -1721,6 +1721,14 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # Real user text must never be appended to a synthetic/internal goal
+        # continuation (or vice versa).  Preempt by replacing the slot; the
+        # goal hook will re-enqueue a continuation after the real turn if the
+        # goal is still active.
+        if bool(getattr(existing, "internal", False)) != bool(getattr(event, "internal", False)):
+            pending_messages[session_key] = event
+            return
+
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)

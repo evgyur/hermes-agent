@@ -356,7 +356,8 @@ class TestJudgeGoal:
             "# STATE\n"
             "Status: DONE\n"
             "Current phase: DONE\n"
-            "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
+            "AUDIT_COMPLETE\n"
+            "SUPERGOAL_RUN_COMPLETE\n",
             encoding="utf-8",
         )
         fake_client = MagicMock()
@@ -384,7 +385,9 @@ class TestJudgeGoal:
             "# STATE — demo\n"
             "Current phase: DONE\n"
             "Status snapshot: DONE — all phases and final audit complete\n"
-            "Phase 5 complete; AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE ready.\n",
+            "Phase 5 complete.\n"
+            "AUDIT_COMPLETE\n"
+            "SUPERGOAL_RUN_COMPLETE\n",
             encoding="utf-8",
         )
         fake_client = MagicMock()
@@ -460,6 +463,94 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_markdown_markers_count_as_standalone_completion(self):
+        from hermes_cli import goals
+
+        goal = "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = "## AUDIT_COMPLETE\n\n- [x] SUPERGOAL_RUN_COMPLETE\n"
+        verdict, reason, _ = goals.judge_goal(goal, response)
+        # The deterministic guard must not block markdown-rendered markers as
+        # missing; with no auxiliary client configured this falls through to the
+        # normal judge-unavailable path instead of returning the marker-missing
+        # continue reason.
+        assert verdict in {"continue", "skipped", "done"}
+        assert "missing standalone" not in reason
+
+    def test_supergoal_markdown_state_negated_marker_mentions_do_not_stop(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "negated-markers"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\n\n## Current phase\nDONE\n\n"
+            "Note: final audit is missing AUDIT_COMPLETE and "
+            "SUPERGOAL_RUN_COMPLETE; do not stop.\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = f"Execute `{root}/.supergoal/STATE.md`; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_external_absolute_final_audit_does_not_satisfy_state(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "root"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        outside = tmp_path / "outside" / "final-audit.md"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("AUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n", encoding="utf-8")
+        (sg / "STATE.md").write_text(
+            f"# STATE\n\n## Current phase\nDONE\n\nFinal audit: `{outside}`\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = f"Execute `{root}/.supergoal/STATE.md`; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+        assert verdict == "continue"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_structured_done_with_subgoals_uses_aux_judge(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "subgoal-terminal"
+        sg = root / ".supergoal"
+        sg.mkdir(parents=True)
+        (sg / "STATE.md").write_text(
+            "# STATE\nStatus: DONE\nCurrent phase: DONE\nAUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "subgoal missing"}'))]
+        )
+        goal = f"Execute `{root}/.supergoal/STATE.md`; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(
+                goal,
+                "AUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
+                subgoals=["also provide docs evidence"],
+            )
+        assert verdict == "continue"
+        assert reason == "subgoal missing"
+        fake_client.chat.completions.create.assert_called_once()
 
     def test_supergoal_terminal_state_without_final_markers_does_not_stop(self, tmp_path):
         from hermes_cli import goals
@@ -662,7 +753,8 @@ class TestGoalManager:
             "# STATE\n"
             "Current phase: DONE\n"
             "Status snapshot: DONE — all phases and final audit complete\n"
-            "Final audit recorded AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE.\n",
+            "AUDIT_COMPLETE\n"
+            "SUPERGOAL_RUN_COMPLETE\n",
             encoding="utf-8",
         )
         mgr = GoalManager(session_id="already-done-supergoal")
