@@ -180,24 +180,81 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
             return None
 
         def _label_value(*labels: str) -> str:
+            lines = state_text.splitlines()
             for label in labels:
+                # Inline form: `Current phase: DONE` / `Status: COMPLETE`.
                 match = re.search(
                     rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*:\s*(.+?)\s*$",
                     state_text,
                 )
                 if match:
                     return match.group(1).strip().strip("`*_ ").upper()
+
+                # Markdown heading form, common in generated SuperGoal state:
+                #
+                #   ## Current phase
+                #   DONE
+                heading = re.compile(
+                    rf"^\s*#+\s*(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*$",
+                    re.IGNORECASE,
+                )
+                for idx, line in enumerate(lines):
+                    if not heading.match(line):
+                        continue
+                    for nxt in lines[idx + 1 :]:
+                        stripped = nxt.strip()
+                        if not stripped:
+                            continue
+                        if stripped.startswith("#"):
+                            break
+                        return stripped.strip("`*_ -").upper()
             return ""
 
         def _is_terminal_value(value: str) -> bool:
             value = (value or "").strip().upper()
             return value in {"COMPLETE", "DONE"} or value.startswith(("COMPLETE ", "COMPLETE —", "DONE ", "DONE —"))
 
+        def _audit_markers_recorded() -> bool:
+            if "AUDIT_COMPLETE" in state_text.upper() and "SUPERGOAL_RUN_COMPLETE" in state_text.upper():
+                return True
+            # Newer packages keep final markers in reports/final-audit.md and
+            # STATE.md only points at that report.  If Current phase is already
+            # terminal, consult the canonical final-audit report before letting
+            # GoalManager synthesize another continuation turn.
+            candidates = [state_path.parent / "reports" / "final-audit.md"]
+            for match in re.finditer(r"`?([^`\n]*final-audit\.md)`?", state_text, re.IGNORECASE):
+                raw = match.group(1).strip().strip("`'\"<>").rstrip(".,;)]")
+                if not raw:
+                    continue
+                path = Path(raw)
+                if not path.is_absolute():
+                    path = state_path.parent / path
+                candidates.append(path)
+            seen: set[str] = set()
+            for audit_path in candidates:
+                key = str(audit_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    audit_text = audit_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                audit_upper = audit_text.upper()
+                if "AUDIT_COMPLETE" in audit_upper and "SUPERGOAL_RUN_COMPLETE" in audit_upper:
+                    return True
+            return False
+
         status_value = _label_value("Status", "Status snapshot")
         phase_value = _label_value("Current phase")
-        terminal_status = _is_terminal_value(status_value) and _is_terminal_value(phase_value)
-        markers_recorded = "AUDIT_COMPLETE" in state_text.upper() and "SUPERGOAL_RUN_COMPLETE" in state_text.upper()
-        if terminal_status and markers_recorded:
+        # A terminal Current phase is enough when final audit markers exist in
+        # STATE.md or the canonical final-audit report.  Requiring an inline
+        # Status label missed Markdown-style STATE.md files and caused spammy
+        # post-complete continuation loops.
+        terminal_status = _is_terminal_value(phase_value) or (
+            _is_terminal_value(status_value) and _is_terminal_value(phase_value)
+        )
+        if terminal_status and _audit_markers_recorded():
             return f"supergoal STATE.md already complete at {label_root}"
         return ""
 
