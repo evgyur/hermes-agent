@@ -544,6 +544,39 @@ def test_business_dm_ignored_user_id_suppresses_reflected_human_account_echo():
     ) is True
 
 
+def test_business_dm_private_chat_owner_echoes_are_ignored_by_default():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661", "111"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, mirrored owner echo", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, real customer", from_user_id=111)
+    ) is True
+
+
+def test_business_dm_private_chat_owner_echo_guard_can_be_disabled():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_owner_echoes": False,
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, explicit business command", from_user_id=617744661)
+    ) is True
+
+
 def test_business_message_source_keeps_business_connection_id():
     adapter = _make_adapter(require_mention=False)
     message = _business_dm_message("Sigurd, ping", from_user_id=95948382)

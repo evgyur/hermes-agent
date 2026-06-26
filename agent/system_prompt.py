@@ -195,19 +195,44 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # names-only in the index (never hidden — skill_view/skills_list
         # reach everything, and every name stays visible for recall). The
         # default coding posture leaves the index untouched.
-        _compact_cats = frozenset()
+        _compact_cats = set()
         try:
             from agent.coding_context import coding_compact_skill_categories
 
-            _compact_cats = coding_compact_skill_categories(
+            _compact_cats.update(coding_compact_skill_categories(
                 platform=agent.platform, cwd=resolve_context_cwd()
-            )
+            ))
         except Exception:
-            _compact_cats = frozenset()
+            pass
+
+        # Profile/platform-level compaction for high-skill installations.
+        # Config shape:
+        #   skills.compact_categories: [aiwebd, design-pack]
+        #   skills.platform_compact_categories.telegram: [creative, mlops]
+        # Categories are demoted to names-only, not hidden; explicit
+        # skill_view/skills_list still reaches every skill.
+        try:
+            from hermes_cli.config import load_config
+
+            _skills_cfg = (load_config().get("skills", {}) or {})
+            _global_cats = _skills_cfg.get("compact_categories") or []
+            if isinstance(_global_cats, str):
+                _global_cats = [_global_cats]
+            _compact_cats.update(str(c).strip() for c in _global_cats if str(c).strip())
+
+            _platform_cats = (_skills_cfg.get("platform_compact_categories") or {}).get(
+                (agent.platform or "").lower().strip(), []
+            )
+            if isinstance(_platform_cats, str):
+                _platform_cats = [_platform_cats]
+            _compact_cats.update(str(c).strip() for c in _platform_cats if str(c).strip())
+        except Exception:
+            pass
+
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
+            compact_categories=frozenset(_compact_cats) or None,
         )
     else:
         skills_prompt = ""

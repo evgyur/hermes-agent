@@ -35,6 +35,10 @@
     "@streamdown/math": "^1.0.2",
     "agent-browser": "^0.26.0"
   },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "vite": "^8.0.16"
+  },
   "overrides": {
     "lodash": "4.18.1"
   },

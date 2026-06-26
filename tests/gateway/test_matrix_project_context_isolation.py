@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime
 from types import SimpleNamespace
@@ -376,6 +377,99 @@ async def test_matrix_status_reports_current_matrix_room_scope():
     assert "session_key: sha256:" in result
     assert PROJECT_A_NAME not in result
     assert PROJECT_A_ROOM_ID not in result
+
+
+@pytest.mark.asyncio
+async def test_status_prefers_model_switch_runtime_over_stale_billing_provider():
+    source = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    entry = _entry(source, "session-glm", "GLM switch")
+    runner = _make_runner(source, [entry])
+    db = MagicMock()
+    db.get_session_title.return_value = "GLM switch"
+    db.get_session.return_value = {
+        "model": "glm",
+        "billing_provider": "openai-codex",
+        "billing_base_url": "https://chatgpt.com/backend-api/codex",
+        "model_config": json.dumps({
+            "model": "glm",
+            "provider": "human20-keys",
+            "base_url": "http://127.0.0.1:18750/v1",
+            "api_mode": "chat_completions",
+        }),
+    }
+    runner._session_db = db
+
+    result = await runner._handle_status_command(_event("/status", source))
+
+    assert "Model: human20-keys/glm" in result
+    assert "Runtime: human20-keys" in result
+    assert "openai-codex/glm" not in result
+    assert "Runtime: OpenAI Codex" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_does_not_mix_stale_running_agent_provider_with_switched_model():
+    source = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    entry = _entry(source, "session-glm-running", "GLM switch while running")
+    runner = _make_runner(source, [entry])
+    db = MagicMock()
+    db.get_session_title.return_value = "GLM switch while running"
+    db.get_session.return_value = {
+        "model": "glm",
+        "billing_provider": "openai-codex",
+        "billing_base_url": "https://chatgpt.com/backend-api/codex",
+        "model_config": json.dumps({
+            "model": "glm",
+            "provider": "human20-keys",
+            "base_url": "http://127.0.0.1:18750/v1",
+            "api_mode": "chat_completions",
+        }),
+    }
+    runner._session_db = db
+    runner._running_agents[entry.session_key] = SimpleNamespace(
+        provider="openai-codex",
+        model="glm",
+        base_url="https://chatgpt.com/backend-api/codex",
+        context_compressor=None,
+    )
+
+    result = await runner._handle_status_command(_event("/status", source))
+
+    assert "Model: human20-keys/glm" in result
+    assert "Runtime: human20-keys" in result
+    assert "openai-codex/glm" not in result
+    assert "Runtime: OpenAI Codex" not in result
+
+
+def test_persist_model_switch_runtime_records_provider_not_just_model():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    db = MagicMock()
+    db.get_session.return_value = {
+        "model_config": json.dumps({"_branched_from": "root"}),
+    }
+    runner._session_db = db
+    result = SimpleNamespace(
+        new_model="glm",
+        target_provider="human20-keys",
+        base_url="http://127.0.0.1:18750/v1",
+        api_mode="chat_completions",
+    )
+
+    runner._persist_model_switch_runtime("session-glm", result)
+
+    db.update_session_meta.assert_called_once()
+    session_id, raw_config, model = db.update_session_meta.call_args.args
+    persisted = json.loads(raw_config)
+    assert session_id == "session-glm"
+    assert model == "glm"
+    assert persisted["_branched_from"] == "root"
+    assert persisted["model"] == "glm"
+    assert persisted["provider"] == "human20-keys"
+    assert persisted["base_url"] == "http://127.0.0.1:18750/v1"
+    assert persisted["api_mode"] == "chat_completions"
+    assert persisted["billing_provider"] == "human20-keys"
 
 
 @pytest.mark.asyncio

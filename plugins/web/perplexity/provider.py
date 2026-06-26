@@ -33,7 +33,23 @@ _DEFAULT_MODEL = "sonar"
 
 def _api_key() -> str:
     """Return the configured Perplexity API key, supporting both env names."""
-    return (os.getenv("PERPLEXITY_API_KEY") or os.getenv("PPLX_API_KEY") or "").strip()
+    for name in ("PERPLEXITY_API_KEY", "PPLX_API_KEY"):
+        value = _env_value(name)
+        if value:
+            return value
+    return ""
+
+
+def _env_value(name: str) -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(name)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.getenv(name, "")
+    return (value or "").strip()
 
 
 class PerplexityWebSearchProvider(WebSearchProvider):

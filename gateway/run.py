@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -8423,6 +8424,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_help_command(event)
 
         if canonical == "start":
+            start_message = os.environ.get("HERMES_GATEWAY_START_MESSAGE", "").strip()
+            if start_message:
+                logger.info("Replying to /start platform ping for session %s via HERMES_GATEWAY_START_MESSAGE", _quick_key)
+                return start_message
             logger.info("Ignoring /start platform ping for session %s", _quick_key)
             return ""
 
@@ -8996,7 +9001,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # may be sharing a file, not asking for transcription. Dedicated
                 # transcribe-route chats are different: any audio attachment is the task.
                 if event.message_type == MessageType.AUDIO:
-                    if _is_tg_transcribe_media or mtype.startswith("audio/"):
+                    if _is_tg_transcribe_media:
                         audio_paths.append(path)
                     else:
                         audio_file_paths.append(path)
@@ -9037,6 +9042,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             if audio_paths:
+                # Telegram voice events can reach this path more than once during
+                # busy-session queueing, and some adapters may expose the same
+                # cached audio path twice.  Keep the agent transcript intact, but
+                # never echo the same STT result back to the user twice.
+                audio_paths = list(dict.fromkeys(audio_paths))
                 try:
                     _ack_adapter = self.adapters.get(source.platform)
                     _ack_is_transcribe = False
@@ -9062,11 +9072,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Echo each successful transcript back to the user immediately,
                 # before the agent loop runs. Lets the user verify STT quality
                 # in real-time and see the raw whisper output verbatim.
-                if _successful_transcripts:
-                    _echo_adapter = self.adapters.get(source.platform)
+                # Dedicated Telegram transcribe-route chats are different: their
+                # contract is two files only (transcript + Russian summary), so
+                # raw transcript chunks in chat are spam.
+                _echo_adapter = self.adapters.get(source.platform)
+                _suppress_transcript_echo = False
+                if _echo_adapter is not None:
+                    _route_check = getattr(_echo_adapter, "_is_transcribe_route_chat", None)
+                    if callable(_route_check):
+                        try:
+                            _suppress_transcript_echo = bool(_route_check(source.chat_id))
+                        except Exception:
+                            _suppress_transcript_echo = False
+                if _successful_transcripts and not _suppress_transcript_echo:
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
+                        _seen = getattr(self, "_transcript_echo_seen", None)
+                        if _seen is None:
+                            _seen = set()
+                            self._transcript_echo_seen = _seen
                         for _tx in _successful_transcripts:
+                            _echo_key = (
+                                str(getattr(source.platform, "value", source.platform)),
+                                str(source.chat_id),
+                                str(getattr(source, "thread_id", None)),
+                                str(getattr(event, "message_id", None)),
+                                _tx,
+                            )
+                            if _echo_key in _seen:
+                                logger.debug("Transcript echo skipped as duplicate: chat=%s message=%s", source.chat_id, getattr(event, "message_id", None))
+                                continue
+                            if not self._claim_transcript_echo_once(source, event, _tx):
+                                continue
+                            _seen.add(_echo_key)
+                            if len(_seen) > 512:
+                                self._transcript_echo_seen = set(list(_seen)[-256:])
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
@@ -13702,6 +13742,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         path.write_text(content, encoding="utf-8")
         return str(path)
 
+
+    def _claim_transcript_echo_once(self, source, event, transcript: str, *, ttl_seconds: float = 300.0) -> bool:
+        """Return True exactly once for the same visible STT echo in a short window.
+
+        The in-memory guard is not enough when a voice message interrupts an
+        active turn: the fresh-message path and pending-message path can race
+        through different session agents.  This tiny SQLite claim is shared by
+        the gateway process and survives those races, so Telegram gets one
+        transcript bubble while the agent transcript can still be enriched.
+        """
+        tx = (transcript or "").strip()
+        if not tx:
+            return False
+        platform = str(getattr(source.platform, "value", source.platform))
+        material = json.dumps(
+            [platform, str(source.chat_id), str(getattr(source, "thread_id", None)), tx],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        db_path = home / "transcript_echo_dedupe.sqlite3"
+        now = time.time()
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(db_path), timeout=2.0) as con:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS transcript_echo_claims "
+                    "(dedupe_key TEXT PRIMARY KEY, ts REAL NOT NULL, chat_id TEXT, message_id TEXT)"
+                )
+                con.execute("DELETE FROM transcript_echo_claims WHERE ts < ?", (now - ttl_seconds,))
+                con.execute(
+                    "INSERT INTO transcript_echo_claims(dedupe_key, ts, chat_id, message_id) VALUES (?, ?, ?, ?)",
+                    (digest, now, str(source.chat_id), str(getattr(event, "message_id", ""))),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            logger.debug(
+                "Transcript echo skipped by sqlite dedupe: chat=%s message=%s",
+                source.chat_id,
+                getattr(event, "message_id", None),
+            )
+            return False
+        except Exception as exc:
+            # Fail open: a broken dedupe store must not hide transcripts.
+            logger.debug("Transcript echo sqlite dedupe unavailable: %s", exc)
+            return True
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -13854,16 +13942,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 audio_paths.append(path)
 
         if audio_paths:
+            audio_paths = list(dict.fromkeys(audio_paths))
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
             # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages.
-            if successful_transcripts:
+            # feel identical to fresh voice messages. Dedicated Telegram
+            # transcribe-route chats are file-only dropboxes, so suppress
+            # transcript chunk spam there too.
+            _suppress_transcript_echo = False
+            _route_check = getattr(adapter, "_is_transcribe_route_chat", None)
+            if callable(_route_check):
+                try:
+                    _suppress_transcript_echo = bool(_route_check(source.chat_id))
+                except Exception:
+                    _suppress_transcript_echo = False
+            if successful_transcripts and not _suppress_transcript_echo:
                 echo_adapter = self.adapters.get(source.platform)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
                     for tx in successful_transcripts:
+                        seen = getattr(self, "_transcript_echo_seen", None)
+                        if seen is None:
+                            seen = set()
+                            self._transcript_echo_seen = seen
+                        echo_key = (
+                            str(getattr(source.platform, "value", source.platform)),
+                            str(source.chat_id),
+                            str(getattr(source, "thread_id", None)),
+                            str(getattr(event, "message_id", None)),
+                            tx,
+                        )
+                        if echo_key in seen:
+                            logger.debug("Transcript echo skipped as duplicate: chat=%s message=%s", source.chat_id, getattr(event, "message_id", None))
+                            continue
+                        if not self._claim_transcript_echo_once(source, event, tx):
+                            continue
+                        seen.add(echo_key)
+                        if len(seen) > 512:
+                            self._transcript_echo_seen = set(list(seen)[-256:])
                         try:
                             await echo_adapter.send(
                                 source.chat_id,

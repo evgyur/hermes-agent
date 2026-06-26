@@ -6687,8 +6687,28 @@ class TelegramAdapter(BasePlatformAdapter):
         if raw is None:
             raw = os.getenv("TELEGRAM_BUSINESS_IGNORE_USER_IDS", "")
         if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+            ignored = {str(part).strip() for part in raw if str(part).strip()}
+        else:
+            ignored = {part.strip() for part in str(raw).split(",") if part.strip()}
+
+        # Telegram Business can mirror the account owner's own messages back to
+        # the bot.  Those are not customer requests and replying to them can make
+        # the bot appear to speak through the human account.  Fail closed for the
+        # operator/private allowlist unless explicitly disabled for a deployment.
+        raw_ignore_owner = self._telegram_business_config().get("ignore_owner_echoes", True)
+        if isinstance(raw_ignore_owner, str):
+            ignore_owner = raw_ignore_owner.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            ignore_owner = bool(raw_ignore_owner)
+        if ignore_owner:
+            raw_owner_ids = self.config.extra.get("allow_from")
+            if raw_owner_ids is None:
+                raw_owner_ids = os.getenv("TELEGRAM_ALLOWED_USERS", "")
+            if isinstance(raw_owner_ids, list):
+                ignored.update(str(part).strip() for part in raw_owner_ids if str(part).strip())
+            else:
+                ignored.update(part.strip() for part in str(raw_owner_ids).split(",") if part.strip())
+        return ignored
 
     def _message_matches_business_trigger(self, message: Message) -> bool:
         if not self._telegram_business_enabled():
@@ -7727,6 +7747,18 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.voice, "voice message")
                 if not allowed:
+                    recovered = await self._recover_transcribe_route_media_via_telegram_chip(
+                        msg,
+                        event,
+                        ext=".ogg",
+                        mime_type="audio/ogg",
+                        message_type=MessageType.VOICE,
+                        reason=note or "voice message exceeds Bot API download limit",
+                    )
+                    if recovered:
+                        event = self._prepare_recent_visible_context(event)
+                        await self.handle_message(event)
+                        return
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
                     await self.handle_message(event)
@@ -7743,6 +7775,18 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.audio, "audio file")
                 if not allowed:
+                    recovered = await self._recover_transcribe_route_media_via_telegram_chip(
+                        msg,
+                        event,
+                        ext=".mp3",
+                        mime_type="audio/mpeg",
+                        message_type=MessageType.AUDIO,
+                        reason=note or "audio file exceeds Bot API download limit",
+                    )
+                    if recovered:
+                        event = self._prepare_recent_visible_context(event)
+                        await self.handle_message(event)
+                        return
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
                     await self.handle_message(event)

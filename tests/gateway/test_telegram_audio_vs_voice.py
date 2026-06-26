@@ -186,3 +186,65 @@ def test_telegram_media_type_detection_audio_vs_voice():
     assert MessageType.VOICE.value == "voice"
     # Sanity: they are distinct
     assert MessageType.AUDIO != MessageType.VOICE
+
+
+@pytest.mark.asyncio
+async def test_transcribe_route_sends_files_without_raw_transcript_echo(tmp_path):
+    """Dedicated transcribe-route chats must receive documents, not transcript text spam."""
+    runner = _make_runner(stt_enabled=True)
+
+    class _Adapter:
+        def __init__(self):
+            self.sent = []
+            self.documents = []
+
+        def _is_transcribe_route_chat(self, chat_id):
+            return str(chat_id) == "-1003918810557"
+
+        async def send(self, chat_id, content, **kwargs):
+            self.sent.append((chat_id, content, kwargs))
+
+        async def send_document(self, chat_id, file_path, **kwargs):
+            self.documents.append((chat_id, file_path, kwargs))
+
+    adapter = _Adapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda *a, **k: None
+    runner._reply_anchor_for_event = lambda event: None
+    runner._claim_transcript_echo_once = lambda source, event, tx: True
+
+    audio_path = tmp_path / "call.mp3"
+    audio_path.write_bytes(b"fake audio")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003918810557",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.AUDIO,
+        source=source,
+        media_urls=[str(audio_path)],
+        media_types=["audio/mpeg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "длинная транскрипция", "provider": "test"},
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert "длинная транскрипция" in result
+    assert adapter.sent == [
+        (
+            "-1003918810557",
+            "Принял. Достаю медиа и транскрибирую. В конце пришлю 2 файла: транскрипт с таймкодами и /summ-саммари на русском.",
+            {"reply_to": None, "metadata": None},
+        )
+    ]
+    assert len(adapter.documents) == 1
+    assert adapter.documents[0][1].endswith(".transcript-timecoded.txt")

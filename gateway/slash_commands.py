@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -47,6 +48,59 @@ logger = logging.getLogger("gateway.run")
 
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
+
+    @staticmethod
+    def _session_model_config_dict(row: dict[str, Any]) -> dict[str, Any]:
+        """Return the parsed per-session runtime model_config dict.
+
+        ``sessions.billing_provider`` is an accounting bucket from the last
+        completed API call. A typed ``/model ... --provider X`` can change the
+        runtime before the next API call updates billing columns, so status and
+        resume logic must prefer the explicit runtime provider stored in
+        ``model_config`` when present.
+        """
+        raw = row.get("model_config") if isinstance(row, dict) else None
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _persist_model_switch_runtime(self, session_id: str, result: Any) -> None:
+        """Persist a /model switch's runtime identity, not just model name."""
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        model_config: dict[str, Any] = {}
+        try:
+            existing = session_db.get_session(session_id) or {}
+            model_config = self._session_model_config_dict(existing)
+        except Exception:
+            model_config = {}
+        model_config.update({
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+            "billing_provider": result.target_provider,
+            "billing_base_url": result.base_url,
+        })
+        try:
+            if hasattr(session_db, "update_session_meta"):
+                session_db.update_session_meta(
+                    session_id,
+                    json.dumps(model_config, ensure_ascii=False),
+                    result.new_model,
+                )
+            else:
+                session_db.update_session_model(session_id, result.new_model)
+        except Exception as exc:
+            logger.debug("Failed to persist model switch runtime: %s", exc)
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -454,12 +508,42 @@ class GatewaySlashCommandsMixin:
 
         cfg = _load_gateway_runtime_config()
         cfg_model, cfg_provider, cfg_base_url, cfg_context_length = _gateway_status_model_parts(cfg)
-        provider = str(row.get("billing_provider") or cfg_provider or "")
-        model = str(row.get("model") or cfg_model or "unknown")
-        base_url = str(row.get("billing_base_url") or cfg_base_url or "")
+        model_config = self._session_model_config_dict(row)
 
-        # Prefer live/cached agent details when available; they contain the
-        # actual runtime model/context compressor state for this session.
+        # Build the displayed runtime as a coherent tuple. A /model switch
+        # persists the new provider/model/base_url in model_config before the
+        # next API call updates billing columns, while a stale billing_provider
+        # or live in-flight agent can still point at the previous runtime. Do
+        # not mix provider from one source with model from another (for example
+        # the invalid-looking ``openai-codex/glm`` after switching to
+        # ``human20-keys/glm``).
+        provider = str(cfg_provider or "")
+        model = str(cfg_model or "unknown")
+        base_url = str(cfg_base_url or "")
+        explicit_runtime_selected = False
+
+        if model_config.get("provider") or model_config.get("model"):
+            provider = str(model_config.get("provider") or provider)
+            model = str(model_config.get("model") or model)
+            base_url = str(model_config.get("base_url") or base_url)
+            explicit_runtime_selected = True
+        else:
+            provider = str(row.get("billing_provider") or provider)
+            model = str(row.get("model") or model)
+            base_url = str(row.get("billing_base_url") or base_url)
+
+        overrides = getattr(self, "_session_model_overrides", {}) or {}
+        override = overrides.get(session_key, {}) if isinstance(overrides, dict) else {}
+        if override:
+            provider = str(override.get("provider") or provider)
+            model = str(override.get("model") or model)
+            base_url = str(override.get("base_url") or base_url)
+            explicit_runtime_selected = True
+
+        # Use live/cached agent details for context/compressor stats. Only use
+        # them for the displayed provider/model when no explicit switched
+        # runtime is recorded for the session; otherwise a stale in-flight agent
+        # can clobber the just-selected runtime in /status.
         agent = self._running_agents.get(session_key)
         if not agent or agent is _AGENT_PENDING_SENTINEL:
             cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -469,7 +553,7 @@ class GatewaySlashCommandsMixin:
                     cached = agent_cache.get(session_key)
                     if cached:
                         agent = cached[0]
-        if agent and agent is not _AGENT_PENDING_SENTINEL:
+        if agent and agent is not _AGENT_PENDING_SENTINEL and not explicit_runtime_selected:
             agent_provider = getattr(agent, "provider", None)
             agent_model = getattr(agent, "model", None)
             agent_base_url = getattr(agent, "base_url", None)
@@ -1201,8 +1285,9 @@ class GatewaySlashCommandsMixin:
                                 _sess_entry = _self.session_store.get_or_create_session(
                                     event.source
                                 )
-                                _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
+                                _self._persist_model_switch_runtime(
+                                    _sess_entry.session_id,
+                                    result,
                                 )
                             except Exception as exc:
                                 logger.debug(
@@ -1354,8 +1439,9 @@ class GatewaySlashCommandsMixin:
             if _sess_db is not None:
                 try:
                     _sess_entry = self.session_store.get_or_create_session(source)
-                    _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model
+                    self._persist_model_switch_runtime(
+                        _sess_entry.session_id,
+                        result,
                     )
                 except Exception as exc:
                     logger.debug(
