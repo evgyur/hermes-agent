@@ -50,16 +50,29 @@ EXCLUDED_SKILL_DIR_SUFFIXES = (
     ".local-backup",
 )
 
+# Supporting files live inside a skill package and are loaded explicitly via
+# skill_view(skill, file_path=...). They are not standalone skills and must not
+# be scanned for active SKILL.md/DESCRIPTION.md entries.
+SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+
 
 def is_excluded_skill_dir(dirname: str) -> bool:
-    """Return True for operational/non-catalog skill directory names.
-
-    Prunes Hermes metadata, VCS, virtualenv/dependency, cache, vendored, and
-    backup skill trees such as ``*.bak`` or ``*.local-backup`` so stale copies
-    cannot shadow canonical skills.
-    """
+    """Return True for operational/non-catalog skill directory names."""
     normalized = str(dirname or "").strip().lower()
     return normalized in EXCLUDED_SKILL_DIRS or normalized.endswith(EXCLUDED_SKILL_DIR_SUFFIXES)
+
+
+def is_skill_support_path(path) -> bool:
+    """True if *path* is under a support dir of an actual skill root."""
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    parts = path_obj.parts
+    for idx, part in enumerate(parts[:-1]):
+        if part not in SKILL_SUPPORT_DIRS or idx == 0:
+            continue
+        skill_root = Path(*parts[:idx])
+        if (skill_root / "SKILL.md").exists():
+            return True
+    return False
 
 
 def is_excluded_skill_path(path) -> bool:
@@ -69,7 +82,7 @@ def is_excluded_skill_path(path) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(is_excluded_skill_dir(part) for part in parts)
+    return any(is_excluded_skill_dir(part) for part in parts) or is_skill_support_path(path)
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -255,9 +268,9 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     This is an OFFER-time filter: it controls whether a skill shows up in the
     skills index / autocomplete / slash-command list. It is intentionally NOT
     enforced by ``skill_view`` or ``--skills`` preloading — an explicit load is
-    explicit consent, and load-bearing force-loads (e.g. the kanban dispatcher
-    injecting ``--skills kanban-worker``) must always succeed regardless of how
-    the offer surfaces filter the skill.
+    explicit consent, and load-bearing force-loads (e.g. a dispatcher pinning
+    a task to a specialist skill via ``--skills``) must always succeed
+    regardless of how the offer surfaces filter the skill.
 
     A skill matches when ANY of its declared environments is currently active
     (OR semantics, mirroring ``platforms``). Unknown env tags fail open.
@@ -282,7 +295,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -301,10 +314,13 @@ def _load_raw_config() -> Dict[str, Any]:
     if not config_path.exists():
         return {}
     try:
+        data = config_path.read_bytes()
         stat = config_path.stat()
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
+        import hashlib
+        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size, hashlib.sha256(data).hexdigest())
     except OSError:
         cache_key = None
+        data = None
 
     if cache_key is not None:
         cached = _RAW_CONFIG_CACHE.get(cache_key)
@@ -312,7 +328,8 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        raw_text = data.decode("utf-8") if data is not None else config_path.read_text(encoding="utf-8")
+        parsed = yaml_load(raw_text)
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
@@ -480,6 +497,34 @@ def get_all_skills_dirs() -> List[Path]:
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+def _resolve_for_skill_ownership(path) -> Path:
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    try:
+        return path_obj.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return path_obj.expanduser().absolute()
+
+
+def is_external_skill_path(path) -> bool:
+    """Return True when ``path`` lives under a configured external skills dir.
+
+    ``skills.external_dirs`` are externally owned: Hermes can discover and view
+    their skills, and foreground user-directed tool calls may still edit them,
+    but autonomous lifecycle maintenance must treat them as read-only. This
+    helper centralizes the ownership boundary so curator/reporting/tool paths do
+    not each need to re-interpret the config.
+    """
+    candidate = _resolve_for_skill_ownership(path)
+    for root in get_external_skills_dirs():
+        resolved_root = _resolve_for_skill_ownership(root)
+        try:
+            candidate.relative_to(resolved_root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 # ── Condition extraction ──────────────────────────────────────────────────
@@ -672,13 +717,21 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
     Excludes Hermes metadata, VCS, virtualenv/dependency, cache, vendored,
-    and backup skill trees such as ``*.bak`` or ``*.local-backup``.
+    backup trees, and support dirs inside concrete skill roots.
     """
     matches = []
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
-        dirs[:] = [d for d in dirs if not is_excluded_skill_dir(d)]
+        has_skill_md = "SKILL.md" in files
+        dirs[:] = [
+            d
+            for d in dirs
+            if not is_excluded_skill_dir(d)
+            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+        ]
         if filename in files:
-            matches.append(Path(root) / filename)
+            path = Path(root) / filename
+            if not is_excluded_skill_path(path):
+                matches.append(path)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
         yield path
 
