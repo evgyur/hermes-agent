@@ -7748,6 +7748,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=_quick_key,
             reason="session-key-resolved",
         )
+        if self._is_goal_continuation_event(event):
+            try:
+                _goal_session_entry = self.session_store.get_or_create_session(source)
+                _goal_session_id = getattr(_goal_session_entry, "session_id", "") or ""
+            except Exception:
+                _goal_session_id = ""
+            if not self._goal_still_active_for_session(_goal_session_id):
+                logger.info(
+                    "Dropping stale internal /goal continuation for %s — goal is no longer active",
+                    _quick_key or "?",
+                )
+                self._update_gateway_ledger(
+                    event,
+                    "dropped",
+                    session_key=_quick_key,
+                    session_id=_goal_session_id,
+                    reason="stale-internal-goal-continuation",
+                )
+                try:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter and _quick_key:
+                        self._clear_goal_pending_continuations(_quick_key, adapter)
+                except Exception as exc:
+                    logger.debug("stale goal continuation cleanup failed: %s", exc)
+                return None
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -11534,6 +11559,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
+            try:
+                adapter = self.adapters.get(source.platform) if source is not None else None
+                _quick_key = self._session_key_for_source(source) if source is not None else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+                if _quick_key and decision.get("status") in {"done", "blocked"}:
+                    self._set_session_reasoning_override(_quick_key, None)
+            except Exception as exc:
+                logger.debug("goal continuation: terminal cleanup failed: %s", exc)
             return
 
         prompt = decision.get("continuation_prompt") or ""

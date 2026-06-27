@@ -370,6 +370,39 @@ class TestJudgeGoal:
     @pytest.mark.parametrize(
         "response",
         [
+            "blocked: нужен explicit approval.\nSafe-lane complete; live rollout requires approval.",
+            "SUPERGOAL_TURN_YIELD — blocked by approval gate.\nGoal complete: no",
+            "Goal complete: no\nBlocked: yes\nNeed user input: explicit approval for prod deploy.",
+        ],
+    )
+    def test_supergoal_human_approval_blocker_cards_stop_without_aux_judge(self, response):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                )
+            ]
+        )
+        goal = (
+            "Execute `.supergoal/PROTOCOL.md`; preserve public discovery; "
+            "stop for explicit approval before prod deploy; finish after "
+            "AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert "BLOCKED_BY_APPROVAL" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
             "I will not use BLOCKED_BY_APPROVAL unless approval is missing; continuing phase work.",
             "Example only:\n```\nBLOCKED_BY_APPROVAL — phase 7\n```",
         ],

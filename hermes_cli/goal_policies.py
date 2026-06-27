@@ -317,6 +317,21 @@ def is_structured_handoff_reason(reason: str) -> bool:
     )
 
 
+def _has_approval_word(text: str) -> bool:
+    """Return True when text clearly talks about human approval/confirmation."""
+    upper = str(text or "").upper()
+    return any(
+        token in upper
+        for token in (
+            "APPROVAL",
+            "APPROVE",
+            "АПРУВ",
+            "ПОДТВЕРД",
+            "ОДОБР",
+        )
+    )
+
+
 def _is_approval_blocker_response(text: str) -> bool:
     """Detect an intentional approval gate stop.
 
@@ -325,8 +340,36 @@ def _is_approval_blocker_response(text: str) -> bool:
     approval. Without this deterministic guard, a judge can keep returning
     CONTINUE just because final markers are absent, causing the same approval
     phrase to be posted until the turn budget is exhausted.
+
+    Operators do not always emit the exact BLOCKED_BY_APPROVAL marker; the
+    gateway must still stop on clear blocker cards such as
+    ``blocked: нужен explicit approval`` or
+    ``SUPERGOAL_TURN_YIELD — blocked by approval gate``.  Mentions in prose or
+    fenced examples still do not count.
     """
-    return has_standalone_marker_prefix(text, "BLOCKED_BY_APPROVAL")
+    if has_standalone_marker_prefix(text, "BLOCKED_BY_APPROVAL"):
+        return True
+
+    non_fenced = _non_fenced_lines(text)
+    if not non_fenced or not _has_approval_word("\n".join(non_fenced)):
+        return False
+
+    for line in non_fenced:
+        normalized = _normalize_marker_line(line)
+        if not normalized:
+            continue
+        if normalized.startswith("SUPERGOAL_TURN_YIELD") and "BLOCKED" in normalized:
+            return True
+        if normalized == "BLOCKED" or normalized.startswith((
+            "BLOCKED:",
+            "BLOCKED —",
+            "BLOCKED -",
+            "BLOCKED BY APPROVAL",
+        )):
+            return True
+        if normalized.startswith("BLOCKED") and "APPROVAL" in normalized:
+            return True
+    return False
 
 
 def evaluate_structured_completion_guard(
