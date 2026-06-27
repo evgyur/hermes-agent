@@ -675,10 +675,24 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
+def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
+    """True when gateway.message_timestamps.enabled is opted in."""
+    if not isinstance(user_config, dict):
+        return False
+    gw = user_config.get("gateway")
+    if not isinstance(gw, dict):
+        return False
+    mt = gw.get("message_timestamps")
+    if isinstance(mt, dict):
+        return bool(mt.get("enabled", False))
+    return bool(mt)
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
     channel_prompt: Optional[str] = None,
+    inject_timestamps: bool = False,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
@@ -708,6 +722,10 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
+        if inject_timestamps and role == "user" and isinstance(content, str):
+            from hermes_time import get_timezone as _get_msg_tz
+            from gateway.message_timestamps import render_user_content_with_timestamp as _render_msg_ts
+            content = _render_msg_ts(content, msg.get("timestamp"), tz=_get_msg_tz())
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
             continue

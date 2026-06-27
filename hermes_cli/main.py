@@ -265,6 +265,7 @@ from typing import Optional
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
+from hermes_cli.gateway_enroll import cmd_gateway_enroll
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
 from hermes_cli.subcommands.setup import build_setup_parser
@@ -11564,7 +11565,12 @@ def main():
     # =========================================================================
     # gateway + proxy commands  (parsers built in hermes_cli/subcommands/gateway.py)
     # =========================================================================
-    build_gateway_parser(subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy)
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=cmd_gateway,
+        cmd_proxy=cmd_proxy,
+        cmd_gateway_enroll=cmd_gateway_enroll,
+    )
 
     # =========================================================================
     # lsp command
