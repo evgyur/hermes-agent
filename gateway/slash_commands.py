@@ -2994,6 +2994,17 @@ class GatewaySlashCommandsMixin:
             from agent.model_metadata import estimate_request_tokens_rough
 
             session_key = self._session_key_for_source(source)
+            # Preserve the same platform + stable gateway session identity that a
+            # normal gateway turn passes (gateway/run.py main turn), so external
+            # context engines bind this temporary compression agent to the
+            # original platform conversation instead of falling back to an
+            # unbound/default "cli" host source — see #50422. _platform_config_key
+            # maps LOCAL->"cli" exactly like the live turn, avoiding a new
+            # "local" vs "cli" mismatch.
+            from gateway.run import _platform_config_key
+            platform_key = (
+                _platform_config_key(source.platform) if source.platform else None
+            )
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
@@ -3020,6 +3031,21 @@ class GatewaySlashCommandsMixin:
                     partial = False
                     head = msgs
 
+            # Bind the temporary compression agent to the originating source's
+            # platform + stable gateway session key. These are *authoritative*
+            # identity invariants (derived from `source`), so assign them into
+            # runtime_kwargs directly rather than via setdefault: a value already
+            # present there from the resolver would be a placeholder/stale
+            # identity and must not win. Assigning (vs passing a second explicit
+            # kwarg) also keeps each key single-valued, avoiding a "got multiple
+            # values for keyword argument" TypeError. platform is only set when
+            # known: for a source without platform metadata we leave it unset so
+            # AIAgent's default (platform=None -> source "cli") applies, exactly
+            # the prior behavior. _resolve_session_agent_runtime does not set
+            # either key today, so in practice this just adds them.
+            if platform_key is not None:
+                runtime_kwargs["platform"] = platform_key
+            runtime_kwargs["gateway_session_key"] = session_key
             tmp_agent = AIAgent(
                 **runtime_kwargs,
                 model=model,
@@ -3070,12 +3096,6 @@ class GatewaySlashCommandsMixin:
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
-                if rotated:
-                    session_entry.session_id = new_session_id
-                    self.session_store._save()
-                    self._sync_telegram_topic_binding(
-                        source, session_entry, reason="compress-command",
-                    )
 
                 # Rewrite the transcript when EITHER rotation produced a new id
                 # OR in-place compaction succeeded. The danger this guards
@@ -3089,15 +3109,33 @@ class GatewaySlashCommandsMixin:
                 # exactly right (and is the durable write when the throwaway
                 # /compress agent has no _session_db of its own).
                 if rotated or _in_place:
-                    self.session_store.rewrite_transcript(
-                        new_session_id, compressed
-                    )
+                    try:
+                        _rewrite_ok = self.session_store.rewrite_transcript(
+                            new_session_id, compressed
+                        )
+                    except Exception as _rewrite_exc:
+                        logger.warning("Manual /compress transcript rewrite failed: %s", _rewrite_exc)
+                        return t("gateway.compress.failed", error=_rewrite_exc)
+                    if _rewrite_ok is False:
+                        logger.warning(
+                            "Manual /compress transcript rewrite returned False for %s; "
+                            "preserving original live session binding.",
+                            new_session_id,
+                        )
+                        return t("gateway.compress.failed", error="transcript write failed")
                 else:
                     logger.warning(
                         "Manual /compress: session rotation did not occur "
                         "(session_id unchanged) and in-place mode is off — "
                         "preserving original transcript instead of overwriting "
                         "it (#44794)."
+                    )
+                    return t("gateway.compress.failed", error="session rotation did not occur")
+                if rotated:
+                    session_entry.session_id = new_session_id
+                    self.session_store._save()
+                    self._sync_telegram_topic_binding(
+                        source, session_entry, reason="compress-command",
                     )
                 # Reset stored token count — transcript changed, old value is stale
                 self.session_store.update_session(

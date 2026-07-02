@@ -27,6 +27,24 @@ def _now() -> datetime:
     return datetime.now()
 
 
+# Default auto-continue freshness window in seconds (1 hour). A session
+# interrupted by a restart is only auto-resumed while it stays within this
+# window of when ``resume_pending`` was marked. ``gateway/run.py`` bridges
+# config.yaml ``agent.gateway_auto_continue_freshness`` into this env var.
+_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+
+
+def auto_continue_freshness_window() -> float:
+    """Return the configured auto-continue freshness window in seconds."""
+    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
+    if raw is None or raw == "":
+        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+
+
 # ---------------------------------------------------------------------------
 # PII redaction helpers
 # ---------------------------------------------------------------------------
@@ -769,7 +787,96 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
         self._loaded = True
-    
+
+        # Prune any sessions.json entries that point to sessions already ended
+        # in state.db. A hard gateway crash (exit code 1) skips the graceful
+        # shutdown path, so sessions.json is never cleared and is left pointing
+        # at ended sessions. On the next startup those stale entries act as live
+        # routing keys. get_or_create_session() only consulted end_reason at
+        # startup (here) until #54878 added a routing-time guard for the
+        # live-gateway case; this startup prune still self-heals crash-left
+        # entries before the first message arrives. Pruning here (lock already
+        # held) is cheap: one lookup per routing key, once at startup.
+        self._prune_stale_sessions_locked()
+
+    def _prune_stale_sessions_locked(self) -> None:
+        """Remove sessions.json entries whose session has ended in state.db.
+
+        Called once during startup (from ``_ensure_loaded_locked``, lock held).
+        A ``session_id`` is stale when state.db reports ``end_reason IS NOT
+        NULL`` for it. Sessions absent from the DB (never persisted / pre-SQLite
+        legacy) are left alone, and a ``None`` DB handle (SQLite unavailable) is
+        a no-op. DB errors are non-fatal — startup must never fail here.
+        """
+        db = getattr(self, "_db", None)
+        if not db or not self._entries:
+            return
+
+        stale_keys: list = []
+        recovered_keys = 0
+        try:
+            for key, entry in self._entries.items():
+                row = db.get_session(entry.session_id)
+                # row is None        -> not in DB (legacy / pre-SQLite) — keep
+                # end_reason is None  -> session alive — keep
+                # end_reason not None -> session ended — prune
+                if row is not None and row.get("end_reason") is not None:
+                    recovered_entry = None
+                    if entry.origin is not None:
+                        try:
+                            recovered_entry = self._recover_session_from_db(
+                                session_key=key,
+                                source=entry.origin,
+                                now=_now(),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "gateway.session: recovery lookup failed for stale "
+                                "sessions.json entry %r -> %s: %s",
+                                key,
+                                entry.session_id,
+                                exc,
+                            )
+
+                    # If the stale entry points at a compression-ended parent but
+                    # a newer live child session exists for the exact same gateway
+                    # peer, repoint the routing index instead of dropping it. A
+                    # hard restart between compression rotation and the next clean
+                    # save otherwise leaves Telegram with no resumable mapping, so
+                    # queued/resume-pending work disappears until the user sends a
+                    # fresh message.
+                    if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+                        logger.warning(
+                            "gateway.session: repointing stale sessions.json entry "
+                            "%r from ended %s (end_reason=%r) to recovered %s",
+                            key,
+                            entry.session_id,
+                            row["end_reason"],
+                            recovered_entry.session_id,
+                        )
+                        self._entries[key] = recovered_entry
+                        recovered_keys += 1
+                        continue
+
+                    logger.warning(
+                        "gateway.session: pruning stale sessions.json entry "
+                        "%r -> %s (end_reason=%r); left by a crashed gateway",
+                        key, entry.session_id, row["end_reason"],
+                    )
+                    stale_keys.append(key)
+        except Exception as exc:
+            logger.warning(
+                "gateway.session: stale-entry pruning skipped due to DB error: %s",
+                exc,
+            )
+            return
+
+        for key in stale_keys:
+            del self._entries[key]
+
+        if stale_keys or recovered_keys:
+            self._save()
+
     def _save(self) -> None:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         import tempfile
@@ -800,7 +907,105 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-    
+
+    def _create_entry_from_recovered_row(
+        self,
+        *,
+        row: Dict[str, Any],
+        session_key: str,
+        source: SessionSource,
+        now: datetime,
+    ) -> SessionEntry:
+        started_at = row.get("started_at")
+        try:
+            created_at = datetime.fromtimestamp(float(started_at)) if started_at else now
+        except (TypeError, ValueError, OSError):
+            created_at = now
+        return SessionEntry(
+            session_key=session_key,
+            session_id=str(row["id"]),
+            created_at=created_at,
+            updated_at=now,
+            origin=source,
+            display_name=source.chat_name,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+
+    def _recover_session_from_db(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        now: datetime,
+    ) -> Optional[SessionEntry]:
+        """Rebuild a missing session-key mapping from durable state.db data."""
+        if not self._db:
+            return None
+        finder = getattr(self._db, "find_latest_gateway_session_for_peer", None)
+        if not callable(finder):
+            return None
+        try:
+            recovered = finder(
+                source=source.platform.value,
+                user_id=source.user_id,
+                session_key=session_key,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+            )
+        except Exception as exc:
+            logger.debug("Gateway session DB recovery failed for %s: %s", session_key, exc)
+            return None
+        if not recovered:
+            return None
+        try:
+            self._db.reopen_session(str(recovered["id"]))
+        except Exception as exc:
+            logger.debug("Gateway session DB reopen failed for %s: %s", session_key, exc)
+        return self._create_entry_from_recovered_row(
+            row=recovered,
+            session_key=session_key,
+            source=source,
+            now=now,
+        )
+
+    def _record_gateway_session_peer(
+        self,
+        session_id: str,
+        session_key: str,
+        source: Optional[SessionSource],
+    ) -> None:
+        """Persist the routing peer for an existing gateway session row."""
+        if not self._db or not source:
+            return
+        recorder = getattr(self._db, "record_gateway_session_peer", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                session_id,
+                source=source.platform.value,
+                user_id=source.user_id,
+                session_key=session_key,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+            )
+        except Exception as exc:
+            logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
+
+    def _is_session_ended_in_db(self, session_id: str) -> bool:
+        """Return True iff state.db has this session with a non-null end_reason."""
+        if not self._db or not session_id:
+            return False
+        try:
+            row = self._db.get_session(session_id)
+        except Exception as exc:
+            logger.debug("Gateway session DB ended-state lookup failed for %s: %s", session_id, exc)
+            return False
+        return row is not None and row.get("end_reason") is not None
+
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
         
@@ -930,41 +1135,64 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
 
-                # Auto-reset sessions marked as suspended (e.g. after /stop
-                # broke a stuck loop — #7536).  ``suspended`` is the hard
-                # forced-wipe signal and always wins over ``resume_pending``,
-                # so repeated interrupted restarts that escalate via the
-                # existing ``.restart_failure_counts`` stuck-loop counter
-                # still converge to a clean slate.
-                if entry.suspended:
-                    reset_reason = "suspended"
-                elif entry.resume_pending:
-                    # Restart-interrupted session: preserve the session_id
-                    # and return the existing entry so the transcript
-                    # reloads intact.  ``resume_pending`` is cleared after
-                    # the NEXT successful turn completes (not here), which
-                    # means a re-interrupted retry keeps trying — the
-                    # stuck-loop counter handles terminal escalation.
-                    entry.updated_at = now
-                    self._save()
-                    return entry
+                if self._is_session_ended_in_db(entry.session_id):
+                    logger.warning(
+                        "gateway.session: routing key %r -> %s is ended in "
+                        "state.db but still live in sessions.json; dropping "
+                        "stale entry and recovering/recreating the session",
+                        session_key,
+                        entry.session_id,
+                    )
+                    self._entries.pop(session_key, None)
+                    was_auto_reset = False
+                    auto_reset_reason = None
+                    reset_had_activity = False
                 else:
-                    reset_reason = self._should_reset(entry, source)
-                if not reset_reason:
-                    entry.updated_at = now
-                    self._save()
-                    return entry
-                else:
-                    # Session is being auto-reset.
-                    was_auto_reset = True
-                    auto_reset_reason = reset_reason
-                    # Track whether the expired session had any real conversation
-                    reset_had_activity = entry.total_tokens > 0
-                    db_end_session_id = entry.session_id
+                    # Auto-reset sessions marked as suspended (e.g. after /stop
+                    # broke a stuck loop — #7536).  ``suspended`` is the hard
+                    # forced-wipe signal and always wins over ``resume_pending``.
+                    if entry.suspended:
+                        reset_reason = "suspended"
+                    elif entry.resume_pending:
+                        reset_reason = self._should_reset(entry, source)
+                        if not reset_reason:
+                            _fw = auto_continue_freshness_window()
+                            _ref_time = entry.last_resume_marked_at or entry.updated_at
+                            if _fw > 0 and (now - _ref_time).total_seconds() > _fw:
+                                reset_reason = "resume_pending_expired"
+                            else:
+                                entry.updated_at = now
+                                self._save()
+                                self._record_gateway_session_peer(entry.session_id, session_key, entry.origin)
+                                return entry
+                    else:
+                        reset_reason = self._should_reset(entry, source)
+                    if not reset_reason:
+                        entry.updated_at = now
+                        self._save()
+                        self._record_gateway_session_peer(entry.session_id, session_key, entry.origin)
+                        return entry
+                    else:
+                        # Session is being auto-reset.
+                        was_auto_reset = True
+                        auto_reset_reason = reset_reason
+                        reset_had_activity = entry.last_prompt_tokens > 0
+                        db_end_session_id = entry.session_id
             else:
                 was_auto_reset = False
                 auto_reset_reason = None
                 reset_had_activity = False
+
+            if not force_new and not db_end_session_id:
+                recovered_entry = self._recover_session_from_db(
+                    session_key=session_key,
+                    source=source,
+                    now=now,
+                )
+                if recovered_entry is not None:
+                    self._entries[session_key] = recovered_entry
+                    self._save()
+                    return recovered_entry
 
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -989,6 +1217,10 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "session_key": session_key,
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "thread_id": source.thread_id,
             }
 
         # SQLite operations outside the lock
@@ -1001,6 +1233,7 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                self._record_gateway_session_peer(session_id, session_key, source)
             except Exception as e:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
@@ -1021,6 +1254,7 @@ class SessionStore:
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
                 self._save()
+                self._record_gateway_session_peer(entry.session_id, session_key, entry.origin)
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -1215,6 +1449,10 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "session_key": session_key,
+                "chat_id": old_entry.origin.chat_id if old_entry.origin else None,
+                "chat_type": old_entry.origin.chat_type if old_entry.origin else None,
+                "thread_id": old_entry.origin.thread_id if old_entry.origin else None,
             }
 
         if self._db and db_end_session_id:
@@ -1226,6 +1464,11 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                self._record_gateway_session_peer(
+                    session_id,
+                    session_key,
+                    old_entry.origin,
+                )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
 
@@ -1283,6 +1526,11 @@ class SessionStore:
                 self._db.reopen_session(target_session_id)
             except Exception as e:
                 logger.debug("Session DB reopen_session failed: %s", e)
+            self._record_gateway_session_peer(
+                target_session_id,
+                session_key,
+                new_entry.origin if new_entry else None,
+            )
 
         return new_entry
 
