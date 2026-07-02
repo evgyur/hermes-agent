@@ -564,12 +564,17 @@ class GatewaySlashCommandsMixin:
         session_db = getattr(self, "_session_db", None)
         if session_db:
 
+            async def _maybe_await(value: Any) -> Any:
+                if inspect.isawaitable(value):
+                    return await value
+                return value
+
             try:
-                title = session_db.get_session_title(session_entry.session_id)
+                title = await _maybe_await(session_db.get_session_title(session_entry.session_id))
             except Exception:
                 title = None
             try:
-                loaded = session_db.get_session(session_entry.session_id)
+                loaded = await _maybe_await(session_db.get_session(session_entry.session_id))
                 row = loaded if isinstance(loaded, dict) else {}
 
             except Exception:

@@ -1150,6 +1150,50 @@ class TelegramAdapter(BasePlatformAdapter):
     def _self_echo_fingerprint(cls, text: Optional[str]) -> str:
         return hashlib.sha256(cls._self_echo_normalize(text).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _self_echo_store_path() -> Path:
+        """Small persistent echo ledger, used across gateway restarts."""
+        return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "telegram_outbound_echoes.jsonl"
+
+    def _load_recent_persistent_outbound_echoes(self, chat_id: str, now: float) -> List[tuple[float, str, str]]:
+        path = self._self_echo_store_path()
+        if not path.exists():
+            return []
+        entries: List[tuple[float, str, str]] = []
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-300:]
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if str(item.get("chat_id") or "") != str(chat_id):
+                    continue
+                expires_at = float(item.get("expires_at") or 0)
+                if expires_at <= now:
+                    continue
+                normalized = str(item.get("text") or "")
+                fp = str(item.get("fingerprint") or "")
+                if normalized and fp:
+                    entries.append((expires_at, normalized, fp))
+        except Exception as exc:
+            logger.debug("[%s] Failed to read persistent Telegram self-echo ledger: %s", self.name, exc)
+        return entries[-50:]
+
+    def _persist_recent_outbound_echo(self, chat_id: str, expires_at: float, normalized: str, fingerprint: str) -> None:
+        try:
+            path = self._self_echo_store_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "chat_id": str(chat_id),
+                    "expires_at": float(expires_at),
+                    "text": normalized,
+                    "fingerprint": fingerprint,
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("[%s] Failed to persist Telegram self-echo fingerprint: %s", self.name, exc)
+
     def _remember_recent_outbound_text(self, chat_id: str, content: str) -> None:
         """Remember a just-sent response so reflected userbot echoes are ignored."""
         normalized = self._self_echo_normalize(content)
@@ -1163,8 +1207,55 @@ class TelegramAdapter(BasePlatformAdapter):
         expires_at = now + float(os.getenv("TELEGRAM_SELF_ECHO_TTL_SECONDS", "900") or 900)
         key = str(chat_id)
         entries = [item for item in store.get(key, []) if item[0] > now]
-        entries.append((expires_at, normalized, self._self_echo_fingerprint(normalized)))
+        fingerprint = self._self_echo_fingerprint(normalized)
+        entries.append((expires_at, normalized, fingerprint))
         store[key] = entries[-50:]
+        self._persist_recent_outbound_echo(key, expires_at, normalized, fingerprint)
+
+    def _recent_outbound_echo_entries(self, chat_id: str, now: Optional[float] = None) -> List[tuple[float, str, str]]:
+        """Return same-chat and bounded cross-chat recent outbound echo entries."""
+        if now is None:
+            now = time.time()
+        store = getattr(self, "_recent_outbound_text_echoes", None) or {}
+        entries = [item for item in store.get(chat_id, []) if item[0] > now]
+        if entries:
+            store[chat_id] = entries
+
+        # Outbound echoes can arrive after a gateway restart or after the
+        # in-memory cache was lost. Keep a short persistent fingerprint ledger
+        # so reflected copies do not get re-ingested as Chip's text.
+        entries = entries + self._load_recent_persistent_outbound_echoes(chat_id, now)
+
+        # Some Chip delivery paths (userbot/concierge relays, linked DMs, or
+        # platform-level reply mirrors) can reflect a bot-authored message into
+        # a different Telegram chat id from the one the gateway sent to.
+        cross_chat_entries: List[tuple[float, str, str]] = []
+        store_all = getattr(self, "_recent_outbound_text_echoes", None) or {}
+        for key, values in list(store_all.items()):
+            if key == chat_id:
+                continue
+            cross_chat_entries.extend([item for item in values if item[0] > now])
+        try:
+            path = self._self_echo_store_path()
+            if path.exists():
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()[-300:]:
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(data.get("chat_id", "")) == chat_id:
+                        continue
+                    expires_at = float(data.get("expires_at", 0) or 0)
+                    if expires_at <= now:
+                        continue
+                    text = str(data.get("text", "") or "")
+                    fingerprint = str(data.get("fingerprint", "") or "")
+                    if text and fingerprint:
+                        cross_chat_entries.append((expires_at, text, fingerprint))
+        except Exception as exc:
+            logger.debug("[%s] Failed to read cross-chat Telegram self-echo ledger: %s", self.name, exc)
+
+        return (entries + cross_chat_entries[-100:])[-150:]
 
     def _is_recent_outbound_text_echo(self, message: "Message") -> bool:
         """True if this incoming text is a reflected copy of our own response."""
@@ -1174,24 +1265,75 @@ class TelegramAdapter(BasePlatformAdapter):
         if not chat_id or not normalized:
             return False
 
-        now = time.time()
-        store = getattr(self, "_recent_outbound_text_echoes", None) or {}
-        entries = [item for item in store.get(chat_id, []) if item[0] > now]
-        if entries:
-            store[chat_id] = entries
-
         incoming_hash = self._self_echo_fingerprint(normalized)
-        for _expires_at, sent_text, sent_hash in entries:
+        for _expires_at, sent_text, sent_hash in self._recent_outbound_echo_entries(chat_id):
             if incoming_hash == sent_hash:
                 return True
             # Markdown stripping and Telegram reply previews can leave tiny
             # differences. Only suppress near-whole-message echoes; a real user
-            # follow-up with extra instructions should still pass through.
+            # follow-up with extra instructions should still pass through and
+            # then be stripped by _strip_recent_outbound_text_echo_prefix().
             if sent_text in normalized and len(normalized) <= len(sent_text) + 24:
                 return True
             if normalized in sent_text and len(sent_text) <= len(normalized) + 24:
                 return True
         return False
+
+    def _strip_recent_outbound_text_echo_prefix(self, message: "Message") -> Optional[str]:
+        """Return only the real user suffix when a message starts with our outbound text.
+
+        A user may reply/forward/copy a bot-authored report and add a complaint or
+        instruction after it. Treating the whole body as user-authored pollutes the
+        transcript and looks like Hermes wrote as Chip. Full echoes are dropped by
+        _is_recent_outbound_text_echo(); this handles echoed-prefix + real suffix.
+        """
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        visible_text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        normalized = self._self_echo_normalize(visible_text)
+        if not chat_id or not normalized:
+            return None
+        for _expires_at, sent_text, _sent_hash in self._recent_outbound_echo_entries(chat_id):
+            if not sent_text or not normalized.startswith(sent_text):
+                continue
+            suffix = normalized[len(sent_text):].strip()
+            suffix = re.sub(r"^[\s\-–—:;,.!?]+", "", suffix).strip()
+            if len(suffix) >= 3:
+                return suffix
+        return None
+
+    def _is_recent_outbound_text_quote(self, chat_id: str, text: Optional[str]) -> bool:
+        """True when reply_to_text is a quote/snippet of a recent bot-authored outbound.
+
+        Telegram reply previews may carry only the first part of a bot message.
+        Even if the reflected full echo was dropped, a user's reply to that echo
+        can still expose the preview as `[Replying to: ...]` unless we classify
+        the replied-to text as assistant-owned by content, not only by from_user.
+        """
+        normalized = self._self_echo_normalize(text)
+        if not chat_id or len(normalized) < 40:
+            return False
+        for _expires_at, sent_text, sent_hash in self._recent_outbound_echo_entries(str(chat_id)):
+            if not sent_text:
+                continue
+            if normalized == sent_text or self._self_echo_fingerprint(normalized) == sent_hash:
+                return True
+            if sent_text.startswith(normalized):
+                return True
+            if normalized in sent_text and len(normalized) >= min(120, max(40, int(len(sent_text) * 0.20))):
+                return True
+        return False
+
+    def _is_self_bot_message(self, message: Any) -> bool:
+        """Return True for updates authored by this bot account itself."""
+        if not self._bot:
+            return False
+        user = getattr(message, "from_user", None)
+        if not user:
+            return False
+        return bool(
+            getattr(user, "is_bot", False)
+            and getattr(user, "id", None) == getattr(self._bot, "id", None)
+        )
 
     @staticmethod
     def _recent_visible_context_key(event: MessageEvent) -> tuple[str, str]:
@@ -1675,8 +1817,22 @@ class TelegramAdapter(BasePlatformAdapter):
     def _business_connection_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        business_connection_id = (metadata or {}).get("business_connection_id")
+        metadata = metadata or {}
+        business_connection_id = metadata.get("business_connection_id")
         if not business_connection_id:
+            return {}
+        if not metadata.get("telegram_business_send_as_account"):
+            # Telegram Business Bot API sends with business_connection_id render
+            # as the connected human/business account, not as the bot.  That is
+            # unsafe as a default for agent output: one Hermes reply in a
+            # delegated bot chat visibly appeared authored by Chip.  Preserve
+            # the inbound business metadata for session isolation/reply routing,
+            # but fail closed on outbound identity unless a future trusted path
+            # opts in explicitly per send.
+            logger.warning(
+                "[%s] Suppressing Telegram Business send-as-account for agent reply",
+                self.name,
+            )
             return {}
         return {"business_connection_id": str(business_connection_id)}
 
@@ -1720,23 +1876,50 @@ class TelegramAdapter(BasePlatformAdapter):
         if utf16_len(content) > 32768:
             return False
 
+        if self._has_cjk_text(content):
+            return False
+
         configured_chats = getattr(self, "_rich_message_chat_ids", set())
+        rich_shape = self._has_rich_message_shape(stripped)
+        bare_table = self._has_markdown_table(stripped) and not re.search(r"^\s*- \[[ xX]\] ", stripped, re.M) and not re.search(r"^\s*#{1,6}\s+", stripped, re.M)
         if not configured_chats:
-            # Upstream Bot API 10.1 behavior: when there is no private allowlist,
-            # capability checks decide whether rich sending is attempted.
-            return True
+            # Default/global behavior: plain rich-markdown stays legacy unless
+            # explicitly opted in. Bare pipe tables are auto-routed because the
+            # legacy path destroys their structure.
+            if not getattr(self, "_rich_messages_enabled", False):
+                return bare_table
+            return rich_shape
         if str(chat_id) not in configured_chats:
             return False
 
         # Private HEL1 gate: configured chats use rich for chipline reports,
         # tables/images, or sufficiently long final replies.
-        if re.search(r"^\s*[➊➋➌➍➎➏➐➑➒➓]\s+", content, re.M):
-            return True
-        if "|" in content and re.search(r"^\s*\|.*\|\s*$", content, re.M):
+        if rich_shape:
             return True
         if "![" in content and "](http" in content:
             return True
         return len(stripped) >= getattr(self, "_rich_message_min_chars", 500)
+
+    @staticmethod
+    def _has_cjk_text(content: str) -> bool:
+        return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U0003ffff]", content or ""))
+
+    @staticmethod
+    def _has_markdown_table(content: str) -> bool:
+        lines = (content or "").splitlines()
+        for i in range(len(lines) - 1):
+            if "|" in lines[i] and _TABLE_SEPARATOR_RE.match(lines[i + 1]):
+                return True
+        return False
+
+    def _has_rich_message_shape(self, content: str) -> bool:
+        return bool(
+            self._has_markdown_table(content)
+            or re.search(r"^\s*- \[[ xX]\] ", content, re.M)
+            or re.search(r"^\s*[➊➋➌➍➎➏➐➑➒➓]\s+", content, re.M)
+            or "<details" in content.lower()
+            or "$$" in content
+        )
 
     async def _post_telegram_bot_api(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         token = str(self.config.token or "")
@@ -1872,11 +2055,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         return bool(
-            getattr(self, "_rich_messages_enabled", False)
+            (getattr(self, "_rich_messages_enabled", False) or self._has_markdown_table(content))
             and not getattr(self, "_rich_send_disabled", False)
             and not (metadata or {}).get("expect_edits")
             and content
             and content.strip()
+            and not self._has_cjk_text(content)
             and not self._has_telegram_desktop_details_math_crash_shape(content)
             and self._content_fits_rich_limits(content)
             and self._bot_supports_rich()
@@ -2103,14 +2287,64 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id = (msg.get("result") or {}).get("message_id")
         else:
             message_id = getattr(msg, "message_id", None)
+        if message_id is not None:
+            try:
+                from gateway import rich_sent_store
+
+                rich_sent_store.record(chat_id, str(message_id), content)
+            except Exception:
+                pass
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
         )
 
+    async def _try_edit_rich(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Attempt ``editMessageText`` with Bot API 10.1 ``rich_message``."""
+        thread_id = self._metadata_thread_id(metadata)
+        thread_kwargs = self._thread_kwargs_for_send(
+            chat_id,
+            thread_id,
+            metadata,
+            reply_to_message_id=None,
+            reply_to_mode=self._reply_to_mode,
+        )
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "rich_message": self._rich_message_payload(content),
+        }
+        payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        payload.update(self._business_connection_kwargs(metadata))
+        try:
+            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return SendResult(success=True, message_id=message_id)
+            if self._is_rich_fallback_error(exc):
+                if self._is_rich_capability_error(exc):
+                    self._rich_send_disabled = True
+                return None
+            return SendResult(success=False, error=str(exc), retryable=True)
+        try:
+            from gateway import rich_sent_store
+
+            rich_sent_store.record(chat_id, str(message_id), content)
+        except Exception:
+            pass
+        return SendResult(success=True, message_id=message_id)
+
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            getattr(self, "_rich_messages_enabled", False)
+            self._coerce_bool_extra("rich_drafts", False)
+            and getattr(self, "_rich_messages_enabled", False)
+            and not self._has_cjk_text(content)
             and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
             and content
@@ -3486,14 +3720,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        # Pre-flight: if content already exceeds the limit, split-and-deliver
-        # without round-tripping a doomed edit.
-        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
-            return await self._edit_overflow_split(
-                chat_id, message_id, content, finalize=finalize, metadata=metadata,
-            )
-
         try:
+            rich_available = self._should_use_rich_message(chat_id, content, finalize=finalize, metadata=metadata) and self._should_attempt_rich(content, metadata=metadata)
+            if finalize and rich_available:
+                configured_chats = getattr(self, "_rich_message_chat_ids", set())
+                if configured_chats and str(chat_id) in configured_chats:
+                    rich_edit = await self._edit_rich_message(chat_id, message_id, content, metadata=metadata)
+                else:
+                    rich_edit = await self._try_edit_rich(chat_id, message_id, content, metadata=metadata)
+                if rich_edit is not None:
+                    return rich_edit
+
+            # Pre-flight: if content already exceeds the legacy MarkdownV2 limit,
+            # split-and-deliver without round-tripping a doomed edit. Rich-capable
+            # tables above the legacy cap are handled before this block.
+            if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+                return await self._edit_overflow_split(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+
             if not finalize:
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
@@ -3503,48 +3748,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=message_id)
 
-            if self._should_use_rich_message(chat_id, content, finalize=finalize, metadata=metadata):
-                try:
-                    return await self._edit_rich_message(
-                        chat_id,
-                        message_id,
-                        content,
-                        metadata=metadata,
-                    )
-                except Exception as rich_err:
-                    if "not modified" in str(rich_err).lower():
-                        return SendResult(success=True, message_id=message_id)
-                    logger.warning(
-                        "[%s] editMessageText.rich_message failed, sending rich replacement instead of text fallback: %s",
-                        self.name,
-                        rich_err,
-                    )
-                    try:
-                        thread_id = self._metadata_thread_id(metadata)
-                        thread_kwargs = self._thread_kwargs_for_send(
-                            chat_id,
-                            thread_id,
-                            metadata,
-                            reply_to_message_id=None,
-                            reply_to_mode=self._reply_to_mode,
-                        )
-                        replacement = await self._send_rich_message(
-                            chat_id,
-                            content,
-                            thread_kwargs=thread_kwargs,
-                            metadata=metadata,
-                        )
-                        try:
-                            await self.delete_message(chat_id, message_id)
-                        except Exception:
-                            pass
-                        return replacement
-                    except Exception as replacement_err:
-                        logger.warning(
-                            "[%s] sendRichMessage replacement failed, falling back to text edit: %s",
-                            self.name,
-                            replacement_err,
-                        )
+            if self._should_use_rich_message(chat_id, content, finalize=finalize, metadata=metadata) and self._should_attempt_rich(content, metadata=metadata):
+                rich_edit = await self._try_edit_rich(chat_id, message_id, content, metadata=metadata)
+                if rich_edit is not None:
+                    return rich_edit
 
             formatted = self.format_message(content)
             try:
@@ -5432,9 +5639,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     # is cleared by something else.
                     try:
                         from tools.clarify_gateway import mark_awaiting_text
-                        mark_awaiting_text(clarify_id)
+                        marked = mark_awaiting_text(clarify_id)
                     except Exception as exc:
                         logger.warning("[%s] mark_awaiting_text failed: %s", self.name, exc)
+                        marked = False
+                    if not marked:
+                        self._clarify_state.pop(clarify_id, None)
+                        await query.answer(text="This prompt expired. Ask me again if needed.", show_alert=True)
+                        try:
+                            await query.edit_message_text(
+                                text=f"❓ {query.message.text or ''}\n\n<i>This prompt expired. Use /retry to ask again.</i>",
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=None,
+                            )
+                        except Exception:
+                            pass
+                        return
 
                     await query.answer(text="✏️ Type your answer in the chat.")
                     try:
@@ -5510,6 +5730,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
                     resolved = False
+
+                if not resolved:
+                    await query.answer(text="This prompt expired. Ask me again if needed.", show_alert=True)
+                    try:
+                        await query.edit_message_text(
+                            text=f"❓ {_html.escape(query.message.text or '')}\n\n<i>This prompt expired. Use /retry to ask again.</i>",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
+                        clarify_id,
+                    )
+                    return
 
                 await query.answer(text=f"✓ {resolved_text[:60]}")
                 try:
@@ -6687,28 +6923,120 @@ class TelegramAdapter(BasePlatformAdapter):
         if raw is None:
             raw = os.getenv("TELEGRAM_BUSINESS_IGNORE_USER_IDS", "")
         if isinstance(raw, list):
-            ignored = {str(part).strip() for part in raw if str(part).strip()}
-        else:
-            ignored = {part.strip() for part in str(raw).split(",") if part.strip()}
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
 
-        # Telegram Business can mirror the account owner's own messages back to
-        # the bot.  Those are not customer requests and replying to them can make
-        # the bot appear to speak through the human account.  Fail closed for the
-        # operator/private allowlist unless explicitly disabled for a deployment.
-        raw_ignore_owner = self._telegram_business_config().get("ignore_owner_echoes", True)
-        if isinstance(raw_ignore_owner, str):
-            ignore_owner = raw_ignore_owner.strip().lower() not in {"0", "false", "no", "off"}
-        else:
-            ignore_owner = bool(raw_ignore_owner)
-        if ignore_owner:
-            raw_owner_ids = self.config.extra.get("allow_from")
-            if raw_owner_ids is None:
-                raw_owner_ids = os.getenv("TELEGRAM_ALLOWED_USERS", "")
-            if isinstance(raw_owner_ids, list):
-                ignored.update(str(part).strip() for part in raw_owner_ids if str(part).strip())
-            else:
-                ignored.update(part.strip() for part in str(raw_owner_ids).split(",") if part.strip())
-        return ignored
+    def _telegram_business_auto_transcribe_voice_enabled(self) -> bool:
+        """Return whether Telegram Business inbox voice notes are transcribed directly.
+
+        Voice notes normally carry no text, so a `Sigurd` wake word cannot be
+        present. When enabled, delegated-inbox voice/audio messages are handled
+        as a deterministic STT hook and never enter the LLM transcript.
+        """
+        value = self._telegram_business_config().get("auto_transcribe_voice", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _should_auto_transcribe_business_voice(self, message: Any) -> bool:
+        """True for configured Telegram Business voice/audio notes."""
+        if not self._telegram_business_enabled():
+            return False
+        if not self._telegram_business_auto_transcribe_voice_enabled():
+            return False
+        if not self._is_telegram_business_message(message):
+            return False
+        if not (getattr(message, "voice", None) or getattr(message, "audio", None)):
+            return False
+        user = getattr(message, "from_user", None)
+        if getattr(user, "is_bot", False):
+            return False
+        return True
+
+    async def _handle_business_voice_transcription_hook(self, message: Any) -> bool:
+        """Transcribe a Telegram Business voice/audio message and echo text back.
+
+        Returns True when this hook claimed the message. The transcript is sent
+        directly to the delegated inbox using the same business_connection_id;
+        raw private audio/text is not routed through the agent or persisted to
+        the LLM session transcript.
+        """
+        if not self._should_auto_transcribe_business_voice(message):
+            return False
+
+        source = getattr(message, "voice", None) or getattr(message, "audio", None)
+        if source is None:
+            return False
+
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not chat_id:
+            return False
+
+        allowed, note = self._telegram_media_size_allowed(source, "business voice message")
+        business_connection_id = getattr(message, "business_connection_id", None)
+        metadata = {"business_connection_id": str(business_connection_id)} if business_connection_id else None
+        reply_to = str(getattr(message, "message_id", "") or "") or None
+        if not allowed:
+            await self.send(
+                chat_id,
+                note or "Голосовое слишком большое, не смог транскрибировать.",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return True
+
+        try:
+            file_obj = await source.get_file()
+            audio_bytes = await file_obj.download_as_bytearray()
+            ext = ".ogg" if getattr(message, "voice", None) else ".mp3"
+            cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
+
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, cached_path)
+            if not result.get("success"):
+                error = str(result.get("error") or "unknown STT error")
+                logger.warning("[Telegram] Business voice transcription failed: %s", error)
+                await self.send(
+                    chat_id,
+                    f"🎙️ Не смог транскрибировать голосовое: {error}",
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                return True
+
+            transcript = str(result.get("transcript") or "").strip()
+            if not transcript:
+                await self.send(
+                    chat_id,
+                    "🎙️ Голосовое распознано как пустое или тишина.",
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                return True
+
+            await self.send(
+                chat_id,
+                f"🎙️ Транскрипт:\n{transcript}",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            logger.info(
+                "[Telegram] Business voice transcribed and echoed: chat=%s message=%s provider=%s",
+                chat_id,
+                getattr(message, "message_id", None),
+                result.get("provider"),
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[Telegram] Business voice transcription hook failed: %s", exc, exc_info=True)
+            await self.send(
+                chat_id,
+                f"🎙️ Не смог транскрибировать голосовое: {exc}",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return True
 
     def _message_matches_business_trigger(self, message: Message) -> bool:
         if not self._telegram_business_enabled():
@@ -6717,6 +7045,15 @@ class TelegramAdapter(BasePlatformAdapter):
         user = getattr(message, "from_user", None)
         user_id = str(getattr(user, "id", "") or "")
         if user_id and user_id in self._telegram_business_ignored_user_ids():
+            return False
+        allowed_owner_ids = self._telegram_chat_id_set(self.config.extra.get("allow_from"))
+        env_allowed = os.getenv("TELEGRAM_ALLOWED_USERS", "")
+        allowed_owner_ids.update(self._telegram_chat_id_set(env_allowed))
+        if user_id and user_id in allowed_owner_ids:
+            # Telegram Business owner/account echoes are agent output reflected
+            # through the delegated human inbox. Keep this fail-closed even if
+            # a legacy knob such as business.ignore_owner_echoes=false is left
+            # in config; explicit owner commands should use the normal bot DM.
             return False
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
         free_response = self._telegram_business_free_response_chats()
@@ -7322,6 +7659,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         thread_id = getattr(message, "message_thread_id", None)
 
+        # Telegram should never dispatch our own bot-authored messages back
+        # into the agent. If an adapter/webhook/polling edge surfaces one,
+        # drop it before auth/session handling so it cannot appear as Chip.
+        if self._is_self_bot_message(message):
+            return False
+
         # Check ignored_threads first — applies to both groups and DM topics
         if thread_id is not None:
             try:
@@ -7459,6 +7802,15 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        stripped_followup = self._strip_recent_outbound_text_echo_prefix(msg)
+        if stripped_followup:
+            logger.info(
+                "[%s] Stripped reflected outbound Telegram prefix; preserving user suffix: chat=%s msg=%s",
+                self.name,
+                getattr(getattr(msg, "chat", None), "id", "unknown"),
+                getattr(msg, "message_id", "unknown"),
+            )
+            event.text = stripped_followup
         event.text = self._clean_bot_trigger_text(event.text)
         await self._hydrate_reply_to_document_text(event, msg)
         if not event.media_urls:
@@ -7674,6 +8026,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if await self._handle_business_voice_transcription_hook(update.message):
             return
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
@@ -8479,14 +8833,37 @@ class TelegramAdapter(BasePlatformAdapter):
         # / caption when no native quote is present.
         reply_to_id = None
         reply_to_text = None
+        reply_to_author_id = None
+        reply_to_author_name = None
+        reply_to_is_own = False
         if message.reply_to_message:
-            reply_to_id = str(message.reply_to_message.message_id)
+            replied = message.reply_to_message
+            reply_to_id = str(replied.message_id)
+            replied_user = getattr(replied, "from_user", None)
+            if replied_user is not None:
+                reply_to_author_id = str(getattr(replied_user, "id", "") or "") or None
+                reply_to_author_name = getattr(replied_user, "full_name", None) or getattr(replied_user, "username", None)
+                reply_to_is_own = bool(
+                    self._bot
+                    and getattr(replied_user, "id", None) == getattr(self._bot, "id", None)
+                )
             quote = getattr(message, "quote", None)
             quote_text = getattr(quote, "text", None) if quote is not None else None
             if quote_text:
                 reply_to_text = quote_text
             else:
-                reply_to_text = self._message_text_with_hidden_links(message.reply_to_message) or None
+                reply_to_text = self._message_text_with_hidden_links(replied) or None
+                if not reply_to_text:
+                    reply_to_text = self._rich_reply_text_from_message(replied)
+                if not reply_to_text:
+                    try:
+                        from gateway import rich_sent_store
+
+                        reply_to_text = rich_sent_store.lookup(str(chat.id), reply_to_id)
+                    except Exception:
+                        reply_to_text = None
+            if reply_to_text and not reply_to_is_own:
+                reply_to_is_own = self._is_recent_outbound_text_quote(str(chat.id), reply_to_text)
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
@@ -8506,10 +8883,53 @@ class TelegramAdapter(BasePlatformAdapter):
             platform_update_id=update_id,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_author_name=reply_to_author_name,
+            reply_to_is_own_message=reply_to_is_own,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+
+    @staticmethod
+    def _rich_block_to_text(block: Any) -> str:
+        if isinstance(block, str):
+            return block
+        if isinstance(block, list):
+            return "".join(TelegramAdapter._rich_block_to_text(item) for item in block)
+        if not isinstance(block, dict):
+            return ""
+        typ = str(block.get("type") or "")
+        if "text" in block:
+            return TelegramAdapter._rich_block_to_text(block.get("text"))
+        if typ == "list":
+            lines = []
+            for item in block.get("items") or []:
+                if isinstance(item, dict):
+                    label = str(item.get("label") or "-")
+                    body = TelegramAdapter._rich_block_to_text(item.get("blocks") or item.get("text") or "").strip()
+                    lines.append(f"{label} {body}".strip())
+            return "\n".join(line for line in lines if line)
+        if "blocks" in block:
+            return "\n".join(
+                part for part in (TelegramAdapter._rich_block_to_text(b).strip() for b in (block.get("blocks") or [])) if part
+            )
+        return ""
+
+    @classmethod
+    def _rich_reply_text_from_message(cls, message: Any) -> Optional[str]:
+        api_kwargs = getattr(message, "api_kwargs", None)
+        getter = getattr(api_kwargs, "get", None)
+        rich = getter("rich_message") if callable(getter) else None
+        if not isinstance(rich, dict):
+            return None
+        blocks = rich.get("blocks")
+        if not blocks:
+            return None
+        text = "\n".join(
+            part for part in (cls._rich_block_to_text(block).strip() for block in blocks) if part
+        )
+        return text or None
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 

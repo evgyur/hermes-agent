@@ -1539,6 +1539,9 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+    reply_to_author_id: Optional[str] = None
+    reply_to_author_name: Optional[str] = None
+    reply_to_is_own_message: bool = False
 
     # Ephemeral recent visible chat context, populated by adapters that can
     # observe nearby platform messages. The gateway injects this into the
@@ -3074,6 +3077,23 @@ class BasePlatformAdapter(ABC):
                     if chars[i] != '\n':
                         chars[i] = ' '
         return ''.join(chars)
+
+    @staticmethod
+    def strip_media_directives_for_display(content: str) -> str:
+        """Return text with delivery-only MEDIA/directive markers removed.
+
+        Streaming previews must hide native-delivery directives before the
+        final attachment delivery pass runs. Reuse ``extract_media`` so the
+        visible cleanup grammar stays aligned with the native media extractor,
+        while the fallback strips non-media directives such as ``[[as_document]]``.
+        """
+        if not content:
+            return content
+        try:
+            _media, cleaned = BasePlatformAdapter.extract_media(content)
+            return _strip_media_directives(cleaned)
+        except Exception:
+            return _strip_media_directives(content)
 
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:

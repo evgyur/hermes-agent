@@ -117,9 +117,39 @@ async def test_own_message_reply_prefix_marks_assistant_message():
         history=[],
     )
 
-    assert result is not None
-    assert result.startswith('[Replying to your previous message: "Use the direct train."]')
-    assert result.endswith("this one")
+    assert result == "this one"
+    assert event.recent_context is not None
+    assert "previous bot/assistant message" in event.recent_context
+    assert "Use the direct train." in event.recent_context
+
+
+@pytest.mark.asyncio
+async def test_reply_to_own_tool_status_does_not_pollute_user_turn():
+    runner = _make_runner()
+    source = _source()
+    tool_status = (
+        '📖 read_file: "lesson-video-player.tsx L19-43"\n'
+        '🔧 patch: "/home/hermes/workspace/human20/human2..."'
+    )
+    event = MessageEvent(
+        text="Продолжаем",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=tool_status,
+        reply_to_is_own_message=True,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == "Продолжаем"
+    assert "read_file" not in result
+    assert event.recent_context is not None
+    assert "quoted text is NOT user-authored" in event.recent_context
+    assert "read_file" in event.recent_context
 
 
 @pytest.mark.asyncio

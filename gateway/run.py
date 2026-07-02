@@ -9302,14 +9302,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_text = f"{context_note}\n\n{message_text}"
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            # Always preserve the reply-to pointer — even when the quoted text
+            # already appears in history. For replies to our own/bot-authored
+            # messages, keep the quote out of the persisted user turn: otherwise
+            # bot/tool/status text appears in transcripts as if the user authored
+            # it. Put that context into the ephemeral system prompt instead.
+            reply_snippet = str(event.reply_to_text or "")[:500]
+            if getattr(event, "reply_to_is_own_message", False):
+                reply_note = (
+                    '[Reply context: the user replied to this previous bot/assistant message; '
+                    f'the quoted text is NOT user-authored: "{reply_snippet}"]'
+                )
+                existing_context = str(getattr(event, "recent_context", "") or "").strip()
+                event.recent_context = f"{existing_context}\n\n{reply_note}" if existing_context else reply_note
+            else:
+                # For human-authored reply targets, the prefix remains in the
+                # user turn as a compact disambiguation pointer.
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:
             try:

@@ -11,6 +11,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -984,7 +985,7 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
         ("send_video", "send_video", "video_path", "clip.mp4", b"video-data"),
     ],
 )
-async def test_native_media_preserves_business_connection_id(
+async def test_native_media_uses_bot_identity_for_business_metadata_by_default(
     tmp_path,
     method_name,
     bot_method_name,
@@ -992,12 +993,7 @@ async def test_native_media_preserves_business_connection_id(
     filename,
     payload,
 ):
-    """Business DMs need business_connection_id on native media sends.
-
-    Text replies already include it. Without it, Telegram rejects photos/files
-    in Business chats with "bot can't initiate conversation with a user" and
-    Hermes falls back to a useless local path text bubble.
-    """
+    """Business metadata must not make native media appear human-authored."""
     adapter = _make_adapter()
     media_path = tmp_path / filename
     media_path.write_bytes(payload)
@@ -1016,11 +1012,37 @@ async def test_native_media_preserves_business_connection_id(
     )
 
     assert result.success is True
+    assert "business_connection_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_native_media_business_send_as_account_requires_explicit_opt_in(tmp_path):
+    adapter = _make_adapter()
+    media_path = tmp_path / "report.txt"
+    media_path.write_bytes(b"report-data")
+    call_log = []
+
+    async def mock_send_document(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=790)
+
+    adapter._bot = SimpleNamespace(send_document=mock_send_document)
+
+    result = await adapter.send_document(
+        chat_id="244340834",
+        file_path=str(media_path),
+        metadata={
+            "business_connection_id": "biz-123",
+            "telegram_business_send_as_account": True,
+        },
+    )
+
+    assert result.success is True
     assert call_log[0]["business_connection_id"] == "biz-123"
 
 
 @pytest.mark.asyncio
-async def test_media_group_preserves_business_connection_id(tmp_path):
+async def test_media_group_uses_bot_identity_for_business_metadata_by_default(tmp_path):
     adapter = _make_adapter()
     image_path = tmp_path / "photo.png"
     image_path.write_bytes(b"png-data")
@@ -1038,7 +1060,7 @@ async def test_media_group_preserves_business_connection_id(tmp_path):
         metadata={"business_connection_id": "biz-123"},
     )
 
-    assert call_log[0]["business_connection_id"] == "biz-123"
+    assert "business_connection_id" not in call_log[0]
 
 
 @pytest.mark.asyncio
@@ -1437,6 +1459,46 @@ async def test_send_retries_pool_timeout():
     assert result.success is True
     assert result.message_id == "202"
     assert attempt[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_send_drains_general_request_pool_before_retrying_pool_timeout():
+    """Pool timeout should reset the send-message request pool before retrying."""
+    adapter = _make_adapter()
+    general_request = SimpleNamespace(
+        shutdown=AsyncMock(),
+        initialize=AsyncMock(),
+    )
+    polling_request = SimpleNamespace(
+        shutdown=AsyncMock(),
+        initialize=AsyncMock(),
+    )
+    adapter._app = SimpleNamespace(
+        bot=SimpleNamespace(_request=(polling_request, general_request))
+    )
+
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        if attempt[0] == 1:
+            raise FakeTimedOut(
+                "Pool timeout: All connections in the connection pool are "
+                "occupied. Request was *not* sent to Telegram."
+            )
+        return SimpleNamespace(message_id=203)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="test message")
+
+    assert result.success is True
+    assert result.message_id == "203"
+    assert attempt[0] == 2
+    general_request.shutdown.assert_awaited_once()
+    general_request.initialize.assert_awaited_once()
+    polling_request.shutdown.assert_not_awaited()
+    polling_request.initialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

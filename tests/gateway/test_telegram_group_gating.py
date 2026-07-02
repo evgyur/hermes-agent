@@ -544,23 +544,29 @@ def test_business_dm_ignored_user_id_suppresses_reflected_human_account_echo():
     ) is True
 
 
-def test_business_dm_private_chat_owner_echoes_are_ignored_by_default():
+def test_business_dm_private_chat_owner_echoes_are_fail_closed():
     adapter = _make_adapter(
         require_mention=False,
         private_chats=["617744661", "111"],
         allow_from=["617744661"],
     )
-    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd", "Сигурд"]}
 
     assert adapter._should_process_message(
-        _business_dm_message("Sigurd, mirrored owner echo", from_user_id=617744661)
+        _business_dm_message("plain mirrored owner echo", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, mirrored owner command", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Сигурд, проверь", from_user_id=617744661)
     ) is False
     assert adapter._should_process_message(
         _business_dm_message("Sigurd, real customer", from_user_id=111)
     ) is True
 
 
-def test_business_dm_private_chat_owner_echo_guard_can_be_disabled():
+def test_business_dm_private_chat_owner_echo_guard_is_fail_closed_even_if_legacy_config_disables_it():
     adapter = _make_adapter(
         require_mention=False,
         private_chats=["617744661"],
@@ -573,8 +579,77 @@ def test_business_dm_private_chat_owner_echo_guard_can_be_disabled():
     }
 
     assert adapter._should_process_message(
-        _business_dm_message("Sigurd, explicit business command", from_user_id=617744661)
-    ) is True
+        _business_dm_message("Sigurd, reflected owner echo", from_user_id=617744661)
+    ) is False
+
+
+def test_business_dm_explicit_ignore_user_id_still_suppresses_trigger():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_user_ids": ["617744661"],
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, explicit ignored user", from_user_id=617744661)
+    ) is False
+
+
+def test_business_voice_auto_transcribe_bypasses_wake_word_gate(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter.config.extra["business"] = {
+            "enabled": True,
+            "trigger_words": ["Sigurd"],
+            "auto_transcribe_voice": True,
+        }
+        adapter.send = AsyncMock()
+        adapter._message_handler = AsyncMock()
+
+        class FakeVoice:
+            file_size = 128
+
+            async def get_file(self):
+                return SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg")))
+
+        message = _business_dm_message("", from_user_id=222, business_connection_id="biz-voice")
+        message.voice = FakeVoice()
+        message.audio = None
+        update = SimpleNamespace(update_id=5001, message=message, effective_message=None)
+
+        monkeypatch.setattr("gateway.platforms.telegram.cache_audio_from_bytes", lambda *_args, **_kw: "/tmp/voice.ogg")
+        monkeypatch.setattr(
+            "tools.transcription_tools.transcribe_audio",
+            lambda path: {"success": True, "transcript": "Привет, это тест", "provider": "groq"},
+        )
+
+        await adapter._handle_media_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args is not None
+        args, kwargs = adapter.send.await_args
+        assert args[0] == "222"
+        assert "Привет, это тест" in args[1]
+        assert kwargs["reply_to"] == "43"
+        assert kwargs["metadata"] == {"business_connection_id": "biz-voice"}
+
+    asyncio.run(_run())
+
+
+def test_business_voice_auto_transcribe_is_config_gated():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+    message = _business_dm_message("", from_user_id=222, business_connection_id="biz-voice")
+    message.voice = SimpleNamespace(file_size=128)
+    message.audio = None
+
+    assert adapter._should_auto_transcribe_business_voice(message) is False
 
 
 def test_business_message_source_keeps_business_connection_id():
