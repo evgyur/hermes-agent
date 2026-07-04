@@ -1052,6 +1052,25 @@ class TestGoalManager:
         assert d2["verdict"] == "inactive"
         assert d2["should_continue"] is False
 
+
+    def test_stale_manager_does_not_repeat_done_notice(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        active = GoalManager(session_id="eval-stale-done")
+        active.set("finish once")
+
+        stale = GoalManager(session_id="eval-stale-done")
+        active.mark_done("already finished")
+
+        with patch.object(goals, "judge_goal") as judge:
+            decision = stale.evaluate_after_turn("Goal complete: yes")
+
+        judge.assert_not_called()
+        assert decision["verdict"] == "inactive"
+        assert decision["should_continue"] is False
+        assert decision["message"] == ""
+
     def test_continuation_prompt_shape(self, hermes_home):
         """The continuation prompt must include the goal text verbatim —
         and must be safe to inject as a user-role message (prompt-cache

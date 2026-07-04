@@ -1390,6 +1390,10 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         self._state = None
 
+    def _reload_state(self) -> Optional[GoalState]:
+        self._state = load_goal(self.session_id)
+        return self._state
+
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
@@ -1406,7 +1410,7 @@ class GoalManager:
         that case generating another continuation prompt is a control-plane bug,
         so reconcile persisted GoalManager state before prompting the LLM again.
         """
-        state = self._state
+        state = self._reload_state()
         if state is None or state.status != "active" or state.subgoals:
             return None
         decision = evaluate_structured_completion_guard(state.goal, "")
@@ -1623,7 +1627,7 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
-        state = self._state
+        state = self._reload_state()
         if state is None or state.status != "active":
             return {
                 "status": state.status if state else None,
@@ -1658,7 +1662,16 @@ class GoalManager:
         reconciled = self.reconcile_structured_completion_from_state()
         if reconciled is not None:
             return reconciled
-
+        state = self._state
+        if state is None or state.status != "active":
+            return {
+                "status": state.status if state else None,
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "inactive",
+                "reason": "no active goal",
+                "message": "",
+            }
 
         # Count the turn that just finished.
         state.turns_used += 1
