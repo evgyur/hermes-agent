@@ -223,6 +223,10 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
             value = (value or "").strip().upper()
             return value in {"COMPLETE", "DONE"} or value.startswith(("COMPLETE ", "COMPLETE —", "DONE ", "DONE —"))
 
+        def _is_audit_complete_value(value: str) -> bool:
+            value = (value or "").strip().upper()
+            return value == "AUDIT_COMPLETE" or value.startswith(("AUDIT_COMPLETE ", "AUDIT_COMPLETE —"))
+
         def _audit_markers_recorded_in(text: str) -> bool:
             return has_standalone_marker(text, "AUDIT_COMPLETE") and has_standalone_marker(
                 text,
@@ -274,6 +278,13 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
 
         status_value = _label_value("Status", "Status snapshot")
         phase_value = _label_value("Current phase")
+        # Some SuperGoal packages use Status: AUDIT_COMPLETE as their durable
+        # terminal state and keep the human-facing SUPERGOAL_RUN_COMPLETE marker
+        # in the final response/report rather than duplicating it in STATE.md.
+        # Once the canonical STATE.md says AUDIT_COMPLETE, another continuation
+        # is pure control-plane churn: stop before spending another model turn.
+        if _is_audit_complete_value(status_value):
+            return f"supergoal STATE.md already audit-complete at {label_root}"
         # A terminal Current phase is enough when final audit markers exist in
         # STATE.md or the canonical final-audit report.  Requiring an inline
         # Status label missed Markdown-style STATE.md files and caused spammy
@@ -287,6 +298,36 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
 
     candidate_roots = _candidate_state_roots(goal)
 
+    direct_state_paths = _direct_state_paths(allow_relative=not candidate_roots)
+
+    def _is_under(path: Path, root: Path) -> bool:
+        try:
+            resolved = path.resolve(strict=False)
+            base = root.resolve(strict=False)
+        except Exception:
+            resolved = path
+            base = root
+        return base in (resolved, *resolved.parents)
+
+    # Explicit STATE.md paths are the strongest signal only when they belong to
+    # the current canonical root(s). Nested SuperGoal packages often live under
+    # `<repo>/.supergoal/<package>/STATE.md`; reducing those to
+    # `<repo>/.supergoal/STATE.md` can bind the guard to an older sibling. But a
+    # direct STATE.md from an explicitly named previous rail must not override a
+    # later `project root: <current>` clause.
+    primary_root = candidate_roots[0] if candidate_roots else None
+    prioritized_direct_paths = [
+        p for p in direct_state_paths
+        if primary_root is None or _is_under(p, primary_root)
+    ]
+    for state_path in prioritized_direct_paths:
+        label_root = state_path.parent.parent if state_path.parent.name == ".supergoal" else state_path.parent
+        reason = _completion_reason_for_state(state_path, label_root)
+        if reason:
+            return reason
+        if reason == "":
+            return None
+
     for root in candidate_roots:
         state_path = root / ".supergoal" / "STATE.md"
         reason = _completion_reason_for_state(state_path, root)
@@ -295,14 +336,6 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
         if reason == "":
             # First existing STATE.md is canonical for this goal.  Do not keep
             # scanning older previous-rail paths that may also be mentioned.
-            return None
-
-    for state_path in _direct_state_paths(allow_relative=not candidate_roots):
-        label_root = state_path.parent.parent if state_path.parent.name == ".supergoal" else state_path.parent
-        reason = _completion_reason_for_state(state_path, label_root)
-        if reason:
-            return reason
-        if reason == "":
             return None
     return None
 

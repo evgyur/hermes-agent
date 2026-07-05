@@ -487,6 +487,43 @@ class TestJudgeGoal:
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_nested_explicit_audit_complete_state_stops_without_aux_judge(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "repo"
+        package = root / ".supergoal" / "self-improving-copytrader"
+        package.mkdir(parents=True)
+        # Older root package state must not steal precedence from the explicit
+        # nested STATE.md named in the goal body.
+        (root / ".supergoal" / "STATE.md").write_text(
+            "# unrelated root state\nCurrent phase: 4\nStatus: ACTIVE\n",
+            encoding="utf-8",
+        )
+        (package / "STATE.md").write_text(
+            "# Self-improving copy-trader state\n\n"
+            "Status: `AUDIT_COMPLETE`\n"
+            "Updated: 2026-07-05 15:45:47 UTC\n\n"
+            "## Completed\n"
+            "- SuperGoal phases 1-8 executed.\n"
+            "- Tests: `36 passed`.\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = (
+            f"Execute the Self-improving Hyperliquid copy-trader SuperGoal from `{package}`. "
+            f"Load `{package}/PROTOCOL.md`, `{package}/STATE.md`, `{package}/ROADMAP.md`, "
+            "then execute phases 1-8 continuously until AUDIT_COMPLETE or a real blocker."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "GOAL COMPLETE / AUDIT_COMPLETE. Останавливаюсь.")
+        assert verdict == "done"
+        assert "STATE.md already audit-complete" in reason
+        assert str(package) in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_markdown_state_with_external_final_audit_stops_without_aux_judge(self, tmp_path):
         from hermes_cli import goals
 
@@ -850,6 +887,31 @@ class TestGoalManager:
         assert mgr.state.status == "done"
         assert "STATE.md already complete" in (mgr.state.last_reason or "")
         assert not GoalManager(session_id="already-done-supergoal").is_active()
+
+    def test_goal_manager_reconciles_nested_audit_complete_state_before_continuation(self, hermes_home, tmp_path):
+        from hermes_cli.goals import GoalManager
+
+        root = tmp_path / "repo"
+        package = root / ".supergoal" / "nested-package"
+        package.mkdir(parents=True)
+        (root / ".supergoal" / "STATE.md").write_text(
+            "# root state\nStatus: ACTIVE\n",
+            encoding="utf-8",
+        )
+        (package / "STATE.md").write_text(
+            "# STATE\nStatus: `AUDIT_COMPLETE`\n",
+            encoding="utf-8",
+        )
+        mgr = GoalManager(session_id="already-audit-complete-nested-supergoal")
+        mgr.set(
+            f"Execute nested SuperGoal from `{package}`. Load `{package}/STATE.md`; "
+            "continue until AUDIT_COMPLETE or a real blocker."
+        )
+
+        assert mgr.next_continuation_prompt() is None
+        assert mgr.state is not None
+        assert mgr.state.status == "done"
+        assert "STATE.md already audit-complete" in (mgr.state.last_reason or "")
 
     def test_set_rejects_empty(self, hermes_home):
         from hermes_cli.goals import GoalManager
