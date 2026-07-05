@@ -524,6 +524,37 @@ class TestJudgeGoal:
         assert str(package) in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_nested_package_root_audit_complete_state_stops_without_state_file_name(self, tmp_path):
+        from hermes_cli import goals
+
+        root = tmp_path / "repo"
+        package = root / ".supergoal" / "hlcopy-self-improving-safe-autonomy-v2"
+        package.mkdir(parents=True)
+        (root / ".supergoal" / "STATE.md").write_text(
+            "# unrelated root state\nStatus: ACTIVE\n",
+            encoding="utf-8",
+        )
+        (package / "STATE.md").write_text(
+            "# SuperGoal State\n\n"
+            "Status: AUDIT_COMPLETE\n"
+            "Updated: 2026-07-05T19:45:27Z\n",
+            encoding="utf-8",
+        )
+        fake_client = MagicMock()
+        goal = (
+            f"Execute the SuperGoal package at `{package}` from `PROTOCOL.md`. "
+            "Continue through all phases until AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE, or a real blocker."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, "SUPERGOAL_RUN_COMPLETE — already closed.")
+        assert verdict == "done"
+        assert "STATE.md already audit-complete" in reason
+        assert str(package) in reason
+        fake_client.chat.completions.create.assert_not_called()
+
     def test_supergoal_markdown_state_with_external_final_audit_stops_without_aux_judge(self, tmp_path):
         from hermes_cli import goals
 
@@ -906,6 +937,31 @@ class TestGoalManager:
         mgr.set(
             f"Execute nested SuperGoal from `{package}`. Load `{package}/STATE.md`; "
             "continue until AUDIT_COMPLETE or a real blocker."
+        )
+
+        assert mgr.next_continuation_prompt() is None
+        assert mgr.state is not None
+        assert mgr.state.status == "done"
+        assert "STATE.md already audit-complete" in (mgr.state.last_reason or "")
+
+    def test_goal_manager_reconciles_nested_package_root_before_continuation(self, hermes_home, tmp_path):
+        from hermes_cli.goals import GoalManager
+
+        root = tmp_path / "repo"
+        package = root / ".supergoal" / "hlcopy-self-improving-safe-autonomy-v2"
+        package.mkdir(parents=True)
+        (root / ".supergoal" / "STATE.md").write_text(
+            "# root state\nStatus: ACTIVE\n",
+            encoding="utf-8",
+        )
+        (package / "STATE.md").write_text(
+            "# STATE\nStatus: AUDIT_COMPLETE\n",
+            encoding="utf-8",
+        )
+        mgr = GoalManager(session_id="already-audit-complete-package-root")
+        mgr.set(
+            f"Execute the SuperGoal package at `{package}` from `PROTOCOL.md`. "
+            "Continue until AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         )
 
         assert mgr.next_continuation_prompt() is None

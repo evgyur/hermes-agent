@@ -179,6 +179,40 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
                 paths.append(path)
         return paths
 
+    def _explicit_package_state_paths(allow_relative: bool) -> List[Path]:
+        """Return STATE.md paths for explicit `.supergoal/<package>` dirs.
+
+        SuperGoal launch bodies commonly name a package root like
+        ``/repo/.supergoal/hlcopy-v2`` but not the literal ``STATE.md`` file.
+        Normalizing that path to ``/repo`` makes the guard inspect
+        ``/repo/.supergoal/STATE.md`` and miss the completed nested package.
+        """
+        paths: List[Path] = []
+        seen: set[str] = set()
+        text = str(goal or "")
+        candidates: List[str] = []
+        candidates.extend(m.group(1) for m in re.finditer(r"`(/[^`]*\.supergoal/[^`]+)`", text))
+        candidates.extend(m.group(1) for m in re.finditer(r"`(\.supergoal/[^`]+)`", text))
+        candidates.extend(m.group(1) for m in re.finditer(r"(/\S*\.supergoal/\S+)", text))
+        if allow_relative:
+            candidates.extend(m.group(1) for m in re.finditer(r"(\.supergoal/\S+)", text))
+
+        for raw in candidates:
+            raw = (raw or "").strip().strip("`'\"<>").rstrip(".,;)]")
+            if not raw:
+                continue
+            if not allow_relative and raw.startswith(".supergoal/"):
+                continue
+            if raw.endswith("STATE.md") or ".md" in Path(raw).name.lower():
+                continue
+            path = Path(raw) if raw.startswith("/") else Path.cwd() / raw
+            state_path = path / "STATE.md"
+            key = str(state_path)
+            if key not in seen:
+                seen.add(key)
+                paths.append(state_path)
+        return paths
+
     def _completion_reason_for_state(state_path: Path, label_root: Path) -> Optional[str]:
         if not state_path.exists() or not state_path.is_file():
             return None
@@ -299,6 +333,7 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
     candidate_roots = _candidate_state_roots(goal)
 
     direct_state_paths = _direct_state_paths(allow_relative=not candidate_roots)
+    package_state_paths = _explicit_package_state_paths(allow_relative=not candidate_roots)
 
     def _is_under(path: Path, root: Path) -> bool:
         try:
@@ -317,7 +352,7 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
     # later `project root: <current>` clause.
     primary_root = candidate_roots[0] if candidate_roots else None
     prioritized_direct_paths = [
-        p for p in direct_state_paths
+        p for p in [*direct_state_paths, *package_state_paths]
         if primary_root is None or _is_under(p, primary_root)
     ]
     for state_path in prioritized_direct_paths:
