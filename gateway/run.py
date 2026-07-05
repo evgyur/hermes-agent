@@ -3376,6 +3376,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route["request_overrides"] = overrides or {}
         return route
 
+    @staticmethod
+    def _is_use_xhigh_gpt55_trigger(message: str) -> bool:
+        """Return True when the user explicitly asks for GPT-5.5 xhigh.
+
+        Telegram group messages may arrive as ``[Sender] text`` and can also
+        be wrapped after a channel-context preface with ``[New message]``.
+        Detect only a leading operator directive so incidental mentions of
+        "use xhigh" inside a task body don't silently reroute the model.
+        """
+        text = str(message or "").strip()
+        if not text:
+            return False
+        if "[New message]" in text:
+            text = text.rsplit("[New message]", 1)[-1].strip()
+        text = re.sub(r"^\[[^\]\n]{1,120}\]\s*", "", text).strip()
+        return bool(
+            re.match(
+                r"(?is)^use\s+xhigh(?:\s+reasoning)?(?:\b|\s*[:—\-.,;])",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _gpt55_xhigh_reasoning_config() -> dict:
+        """Runtime reasoning override for explicit `use xhigh` turns."""
+        return {"enabled": True, "effort": "xhigh"}
+
+    @staticmethod
+    def _resolve_gpt55_openai_codex_runtime(previous_runtime: Optional[dict] = None) -> tuple[str, dict]:
+        """Resolve the exact GPT-5.5/OpenAI-Codex runtime for one turn."""
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested="openai-codex",
+            target_model="gpt-5.5",
+        )
+        previous_runtime = previous_runtime or {}
+        return "gpt-5.5", {
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider") or "openai-codex",
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+            "max_tokens": previous_runtime.get("max_tokens"),
+        }
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -16251,6 +16299,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 session_key=session_key,
             )
+            if self._is_use_xhigh_gpt55_trigger(message):
+                model, runtime_kwargs = self._resolve_gpt55_openai_codex_runtime(runtime_kwargs)
+                reasoning_config = self._gpt55_xhigh_reasoning_config()
+                logger.info(
+                    "Explicit use-xhigh trigger: forcing model=%s provider=%s reasoning=%s session=%s",
+                    model,
+                    runtime_kwargs.get("provider"),
+                    reasoning_config.get("effort"),
+                    session_key or "",
+                )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
