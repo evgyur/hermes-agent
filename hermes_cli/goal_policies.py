@@ -63,7 +63,15 @@ def has_standalone_marker(text: str, marker: str) -> bool:
     if not target:
         return False
     for line in _non_fenced_lines(text):
-        if _normalize_marker_line(line) == target:
+        normalized = _normalize_marker_line(line)
+        if normalized == target:
+            return True
+        # Accept compact status lines as terminal marker lines too:
+        # ``AUDIT_COMPLETE: yes`` / ``SUPERGOAL_RUN_COMPLETE: true``.
+        # These are common in final audit reports.  Keep this deliberately
+        # positive-only so ``Goal complete: no`` or examples in prose do not
+        # satisfy a structured SuperGoal contract.
+        if re.match(rf"^{re.escape(target)}\s*:\s*(YES|TRUE|DONE|COMPLETE)\b", normalized):
             return True
     return False
 
@@ -259,7 +267,15 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
 
         def _is_audit_complete_value(value: str) -> bool:
             value = (value or "").strip().upper()
-            return value == "AUDIT_COMPLETE" or value.startswith(("AUDIT_COMPLETE ", "AUDIT_COMPLETE —"))
+            return (
+                value in {"AUDIT_COMPLETE", "SUPERGOAL_RUN_COMPLETE"}
+                or value.startswith((
+                    "AUDIT_COMPLETE ",
+                    "AUDIT_COMPLETE —",
+                    "SUPERGOAL_RUN_COMPLETE ",
+                    "SUPERGOAL_RUN_COMPLETE —",
+                ))
+            )
 
         def _audit_markers_recorded_in(text: str) -> bool:
             return has_standalone_marker(text, "AUDIT_COMPLETE") and has_standalone_marker(
@@ -274,8 +290,18 @@ def _state_file_completion_reason(goal: str) -> Optional[str]:
             # STATE.md only points at that report.  If Current phase is already
             # terminal, consult the canonical final-audit report before letting
             # GoalManager synthesize another continuation turn.
-            canonical_root = state_path.parent.parent if state_path.parent.name == ".supergoal" else label_root
-            allowed_base = canonical_root / ".supergoal"
+            if state_path.parent.name == ".supergoal":
+                canonical_root = state_path.parent.parent
+                allowed_base = state_path.parent
+            elif state_path.parent.parent.name == ".supergoal":
+                # Nested package: <repo>/.supergoal/<package>/STATE.md.
+                # Final audit artifacts live under the package root itself,
+                # not under <package>/.supergoal/.
+                canonical_root = state_path.parent.parent.parent
+                allowed_base = state_path.parent
+            else:
+                canonical_root = label_root
+                allowed_base = state_path.parent
             candidates = [state_path.parent / "reports" / "final-audit.md"]
             for match in re.finditer(r"`?([^`\n]*final-audit\.md)`?", state_text, re.IGNORECASE):
                 raw = match.group(1).strip().strip("`'\"<>").rstrip(".,;)]")
@@ -463,6 +489,32 @@ def evaluate_structured_completion_guard(
         return StructuredCompletionDecision("done", "supergoal stopped with AUDIT_HANDOFF")
     if _is_approval_blocker_response(last_response):
         return StructuredCompletionDecision("done", "supergoal stopped with BLOCKED_BY_APPROVAL")
+
+    # Operators often render the final marker as a compact status line, e.g.
+    # ``SUPERGOAL_RUN_COMPLETE — уже закрыто: AUDIT_COMPLETE, Status: COMPLETE``.
+    # That is an intentional terminal marker, not a prose/example mention.  Treat
+    # a non-fenced line starting with SUPERGOAL_RUN_COMPLETE as terminal when any
+    # required AUDIT_COMPLETE marker also appears outside fences.  Without this,
+    # GoalManager keeps re-prompting until the 20-turn budget is exhausted and
+    # spams the same "already complete" answer.
+    non_fenced_marker_lines = [
+        _normalize_marker_line(line) for line in _non_fenced_lines(last_response)
+    ]
+    non_fenced_normalized = "\n".join(non_fenced_marker_lines)
+    has_terminal_prefix_line = any(
+        line.startswith("SUPERGOAL_RUN_COMPLETE")
+        and line != "SUPERGOAL_RUN_COMPLETE"
+        and not re.match(r"^SUPERGOAL_RUN_COMPLETE\s*:\s*(NO|FALSE|MISSING|NOT\b)", line)
+        for line in non_fenced_marker_lines
+    )
+    if has_terminal_prefix_line and (
+        "AUDIT_COMPLETE" not in goal_upper or "AUDIT_COMPLETE" in non_fenced_normalized
+    ):
+        return StructuredCompletionDecision(
+            "done",
+            "supergoal stopped with SUPERGOAL_RUN_COMPLETE terminal marker",
+        )
+
     if "SUPERGOAL_RUN_COMPLETE" in goal_upper and not has_standalone_marker(
         last_response,
         "SUPERGOAL_RUN_COMPLETE",

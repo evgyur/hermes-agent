@@ -245,6 +245,104 @@ class TestJudgeGoal:
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
 
+    def test_supergoal_terminal_marker_prefix_stops_without_aux_judge(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                )
+            ]
+        )
+        goal = "Run phases; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = (
+            "SUPERGOAL_RUN_COMPLETE — уже закрыто: AUDIT_COMPLETE, "
+            "Status: COMPLETE. Стоп."
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal(goal, response)
+        assert verdict == "done"
+        assert "SUPERGOAL_RUN_COMPLETE" in reason
+        fake_client.chat.completions.create.assert_not_called()
+
+    def test_supergoal_positive_marker_status_lines_are_standalone_markers(self):
+        from hermes_cli.goal_policies import has_standalone_marker
+
+        assert has_standalone_marker("AUDIT_COMPLETE: yes", "AUDIT_COMPLETE")
+        assert has_standalone_marker("**SUPERGOAL_RUN_COMPLETE: true**", "SUPERGOAL_RUN_COMPLETE")
+        assert not has_standalone_marker("Goal complete: no", "Goal complete")
+
+    def test_supergoal_negative_terminal_status_line_does_not_stop(self):
+        from hermes_cli import goals
+
+        goal = "Run phases; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        response = "AUDIT_COMPLETE: yes\nSUPERGOAL_RUN_COMPLETE: no\nGoal complete: no"
+        result = goals.judge_goal(goal, response)
+        verdict, reason = result[0], result[1]
+        assert verdict == "continue"
+        assert "standalone SUPERGOAL_RUN_COMPLETE" in reason
+
+    def test_supergoal_nested_state_status_run_complete_reconciles_without_llm_turn(self, hermes_home, tmp_path):
+        from hermes_cli.goals import GoalManager
+
+        package = tmp_path / "repo" / ".supergoal" / "trader20-security-hardening-v1"
+        package.mkdir(parents=True)
+        (package / "STATE.md").write_text(
+            "# STATE\n"
+            "Status: SUPERGOAL_RUN_COMPLETE\n"
+            "Current phase: 12\n"
+            "Release: 20260707T011841Z-dd852560a176\n",
+            encoding="utf-8",
+        )
+
+        mgr = GoalManager("supergoal-nested-state-status")
+        mgr.set(
+            f"Execute the disk-backed SuperGoal package in `{package}`. "
+            "Completion requires AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+
+        decision = mgr.reconcile_structured_completion_from_state()
+        assert decision is not None
+        assert decision["status"] == "done"
+        assert mgr.state is not None
+        assert mgr.state.status == "done"
+        assert "already audit-complete" in str(mgr.state.last_reason)
+
+    def test_supergoal_nested_package_final_audit_report_is_allowed_base(self, hermes_home, tmp_path):
+        from hermes_cli.goals import GoalManager
+
+        package = tmp_path / "repo" / ".supergoal" / "nested-package"
+        reports = package / "reports"
+        reports.mkdir(parents=True)
+        (package / "STATE.md").write_text(
+            "# STATE\n"
+            "Status: COMPLETE\n"
+            "Current phase: DONE\n"
+            "Final audit: reports/final-audit.md\n",
+            encoding="utf-8",
+        )
+        (reports / "final-audit.md").write_text(
+            "AUDIT_COMPLETE: yes\nSUPERGOAL_RUN_COMPLETE: yes\nGoal complete: yes\n",
+            encoding="utf-8",
+        )
+
+        mgr = GoalManager("supergoal-nested-final-audit")
+        mgr.set(
+            f"Run `{package}` and stop only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
+        )
+
+        decision = mgr.reconcile_structured_completion_from_state()
+        assert decision is not None
+        assert decision["status"] == "done"
+        assert mgr.state is not None
+        assert mgr.state.status == "done"
+        assert "already complete" in str(mgr.state.last_reason)
+
     def test_supergoal_inline_marker_mentions_do_not_satisfy_guard(self):
         from hermes_cli import goals
 
