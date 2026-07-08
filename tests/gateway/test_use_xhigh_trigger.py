@@ -5,6 +5,9 @@ def test_use_xhigh_trigger_accepts_plain_prefixes():
     assert GatewayRunner._is_use_xhigh_gpt55_trigger("use xhigh fix this")
     assert GatewayRunner._is_use_xhigh_gpt55_trigger("use xhigh reasoning: fix this")
     assert GatewayRunner._is_use_xhigh_gpt55_trigger("use xhigh reasoning — fix this")
+    assert GatewayRunner._is_use_xhigh_gpt55_trigger("xhigh reasoning gpt fix this")
+    assert GatewayRunner._is_use_xhigh_gpt55_trigger("xhigh gpt-5.5: fix this")
+    assert GatewayRunner._is_use_xhigh_gpt55_trigger("Xhigh reasoning gpt не доступен?")
 
 
 def test_use_xhigh_trigger_accepts_telegram_sender_and_context_wrappers():

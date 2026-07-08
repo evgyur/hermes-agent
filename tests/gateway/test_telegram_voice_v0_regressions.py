@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -33,6 +34,56 @@ def _runner(adapter=None):
     runner._thread_metadata_for_source = lambda *_args, **_kwargs: {}
     runner._reply_anchor_for_event = lambda _event: None
     return runner
+
+
+def test_telegram_native_voice_transcript_followup_is_suppressed_after_voice():
+    adapter = object.__new__(TelegramAdapter)
+    adapter._recent_voice_message_keys = {}
+
+    user = SimpleNamespace(id=617744661)
+    chat = SimpleNamespace(id=617744661)
+    voice_msg = SimpleNamespace(chat=chat, from_user=user)
+    transcript_msg = SimpleNamespace(
+        chat=chat,
+        from_user=user,
+        text="🎙 Расшифровка голосового:\n\nДавай проверим.",
+    )
+
+    assert adapter._is_native_voice_transcript_followup(transcript_msg) is False
+    adapter._remember_recent_voice_message(voice_msg)
+    assert adapter._is_native_voice_transcript_followup(transcript_msg) is True
+
+
+def test_telegram_native_voice_transcript_followup_matcher_stays_narrow():
+    assert TelegramAdapter._voice_transcript_followup_text("🎙 Расшифровка голосового:\n\nДавай проверим.") is True
+    assert TelegramAdapter._voice_transcript_followup_text("Давай проверим") is False
+    assert TelegramAdapter._voice_transcript_followup_text("🎙 Транскрипт:\nДавай проверим") is False
+
+
+@pytest.mark.asyncio
+async def test_telegram_native_voice_transcript_followup_is_deleted_and_not_enqueued():
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter._recent_voice_message_keys = {}
+    adapter.delete_message = AsyncMock(return_value=True)
+    adapter._enqueue_text_event = Mock()
+
+    user = SimpleNamespace(id=617744661)
+    chat = SimpleNamespace(id=617744661)
+    voice_msg = SimpleNamespace(chat=chat, from_user=user)
+    transcript_msg = SimpleNamespace(
+        chat=chat,
+        from_user=user,
+        message_id=12762,
+        text="🎙 Расшифровка голосового:\n\nПривет.",
+    )
+    update = SimpleNamespace(effective_message=transcript_msg, message=transcript_msg, update_id=1)
+
+    adapter._remember_recent_voice_message(voice_msg)
+    await TelegramAdapter._handle_text_message(adapter, update, SimpleNamespace())
+
+    adapter.delete_message.assert_awaited_once_with("617744661", "12762")
+    adapter._enqueue_text_event.assert_not_called()
 
 
 def test_telegram_audio_size_gate_rejects_oversized_media_before_download():

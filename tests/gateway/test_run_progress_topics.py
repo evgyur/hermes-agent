@@ -702,10 +702,11 @@ async def _run_with_agent(
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
 ):
-    if config_data:
-        import yaml
+    import yaml
 
-        (tmp_path / "config.yaml").write_text(yaml.dump(config_data), encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(config_data or {}), encoding="utf-8"
+    )
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -769,6 +770,27 @@ async def test_run_agent_suppresses_tool_progress_for_configured_telegram_chat(m
     assert adapter.sent == []
     assert adapter.edits == []
     assert adapter.typing == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_allows_tool_progress_for_configured_topic_even_when_telegram_default_off(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-visible-topic-default-off",
+        chat_id="-1003942534566",
+        chat_type="group",
+        thread_id="1",
+        config_data={
+            "display": {"platforms": {"telegram": {"tool_progress": False}}},
+            "telegram": {"tool_progress_topics": ["-1003942534566:1"]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == '💻 terminal: "pwd"'
 
 
 @pytest.mark.asyncio
@@ -890,15 +912,16 @@ async def test_run_agent_surfaces_real_interim_commentary(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_run_agent_surfaces_interim_commentary_by_default(monkeypatch, tmp_path):
+async def test_run_agent_suppresses_interim_commentary_by_default_for_telegram(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         CommentaryAgent,
-        session_id="sess-commentary-default-on",
+        session_id="sess-commentary-default-off-telegram",
     )
 
-    assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+    assert result.get("already_sent") is not True
+    assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,27 @@ def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monk
     assert config.stt_enabled is False
 
 
+def test_gateway_config_stt_echo_transcripts_default_on():
+    config = GatewayConfig.from_dict({})
+
+    assert config.stt_enabled is True
+    assert config.stt_echo_transcripts is True
+
+
+def test_gateway_config_stt_echo_transcripts_can_be_disabled_nested():
+    config = GatewayConfig.from_dict({"stt": {"echo_transcripts": False}})
+
+    assert config.stt_enabled is True
+    assert config.stt_echo_transcripts is False
+
+
+def test_gateway_config_stt_echo_transcripts_can_be_explicitly_enabled_nested():
+    config = GatewayConfig.from_dict({"stt": {"echo_transcripts": True}})
+
+    assert config.stt_enabled is True
+    assert config.stt_echo_transcripts is True
+
+
 @pytest.mark.asyncio
 async def test_enrich_message_with_transcription_surfaces_path_when_stt_disabled():
     from gateway.run import GatewayRunner
@@ -185,3 +206,110 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     # Success path: the transcript passes through as a plain quoted line, with
     # no "voice message" meta-commentary that the LLM would echo back.
     assert "queued voice transcript" in result
+
+
+@pytest.mark.asyncio
+async def test_dequeued_voice_echoes_by_default():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._has_setup_skill = lambda: False
+    runner._thread_metadata_for_source = lambda *_args, **_kwargs: {}
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._claim_transcript_echo_once = lambda *_args, **_kwargs: True
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/queued-voice.ogg"],
+        media_types=["audio/ogg"],
+        message_id="42",
+    )
+
+    class Adapter:
+        send = AsyncMock()
+
+        def get_pending_message(self, session_key):
+            return event
+
+        def _is_transcribe_route_chat(self, chat_id):
+            return False
+
+    adapter = Adapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "default should echo this transcript",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._dequeue_pending_with_transcription(
+            adapter,
+            "telegram:dm:123",
+            source,
+        )
+
+    assert "default should echo this transcript" in result
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dequeued_voice_does_not_echo_when_stt_echo_transcripts_disabled():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True, stt_echo_transcripts=False)
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/queued-voice.ogg"],
+        media_types=["audio/ogg"],
+        message_id="42",
+    )
+
+    class Adapter:
+        send = AsyncMock()
+
+        def get_pending_message(self, session_key):
+            return event
+
+        def _is_transcribe_route_chat(self, chat_id):
+            return False
+
+    adapter = Adapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "do not echo this transcript",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._dequeue_pending_with_transcription(
+            adapter,
+            "telegram:dm:123",
+            source,
+        )
+
+    assert "do not echo this transcript" in result
+    adapter.send.assert_not_awaited()

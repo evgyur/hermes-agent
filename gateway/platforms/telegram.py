@@ -549,6 +549,12 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Some Telegram clients / Bot API surfaces deliver the native voice
+        # transcription as a follow-up text message right after the voice
+        # update. Hermes already transcribes the voice internally, so letting
+        # that text through creates a second user turn that looks like a
+        # visible transcript echo.
+        self._recent_voice_message_keys: Dict[tuple[str, str], float] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -1814,6 +1820,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    @staticmethod
+    def _truthy_config_value(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     def _business_connection_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -1821,20 +1833,32 @@ class TelegramAdapter(BasePlatformAdapter):
         business_connection_id = metadata.get("business_connection_id")
         if not business_connection_id:
             return {}
-        if not metadata.get("telegram_business_send_as_account"):
+
+        send_as_account = metadata.get("telegram_business_send_as_account")
+        if send_as_account is None:
+            business_cfg: Dict[str, Any] = {}
+            config = getattr(self, "config", None)
+            extra = getattr(config, "extra", {}) if config is not None else {}
+            raw = extra.get("business") if isinstance(extra, dict) else None
+            if isinstance(raw, dict):
+                business_cfg = raw
+            send_as_account = business_cfg.get(
+                "send_as_account",
+                business_cfg.get("reply_via_business_connection", False),
+            )
+
+        if not self._truthy_config_value(send_as_account):
             # Telegram Business Bot API sends with business_connection_id render
-            # as the connected human/business account, not as the bot.  That is
-            # unsafe as a default for agent output: one Hermes reply in a
-            # delegated bot chat visibly appeared authored by Chip.  Preserve
-            # the inbound business metadata for session isolation/reply routing,
-            # but fail closed on outbound identity unless a future trusted path
-            # opts in explicitly per send.
+            # as the connected human/business account in the peer chat. Keep the
+            # default fail-closed, but allow Chip's explicitly configured
+            # Business concierge route to use the official business connection.
             logger.warning(
                 "[%s] Suppressing Telegram Business send-as-account for agent reply",
                 self.name,
             )
             return {}
         return {"business_connection_id": str(business_connection_id)}
+
 
     def _telegram_api_base_url(self) -> str:
         """Return the Bot API method base URL, without the token suffix."""
@@ -6900,7 +6924,9 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._message_matches_mention_patterns(message)
 
     def _telegram_business_config(self) -> Dict[str, Any]:
-        raw = self.config.extra.get("business")
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", {}) if config is not None else {}
+        raw = extra.get("business") if isinstance(extra, dict) else None
         return raw if isinstance(raw, dict) else {}
 
     def _telegram_business_enabled(self) -> bool:
@@ -7046,23 +7072,14 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = str(getattr(user, "id", "") or "")
         if user_id and user_id in self._telegram_business_ignored_user_ids():
             return False
+
         allowed_owner_ids = self._telegram_chat_id_set(self.config.extra.get("allow_from"))
         env_allowed = os.getenv("TELEGRAM_ALLOWED_USERS", "")
         allowed_owner_ids.update(self._telegram_chat_id_set(env_allowed))
-        if user_id and user_id in allowed_owner_ids:
-            # Telegram Business owner/account echoes are agent output reflected
-            # through the delegated human inbox. Keep this fail-closed even if
-            # a legacy knob such as business.ignore_owner_echoes=false is left
-            # in config; explicit owner commands should use the normal bot DM.
-            return False
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
         free_response = self._telegram_business_free_response_chats()
-        if user_id in free_response or chat_id in free_response:
-            return True
 
-        if self._message_mentions_bot(message):
-            return True
-
+        mentions_this_bot = self._message_mentions_bot(message)
         text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
         raw_words = self._telegram_business_config().get("trigger_words", [])
         if isinstance(raw_words, str):
@@ -7071,14 +7088,27 @@ class TelegramAdapter(BasePlatformAdapter):
             trigger_words = [str(part).strip() for part in raw_words if str(part).strip()]
         else:
             trigger_words = []
+
+        has_wake_word = False
         for word in trigger_words:
             if re.search(rf"(?i)(?<![\w@]){re.escape(word)}(?![\w@])", text):
-                return True
+                has_wake_word = True
+                break
 
         allow_reply = self._telegram_business_config().get("allow_reply_trigger", False)
         if isinstance(allow_reply, str):
             allow_reply = allow_reply.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(allow_reply and self._is_reply_to_bot(message))
+        has_reply_trigger = bool(allow_reply and self._is_reply_to_bot(message))
+
+        if user_id and user_id in allowed_owner_ids:
+            # Ignore plain owner/account echoes, but allow explicit owner wake
+            # commands in a delegated Telegram Business DM.
+            return bool(mentions_this_bot or has_wake_word or has_reply_trigger)
+
+        if user_id in free_response or chat_id in free_response:
+            return True
+        return bool(mentions_this_bot or has_wake_word or has_reply_trigger)
+
 
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
@@ -7787,6 +7817,23 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if self._is_native_voice_transcript_followup(msg):
+            chat_id = getattr(getattr(msg, "chat", None), "id", "unknown")
+            message_id = getattr(msg, "message_id", "unknown")
+            deleted = False
+            try:
+                if chat_id != "unknown" and message_id != "unknown":
+                    deleted = await self.delete_message(str(chat_id), str(message_id))
+            except Exception as exc:
+                logger.debug("[%s] Native Telegram voice transcript delete failed: %s", self.name, exc)
+            logger.info(
+                "[%s] Ignoring native Telegram voice transcript follow-up: chat=%s msg=%s deleted=%s",
+                self.name,
+                chat_id,
+                message_id,
+                deleted,
+            )
+            return
         if self._is_recent_outbound_text_echo(msg):
             logger.info(
                 "[%s] Ignoring reflected outbound Telegram text echo: chat=%s msg=%s",
@@ -7818,6 +7865,42 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._recover_transcribe_route_tme_link_via_telegram_chip(event, msg.chat.id)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    @staticmethod
+    def _voice_transcript_followup_text(text: str) -> bool:
+        body = str(text or "").strip()
+        if not body:
+            return False
+        # Telegram's native transcript UI is localized; the Russian client
+        # currently emits this heading when it is surfaced as text. Keep this
+        # narrow so ordinary user text still reaches Hermes.
+        return bool(re.match(r"^🎙\s*Расшифровка голосового\s*:\s*\S", body, re.IGNORECASE | re.DOTALL))
+
+    @staticmethod
+    def _voice_transcript_key_from_message(msg: Any) -> tuple[str, str]:
+        chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or "")
+        return chat_id, user_id
+
+    def _remember_recent_voice_message(self, msg: Any) -> None:
+        recent = getattr(self, "_recent_voice_message_keys", None)
+        if recent is None:
+            recent = {}
+            self._recent_voice_message_keys = recent
+        now = time.monotonic()
+        recent[self._voice_transcript_key_from_message(msg)] = now
+        if len(recent) > 256:
+            cutoff = now - 60.0
+            for key, ts in list(recent.items()):
+                if ts < cutoff:
+                    recent.pop(key, None)
+
+    def _is_native_voice_transcript_followup(self, msg: Any) -> bool:
+        if not self._voice_transcript_followup_text(getattr(msg, "text", "") or ""):
+            return False
+        recent = getattr(self, "_recent_voice_message_keys", None) or {}
+        ts = recent.get(self._voice_transcript_key_from_message(msg))
+        return bool(ts and (time.monotonic() - ts) <= 10.0)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8122,6 +8205,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
+                self._remember_recent_voice_message(msg)
                 logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
@@ -8169,6 +8253,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif msg.video:
             try:
+                allowed, note = self._telegram_media_size_allowed(msg.video, "video file")
+                if not allowed:
+                    event.text = self._append_observed_note(event.text, note or "")
+                    logger.info("[Telegram] Skipped oversized user video (size=%s)", getattr(msg.video, "file_size", None))
+                    await self.handle_message(event)
+                    return
                 file_obj = await msg.video.get_file()
                 video_bytes = await file_obj.download_as_bytearray()
                 ext = ".mp4"

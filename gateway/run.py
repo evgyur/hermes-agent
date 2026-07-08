@@ -1277,6 +1277,84 @@ def _resolve_gateway_profile_route(user_config: dict, source: Any) -> tuple[Opti
         return None, None
 
 
+_AUTO_PO_CONTROL_RE = re.compile(
+    r"\b(hermes|gateway|config|profile|profiles|skill|skills|quick[_ -]?command|po_quick|promptoptimizer|prompt optimizer|/po)\b",
+    re.IGNORECASE,
+)
+
+
+def _auto_po_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int)):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return []
+
+
+def _auto_po_route_matches(source: Any, route: Any) -> bool:
+    """Return True when a Telegram source matches an auto-/po route entry."""
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    thread_id = str(getattr(source, "thread_id", "") or "")
+    if not chat_id:
+        return False
+
+    if isinstance(route, dict):
+        chats = _auto_po_list(route.get("chats") or route.get("chat_ids") or route.get("chat_id"))
+        if not chats:
+            return False
+        if chat_id not in {str(c) for c in chats}:
+            return False
+        threads = route.get("threads") or route.get("thread_ids") or route.get("thread_id")
+        if threads is None:
+            return True
+        return bool(thread_id and thread_id in {str(t) for t in _auto_po_list(threads)})
+
+    raw = str(route).strip()
+    if not raw:
+        return False
+    if ":" in raw:
+        route_chat, route_thread = raw.rsplit(":", 1)
+        return chat_id == route_chat and bool(thread_id) and thread_id == route_thread
+    return chat_id == raw
+
+
+def _looks_like_auto_po_payload(text: str) -> bool:
+    """Conservative guard so meta/control chatter in the PO room stays normal."""
+    body = str(text or "").strip()
+    if not body:
+        return False
+    if body.startswith("/"):
+        return False
+    lowered = body.lower()
+    if lowered in {"да", "нет", "ок", "окей", "го", "давай", "yes", "no", "ok"}:
+        return False
+    if _AUTO_PO_CONTROL_RE.search(body):
+        return False
+    return True
+
+
+def _should_auto_po_route(user_config: dict, source: Any, text: str) -> bool:
+    """Config-driven Telegram route that rewrites plain text into /po."""
+    try:
+        platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", "") or "")
+        if platform != "telegram":
+            return False
+        if not _looks_like_auto_po_payload(text):
+            return False
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return False
+        routes = telegram_cfg.get("auto_po_routes") or telegram_cfg.get("prompt_optimizer_routes") or []
+        for route in _auto_po_list(routes):
+            if _auto_po_route_matches(source, route):
+                return True
+    except Exception as exc:
+        logger.debug("auto /po route check failed: %s", exc)
+    return False
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -3393,7 +3471,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = re.sub(r"^\[[^\]\n]{1,120}\]\s*", "", text).strip()
         return bool(
             re.match(
-                r"(?is)^use\s+xhigh(?:\s+reasoning)?(?:\b|\s*[:—\-.,;])",
+                r"(?is)^(?:"
+                r"use\s+xhigh(?:\s+reasoning)?"
+                r"|"
+                r"xhigh(?:\s+reasoning)?(?:\s+(?:gpt|gptt|gpt-?5(?:\.5)?|codex))?"
+                r")(?:\b|\s*[:—\-.,;?])",
                 text,
             )
         )
@@ -8375,6 +8457,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Check for commands
         command = event.get_command()
+        if not command:
+            try:
+                user_config_for_auto_po = _load_gateway_config()
+                if _should_auto_po_route(user_config_for_auto_po, source, event.text):
+                    payload = str(event.text or "").strip()
+                    try:
+                        event = dataclasses.replace(event, text=f"/po {payload}")
+                    except Exception:
+                        event.text = f"/po {payload}"
+                    command = event.get_command()
+                    logger.info(
+                        "Auto /po route active: chat=%s thread=%s",
+                        getattr(source, "chat_id", None),
+                        getattr(source, "thread_id", None),
+                    )
+            except Exception as _auto_po_err:
+                logger.debug("Auto /po route failed: %s", _auto_po_err)
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -8759,8 +8858,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     sanitized_env["HERMES_ORIGIN_CHAT_ID"] = str(_src.chat_id or "")
                                     sanitized_env["HERMES_ORIGIN_THREAD_ID"] = str(_src.thread_id or "")
                                     sanitized_env["HERMES_ORIGIN_USER_ID"] = str(_src.user_id or "")
+                                    # Back-compat names used by deterministic quick-command scripts
+                                    # that deliver their own Telegram messages (e.g. /po).
+                                    sanitized_env["HERMES_CHAT_ID"] = str(_src.chat_id or "")
+                                    sanitized_env["HERMES_THREAD_ID"] = str(_src.thread_id or "")
                             except Exception:
                                 pass
+                            sanitized_env["HERMES_RAW_TEXT"] = str(getattr(event, "text", "") or "")
+                            sanitized_env["HERMES_RAW_PLATFORM_TEXT"] = str(getattr(event, "text", "") or "")
                             proc = await asyncio.create_subprocess_shell(
                                 run_cmd,
                                 stdout=asyncio.subprocess.PIPE,
@@ -8773,11 +8878,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except (TypeError, ValueError):
                                 timeout_seconds = 30.0
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-                            output = (stdout or stderr).decode().strip()
+                            stdout_text = (stdout or b"").decode().strip()
+                            stderr_text = (stderr or b"").decode().strip()
+                            output = (stdout_text or stderr_text).strip()
                             # Redact any remaining sensitive patterns in output
                             if output:
                                 from agent.redact import redact_sensitive_text
                                 output = redact_sensitive_text(output)
+                            if proc.returncode != 0:
+                                return output if output else f"Quick command failed with exit code {proc.returncode}."
+                            if qcmd.get("silent"):
+                                return None
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
                             return "Quick command timed out."
@@ -9175,7 +9286,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _suppress_transcript_echo = bool(_route_check(source.chat_id))
                         except Exception:
                             _suppress_transcript_echo = False
-                if _successful_transcripts and not _suppress_transcript_echo:
+                if (
+                    _successful_transcripts
+                    and not _suppress_transcript_echo
+                    and getattr(self.config, "stt_echo_transcripts", True)
+                ):
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
                         _seen = getattr(self, "_transcript_echo_seen", None)
@@ -14009,10 +14124,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _no_stt_note += "]"
                         enriched_parts.append(_no_stt_note)
                     else:
-                        enriched_parts.append(
-                            "[The user sent a voice message but I had trouble "
-                            f"transcribing it~ ({error})]"
-                        )
+                        logger.debug("Voice transcription failed: %s", error)
+                        enriched_parts.append("[voice message could not be transcribed]")
             except Exception as e:
                 logger.error("Transcription error: %s", e)
                 enriched_parts.append(
@@ -14086,7 +14199,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _suppress_transcript_echo = bool(_route_check(source.chat_id))
                 except Exception:
                     _suppress_transcript_echo = False
-            if successful_transcripts and not _suppress_transcript_echo:
+            if (
+                successful_transcripts
+                and not _suppress_transcript_echo
+                and getattr(self.config, "stt_echo_transcripts", True)
+            ):
                 echo_adapter = self.adapters.get(source.platform)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
@@ -15518,6 +15635,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{chat_id}:{thread_id}" in visible_topic_ids or thread_id in visible_topic_ids
                 ):
                     suppress_tool_status_for_chat = False
+                    # Explicit topic allowlist wins over the global Telegram
+                    # default. This lets operators keep Telegram tool progress
+                    # globally quiet while enabling it in one debugging topic.
+                    if progress_mode == "off" and source.platform != Platform.WEBHOOK:
+                        progress_mode = "new"
+                        tool_progress_enabled = True
 
                 if tool_progress_enabled and suppress_tool_status_for_chat:
                     tool_progress_enabled = False
