@@ -32,6 +32,32 @@ from gateway.whatsapp_identity import (
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
+    def _authorization_adapter(
+        self,
+        platform: Optional[Platform],
+        profile: Optional[str] = None,
+    ):
+        """Resolve the live adapter whose intake policy should gate authorization."""
+        if not platform:
+            return None
+        profile_name = (profile or "").strip() or None
+        if profile_name and profile_name != "default":
+            profile_adapters = getattr(self, "_profile_adapters", None) or {}
+            if profile_name in profile_adapters:
+                return profile_adapters[profile_name].get(platform)
+            return None
+        adapters = getattr(self, "adapters", None) or {}
+        return adapters.get(platform)
+
+    def _adapter_for_source(self, source: Optional[SessionSource]):
+        """Resolve the live adapter for an inbound ``SessionSource``."""
+        if source is None:
+            return None
+        return self._authorization_adapter(
+            getattr(source, "platform", None),
+            getattr(source, "profile", None),
+        )
+
     def _adapter_authorization_is_upstream(self, platform: Optional[Platform]) -> bool:
         """Whether the adapter for *platform* delegates authz to a trusted upstream.
 
@@ -416,7 +442,8 @@ class GatewayAuthorizationMixin:
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
-        if self.pairing_store.is_approved(platform_name, user_id):
+        pairing_store = self._pairing_store_for(source)
+        if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
             return True
 
         # Check platform-specific and global allowlists

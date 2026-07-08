@@ -82,7 +82,7 @@ _TERMINAL_AUTH_REASONS = frozenset({
 # without losing recoverability — the user always has the option to re-add
 # via ``hermes auth add``.
 #
-# Singleton-seeded entries (``device_code``, ``loopback_pkce``, ``claude_code``)
+# Singleton-seeded entries (``device_code``, ``claude_code``)
 # are NOT pruned because ``_seed_from_singletons`` would just re-create them
 # on the next ``load_pool()`` with the same stale singleton tokens, defeating
 # the cleanup.  They remain in the pool marked DEAD until an explicit re-auth
@@ -708,11 +708,11 @@ class CredentialPool:
         keeps the consumed refresh_token and the next ``_refresh_entry`` call
         would replay it and get a ``refresh_token_reused``-style 4xx.
 
-        Only applies to entries seeded from the singleton (``loopback_pkce``);
-        manually added entries (``manual:xai_pkce``) are independent
-        credentials with their own refresh-token lifecycle.
+        Only applies to entries seeded from the singleton (``device_code``);
+        manually added entries are independent credentials with their own
+        refresh-token lifecycle.
         """
-        if self.provider != "xai-oauth" or entry.source != "loopback_pkce":
+        if self.provider != "xai-oauth" or entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -852,8 +852,9 @@ class CredentialPool:
         """
         # Only sync entries that were seeded *from* a singleton.  Manually
         # added pool entries (source="manual:*") are independent credentials
-        # and must not write back to the singleton.
-        if entry.source not in {"device_code", "loopback_pkce"}:
+        # and must not write back to the singleton.  All singleton-seeded
+        # device-code sources (nous, openai-codex, xAI) use ``device_code``.
+        if entry.source != "device_code":
             return
         try:
             with _auth_store_lock():
@@ -1241,7 +1242,7 @@ class CredentialPool:
         if self.provider == "xai-oauth":
             return auth_mod._xai_access_token_is_expiring(
                 entry.access_token,
-                auth_mod.XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+                auth_mod._xai_proactive_refresh_skew_seconds(entry.access_token),
             )
         if self.provider == "nous":
             # Nous refresh can require network access and should happen when
@@ -1303,7 +1304,7 @@ class CredentialPool:
             # tokens that another process (or a fresh `hermes model` ->
             # xAI Grok OAuth login) has since rotated in auth.json.
             if (self.provider == "xai-oauth"
-                    and entry.source == "loopback_pkce"
+                    and entry.source == "device_code"
                     and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -1949,28 +1950,30 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # (``providers["xai-oauth"]``).  Surface them in the pool too so
         # ``hermes auth list`` reflects the logged-in state and so the pool
         # is the single source of truth for refresh during runtime resolution.
-        if _is_suppressed(provider, "loopback_pkce"):
-            return changed, active_sources
-
         state = _load_provider_state(auth_store, "xai-oauth")
         tokens = state.get("tokens") if isinstance(state, dict) else None
         if isinstance(tokens, dict) and tokens.get("access_token"):
-            active_sources.add("loopback_pkce")
+            # Device code is the only supported xAI OAuth flow; the singleton is
+            # always surfaced as ``device_code`` (consistent with nous/codex).
+            source = "device_code"
+            if _is_suppressed(provider, source):
+                return changed, active_sources
+            active_sources.add(source)
             from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
 
             base_url = DEFAULT_XAI_OAUTH_BASE_URL
             changed |= _upsert_entry(
                 entries,
                 provider,
-                "loopback_pkce",
+                source,
                 {
-                    "source": "loopback_pkce",
+                    "source": source,
                     "auth_type": AUTH_TYPE_OAUTH,
                     "access_token": tokens.get("access_token", ""),
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": base_url,
                     "last_refresh": state.get("last_refresh"),
-                    "label": label_from_token(tokens.get("access_token", ""), "loopback_pkce"),
+                    "label": label_from_token(tokens.get("access_token", ""), source),
                 },
             )
 
@@ -1987,8 +1990,20 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = env_file.get(key) or _get_secret(key, "") or ""
-        return val.strip()
+        raw = env_file.get(key, "").strip()
+        env_val = os.environ.get(key, "").strip()
+        # If .env contains an unresolved op:// reference, prefer the
+        # already-resolved value from os.environ (set by
+        # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
+        # "op://Vault/Item/field" string would otherwise win and every
+        # provider auth attempt would receive a URL instead of a key.  This
+        # happens during a partial migration, or when the user wrote op://
+        # references straight into .env rather than the secrets.onepassword
+        # config block.  For every non-op:// value the original
+        # .env-takes-precedence behaviour is preserved unchanged.
+        if raw.startswith("op://") and env_val:
+            return env_val
+        return raw or _get_secret(key, "") or env_val
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it

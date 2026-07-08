@@ -7101,9 +7101,11 @@ class TelegramAdapter(BasePlatformAdapter):
         has_reply_trigger = bool(allow_reply and self._is_reply_to_bot(message))
 
         if user_id and user_id in allowed_owner_ids:
-            # Ignore plain owner/account echoes, but allow explicit owner wake
-            # commands in a delegated Telegram Business DM.
-            return bool(mentions_this_bot or has_wake_word or has_reply_trigger)
+            # Telegram Business owner/account echoes are agent output reflected
+            # through the delegated human inbox. Keep this fail-closed even if
+            # legacy knobs are present; explicit owner commands should use the
+            # normal bot DM to avoid rendering Hermes as the connected human.
+            return False
 
         if user_id in free_response or chat_id in free_response:
             return True
