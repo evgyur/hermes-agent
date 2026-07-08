@@ -54,6 +54,17 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
+def test_telegram_status_suppresses_pre_api_compression_progress():
+    """Pre-API compression progress is internal lifecycle noise, not a chat reply."""
+    message = (
+        "📦 Pre-API compression: ~240,756 tokens near the context/output limit. "
+        "Compacting before the next model call."
+    )
+
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", message) is None
+    assert _prepare_gateway_status_message("local", "lifecycle", message) == message
+
+
 def test_programmatic_surfaces_keep_raw_status():
     """Programmatic surfaces (local/api/webhook) must keep raw diagnostics.
 
