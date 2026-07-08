@@ -131,10 +131,23 @@ def _group_message(
     )
 
 
-def _dm_message(text="hello", *, from_user_id=111, reply_to_bot=False, entities=None, caption=None, caption_entities=None):
+def _dm_message(
+    text="hello",
+    *,
+    from_user_id=111,
+    reply_to_bot=False,
+    reply_to_user_id=None,
+    reply_to_text="previous bot reply",
+    reply_to_message_id=10,
+    entities=None,
+    caption=None,
+    caption_entities=None,
+):
     reply_to_message = None
     if reply_to_bot:
-        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999))
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=reply_to_message_id, text=reply_to_text, caption=None)
+    elif reply_to_user_id is not None:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=reply_to_user_id), message_id=reply_to_message_id, text=reply_to_text, caption=None)
     return SimpleNamespace(
         message_id=43,
         text=text,
@@ -563,6 +576,34 @@ def test_business_dm_private_chat_owner_plain_echoes_are_fail_closed_but_wake_wo
     ) is True
     assert adapter._should_process_message(
         _business_dm_message("Sigurd, real customer", from_user_id=111)
+    ) is True
+
+
+def test_business_dm_private_chat_owner_reply_to_business_assistant_echo_dispatches(monkeypatch):
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+    outbound = "Да, смогу. Но возврат — финансовое действие, поэтому сначала сверю оплату и покажу тебе точную строку."
+    monkeypatch.setattr(
+        adapter,
+        "_recent_outbound_echo_entries",
+        lambda chat_id, now=None: [(9999999999.0, adapter._self_echo_normalize(outbound), "fingerprint")],
+    )
+
+    assert adapter._should_process_message(
+        _business_dm_message(
+            "сам всё выясни",
+            from_user_id=617744661,
+            reply_to_user_id=617744661,
+            reply_to_text=outbound,
+        )
     ) is True
 
 

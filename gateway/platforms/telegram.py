@@ -3643,7 +3643,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                sent_message_id = getattr(msg, "message_id", None)
+                if sent_message_id is not None:
+                    message_ids.append(str(sent_message_id))
+                    try:
+                        from gateway import rich_sent_store
+
+                        rich_sent_store.record(chat_id, str(sent_message_id), _strip_mdv2(chunk))
+                    except Exception:
+                        pass
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -7098,7 +7106,10 @@ class TelegramAdapter(BasePlatformAdapter):
         allow_reply = self._telegram_business_config().get("allow_reply_trigger", False)
         if isinstance(allow_reply, str):
             allow_reply = allow_reply.strip().lower() in {"1", "true", "yes", "on"}
-        has_reply_trigger = bool(allow_reply and self._is_reply_to_bot(message))
+        has_reply_trigger = bool(
+            allow_reply
+            and (self._is_reply_to_bot(message) or self._is_reply_to_own_outbound_text(message))
+        )
 
         if user_id and user_id in allowed_owner_ids:
             # Telegram Business owner/account echoes are often agent output
@@ -7240,6 +7251,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         reply_user = getattr(message.reply_to_message, "from_user", None)
         return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
+
+    def _is_reply_to_own_outbound_text(self, message: Any) -> bool:
+        """True when the reply target is a message this adapter previously sent.
+
+        Telegram Business messages can render as the connected human account in
+        Telethon / reply previews, so ``from_user == bot`` is not reliable for
+        Chip's third-party DM concierge flow. Use our send-time message-id/text
+        index first, then the recent text echo ledger as a best-effort fallback.
+        """
+        replied = getattr(message, "reply_to_message", None)
+        if not replied:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        reply_to_id = str(getattr(replied, "message_id", "") or "")
+        if not chat_id:
+            return False
+
+        reply_to_text = None
+        if reply_to_id:
+            try:
+                from gateway import rich_sent_store
+
+                reply_to_text = rich_sent_store.lookup(chat_id, reply_to_id)
+            except Exception:
+                reply_to_text = None
+        if not reply_to_text:
+            reply_to_text = self._message_text_with_hidden_links(replied) or None
+        if not reply_to_text:
+            reply_to_text = self._rich_reply_text_from_message(replied)
+        return self._is_recent_outbound_text_quote(chat_id, reply_to_text)
 
     @staticmethod
     def _extract_bot_mention_usernames(message: Message) -> set[str]:
