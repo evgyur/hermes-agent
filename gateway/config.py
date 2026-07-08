@@ -445,6 +445,13 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Whether to show platform-specific "typing" / thinking indicators while
+    # the agent is working.
+    typing_indicator: bool = True
+
+    # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
+    channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -454,6 +461,7 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "typing_indicator": self.typing_indicator,
         }
         if self.token:
             result["token"] = self.token
@@ -481,6 +489,20 @@ class PlatformConfig:
         if _grn is None:
             _grn = data.get("extra", {}).get("gateway_restart_notification")
 
+        # typing_indicator mirrors gateway_restart_notification: it may arrive
+        # top-level or bridged into extra by the shared-key loop in
+        # load_gateway_config(), so check both.
+        _typing = data.get("typing_indicator")
+        if _typing is None:
+            _typing = data.get("extra", {}).get("typing_indicator")
+
+        channel_overrides: Dict[str, ChannelOverride] = {}
+        raw_overrides = data.get("channel_overrides") or {}
+        if isinstance(raw_overrides, dict):
+            for cid, ov_data in raw_overrides.items():
+                if isinstance(ov_data, dict):
+                    channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -488,6 +510,8 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            typing_indicator=_coerce_bool(_typing, True),
+            channel_overrides=channel_overrides,
             extra=data.get("extra", {}),
         )
 
@@ -1141,6 +1165,20 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "typing_indicator" in platform_cfg:
+                    bridged["typing_indicator"] = platform_cfg["typing_indicator"]
+                has_channel_overrides = "channel_overrides" in platform_cfg
+                if has_channel_overrides:
+                    raw_overrides = platform_cfg.get("channel_overrides")
+                    if isinstance(raw_overrides, dict):
+                        plat_data, _extra = _ensure_platform_extra_dict(
+                            platforms_data, plat.value
+                        )
+                        plat_data["channel_overrides"] = {
+                            str(cid): ov_data
+                            for cid, ov_data in raw_overrides.items()
+                            if isinstance(ov_data, dict)
+                        }
                 if plat == Platform.TELEGRAM and "auto_skill_routes" in platform_cfg:
                     bridged["auto_skill_routes"] = platform_cfg["auto_skill_routes"]
                 if plat == Platform.TELEGRAM and "transcribe_routes" in platform_cfg:

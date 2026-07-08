@@ -1068,6 +1068,46 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
 
+    @staticmethod
+    def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
+        """Extract the profile namespace encoded in a gateway session key."""
+        if not session_key:
+            return None
+        parts = str(session_key).split(":")
+        if len(parts) < 2 or parts[0] != "agent":
+            return None
+        namespace = parts[1] or "main"
+        return "default" if namespace == "main" else namespace
+
+    @staticmethod
+    def _active_profile_name() -> str:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
+    def _recovered_row_allowed_for_active_profile(
+        self,
+        *,
+        requested_session_key: str,
+        recovered: Dict[str, Any],
+    ) -> bool:
+        """Prevent non-multiplexed gateways from reviving another profile's row."""
+        if getattr(self.config, "multiplex_profiles", False):
+            return True
+
+        recovered_key = str(recovered.get("session_key") or "")
+        if not recovered_key or recovered_key == requested_session_key:
+            return True
+
+        recovered_profile = self._profile_from_session_key(recovered_key)
+        if recovered_profile is None:
+            return True
+
+        return recovered_profile == self._active_profile_name()
+
     def _create_entry_from_recovered_row(
         self,
         *,

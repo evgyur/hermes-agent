@@ -3823,6 +3823,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 0
 
+    def _pairing_store_for(self, source):
+        per_profile = getattr(self, "pairing_stores", None) or {}
+        profile = getattr(source, "profile", None)
+        if profile and profile in per_profile:
+            return per_profile[profile]
+        return getattr(self, "pairing_store", None)
+
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
 
