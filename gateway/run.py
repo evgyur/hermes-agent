@@ -3809,6 +3809,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _active_cron_job_count(self) -> int:
+        """Count cron jobs currently executing outside ``_running_agents``.
+
+        Cron jobs run through ``cron.scheduler`` on its own worker pool, so a
+        cron-only workload is invisible to the regular running-agent drain.
+        This helper is best-effort and must never make gateway shutdown fail.
+        """
+        try:
+            from cron.scheduler import get_running_job_ids
+
+            return len(get_running_job_ids())
+        except Exception:
+            return 0
+
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
 
@@ -7466,6 +7480,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _e:
                     logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
+                try:
+                    # Cron jobs run outside ``_running_agents``. If the global
+                    # process sweep just killed their tool subprocess, mark the
+                    # job interrupted so the scheduler cannot report success
+                    # from truncated tool output.
+                    from cron.scheduler import mark_running_jobs_interrupted
+
+                    _interrupted = mark_running_jobs_interrupted(
+                        f"Gateway shutdown ({phase}) killed the job's tool "
+                        "subprocess before the run finished."
+                    )
+                    if _interrupted:
+                        logger.warning(
+                            "Shutdown (%s): marked %d in-flight cron job(s) interrupted: %s",
+                            phase, len(_interrupted), ", ".join(_interrupted),
+                        )
+                except Exception as _e:
+                    logger.debug("mark_running_jobs_interrupted (%s) error: %s", phase, _e)
                 try:
                     from tools.terminal_tool import cleanup_all_environments
                     cleanup_all_environments()
