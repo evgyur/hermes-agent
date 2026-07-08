@@ -544,7 +544,7 @@ def test_business_dm_ignored_user_id_suppresses_reflected_human_account_echo():
     ) is True
 
 
-def test_business_dm_private_chat_owner_echoes_are_fail_closed():
+def test_business_dm_private_chat_owner_plain_echoes_are_fail_closed_but_wake_words_dispatch():
     adapter = _make_adapter(
         require_mention=False,
         private_chats=["617744661", "111"],
@@ -557,16 +557,16 @@ def test_business_dm_private_chat_owner_echoes_are_fail_closed():
     ) is False
     assert adapter._should_process_message(
         _business_dm_message("Sigurd, mirrored owner command", from_user_id=617744661)
-    ) is False
+    ) is True
     assert adapter._should_process_message(
         _business_dm_message("Сигурд, проверь", from_user_id=617744661)
-    ) is False
+    ) is True
     assert adapter._should_process_message(
         _business_dm_message("Sigurd, real customer", from_user_id=111)
     ) is True
 
 
-def test_business_dm_private_chat_owner_echo_guard_is_fail_closed_even_if_legacy_config_disables_it():
+def test_business_dm_private_chat_owner_plain_echo_guard_survives_legacy_knob_but_wake_word_dispatches():
     adapter = _make_adapter(
         require_mention=False,
         private_chats=["617744661"],
@@ -579,8 +579,11 @@ def test_business_dm_private_chat_owner_echo_guard_is_fail_closed_even_if_legacy
     }
 
     assert adapter._should_process_message(
-        _business_dm_message("Sigurd, reflected owner echo", from_user_id=617744661)
+        _business_dm_message("plain reflected owner echo", from_user_id=617744661)
     ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, reflected owner command", from_user_id=617744661)
+    ) is True
 
 
 def test_business_dm_explicit_ignore_user_id_still_suppresses_trigger():

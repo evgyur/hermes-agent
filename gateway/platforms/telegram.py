@@ -7101,11 +7101,13 @@ class TelegramAdapter(BasePlatformAdapter):
         has_reply_trigger = bool(allow_reply and self._is_reply_to_bot(message))
 
         if user_id and user_id in allowed_owner_ids:
-            # Telegram Business owner/account echoes are agent output reflected
-            # through the delegated human inbox. Keep this fail-closed even if
-            # legacy knobs are present; explicit owner commands should use the
-            # normal bot DM to avoid rendering Hermes as the connected human.
-            return False
+            # Telegram Business owner/account echoes are often agent output
+            # reflected through the delegated human inbox. Keep plain echoes
+            # fail-closed even if the legacy knob ignore_owner_echoes:false is
+            # present, but allow explicit owner wake commands: Chip intentionally
+            # uses "Sigurd/Сигурд" in third-party Business DMs as a concierge
+            # trigger, and that must dispatch via the official Business route.
+            return bool(mentions_this_bot or has_wake_word or has_reply_trigger)
 
         if user_id in free_response or chat_id in free_response:
             return True
