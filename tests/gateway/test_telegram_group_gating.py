@@ -708,6 +708,37 @@ def test_business_message_source_keeps_business_connection_id():
     assert event.source.external_safe_mode is True
 
 
+def test_business_bot_dialog_mirror_is_dropped_even_with_trigger():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"], "allow_reply_trigger": True}
+    message = _business_dm_message("Sigurd, ping", from_user_id=617744661, reply_to_bot=True)
+    # Telegram Business can mirror Chip's direct DM with this bot as a Business
+    # update whose chat id is the bot id. Processing it duplicates the normal DM
+    # and can render the reply as the connected human/business account.
+    message.chat.id = 999
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_business_third_party_wake_still_dispatches():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+    message = _business_dm_message("Sigurd, ping", from_user_id=95948382)
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_business_bot_dialog_mirror_voice_is_not_auto_transcribed():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "auto_transcribe_voice": True}
+    message = _business_dm_message("", from_user_id=617744661, business_connection_id="biz-voice")
+    message.chat.id = 999
+    message.voice = SimpleNamespace(file_size=128)
+    message.audio = None
+
+    assert adapter._should_auto_transcribe_business_voice(message) is False
+
+
 def test_business_reply_trigger_requires_explicit_opt_in():
     adapter = _make_adapter(require_mention=False)
     adapter.config.extra["business"] = {

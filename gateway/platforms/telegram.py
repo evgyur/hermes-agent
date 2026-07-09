@@ -6946,6 +6946,25 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_telegram_business_message(self, message: Message) -> bool:
         return bool(getattr(message, "business_connection_id", None))
 
+    def _is_business_bot_dialog_mirror(self, message: Any) -> bool:
+        """True for Telegram Business copies of the user's direct dialog with this bot.
+
+        Telegram can surface the same owner-authored DM twice: once as the normal
+        bot DM (`chat.id == from_user.id`) and once through the Business inbox
+        with `business_connection_id` and `chat.id == this bot's id`. Processing
+        both makes Hermes answer twice; the Business reply can render in Telegram
+        as if it came from the connected account. Keep third-party Business
+        concierge chats alive, but drop this bot-dialog mirror.
+        """
+        if not self._is_telegram_business_message(message):
+            return False
+        bot = getattr(self, "_bot", None)
+        bot_id = str(getattr(bot, "id", "") or "")
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not bot_id or not chat_id:
+            return False
+        return chat_id == bot_id
+
     def _telegram_business_free_response_chats(self) -> set[str]:
         raw = self._telegram_business_config().get("free_response_chats", [])
         if isinstance(raw, list):
@@ -6979,6 +6998,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._telegram_business_auto_transcribe_voice_enabled():
             return False
         if not self._is_telegram_business_message(message):
+            return False
+        if self._is_business_bot_dialog_mirror(message):
             return False
         if not (getattr(message, "voice", None) or getattr(message, "audio", None)):
             return False
@@ -7755,6 +7776,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not self._is_group_chat(message):
             if self._is_telegram_business_message(message):
+                if self._is_business_bot_dialog_mirror(message):
+                    return False
                 if explicit_policy and chat_id_str not in private_chats:
                     user = getattr(message, "from_user", None)
                     user_id = str(getattr(user, "id", "") or "")
