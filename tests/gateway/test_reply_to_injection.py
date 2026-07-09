@@ -7,6 +7,8 @@ in the conversation history. History can contain the same or similar text
 multiple times, and without an explicit pointer the agent has to guess
 which prior message the user is referencing.
 """
+import inspect
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -120,7 +122,51 @@ async def test_own_message_reply_prefix_marks_assistant_message():
     assert result == "this one"
     assert event.recent_context is not None
     assert "previous bot/assistant message" in event.recent_context
+    assert "CURRENT TELEGRAM REPLY" in event.recent_context
+    assert "message ID 42" in event.recent_context
     assert "Use the direct train." in event.recent_context
+
+
+@pytest.mark.asyncio
+async def test_own_reply_context_is_appended_after_preprocessing():
+    """Regression: context_prompt used to be built before reply preprocessing.
+
+    _prepare_inbound_message_text then added the own-message reply note to the
+    event, but the already-built model prompt never saw it.
+    """
+    from gateway.run import _append_recent_context_prompt
+
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="Прочитай",
+        source=source,
+        reply_to_message_id="455",
+        reply_to_text="Hermes automation uptime alert: webhook health failed",
+        reply_to_is_own_message=True,
+    )
+
+    base_prompt = "base"
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+    final_prompt = _append_recent_context_prompt(base_prompt, event)
+
+    assert result == "Прочитай"
+    assert "message ID 455" in final_prompt
+    assert "webhook health failed" in final_prompt
+
+
+def test_gateway_appends_reply_context_after_inbound_preprocessing():
+    """The model prompt must be built after reply preprocessing mutates the event."""
+    source = inspect.getsource(GatewayRunner._handle_message_with_agent)
+    prepare_pos = source.index("message_text = await self._prepare_inbound_message_text(")
+    append_pos = source.index(
+        "context_prompt = _append_recent_context_prompt(context_prompt, event)"
+    )
+    assert prepare_pos < append_pos
 
 
 @pytest.mark.asyncio

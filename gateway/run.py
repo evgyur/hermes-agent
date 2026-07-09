@@ -9926,7 +9926,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_snippet = str(event.reply_to_text or "")[:500]
             if getattr(event, "reply_to_is_own_message", False):
                 reply_note = (
-                    '[Reply context: the user replied to this previous bot/assistant message; '
+                    '[CURRENT TELEGRAM REPLY — use this context to interpret the current user message. '
+                    f'The user replied to previous bot/assistant message ID {event.reply_to_message_id}; '
                     f'the quoted text is NOT user-authored: "{reply_snippet}"]'
                 )
                 existing_context = str(getattr(event, "recent_context", "") or "").strip()
@@ -10027,9 +10028,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r",
+            "inbound message: platform=%s user=%s chat=%s reply_to=%s reply_text=%s own_reply=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview,
+            source.chat_id or "unknown",
+            getattr(event, "reply_to_message_id", None) or "-",
+            bool(getattr(event, "reply_to_text", None)),
+            bool(getattr(event, "reply_to_is_own_message", False)),
+            _msg_preview,
         )
 
         # Get or create session
@@ -10158,7 +10163,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        context_prompt = _append_recent_context_prompt(context_prompt, event)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -10684,6 +10688,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
+
+        # Reply-to context is finalized by _prepare_inbound_message_text().
+        # Append it only now: doing this before preprocessing silently dropped
+        # bot-authored reply targets from the model prompt, so a Telegram reply
+        # like "Прочитай" arrived without the message it referenced.
+        context_prompt = _append_recent_context_prompt(context_prompt, event)
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
