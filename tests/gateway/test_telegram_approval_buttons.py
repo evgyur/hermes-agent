@@ -452,6 +452,73 @@ class TestTelegramApprovalCallback:
         assert "tok" not in state.get("tokens", {})
 
     @pytest.mark.asyncio
+    async def test_subconscious_v3_feedback_button_records_bounded_feedback(self, tmp_path):
+        adapter = _make_adapter()
+        runtime = tmp_path / "runtime"
+        project = tmp_path / "project"
+        runtime.mkdir()
+        (project / "scripts").mkdir(parents=True)
+        proposal_id = "prp_a900471f04148fb763f9c2f15f2c62cd"
+
+        query = AsyncMock()
+        query.data = f"subcv3:a:{proposal_id}"
+        query.message = MagicMock()
+        query.message.chat_id = -1003971448755
+        query.message.message_thread_id = 1551
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = "617744661"
+        query.from_user.first_name = 'Evgeny "Chip"'
+        query.answer = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"ok":true,"action":"accept","writes_canonical_memory":false}',
+            stderr="",
+        )
+        with patch.dict(os.environ, {
+            "TELEGRAM_ALLOWED_USERS": "*",
+            "SUBC_V3_RUNTIME": str(runtime),
+            "SUBC_V3_PROJECT": str(project),
+        }, clear=False):
+            with patch("gateway.platforms.telegram.subprocess.run", return_value=completed) as run:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        cmd = run.call_args.args[0]
+        assert "subc_v3_feedback.py" in " ".join(cmd)
+        assert cmd[cmd.index("--proposal-id") + 1] == proposal_id
+        assert cmd[cmd.index("--action") + 1] == "accept"
+        actor_hash = cmd[cmd.index("--actor-ref-hash") + 1]
+        assert actor_hash.startswith("sha256:") and "617744661" not in actor_hash
+        query.answer.assert_called_once()
+        assert "Accepted" in query.answer.call_args.kwargs["text"]
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    @pytest.mark.asyncio
+    async def test_subconscious_v3_feedback_rejects_unknown_action(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "subcv3:x:prp_a900471f04148fb763f9c2f15f2c62cd"
+        query.message = MagicMock()
+        query.message.chat_id = -1003971448755
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = "617744661"
+        query.answer = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("gateway.platforms.telegram.subprocess.run") as run:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        run.assert_not_called()
+        assert "Invalid" in query.answer.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
     async def test_deny_button(self):
         adapter = _make_adapter()
         adapter._approval_state[2] = "some-session"

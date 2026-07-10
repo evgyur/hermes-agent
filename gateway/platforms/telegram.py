@@ -5423,6 +5423,62 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.resume_typing_for_chat(str(query_chat_id))
             return
 
+        # --- SUBCONSCIOUS v3 proposal feedback callbacks (subcv3:verb:proposal_id) ---
+        if data.startswith("subcv3:"):
+            parts = data.split(":", 2)
+            action_map = {
+                "a": ("accept", "Accepted"),
+                "r": ("reject", "Rejected"),
+                "k": ("skip", "Skipped"),
+                "s": ("save", "Saved"),
+                "m": ("mute", "Muted"),
+                "d": ("deep_dive", "Deep dive saved"),
+            }
+            if len(parts) != 3 or parts[1] not in action_map or not re.fullmatch(r"prp_[a-f0-9]{16,64}", parts[2]):
+                await query.answer(text="Invalid SUBCONSCIOUS v3 feedback data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this proposal.")
+                return
+
+            action, label = action_map[parts[1]]
+            proposal_id = parts[2]
+            runtime = Path(os.getenv("SUBC_V3_RUNTIME") or "/home/hermes/.hermes/profiles/subc/v3")
+            project = Path(os.getenv("SUBC_V3_PROJECT") or "/home/hermes/workspace/chip-subconscious-v3")
+            actor_ref_hash = "sha256:" + hashlib.sha256(caller_id.encode("utf-8")).hexdigest()
+            cmd = [
+                sys.executable,
+                str(project / "scripts" / "subc_v3_feedback.py"),
+                "--state", str(runtime / "delivery-state.json"),
+                "--proposal-id", proposal_id,
+                "--action", action,
+                "--actor-ref-hash", actor_ref_hash,
+            ]
+            try:
+                completed = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=str(project))
+                if completed.returncode != 0:
+                    raise RuntimeError(completed.stderr or completed.stdout or "feedback command failed")
+                payload = json.loads(completed.stdout or "{}")
+                if not payload.get("ok") or payload.get("writes_canonical_memory") is not False:
+                    raise RuntimeError("feedback command returned an unsafe result")
+                await query.answer(text=label)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.error("Failed to record SUBCONSCIOUS v3 feedback: %s", exc)
+                await query.answer(text="Failed to record SUBCONSCIOUS v3 feedback.")
+            return
+
         # --- Subconscious pending-intent callbacks (subc:y|n:token) ---
         if data.startswith("subc:"):
             parts = data.split(":", 2)
