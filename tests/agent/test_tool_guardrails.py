@@ -256,3 +256,26 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_skill_view_is_treated_as_idempotent_and_blocked_on_repeated_no_progress():
+    """Regression: Human20Bot must not reload the same skill forever."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"name": "team20-ops"}
+    result = "same skill contents"
+
+    assert controller.before_call("skill_view", args).action == "allow"
+    assert controller.after_call("skill_view", args, result, failed=False).action == "allow"
+    assert controller.before_call("skill_view", args).action == "allow"
+    warning = controller.after_call("skill_view", args, result, failed=False)
+    assert warning.code == "idempotent_no_progress_warning"
+
+    blocked = controller.before_call("skill_view", args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
