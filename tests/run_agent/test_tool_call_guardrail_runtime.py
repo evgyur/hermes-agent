@@ -134,6 +134,35 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-block"
     assert "repeated_exact_failure_block" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is not None
+
+
+def test_idempotent_no_progress_block_skips_duplicate_without_halting_turn():
+    config = _hard_stop_config(
+        hard_stop_after={
+            "exact_failure": 2,
+            "same_tool_failure": 8,
+            "idempotent_no_progress": 2,
+        }
+    )
+    agent = _make_agent("skill_view", config=config)
+    args = {"name": "team20-ops"}
+    repeated_result = json.dumps({"content": "loaded"})
+    agent._tool_guardrails.after_call("skill_view", args, repeated_result, failed=False)
+    agent._tool_guardrails.after_call("skill_view", args, repeated_result, failed=False)
+    tc = _mock_tool_call("skill_view", json.dumps(args), "c-skip-duplicate")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "c-skip-duplicate"
+    assert "idempotent_no_progress_block" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
