@@ -103,6 +103,21 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+def _web_extract_url(value: Any) -> Optional[str]:
+    """Return a usable URL from a model-supplied extract item.
+
+    Models sometimes forward a complete web-search result instead of its URL.
+    Accept the two common URL keys, but reject missing/non-string values rather
+    than stringifying arbitrary objects into misleading fetch targets.
+    """
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("href")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
 def _env_value(name: str) -> str:
@@ -132,21 +147,77 @@ def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
         from hermes_cli.config import load_config
-        return load_config().get("web", {})
+        # ``or {}``: a present-but-null ``web:`` section (YAML ``web:`` with no
+        # body) makes ``.get("web", {})`` return None, which would break every
+        # caller that does ``_load_web_config().get(...)``. Honor the ``-> dict``
+        # contract so callers never see None.
+        return load_config().get("web") or {}
     except (ImportError, Exception):
         return {}
 
-# Recognized web backend names (config values accepted in ``web.backend`` /
-# ``web.search_backend`` / ``web.extract_backend``). Kept as a single source of
-# truth for config validation across the selection helpers.
-_KNOWN_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "perplexity"}
+
+# The built-in web backends whose availability is driven by hardcoded
+# env-var / package / OAuth probes below. Any name NOT in this set is a
+# candidate plugin-registered provider and must be resolved through the
+# web_search_registry (``is_available()``) instead. Kept as a single named
+# constant so the whitelist early-returns and the availability chokepoint
+# stay in sync.
+#
+# NOTE: this intentionally includes ``xai``, which the registry's
+# ``_LEGACY_PREFERENCE`` does NOT — xai availability is probed via
+# ``has_xai_credentials()`` (env var OR auth.json OAuth), not a registered
+# WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
+# a registered provider, drop it here so the registry path takes over.
+_LEGACY_WEB_BACKENDS = frozenset(
+    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
 )
 
-# Backends that only service web_search (their provider's ``supports_extract()``
-# is False). They are skipped during *extract* auto-detect so a search-only
-# credential (e.g. SEARXNG_URL) does not shadow extract-capable backends.
-_SEARCH_ONLY_BACKENDS = frozenset({"searxng", "brave-free", "ddgs", "xai", "perplexity"})
+
+def _registered_web_provider(backend: str):
+    """Return a plugin-registered web provider by name, or ``None``.
+
+    Consults ``agent.web_search_registry`` so backends contributed by the
+    plugin system (which are absent from :data:`_LEGACY_WEB_BACKENDS`) are
+    discoverable during availability/selection resolution. Returns ``None``
+    on any lookup failure so callers can fall through to legacy checks.
+    """
+    if not backend:
+        return None
+    try:
+        from agent.web_search_registry import get_provider
+
+        return get_provider(backend)
+    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
+        logger.debug("web provider registry lookup failed for %r: %s", backend, exc)
+        return None
+
+
+def _registered_web_provider_available(backend: str):
+    """Availability of a *registered* web provider, or ``None`` if unregistered.
+
+    Returns ``True``/``False`` when *backend* names a registered provider
+    (calling its ``is_available()``), or ``None`` when it isn't registered —
+    letting the caller fall through to the legacy built-in probes.
+    """
+    provider = _registered_web_provider(backend)
+    if provider is None:
+        return None
+    try:
+        return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001 — a broken provider is "unavailable"
+        logger.debug("web provider %r.is_available() raised: %s", backend, exc)
+        return False
+
+
+def _list_registered_web_providers():
+    """Return all plugin-registered web providers (empty list on failure)."""
+    try:
+        from agent.web_search_registry import list_providers
+
+        return list_providers()
+    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
+        logger.debug("web provider registry list failed: %s", exc)
+        return []
 
 
 def _get_backend() -> str:
@@ -157,7 +228,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in _KNOWN_WEB_BACKENDS:
+    if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -168,7 +239,6 @@ def _get_backend() -> str:
     # with "no subscription" and the tool returns an error to the agent
     # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
-        ("perplexity", _has_env("PERPLEXITY_API_KEY") or _has_env("PPLX_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
@@ -279,8 +349,6 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
-    if backend == "perplexity":
-        return _has_env("PERPLEXITY_API_KEY") or _has_env("PPLX_API_KEY")
     return False
 
 
@@ -604,11 +672,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch through the web search registry. Providers
-        # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl,
-        # xai, perplexity) live as plugins; the dispatcher is just a
-        # registry lookup + delegation. Sync only — every provider's
-        # search() is sync.
+        # Dispatch through the web search registry. All 7 providers
+        # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
+        # now live as plugins; the dispatcher is just a registry lookup +
+        # delegation. Sync only — every provider's search() is sync.
         _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
             get_active_search_provider,
@@ -674,7 +741,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
 
 async def web_extract_tool(
-    urls: List[str],
+    urls: List[Any],
     format: str = None,
     char_limit: Optional[int] = None,
 ) -> str:
@@ -690,7 +757,8 @@ async def web_extract_tool(
     ``[IMAGE: alt]`` placeholders (real image URLs are preserved as links).
 
     Args:
-        urls (List[str]): List of URLs to extract content from
+        urls (List[Any]): URL strings or search-result objects containing a
+            string ``url`` or ``href`` field
         format (str): Desired output format ("markdown" or "html", optional)
         char_limit (Optional[int]): Per-page char budget sent to the model
             (default: web.extract_char_limit or 15000). Larger pages truncate.
@@ -710,7 +778,21 @@ async def web_extract_tool(
     from agent.redact import _PREFIX_RE
     from urllib.parse import unquote
     normalized_urls: List[str] = []
-    for _url in urls:
+    normalized_indices: List[int] = []
+    invalid_urls: Dict[int, Dict[str, Any]] = {}
+    for index, item in enumerate(urls):
+        _url = _web_extract_url(item)
+        if _url is None:
+            invalid_urls[index] = {
+                "url": "",
+                "title": "",
+                "content": "",
+                "error": (
+                    f"Invalid URL item at index {index}: expected a URL string "
+                    "or an object with a string 'url' or 'href' field"
+                ),
+            }
+            continue
         normalized_url = normalize_url_for_request(_url)
         if (
             _PREFIX_RE.search(_url)
@@ -735,6 +817,7 @@ async def web_extract_tool(
                 ),
             })
         normalized_urls.append(normalized_url)
+        normalized_indices.append(index)
 
     debug_call_data = {
         "parameters": {
@@ -756,15 +839,17 @@ async def web_extract_tool(
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
-        ssrf_blocked: List[Dict[str, Any]] = []
-        for url in normalized_urls:
+        safe_indices = []
+        ssrf_blocked: Dict[int, Dict[str, Any]] = {}
+        for index, url in zip(normalized_indices, normalized_urls):
             if not await async_is_safe_url(url):
-                ssrf_blocked.append({
+                ssrf_blocked[index] = {
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
-                })
+                }
             else:
                 safe_urls.append(url)
+                safe_indices.append(index)
 
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
@@ -858,9 +943,25 @@ async def web_extract_tool(
                     provider.extract, safe_urls, format=format
                 )
 
-        # Merge any SSRF-blocked results back in
-        if ssrf_blocked:
-            results = ssrf_blocked + results
+        # Reconstruct the original input order across invalid, blocked, and
+        # provider-processed entries. Providers are expected to preserve the
+        # order of the safe URL list they receive.
+        if invalid_urls or ssrf_blocked:
+            safe_results = {
+                index: (
+                    results[position]
+                    if position < len(results)
+                    else {
+                        "url": safe_urls[position],
+                        "title": "",
+                        "content": "",
+                        "error": "Extract backend returned no result for this URL",
+                    }
+                )
+                for position, index in enumerate(safe_indices)
+            }
+            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+            results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
         
@@ -956,7 +1057,9 @@ def check_web_api_key() -> bool:
     :func:`_is_backend_available`, which delegates non-legacy names to the
     registry.
     """
-    configured = _load_web_config().get("backend", "").lower().strip()
+    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
+    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
+    configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured and _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so

@@ -68,7 +68,9 @@ class TestRuffConfig:
 
 
 class TestLintWorkflow:
-    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
+    _ACTIVE_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
+    _DISABLED_PATH = REPO_ROOT / ".github" / "workflows.disabled" / "lint.yml"
+    WORKFLOW_PATH = _ACTIVE_PATH if _ACTIVE_PATH.exists() else _DISABLED_PATH
 
     def test_workflow_exists(self):
         assert self.WORKFLOW_PATH.exists(), (

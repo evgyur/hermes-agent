@@ -33,6 +33,33 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         help="Provider to configure directly (e.g. honcho), skipping the picker",
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
+    local_parser = memory_sub.add_parser(
+        "local",
+        help="Manage profile-scoped Hermes local hot/warm/cold memory",
+        description=(
+            "Append, compact, rotate, delete, and doctor the private local "
+            "memory store under HERMES_HOME."
+        ),
+    )
+    local_sub = local_parser.add_subparsers(dest="local_memory_command")
+    local_append = local_sub.add_parser(
+        "append", help="Append a typed local memory event to hot memory"
+    )
+    local_append.add_argument("text", nargs="*", help="Text to store; stdin is used when omitted")
+    local_append.add_argument("--source-class", default="operator_note")
+    local_append.add_argument("--origin-ref", default="cli")
+    local_append.add_argument("--confidence", type=float, default=0.5)
+    local_append.add_argument("--label", action="append", default=[])
+    local_append.add_argument("--ttl-seconds", type=int, default=None)
+    local_compact = local_sub.add_parser("compact", help="Compact hot notes into warm memory")
+    local_compact.add_argument("--limit", type=int, default=None)
+    local_rotate = local_sub.add_parser("rotate", help="Expire old hot/warm notes into tombstones")
+    local_rotate.add_argument("--hot-max-age-seconds", type=int, default=86400)
+    local_rotate.add_argument("--warm-max-age-seconds", type=int, default=30 * 86400)
+    local_delete = local_sub.add_parser("delete", help="Delete a local note by id, leaving a tombstone")
+    local_delete.add_argument("note_id")
+    local_delete.add_argument("--reason", default="operator_delete")
+    local_sub.add_parser("doctor", help="Check local memory store health")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",

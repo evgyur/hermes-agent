@@ -135,6 +135,10 @@ _ALLOWED_SYNC_DB_ESCAPES = 3
 # test_offloaded_helpers_never_called_bare_on_loop. Adding a helper here without
 # wrapping its loop call sites makes that test fail.
 _OFFLOADED_SYNC_HELPERS = frozenset({
+    "_record_gateway_ledger_received",
+    "_update_gateway_ledger",
+    "_mark_gateway_ledger_after_agent_result",
+    "_mark_gateway_ledger_session_drained",
     "_telegram_topic_mode_enabled",
     "_is_telegram_topic_lane",
     "_is_telegram_topic_root_lobby",

@@ -77,8 +77,8 @@ def _build_codex_gpt5_autoraise_notice(autoraise: Dict[str, Any]) -> str:
     include the exact opt-back-out command.
     """
     model = str(autoraise.get("model") or "gpt-5.4/5.5").strip().lower().rsplit("/", 1)[-1]
-    # gpt-5.3-codex-spark has a native 128K window; the gpt-5.4/5.5 family is
-    # capped at 272K by the Codex OAuth backend.
+    # gpt-5.3-codex-spark has a native 128K window; the gpt-5.4/5.5/5.6 family
+    # is capped at 272K by the Codex OAuth backend.
     cap = "128K" if model.startswith("gpt-5.3-codex-spark") else "272K"
     from_pct = int(round(autoraise["from"] * 100))
     to_pct = int(round(autoraise["to"] * 100))
@@ -187,10 +187,26 @@ def _normalized_custom_base_url(value: Any) -> str:
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
-    provider_model = str(entry.get("model", "") or "").strip().lower()
-    if not provider_model:
+    agent_model_norm = str(agent_model or "").strip().lower()
+    # Multi-model entries (v12+ `providers.<name>.models` mapping / legacy
+    # `models:` list): the agent's model matching ANY catalog entry counts.
+    # Without this, a provider whose `model`/`default_model` differs from the
+    # session model silently fails to match and per-provider request settings
+    # (extra_body, e.g. OpenAI service_tier) are dropped — billing the whole
+    # session at the wrong tier (July 2026 sweeper incident: flex config
+    # ignored, ~2.3x overbilling).
+    models = entry.get("models")
+    catalog: List[str] = []
+    if isinstance(models, dict):
+        catalog = [str(k).strip().lower() for k in models.keys()]
+    elif isinstance(models, (list, tuple)):
+        catalog = [str(m).strip().lower() for m in models]
+    if catalog and agent_model_norm in catalog:
         return True
-    return provider_model == str(agent_model or "").strip().lower()
+    provider_model = str(entry.get("model", "") or "").strip().lower()
+    if not provider_model and not catalog:
+        return True
+    return provider_model == agent_model_norm
 
 
 def _custom_provider_extra_body_for_agent(
@@ -302,6 +318,7 @@ def init_agent(
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
+    reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
@@ -411,13 +428,25 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
-    agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+    if credential_pool is not None:
+        try:
+            from agent.credential_pool import credential_pool_matches_provider
+
+            if not credential_pool_matches_provider(
+                credential_pool,
+                agent.provider,
+                base_url=agent.base_url,
+            ):
+                credential_pool = None
+        except Exception:
+            credential_pool = None
+    agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -535,6 +564,7 @@ def init_agent(
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
+    agent.reaction_callback = reaction_callback
     agent.tool_gen_callback = tool_gen_callback
 
     
@@ -1538,12 +1568,14 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
-    # Per-model/route compaction-threshold override. Codex gpt-5.5 raises to
-    # 85% (the Codex backend caps the window at 272K, so the default 50% would
-    # compact at ~136K — half the usable context). Gated by an opt-out config
-    # flag so the user can fall back to the global threshold. If the override
-    # fires, CLI users get a startup notice; gateway chats stay quiet because
-    # the threshold can apply to many independent chat sessions in one process.
+    # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
+    # raise to 85% (the Codex backend caps both families at 272K, so the
+    # default 50% would compact at ~136K — half the usable context). Gated by
+    # an opt-out config flag so the user can fall back to the global threshold;
+    # when the override fires we stash a one-time notification (replayed on the
+    # first turn) that tells the user what changed and how to revert. The
+    # notice has its own display gate so users can keep the threshold
+    # autoraise without getting the banner on gateway turns.
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
     ).lower() in {"true", "1", "yes"}
@@ -2087,25 +2119,27 @@ def init_agent(
             print(f"📊 Context limit: {agent.context_compressor.context_length:,} tokens (compress at {int(_active_threshold_pct*100)}% = {agent.context_compressor.threshold_tokens:,})")
         else:
             print(f"📊 Context limit: {agent.context_compressor.context_length:,} tokens (auto-compression disabled)")
-        # One-time notice when the Codex gpt-5.5 autoraise kicked in, with the
-        # exact opt-back-out command. Printed inline at startup for CLI users.
-        # Gateway chats intentionally do not replay this info notice: one
-        # gateway process can initialize agents for many chats/topics, and
-        # replaying it there becomes cross-chat status spam.
-        _autoraise = getattr(agent, "_compression_threshold_autoraised", None)
-        if _autoraise and compression_enabled:
-            print(_build_codex_gpt55_autoraise_notice(_autoraise))
+        # Notice with the exact opt-back-out command. Printed inline at startup
+        # for CLI users; gateway users get the same text replayed via
+        # _compression_warning on turn 1 (set below).
+        if _show_autoraise_notice:
+            print(_build_codex_gpt5_autoraise_notice(_autoraise))
 
-    # Check immediately so CLI users see real compression warnings at startup.
-    # Gateway status_callback is not yet wired, so warnings that require user
-    # action are stored in _compression_warning and replayed on the first
-    # run_conversation(). The Codex gpt-5.5 autoraise info notice above is not
-    # stored here because it is harmless and otherwise spams every gateway chat.
+    # Check immediately so CLI users see the warning at startup.
+    # Gateway status_callback is not yet wired, so any warning is stored
+    # in _compression_warning and replayed in the first run_conversation().
     agent._compression_warning = None
-    # Real compression warnings are stored by the lazy feasibility check below
-    # and replayed through status_callback on the first turn. The Codex gpt-5.5
-    # autoraise notice is informational and intentionally CLI-only to avoid
-    # sending the same status note into every gateway chat/topic.
+    # Gateway parity for the Codex gpt-5.x autoraise notice: the startup print
+    # above only reaches the CLI, so stash the same text here to be replayed
+    # through status_callback on the first turn (Telegram/Discord/Slack/etc.).
+    if _show_autoraise_notice:
+        agent._compression_warning = _build_codex_gpt5_autoraise_notice(_autoraise)
+
+    # Mark shown so repeated inits in this profile (e.g. every gateway message)
+    # stay silent. Recorded once, whether the notice went to the CLI print or
+    # the gateway replay slot.
+    if _show_autoraise_notice:
+        _record_codex_gpt55_autoraise_notice(_autoraise)
     # Lazy feasibility check: deferred to the first turn that approaches the
     # compression threshold. Running it eagerly here costs ~400ms cold (network
     # probe of the auxiliary provider chain + /models lookup) on every agent

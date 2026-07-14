@@ -250,7 +250,17 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    # Keep pytest anchored to this checkout even when an explicitly requested
+    # probe file lives under /tmp. Otherwise pytest can choose /tmp as its
+    # root and traverse unrelated, unreadable service artifacts there.
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        f"--rootdir={repo_root}",
+        str(file),
+        *pytest_args,
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -260,8 +270,7 @@ def _run_one_file(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        env=os.environ,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

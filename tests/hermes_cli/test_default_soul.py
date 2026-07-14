@@ -24,7 +24,9 @@ def test_default_soul_is_public_safe_and_useful():
         assert not re.search(pattern, DEFAULT_SOUL_MD)
 
 
-def test_docker_soul_matches_seed_template():
+def test_docker_soul_is_human20_powerpack_override():
     repo_root = Path(__file__).resolve().parents[2]
     docker_soul = (repo_root / "docker" / "SOUL.md").read_text(encoding="utf-8")
-    assert docker_soul == DEFAULT_SOUL_MD
+    assert docker_soul != DEFAULT_SOUL_MD
+    assert docker_soul.startswith("# SOUL.md — Human20 Hermes Voice")
+    assert "## Рабочий стандарт" in docker_soul

@@ -105,9 +105,12 @@ def _build_subprocess_env() -> dict[str, str]:
     # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
     env = hermes_subprocess_env(inherit_credentials=True)
     home = _resolve_home_dir()
-    env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    # Copilot ACP resolves its own login/config from the operator's real home.
+    # Keep HERMES_HOME profile-scoped, but do not redirect HOME to
+    # ``$HERMES_HOME/home`` or existing Copilot credentials disappear.
+    env["HOME"] = home
     return env
 
 

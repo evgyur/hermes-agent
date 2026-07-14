@@ -515,8 +515,48 @@ class CLICommandsMixin:
         print(f"  Home:    {display}")
         print()
 
+    def _handle_recall_command(self, cmd_original: str) -> None:
+        """Handle ``/recall <query>`` — compact search over local session traces."""
+        from cli import _cprint
+
+        parts = cmd_original.split(maxsplit=1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if not query:
+            _cprint("  Usage: /recall <query>")
+            return
+        try:
+            from hermes_cli.recall import RecallCommand
+
+            db_path = getattr(self._session_db, "db_path", None) if self._session_db else None
+            output = RecallCommand(db_path=str(db_path) if db_path else None).execute(query)
+        except Exception as exc:
+            _cprint(f"  /recall failed: {exc}")
+            return
+        _cprint(output)
+
+    def _handle_handoff_summary_command(self, topic: str) -> None:
+        """Handle topic-mode ``/handoff <topic>`` — write local artifacts."""
+        from cli import _cprint
+
+        topic = topic.strip()
+        if not topic:
+            _cprint("  Usage: /handoff <topic|platform>")
+            return
+        try:
+            from hermes_cli.handoff_summary import HandoffSummaryCommand
+
+            db_path = getattr(self._session_db, "db_path", None) if self._session_db else None
+            output = HandoffSummaryCommand(db_path=str(db_path) if db_path else None).execute(topic)
+        except Exception as exc:
+            _cprint(f"  /handoff artifact failed: {exc}")
+            return
+        _cprint(output)
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
-        """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
+        """Handle ``/handoff <topic|platform>``.
+
+        Known gateway platform names keep the existing CLI-to-gateway transfer
+        behavior. Any other argument is treated as a local artifact topic.
 
         Flow:
           1. Validate platform name + the gateway has a home channel for it.
@@ -554,7 +594,7 @@ class CLICommandsMixin:
         try:
             platform = Platform(platform_name)
         except (ValueError, KeyError):
-            _cprint(f"  Unknown platform '{platform_name}'.")
+            self._handle_handoff_summary_command(parts[1].strip())
             return True
 
         try:
@@ -2471,7 +2511,7 @@ class CLICommandsMixin:
 
         Usage:
             /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, minimal, low, medium, high, xhigh)
+            /reasoning <level>      Set effort (none, minimal, low, medium, high, xhigh, max, ultra)
             /reasoning show|on      Show model thinking/reasoning in output
             /reasoning hide|off     Hide model thinking/reasoning from output
             /reasoning full         Show complete thinking (no 10-line clamp)
@@ -2493,7 +2533,7 @@ class CLICommandsMixin:
             full_state = "full" if getattr(self, "reasoning_full", False) else "clamped to 10 lines"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state} ({full_state}){_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|show|hide|full|clamp>{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp>{_RST}")
             return
 
         arg = parts[1].strip().lower()
@@ -2534,7 +2574,7 @@ class CLICommandsMixin:
         parsed = _parse_reasoning_config(arg)
         if parsed is None:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh, max, ultra{_RST}")
             _cprint(f"  {_DIM}Display:      show, hide{_RST}")
             return
 

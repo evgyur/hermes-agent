@@ -37,7 +37,14 @@ class GatewayAuthorizationMixin:
         platform: Optional[Platform],
         profile: Optional[str] = None,
     ):
-        """Resolve the live adapter whose intake policy should gate authorization."""
+        """Resolve the live adapter whose intake policy should gate authorization.
+
+        In multiplex mode, secondary-profile adapters live in
+        ``_profile_adapters[profile]`` while the default/active profile uses
+        ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
+        When a stamped profile has its own adapter registry entry, the default
+        profile's same-platform adapter must not be consulted as a fallback.
+        """
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
@@ -45,6 +52,9 @@ class GatewayAuthorizationMixin:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
+            # Fail closed: a stamped secondary profile with no registry entry
+            # (e.g. its adapter failed to connect) must NOT fall back to the
+            # default profile's adapter — that sends replies out the wrong bot.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
@@ -53,12 +63,19 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        # ``getattr`` guards test fixtures that build a bare source via
+        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
             getattr(source, "platform", None),
             getattr(source, "profile", None),
         )
 
-    def _adapter_authorization_is_upstream(self, platform: Optional[Platform]) -> bool:
+    def _adapter_authorization_is_upstream(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> bool:
         """Whether the adapter for *platform* delegates authz to a trusted upstream.
 
         Mirrors ``BasePlatformAdapter.authorization_is_upstream``. The relay
@@ -72,15 +89,17 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return False
-        adapters = getattr(self, "adapters", None)
-        if not adapters:
-            return False
-        adapter = adapters.get(platform)
+        adapter = self._authorization_adapter(platform, profile)
         if adapter is None:
             return False
         return bool(getattr(adapter, "authorization_is_upstream", False))
 
-    def _adapter_enforces_own_access_policy(self, platform: Optional[Platform]) -> bool:
+    def _adapter_enforces_own_access_policy(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> bool:
         """Whether the adapter for *platform* gates access at intake itself.
 
         Mirrors ``BasePlatformAdapter.enforces_own_access_policy``. Adapters
@@ -98,15 +117,17 @@ class GatewayAuthorizationMixin:
         # Some test helpers build a bare GatewayRunner via object.__new__ and
         # never set ``adapters``; treat a missing/empty map as "no adapter"
         # rather than raising (see pitfalls.md #17).
-        adapters = getattr(self, "adapters", None)
-        if not adapters:
-            return False
-        adapter = adapters.get(platform)
+        adapter = self._authorization_adapter(platform, profile)
         if adapter is None:
             return False
         return bool(getattr(adapter, "enforces_own_access_policy", False))
 
-    def _adapter_dm_policy(self, platform: Optional[Platform]) -> str:
+    def _adapter_dm_policy(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> str:
         """Best-effort read of an own-policy adapter's effective DM policy.
 
         Returns the lowercased ``dm_policy`` (``"open"`` / ``"allowlist"`` /
@@ -124,8 +145,7 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return ""
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._authorization_adapter(platform, profile)
         policy = getattr(adapter, "_dm_policy", None) if adapter is not None else None
         if policy is None:
             config = getattr(self, "config", None)
@@ -139,7 +159,12 @@ class GatewayAuthorizationMixin:
                 policy = extra.get("dm_policy")
         return str(policy or "").strip().lower()
 
-    def _adapter_group_policy(self, platform: Optional[Platform]) -> str:
+    def _adapter_group_policy(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> str:
         """Best-effort read of an own-policy adapter's effective group policy.
 
         Mirror of ``_adapter_dm_policy`` for group / forum / channel traffic:
@@ -155,8 +180,7 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return ""
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._authorization_adapter(platform, profile)
         policy = getattr(adapter, "_group_policy", None) if adapter is not None else None
         if policy is None:
             config = getattr(self, "config", None)
@@ -174,6 +198,8 @@ class GatewayAuthorizationMixin:
         self,
         platform: Optional[Platform],
         chat_id: Optional[str],
+        *,
+        profile: Optional[str] = None,
     ) -> bool:
         """Whether a per-group sender allowlist gated this group message.
 
@@ -186,8 +212,7 @@ class GatewayAuthorizationMixin:
         """
         if not platform or not chat_id:
             return False
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._authorization_adapter(platform, profile)
         groups = getattr(adapter, "_groups", None) if adapter is not None else None
         if groups is None:
             config = getattr(self, "config", None)
@@ -222,21 +247,31 @@ class GatewayAuthorizationMixin:
             return any(str(item).strip() for item in sender_allow)
         return False
 
-    def _telegram_per_chat_group_user_decision(self, source: SessionSource) -> Optional[bool]:
-        """Return an allow/deny decision for Telegram per-chat group sender allowlists.
+    def _pairing_store_for(self, source: "SessionSource"):
+        """Pick the per-profile PairingStore for a source, falling back to global.
 
-        ``TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS`` is a JSON object mapping chat IDs to
-        sender-user allowlists. When a chat is present in the map, it intentionally
-        narrows ``TELEGRAM_GROUP_ALLOWED_USERS`` for that chat: globally allowed
-        group senders are not automatically allowed in that one room.
+        In a multiplexing gateway, each profile owns its own pairing whitelist
+        so isolation is preserved. When the source has no profile (single-
+        profile gateway, or a path that hasn't stamped profile yet) or the
+        profile isn't registered, fall back to ``self.pairing_store`` (the
+        global default) so existing behavior is preserved.
         """
-        if source.platform != Platform.TELEGRAM:
-            return None
-        if source.chat_type not in {"group", "forum"}:
-            return None
-        if not source.chat_id:
-            return None
+        per_profile = getattr(self, "pairing_stores", None) or {}
+        profile = getattr(source, "profile", None)
+        if profile and profile in per_profile:
+            return per_profile[profile]
+        return getattr(self, "pairing_store", None)
 
+    def _telegram_per_chat_group_user_decision(
+        self, source: SessionSource
+    ) -> Optional[bool]:
+        """Return an explicit Telegram per-chat sender allow/deny decision."""
+        if (
+            source.platform != Platform.TELEGRAM
+            or source.chat_type not in {"group", "forum"}
+            or not source.chat_id
+        ):
+            return None
         raw = os.getenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", "").strip()
         if not raw:
             return None
@@ -246,21 +281,22 @@ class GatewayAuthorizationMixin:
             return None
         if not isinstance(mapping, dict):
             return None
-
         chat_allow = mapping.get(str(source.chat_id))
         if chat_allow is None:
             return None
         if isinstance(chat_allow, str):
-            allowed_ids = {part.strip() for part in chat_allow.split(",") if part.strip()}
+            allowed_ids = {
+                part.strip() for part in chat_allow.split(",") if part.strip()
+            }
         elif isinstance(chat_allow, (list, tuple, set)):
-            allowed_ids = {str(part).strip() for part in chat_allow if str(part).strip()}
+            allowed_ids = {
+                str(part).strip() for part in chat_allow if str(part).strip()
+            }
         else:
             return None
         if not allowed_ids:
             return False
-        if "*" in allowed_ids:
-            return True
-        return str(source.user_id or "") in allowed_ids
+        return "*" in allowed_ids or str(source.user_id or "") in allowed_ids
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -309,12 +345,22 @@ class GatewayAuthorizationMixin:
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if getattr(source, "delivered_via_upstream_relay", False) is True or self._adapter_authorization_is_upstream(
-            source.platform
+        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
+            source.platform,
+            profile=source.profile,
         ):
             return True
 
         user_id = source.user_id
+
+        # Telegram bot senders remain fail-closed unless the operator opted
+        # into an explicit bot mode.  This check precedes human allowlists so
+        # a bot cannot inherit a human account grant accidentally.
+        if source.platform == Platform.TELEGRAM and getattr(source, "is_bot", False):
+            return os.getenv("TELEGRAM_ALLOW_BOTS", "").strip().lower() in {
+                "mentions",
+                "all",
+            }
 
         # Telegram (and similar) authorize entire group/forum/channel chats
         # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
@@ -341,6 +387,23 @@ class GatewayAuthorizationMixin:
                     }
                     if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
                         return True
+
+        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
+        # Checked before the no-user-id guard below: some platforms deliver
+        # bot/automation traffic with no user_id at all -- e.g. Slack Workflow
+        # Builder posts arrive as subtype=bot_message with user=None -- so
+        # deferring past the guard would reject them outright (the same reason
+        # the chat-scoped allowlist above runs early).
+        platform_allow_bots_map = {
+            Platform.DISCORD: "DISCORD_ALLOW_BOTS",
+            Platform.FEISHU: "FEISHU_ALLOW_BOTS",
+            Platform.TELEGRAM: "TELEGRAM_ALLOW_BOTS",
+            Platform.SLACK: "SLACK_ALLOW_BOTS",
+        }
+        if getattr(source, "is_bot", False):
+            allow_bots_var = platform_allow_bots_map.get(source.platform)
+            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+                return True
 
         if not user_id:
             return False
@@ -392,11 +455,6 @@ class GatewayAuthorizationMixin:
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
         }
-        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
-        platform_allow_bots_map = {
-            Platform.DISCORD: "DISCORD_ALLOW_BOTS",
-            Platform.FEISHU: "FEISHU_ALLOW_BOTS",
-        }
 
         # Plugin platforms: check the registry for auth env var names
         if source.platform not in platform_env_map:
@@ -424,15 +482,9 @@ class GatewayAuthorizationMixin:
         if getattr(source, "role_authorized", False) is True:
             return True
 
-        if getattr(source, "is_bot", False):
-            allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
-                return True
-
-        # Telegram Business delegated inbox messages have already passed the
-        # adapter-side wake-word/mention gate before reaching gateway auth.
-        # They are external contacts by design, so the platform allowlist must
-        # not drop a valid "Sigurd, ..." business-chat command.
+        # Telegram Business delegated inbox traffic has already passed the
+        # adapter's wake-word/mention gate and represents external contacts by
+        # design, so it must not be rejected by the operator allowlist here.
         if (
             source.platform == Platform.TELEGRAM
             and source.chat_type == "dm"
@@ -440,7 +492,20 @@ class GatewayAuthorizationMixin:
         ):
             return True
 
-        # Check pairing store (always checked, regardless of allowlists)
+        # Check pairing store. A pairing entry is a first-class authorization
+        # grant, created only by a trusted operator approving a pairing code
+        # (hermes gateway pairing approve / the authenticated dashboard) — an
+        # inbound sender can never reach approve_code, so this is not an
+        # attacker-controlled path. Honored as a UNION with the allowlist: a
+        # paired user is authorized regardless of the allowlist, and when an
+        # allowlist IS configured, operator approval also writes the user into
+        # that allowlist (see PairingStore._approve_user), keeping a single
+        # operator-visible source of truth. (#23778: the original bypass was the
+        # inbound message/approval-button gate, not this gate; that gate is
+        # fixed separately.)
+        # In multiplex gateways, route to the per-profile PairingStore so each
+        # profile's whitelist is isolated; falls back to the global store when
+        # the source has no profile or the profile isn't registered.
         platform_name = source.platform.value if source.platform else ""
         pairing_store = self._pairing_store_for(source)
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
@@ -479,16 +544,26 @@ class GatewayAuthorizationMixin:
             # flag (checked above), and the pairing flow remain the explicit
             # opt-ins to broader access. (#34515 follow-up: trusting "open" was a
             # fail-open.)
-            if self._adapter_enforces_own_access_policy(source.platform):
+            if self._adapter_enforces_own_access_policy(
+                source.platform,
+                profile=source.profile,
+            ):
                 if source.chat_type in {"group", "forum", "channel"}:
-                    effective_policy = self._adapter_group_policy(source.platform)
+                    effective_policy = self._adapter_group_policy(
+                        source.platform,
+                        profile=source.profile,
+                    )
                     if self._adapter_group_has_sender_allowlist(
                         source.platform,
                         source.chat_id,
+                        profile=source.profile,
                     ):
                         return True
                 else:
-                    effective_policy = self._adapter_dm_policy(source.platform)
+                    effective_policy = self._adapter_dm_policy(
+                        source.platform,
+                        profile=source.profile,
+                    )
                 if effective_policy == "allowlist":
                     return True
             # No allowlists configured -- check global allow-all flag
@@ -534,8 +609,8 @@ class GatewayAuthorizationMixin:
                 if source.chat_id in legacy_chat_ids:
                     return True
 
-        # Telegram per-chat group sender allowlists intentionally narrow the
-        # global group sender allowlist for a configured room.
+        # A configured per-chat Telegram sender list intentionally narrows the
+        # global group-user allowlist for that room.
         per_chat_group_decision = self._telegram_per_chat_group_user_decision(source)
         if per_chat_group_decision is not None:
             return per_chat_group_decision
@@ -591,7 +666,12 @@ class GatewayAuthorizationMixin:
 
         return bool(check_ids & allowed_ids)
 
-    def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
+    def _get_unauthorized_dm_behavior(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
@@ -636,15 +716,19 @@ class GatewayAuthorizationMixin:
         # allowlist or disabled DM policy means the operator restricted access,
         # so unauthorized DMs should be dropped silently rather than answered
         # with a pairing code. An explicit pairing policy opts back into codes.
-        if platform and config and hasattr(config, "platforms"):
-            platform_cfg = config.platforms.get(platform)
-            extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
-            if isinstance(extra, dict):
-                dm_policy = str(extra.get("dm_policy") or "").strip().lower()
-                if dm_policy == "pairing":
-                    return "pair"
-                if dm_policy in {"allowlist", "disabled"}:
-                    return "ignore"
+        # Prefer the profile-scoped live adapter's resolved policy in multiplex
+        # mode; fall back to the default profile's config.extra.
+        if platform:
+            dm_policy = self._adapter_dm_policy(platform, profile=profile)
+            if not dm_policy and config and hasattr(config, "platforms"):
+                platform_cfg = config.platforms.get(platform)
+                extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+                if isinstance(extra, dict):
+                    dm_policy = str(extra.get("dm_policy") or "").strip().lower()
+            if dm_policy == "pairing":
+                return "pair"
+            if dm_policy in {"allowlist", "disabled"}:
+                return "ignore"
 
         # No explicit override.  Fall back to allowlist-aware default:
         # if any allowlist is configured for this platform, silently drop

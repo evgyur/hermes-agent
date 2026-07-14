@@ -10,12 +10,20 @@ import hermes_constants
 from hermes_constants import (
     VALID_REASONING_EFFORTS,
     agent_browser_runnable,
+    find_hermes_node_executable,
+    find_node_executable,
+    find_node_executable_on_path,
     get_default_hermes_root,
     get_hermes_dir,
     get_hermes_home,
+    heal_hermes_managed_node,
+    hermes_managed_node_tree_present,
+    iter_hermes_node_dirs,
     is_container,
+    node_tool_runnable,
     parse_reasoning_effort,
     secure_parent_dir,
+    with_hermes_node_path,
 )
 
 
@@ -108,6 +116,210 @@ class TestGetHermesHome:
         assert get_hermes_home() == local_appdata / "hermes"
 
 
+class TestHermesManagedNode:
+    def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        node_dir = home / "node"
+        bin_dir = node_dir / "bin"
+        node_dir.mkdir(parents=True)
+        bin_dir.mkdir()
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert iter_hermes_node_dirs() == [node_dir, bin_dir]
+
+    def test_windows_finds_npm_cmd_before_path(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        node_dir = home / "node"
+        node_dir.mkdir(parents=True)
+        npm_cmd = node_dir / "npm.cmd"
+        npm_cmd.write_text("@echo off\n")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(hermes_constants, "node_tool_runnable", lambda path: True)
+
+        assert find_hermes_node_executable("npm") == str(npm_cmd)
+
+    def test_windows_path_fallback_prefers_npm_cmd(self, tmp_path, monkeypatch):
+        bin_dir = tmp_path / "nodejs"
+        bin_dir.mkdir()
+        extensionless = bin_dir / "npm"
+        powershell = bin_dir / "npm.ps1"
+        npm_cmd = bin_dir / "npm.cmd"
+        extensionless.write_text("#!/usr/bin/env node\n")
+        powershell.write_text("Write-Output npm\n")
+        npm_cmd.write_text("@echo off\n")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+        assert find_node_executable_on_path("npm") == str(npm_cmd)
+
+    def test_windows_node_executable_falls_back_to_safe_path_shim(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        home.mkdir()
+        bin_dir = tmp_path / "nodejs"
+        bin_dir.mkdir()
+        extensionless = bin_dir / "npm"
+        npm_cmd = bin_dir / "npm.cmd"
+        extensionless.write_text("#!/usr/bin/env node\n")
+        npm_cmd.write_text("@echo off\n")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+        assert find_node_executable("npm") == str(npm_cmd)
+
+    def test_windows_skips_broken_managed_npm_without_path_fallback(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        managed_npm = home / "node" / "npm.cmd"
+        managed_npm.parent.mkdir(parents=True)
+        managed_npm.write_text("@echo off\n")
+        bin_dir = tmp_path / "nodejs"
+        bin_dir.mkdir()
+        path_npm = bin_dir / "npm.cmd"
+        path_npm.write_text("@echo off\n")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
+        monkeypatch.setattr(
+            hermes_constants,
+            "node_tool_runnable",
+            lambda path: False,
+        )
+
+        assert hermes_managed_node_tree_present() is True
+        assert find_node_executable("npm") is None
+        assert find_node_executable("npm") != str(path_npm)
+
+    def test_with_hermes_node_path_prepends_existing_managed_dirs(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        node_dir = home / "node"
+        bin_dir = node_dir / "bin"
+        node_dir.mkdir(parents=True)
+        bin_dir.mkdir()
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        env = with_hermes_node_path({"PATH": "system-node"})
+        parts = env["PATH"].split(os.pathsep)
+
+        assert parts[:2] == [str(node_dir), str(bin_dir)]
+        assert parts[-1] == "system-node"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell stubs; Windows uses .cmd shims")
+class TestNodeToolRunnable:
+    """node_tool_runnable() rejects broken Hermes-managed npm/node wrappers."""
+
+    def _stub(self, tmp_path, name, body, mode=0o755):
+        path = tmp_path / name
+        path.write_text(body)
+        path.chmod(mode)
+        return path
+
+    def test_none_and_empty_rejected(self):
+        assert node_tool_runnable(None) is False
+        assert node_tool_runnable("") is False
+
+    def test_runnable_stub_accepted(self, tmp_path):
+        good = self._stub(tmp_path, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+        assert node_tool_runnable(str(good)) is True
+
+    def test_nonzero_exit_rejected(self, tmp_path):
+        bad = self._stub(tmp_path, "npm", "#!/bin/sh\nexit 1\n")
+        assert node_tool_runnable(str(bad)) is False
+
+    def test_broken_managed_npm_heals_when_node_still_runs(self, tmp_path, monkeypatch):
+        """npm can fail while node --version still succeeds (missing lib/cli.js)."""
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        self._stub(managed_bin, "node", "#!/bin/sh\necho '22.0.0'\nexit 0\n")
+        broken_npm = self._stub(managed_bin, "npm", "#!/bin/sh\nexit 1\n")
+        heal_called = {"value": False}
+
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+
+        def _heal():
+            heal_called["value"] = True
+            broken_npm.write_text("#!/bin/sh\necho '22.0.0'\nexit 0\n")
+            broken_npm.chmod(0o755)
+            return True
+
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        resolved = find_node_executable("npm")
+        assert heal_called["value"] is True
+        assert resolved == str(broken_npm)
+        assert resolved != str(system_bin / "npm")
+
+    def test_broken_managed_npm_heals_instead_of_path_fallback(self, tmp_path, monkeypatch):
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        broken_npm = self._stub(managed_bin, "npm", "#!/bin/sh\nexit 1\n")
+        healed_npm = self._stub(managed_bin, "npm", "#!/bin/sh\necho '22.0.0'\nexit 0\n")
+
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        good_npm = self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+
+        def _heal():
+            broken_npm.write_text(healed_npm.read_text())
+            broken_npm.chmod(0o755)
+            return True
+
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        assert find_hermes_node_executable("npm") == str(healed_npm)
+        assert find_node_executable("npm") == str(healed_npm)
+        assert find_node_executable("npm") != str(good_npm)
+
+    def test_broken_managed_npm_returns_none_when_heal_fails(self, tmp_path, monkeypatch):
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        self._stub(managed_bin, "npm", "#!/bin/sh\nexit 1\n")
+
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
+
+        assert find_node_executable("npm") is None
+
+    def test_healthy_managed_npm_still_preferred(self, tmp_path, monkeypatch):
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        managed_npm = self._stub(managed_bin, "npm", "#!/bin/sh\necho '22.0.0'\nexit 0\n")
+
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", str(system_bin))
+
+        assert find_node_executable("npm") == str(managed_npm)
+
+
 class TestIsContainer:
     """Tests for is_container() — Docker/Podman detection."""
 
@@ -142,12 +354,66 @@ class TestIsContainer:
         """Returns False on a regular Linux host."""
         import builtins
         self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         cgroup_file = tmp_path / "cgroup"
         cgroup_file.write_text("12:memory:/\n")
+        mountinfo_file = tmp_path / "mountinfo"
+        mountinfo_file.write_text("22 21 0:20 / /sys rw shared:7 - sysfs sysfs rw\n")
+        _real_open = builtins.open
+
+        def _fake_open(p, *a, **kw):
+            if p == "/proc/1/cgroup":
+                return _real_open(str(cgroup_file), *a, **kw)
+            if p == "/proc/self/mountinfo":
+                return _real_open(str(mountinfo_file), *a, **kw)
+            return _real_open(p, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", _fake_open)
+        assert is_container() is False
+
+    def test_detects_kubernetes_env(self, monkeypatch):
+        """KUBERNETES_SERVICE_HOST env var triggers detection (k8s/k3s pod)."""
+        self._reset_cache(monkeypatch)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
+        assert is_container() is True
+
+    def test_detects_cgroup_kubepods(self, monkeypatch, tmp_path):
+        """/proc/1/cgroup containing 'kubepods' triggers detection."""
+        import builtins
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text("12:memory:/kubepods/besteffort/podabc\n")
         _real_open = builtins.open
         monkeypatch.setattr("builtins.open", lambda p, *a, **kw: _real_open(str(cgroup_file), *a, **kw) if p == "/proc/1/cgroup" else _real_open(p, *a, **kw))
-        assert is_container() is False
+        assert is_container() is True
+
+    def test_detects_cgroup_v2_via_mountinfo(self, monkeypatch, tmp_path):
+        """cgroup v2 (0::/ only) falls back to containerd marker in mountinfo."""
+        import builtins
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text("0::/\n")  # cgroup v2 — no runtime marker
+        mountinfo_file = tmp_path / "mountinfo"
+        mountinfo_file.write_text(
+            "1234 1233 0:42 /containerd/.../rootfs / rw - overlay overlay rw\n"
+        )
+        _real_open = builtins.open
+
+        def _fake_open(p, *a, **kw):
+            if p == "/proc/1/cgroup":
+                return _real_open(str(cgroup_file), *a, **kw)
+            if p == "/proc/self/mountinfo":
+                return _real_open(str(mountinfo_file), *a, **kw)
+            return _real_open(p, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", _fake_open)
+        assert is_container() is True
 
     def test_caches_result(self, monkeypatch):
         """Second call uses cached value without re-probing."""
@@ -217,10 +483,10 @@ class TestParseReasoningEffort:
         """Guard against silently dropping a documented level.
 
         The docstring promises "minimal", "low", "medium", "high", "xhigh",
-        "max". If someone removes one from VALID_REASONING_EFFORTS without
+        "max", "ultra". If someone removes one from VALID_REASONING_EFFORTS without
         updating the docstring, this test will fail and force the call out.
         """
-        documented = {"minimal", "low", "medium", "high", "xhigh", "max"}
+        documented = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
 
 
@@ -568,3 +834,38 @@ class TestGetHermesDir:
         legacy.symlink_to(empty)
         result = get_hermes_dir("cache/audio", "audio_cache")
         assert result == tmp_path / "cache/audio"
+
+
+class TestWslPathTranslation:
+    """Cross-boundary path translation for a Windows-host UI + WSL backend."""
+
+    def test_windows_drive_to_wsl_mount(self):
+        assert hermes_constants.windows_path_to_wsl(r"C:\Users\alex") == "/mnt/c/Users/alex"
+        assert hermes_constants.windows_path_to_wsl("C:/Users/alex") == "/mnt/c/Users/alex"
+        assert hermes_constants.windows_path_to_wsl("D:\\") == "/mnt/d/"
+
+    def test_windows_drive_ignores_non_drive_paths(self):
+        assert hermes_constants.windows_path_to_wsl("/home/alex") is None
+        assert hermes_constants.windows_path_to_wsl("relative\\dir") is None
+
+    def test_wsl_unc_to_posix_both_spellings(self):
+        assert hermes_constants.wsl_unc_path_to_posix(r"\\wsl.localhost\Ubuntu\home\alex") == "/home/alex"
+        assert hermes_constants.wsl_unc_path_to_posix(r"\\wsl$\Ubuntu\home\alex") == "/home/alex"
+        # Forward-slash spelling and distro root.
+        assert hermes_constants.wsl_unc_path_to_posix("//wsl.localhost/Debian/srv/app") == "/srv/app"
+        assert hermes_constants.wsl_unc_path_to_posix("\\\\wsl.localhost\\Ubuntu\\") == "/"
+
+    def test_wsl_unc_ignores_non_unc_paths(self):
+        assert hermes_constants.wsl_unc_path_to_posix(r"C:\Users\alex") is None
+        assert hermes_constants.wsl_unc_path_to_posix("/home/alex") is None
+
+    def test_translate_is_noop_off_wsl(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_wsl", lambda: False)
+        assert hermes_constants.translate_cwd_for_wsl_backend(r"C:\Users\alex") == r"C:\Users\alex"
+
+    def test_translate_maps_windows_and_unc_on_wsl(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_wsl", lambda: True)
+        assert hermes_constants.translate_cwd_for_wsl_backend(r"C:\Users\alex") == "/mnt/c/Users/alex"
+        assert hermes_constants.translate_cwd_for_wsl_backend(r"\\wsl.localhost\Ubuntu\home\alex") == "/home/alex"
+        # Already-POSIX paths pass through untouched.
+        assert hermes_constants.translate_cwd_for_wsl_backend("/home/alex") == "/home/alex"

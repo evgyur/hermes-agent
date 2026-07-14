@@ -794,6 +794,27 @@ async def test_run_agent_allows_tool_progress_for_configured_topic_even_when_tel
 
 
 @pytest.mark.asyncio
+async def test_run_agent_allows_tool_progress_for_all_topics_in_configured_chat(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-visible-chat-all-topics",
+        chat_id="-1003942534566",
+        chat_type="group",
+        thread_id="858",
+        config_data={
+            "display": {"platforms": {"telegram": {"tool_progress": False}}},
+            "telegram": {"tool_progress_topics": ["-1003942534566:*"]},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == '💻 terminal: "pwd"'
+
+
+@pytest.mark.asyncio
 async def test_run_agent_suppresses_still_working_for_configured_telegram_chat(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.1")
     adapter, result = await _run_with_agent(

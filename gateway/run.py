@@ -25,8 +25,8 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import concurrent.futures
 import dataclasses
-import hashlib
 import inspect
 import json
 import logging
@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -56,7 +56,6 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
-from gateway import goal_launch
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -74,27 +73,16 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 
 _STARTUP_GOAL_RECOVERY_REASON = "active_goal_startup_recovery"
 _STARTUP_GOAL_RISKY_TOOLS = frozenset({
-    "terminal",
-    "send_message",
-    "cronjob",
-    "patch",
-    "write_file",
-    "skill_manage",
-    "memory",
-    "tool_call",
+    "terminal", "send_message", "cronjob", "patch", "write_file",
+    "skill_manage", "memory", "tool_call",
 })
 
 
 @dataclasses.dataclass(frozen=True)
 class StartupGoalRecoveryDecision:
-    """Startup decision for a durable /goal session.
+    """Startup decision for a durable /goal session."""
 
-    ``prompt`` deliberately stays out of hook/log payloads because it contains
-    the full standing goal.  The event scheduler may use it for the official
-    GoalManager continuation path, but observers only get compact metadata.
-    """
-
-    status: str  # auto_resume | alert_only | skip
+    status: str
     session_key: str
     session_id: str
     reason: str
@@ -114,9 +102,8 @@ class StartupGoalRecoveryDecision:
             "ledger_statuses": list(self.ledger_statuses),
         }
 
-
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
+    r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
@@ -126,7 +113,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
     r"|pre-api\s+compression"
-    r"|near\s+the\s+context/output\s+limit.+compacting\s+before\s+the\s+next\s+model\s+call"
+    r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
@@ -135,6 +122,22 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+# Surfaces that consume gateway text programmatically (CLI/TUI "local"
+# diagnostics, API JSON, webhook payloads) and therefore must keep RAW
+# status/error text. EVERY other platform is a human-facing chat surface
+# where operational lifecycle/provider-error noise (and any secrets in it)
+# must be suppressed or sanitized. Widens #28533's Telegram-only filter to
+# all chat gateways (#39293). Fail-closed: unknown/empty platform -> chat.
+_GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
+    {"local", "api_server", "webhook", "msgraph_webhook"}
+)
+
+
+def _gateway_surface_passes_raw_text(platform: Any) -> bool:
+    """True only for programmatic/local surfaces that must keep raw text."""
+    return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
@@ -178,6 +181,7 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxapp-\d+-[A-Za-z0-9\-]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{20,}\b"),
     re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
@@ -244,16 +248,17 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
-def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
-    """Return True when display.platforms.<platform> explicitly sets setting."""
-    display = user_config.get("display") if isinstance(user_config, dict) else None
-    if not isinstance(display, dict):
-        return False
-    platforms = display.get("platforms")
-    if not isinstance(platforms, dict):
-        return False
-    platform_cfg = platforms.get(platform_key)
-    return isinstance(platform_cfg, dict) and setting in platform_cfg
+def _non_conversational_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark Discord lifecycle/status sends without changing other platforms."""
+    if _gateway_platform_value(platform) != "discord":
+        return metadata
+    merged = dict(metadata or {})
+    merged["non_conversational"] = True
+    return merged
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -336,11 +341,76 @@ def _gateway_loop_exception_handler(
 
 
 def _redact_gateway_user_facing_secrets(text: str) -> str:
-    """Best-effort secret redaction before text can leave the gateway."""
+    """Secret redaction before text can leave the gateway.
+
+    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` — the
+    same Tirith-grade redactor already applied to logs, tool output, and
+    approval-command prompts — so the outbound chat path masks the full
+    credential set the startup banner promises ("chat responses are scrubbed
+    before delivery"), not a divergent subset. ``force=True`` honors redaction
+    even when ``security.redact_secrets`` is off, matching the
+    ``_redact_approval_command`` reasoning (#23810).
+
+    The narrow ``_GATEWAY_SECRET_PATTERNS`` set runs as a belt-and-suspenders
+    second pass so nothing the gateway historically caught can regress, and so
+    redaction still degrades gracefully if the import ever fails.
+    """
     redacted = str(text or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(redacted, force=True)
+    except Exception:
+        # Fail-soft: fall back to the local pattern pass below rather than
+        # letting a redactor import/error leak the raw text to chat.
+        pass
     for pattern in _GATEWAY_SECRET_PATTERNS:
         redacted = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", redacted)
     return redacted
+
+
+def _redact_approval_command(cmd: "str | None") -> str:
+    """Redact credentials from a command before it goes into an approval prompt.
+
+    Tirith's *findings* are already redacted, but the gateway approval prompt
+    is built from the raw command string, so a credential-shaped value Tirith
+    flagged would otherwise be echoed verbatim to the chat platform (#48456).
+    Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor
+    — so the prompt honors redaction even when ``security.redact_secrets`` is
+    off. Module-level so the wiring is unit-testable (the call site is a deeply
+    nested gateway closure that cannot be driven directly).
+    """
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str(cmd or ""), force=True)
+
+
+def _format_exec_approval_fallback(
+    command: str,
+    description: str,
+    command_prefix: str,
+    *,
+    allow_permanent: bool = True,
+    smart_denied: bool = False,
+) -> str:
+    """Render the text fallback from approval capabilities, not platform names."""
+    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    heading = "⚠️ **Dangerous command requires approval:**"
+    if smart_denied:
+        heading = "⚠️ **Smart DENY — owner override for one operation:**"
+
+    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    if not smart_denied:
+        choices.append(
+            f"`{command_prefix}approve session` to approve this pattern for the session"
+        )
+        if allow_permanent:
+            choices.append(f"`{command_prefix}approve always` to approve permanently")
+    choices.append(f"`{command_prefix}deny` to cancel")
+    return (
+        f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
+        + ", ".join(choices[:-1]) + f", or {choices[-1]}."
+    )
 
 
 def _gateway_provider_error_reply(text: str) -> str:
@@ -402,15 +472,18 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Sanitize final gateway replies before sending them to high-noise chats.
+    """Sanitize final gateway replies before sending them to chat surfaces.
 
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
-    failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+    Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
+    Signal, Matrix, plugin platforms, etc.) should receive concise, safe
+    provider failure categories with secrets redacted instead of raw HTTP
+    bodies, request IDs, leaked credentials, or policy text. Only programmatic
+    surfaces in ``_GATEWAY_RAW_TEXT_PLATFORMS`` (CLI/TUI ``local`` diagnostics,
+    API JSON, webhook payloads) keep the raw text unchanged.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_surface_passes_raw_text(platform):
         return text
 
     # Cancellation metadata, not assistant prose. ACP/TUI already suppress
@@ -425,11 +498,15 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
-    """Filter/sanitize agent status callbacks before platform delivery."""
+    """Filter/sanitize agent status callbacks before platform delivery.
+
+    Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
+    surfaces should not receive transient auxiliary/compression chatter.
+    """
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_surface_passes_raw_text(platform):
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
@@ -466,6 +543,68 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
     return await adapter.send(chat_id, content, metadata=metadata)
+
+
+def _resolve_progress_thread_id(platform: Any, source_thread_id: Any, event_message_id: Any) -> Optional[str]:
+    """Return thread/root ID that progress/status bubbles should target."""
+    platform_value = getattr(platform, "value", platform)
+    platform_key = str(platform_value or "").lower()
+    if source_thread_id:
+        return str(source_thread_id)
+    if platform_key in {"slack", "mattermost"} and event_message_id:
+        return str(event_message_id)
+    return None
+
+
+def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
+    """Return True when display.platforms.<platform> explicitly sets setting."""
+    display = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display, dict):
+        return False
+    platforms = display.get("platforms")
+    if not isinstance(platforms, dict):
+        return False
+    platform_cfg = platforms.get(platform_key)
+    return isinstance(platform_cfg, dict) and setting in platform_cfg
+
+
+def _resolve_gateway_display_bool(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    *,
+    default: bool = False,
+    platform: Any = None,
+    require_platform_override_for: set[Any] | None = None,
+) -> bool:
+    """Resolve a boolean display setting with optional platform-only opt-in.
+
+    Some display features expose assistant scratch text rather than deliberate
+    user-facing output.  For high-noise threaded chat surfaces such as
+    Mattermost, a global opt-in is too broad: they must be enabled with an
+    explicit display.platforms.<platform>.<setting> override.
+    """
+    current_platform = _gateway_platform_value(platform or platform_key)
+    platform_only = {
+        _gateway_platform_value(candidate)
+        for candidate in (require_platform_override_for or set())
+    }
+    if (
+        current_platform in platform_only
+        and not _has_platform_display_override(user_config, platform_key, setting)
+    ):
+        return False
+
+    from gateway.display_config import resolve_display_setting
+
+    value = resolve_display_setting(user_config, platform_key, setting, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1", "on"}
+    if value is None:
+        return bool(default)
+    return bool(value)
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -546,20 +685,19 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
 def _auto_continue_freshness_window() -> float:
     """Return the configured auto-continue freshness window in seconds.
 
-    Reads ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from
-    ``config.yaml`` ``agent.gateway_auto_continue_freshness`` at gateway
-    startup, same pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the
-    module default when unset or malformed.  Non-positive values disable
-    the freshness gate (restores the pre-fix "always fresh" behaviour for
-    users who want to opt out).
+    Thin wrapper that delegates to the canonical implementation in
+    ``gateway.session`` (the single source of truth shared with the
+    routing-time zombie gate in ``get_or_create_session``).  Reads
+    ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from ``config.yaml``
+    ``agent.gateway_auto_continue_freshness`` at gateway startup, same
+    pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the module default
+    when unset or malformed.  Non-positive values disable the freshness gate
+    (restores the pre-fix "always fresh" behaviour for users who want to opt
+    out).  Kept here so existing call sites and test patches importing it
+    from ``gateway.run`` continue to work.
     """
-    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
-    if raw is None or raw == "":
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    from gateway.session import auto_continue_freshness_window
+    return auto_continue_freshness_window()
 
 
 def _float_env(name: str, default: float) -> float:
@@ -713,7 +851,13 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
 
 
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
-    """True when gateway.message_timestamps.enabled is opted in."""
+    """True when gateway.message_timestamps.enabled is opted in.
+
+    Default OFF: injecting a ``[Tue 2026-04-28 13:40:53 CEST]`` prefix onto
+    every user message changes what the model sees for all gateway users, so
+    it must be explicitly enabled in config.yaml under
+    ``gateway.message_timestamps.enabled``.
+    """
     if not isinstance(user_config, dict):
         return False
     gw = user_config.get("gateway")
@@ -722,6 +866,7 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     mt = gw.get("message_timestamps")
     if isinstance(mt, dict):
         return bool(mt.get("enabled", False))
+    # Allow a bare ``message_timestamps: true`` shorthand.
     return bool(mt)
 
 
@@ -738,8 +883,18 @@ def _build_gateway_agent_history(
     turns.  Keeping that context out of ``conversation_history`` avoids
     consecutive-user repair merging it with the live user turn and then hiding
     the current message behind ``history_offset`` during persistence.
+
+    When ``inject_timestamps`` is True (gateway.message_timestamps.enabled),
+    each replayed user message is rendered with a single human-readable
+    timestamp prefix from its stored metadata.
     """
 
+    from hermes_time import get_timezone as _get_msg_tz
+    from gateway.message_timestamps import (
+        render_user_content_with_timestamp as _render_msg_ts,
+    )
+
+    _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
     separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
@@ -760,9 +915,7 @@ def _build_gateway_agent_history(
 
         content = msg.get("content")
         if inject_timestamps and role == "user" and isinstance(content, str):
-            from hermes_time import get_timezone as _get_msg_tz
-            from gateway.message_timestamps import render_user_content_with_timestamp as _render_msg_ts
-            content = _render_msg_ts(content, msg.get("timestamp"), tz=_get_msg_tz())
+            content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
             continue
@@ -802,8 +955,46 @@ def _build_gateway_agent_history(
     # tools that were killed mid-flight.
     agent_history = _strip_interrupted_tool_tails(agent_history)
 
+    # Strip a dangling assistant(tool_calls) tail with no tool answers —
+    # the signature of a SIGKILL mid-tool-call (e.g. the tool itself ran
+    # `docker restart`/`kill` and took the gateway down before the result
+    # was persisted). Without this the model re-issues the unanswered call
+    # on resume and loops the restart forever (#49201).
+    agent_history = _strip_dangling_tool_call_tail(agent_history)
+
+    # Strip stale dangerous-confirmation text in user messages (#59607).
+    # A high-risk confirmation phrase (e.g. "confirm forced restart") that
+    # is older than the expiry window must not be replayed to the model,
+    # otherwise an unrelated follow-up message can be interpreted as a
+    # fresh confirmation and trigger the destructive action a second time.
+    agent_history = _strip_stale_dangerous_confirmations(
+        agent_history, now=time.time()
+    )
+
     observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
+
+
+def _select_cached_agent_history(
+    persisted_history: List[Dict[str, Any]],
+    live_history: Any,
+) -> List[Dict[str, Any]]:
+    """Prefer a cached agent's live in-memory transcript over a shorter
+    persisted one.
+
+    Guards the FTS write-corruption case (#50502): when message writes fail
+    silently through corrupt FTS triggers, the next turn reloads a stale/empty
+    ``conversation_history`` from disk even though the same cached ``AIAgent``
+    still holds the full live ``_session_messages``. Replacing the live
+    transcript with that shorter persisted copy causes immediate same-session
+    amnesia. When the live transcript is strictly longer, keep it.
+
+    Returns ``persisted_history`` unchanged unless the live copy is a longer
+    list, in which case a copy of the live transcript is returned.
+    """
+    if isinstance(live_history, list) and len(live_history) > len(persisted_history):
+        return list(live_history)
+    return persisted_history
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
@@ -869,62 +1060,17 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
-def _is_interrupted_tool_result(content: Any) -> bool:
-    """Return True if a tool result indicates the tool was interrupted."""
-    if not isinstance(content, str):
-        return False
-    lowered = content.lower()
-    if "[command interrupted]" in lowered:
-        return True
-    if "exit_code" in lowered and ("130" in lowered or "-1" in lowered):
-        return "interrupt" in lowered
-    return False
-
-
-def _strip_interrupted_tool_tails(
-    agent_history: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Strip interrupted assistant→tool sequences from replay history.
-
-    Older interrupted gateway turns can be followed by a queued real user
-    message, so the interrupted assistant/tool block is not necessarily the
-    final tail by the time we rebuild replay history.  Remove any contiguous
-    assistant(tool_calls) + tool-result block that contains an interrupted tool
-    result, while preserving successful tool-call sequences intact.
-    """
-    if not agent_history:
-        return agent_history
-
-    cleaned: List[Dict[str, Any]] = []
-    i = 0
-    n = len(agent_history)
-    while i < n:
-        msg = agent_history[i]
-        if msg.get("role") == "assistant" and "tool_calls" in msg:
-            j = i + 1
-            tool_results: List[Dict[str, Any]] = []
-            while j < n and agent_history[j].get("role") == "tool":
-                tool_results.append(agent_history[j])
-                j += 1
-            if tool_results and any(
-                _is_interrupted_tool_result(m.get("content", ""))
-                for m in tool_results
-            ):
-                logger.debug(
-                    "Stripping interrupted assistant→tool replay block "
-                    "(indices %d–%d, tool_results=%d)",
-                    i, j - 1, len(tool_results),
-                )
-                i = j
-                continue
-        if msg.get("role") == "tool" and _is_interrupted_tool_result(msg.get("content", "")):
-            logger.debug("Stripping orphan interrupted tool result from replay history")
-            i += 1
-            continue
-        cleaned.append(msg)
-        i += 1
-
-    return cleaned
+# Replay-tail sanitization lives in agent/replay_cleanup.py so every resume
+# surface (this messaging gateway AND the TUI/WebUI gateway) shares one
+# implementation.  Re-exported under the historical private names so existing
+# call sites and tests keep working.
+from agent.replay_cleanup import (  # noqa: E402
+    is_interrupted_tool_result as _is_interrupted_tool_result,
+    strip_interrupted_tool_tails as _strip_interrupted_tool_tails,
+    strip_dangling_tool_call_tail as _strip_dangling_tool_call_tail,
+    strip_stale_dangerous_confirmations as _strip_stale_dangerous_confirmations,
+    is_dangerous_confirmation as _is_dangerous_confirmation,
+)
 
 
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
@@ -982,28 +1128,14 @@ _TOOL_MEDIA_RE = re.compile(
 
 
 def _extract_deliverable_media_paths_from_tool_content(content: Any) -> List[str]:
-    """Extract local deliverable paths from a tool-result payload.
-
-    Tool history contains two media shapes:
-
-    * explicit ``MEDIA:/abs/file`` tags (TTS and model-authored directives), and
-    * JSON payloads from producer tools such as ``image_generate``:
-      ``{"success": true, "image": "/abs/file.png"}``.
-
-    The gateway uses the extracted paths both for current-turn delivery and for
-    history de-duplication. Treat JSON payload paths as historical media too;
-    otherwise a later text-only turn in a cached/compressed session can re-send
-    stale images that were generated several turns earlier.
-    """
+    """Extract validated local media paths from tags or producer JSON."""
     text = str(content or "")
     paths: List[str] = []
-
     if "MEDIA:" in text:
         for match in _TOOL_MEDIA_RE.finditer(text):
             path = match.group(1).strip().rstrip('\",}')
             if path:
                 paths.append(path)
-
     try:
         payload = json.loads(text)
     except Exception:
@@ -1011,12 +1143,8 @@ def _extract_deliverable_media_paths_from_tool_content(content: Any) -> List[str
     if isinstance(payload, dict) and payload.get("success"):
         for field in _JSON_MEDIA_TOOL_PATH_FIELDS:
             path = payload.get(field)
-            if (
-                isinstance(path, str)
-                and _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}")
-            ):
+            if isinstance(path, str) and _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}"):
                 paths.append(path)
-
     return paths
 
 
@@ -1076,20 +1204,78 @@ def _collect_auto_append_media_tags(
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
         if tool_name == "image_generate" and "MEDIA:" not in content:
-            for path in _extract_deliverable_media_paths_from_tool_content(content):
-                if path not in history_media_paths:
-                    media_tags.append(f"MEDIA:{path}")
-                    break
+            try:
+                payload = json.loads(content)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("success"):
+                for field in _JSON_MEDIA_TOOL_PATH_FIELDS:
+                    path = payload.get(field)
+                    if (isinstance(path, str)
+                            and _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{path}")
+                            and path not in history_media_paths):
+                        media_tags.append(f"MEDIA:{path}")
+                        break
             continue
         if "MEDIA:" not in content:
             continue
-        for path in _extract_deliverable_media_paths_from_tool_content(content):
+        for match in _TOOL_MEDIA_RE.finditer(content):
+            path = match.group(1).strip().rstrip('",}')
             if path and path not in history_media_paths:
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
     return media_tags, has_voice_directive
+
+
+def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
+    """Collect every media path already delivered in prior tool results.
+
+    Used to dedup auto-appended MEDIA tags so the same file is not re-sent on
+    later turns. Must cover BOTH delivery shapes:
+      * ``MEDIA:<path>`` text tags in tool results, and
+      * ``image_generate`` JSON-payload paths (``host_image`` / ``image`` /
+        ``agent_visible_image``), which carry no MEDIA: tag.
+
+    Missing the JSON-payload shape caused #46627: after a compression
+    boundary the auto-append fallback rescans full history, re-discovers an
+    earlier ``image_generate`` result whose path was never in the dedup set,
+    and re-emits the MEDIA tag every turn.
+    """
+    paths: set = set()
+    tool_name_by_call_id: Dict[str, str] = {}
+    for msg in agent_history:
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                cid = call.get("id") or call.get("call_id")
+                fn = call.get("function") or {}
+                name = str(fn.get("name") or call.get("name") or "")
+                if cid and name:
+                    tool_name_by_call_id[str(cid)] = name
+    for msg in agent_history:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        content = str(msg.get("content", "") or "")
+        if "MEDIA:" in content:
+            for match in _TOOL_MEDIA_RE.finditer(content):
+                p = match.group(1).strip().rstrip('",}')
+                if p:
+                    paths.add(p)
+            continue
+        cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        if tool_name_by_call_id.get(cid) == "image_generate":
+            try:
+                payload = json.loads(content)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("success"):
+                for field in _JSON_MEDIA_TOOL_PATH_FIELDS:
+                    jp = payload.get(field)
+                    if isinstance(jp, str) and jp:
+                        paths.add(jp)
+                        break
+    return paths
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -1213,13 +1399,31 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     pick up rotated API keys. config.yaml remains authoritative for agent budget
     settings such as agent.max_turns; otherwise a stale HERMES_MAX_ITERATIONS in
     .env can replace the startup bridge on later turns.
+
+    In multiplex mode this is a NO-OP for the credential reload: secrets come
+    from the per-turn ``set_secret_scope`` (installed by ``_profile_runtime_scope``)
+    which loads the routed profile's ``.env`` into an isolated mapping. Mutating
+    the process-global ``os.environ`` here would defeat that isolation and leak
+    the default profile's keys to every profile's turns and subprocesses.
     """
+    from agent.secret_scope import is_multiplex_active
+    if is_multiplex_active():
+        # Credentials are resolved from the active profile's secret scope, not
+        # os.environ. Still honor config.yaml's agent.max_turns bridge below
+        # using the scoped home, but never reload .env into global env.
+        _bridge_max_turns_from_config(_hermes_home)
+        return
+
     load_hermes_dotenv(
         hermes_home=_hermes_home,
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
+    _bridge_max_turns_from_config(_hermes_home)
 
-    config_path = _hermes_home / 'config.yaml'
+
+def _bridge_max_turns_from_config(home: "Path") -> None:
+    """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
+    config_path = home / 'config.yaml'
     if not config_path.exists():
         return
     try:
@@ -1228,6 +1432,15 @@ def _reload_runtime_env_preserving_config_authority() -> None:
             cfg = _yaml.safe_load(f) or {}
         from hermes_cli.config import _expand_env_vars
         cfg = _expand_env_vars(cfg)
+        # Managed scope: keep administrator-pinned values authoritative on every
+        # turn too. This per-turn reload re-bridges config→env, so without the
+        # overlay a managed agent.max_turns / timezone / redact_secrets would be
+        # replaced by the user's value after the first turn. Fail-open.
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
     except Exception:
         return
 
@@ -1236,165 +1449,80 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
 
 
-def _load_config_from_home(home: Path) -> dict:
-    """Load a config.yaml from an explicit Hermes home without changing global env."""
-    cfg_path = Path(home) / "config.yaml"
-    if not cfg_path.exists():
-        return {}
+def _current_max_iterations() -> int:
+    """Return the current per-turn iteration budget after runtime env refresh."""
+    _reload_runtime_env_preserving_config_authority()
     try:
-        import yaml as _yaml
-        with open(cfg_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
-        from hermes_cli.config import _expand_env_vars
-        return _expand_env_vars(cfg)
-    except Exception as exc:
-        logger.warning("Failed to load profile config from %s: %s", cfg_path, exc)
-        return {}
+        return int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+    except (TypeError, ValueError):
+        return 90
 
 
-def _resolve_gateway_profile_route(user_config: dict, source: Any) -> tuple[Optional[str], Optional[Path]]:
-    """Resolve optional per-chat gateway profile routing.
+from contextlib import contextmanager as _contextmanager
 
-    Supported platform config shapes, e.g. under ``telegram``:
-    ``profile_routes: {"<chat_id>": "profile"}``,
-    ``chat_profiles: {"<chat_id>": "profile"}``,
-    ``channel_profiles: {"<chat_id>": "profile"}``, or
-    ``profile_routes: [{chats: [...], profile: "profile"}]``.
+
+# Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
+# multiplexer the default profile owns the single shared listener and serves
+# every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
+# enabling one of these is always a misconfiguration: it would try to bind a
+# port already held by the default's listener. We hard-error on it rather than
+# silently dropping the adapter (see _start_one_profile_adapters).
+# Stored as platform .value strings since the Platform enum is imported below.
+_PORT_BINDING_PLATFORM_VALUES = frozenset({
+    "webhook",
+    "api_server",
+    "msgraph_webhook",
+    "feishu",
+    "wecom_callback",
+    "bluebubbles",
+    "sms",
+    "whatsapp_cloud",
+    "line",
+})
+
+
+class MultiplexConfigError(RuntimeError):
+    """A profile multiplexer config is invalid (fail-fast at startup).
+
+    Distinct from a transient adapter-connect failure: a transient error is
+    logged and the gateway stays alive to retry, but a config error means the
+    operator must fix config.yaml, so it aborts startup cleanly.
     """
+
+
+@_contextmanager
+def _profile_runtime_scope(profile_home: "Path"):
+    """Scope config/skills/memory AND credentials to a profile for one turn.
+
+    Combines the two seams the multiplexer needs:
+      1. ``set_hermes_home_override`` — redirects ``get_hermes_home()`` (config,
+         skills, memory, SOUL, sessions) to the profile's home. Contextvar, so
+         it propagates into the agent worker thread via ``copy_context()``.
+      2. ``set_secret_scope`` — installs the profile's ``.env`` secrets as the
+         authoritative credential source, so ``get_secret`` reads this profile's
+         keys and never the process-global ``os.environ`` (which in a
+         multiplexer may hold another profile's values).
+
+    Only used on the multiplexed inbound path. Single-profile gateways never
+    enter this scope, so their behavior is unchanged. Loading the profile's
+    ``.env`` here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
+    returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
+    from inheriting cross-profile secrets.
+    """
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        set_secret_scope,
+        reset_secret_scope,
+    )
+
+    home_token = set_hermes_home_override(str(profile_home))
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
-        platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", "") or "")
-        platform_cfg = (user_config or {}).get(platform) or {}
-        if not isinstance(platform_cfg, dict):
-            return None, None
-        chat_id = str(getattr(source, "chat_id", "") or "")
-        thread_id = str(getattr(source, "thread_id", "") or "")
-
-        def _candidate_from_mapping(obj):
-            if not isinstance(obj, dict):
-                return None
-            candidates = [f"{chat_id}:{thread_id}", chat_id]
-            if chat_id.lstrip("-").isdigit():
-                candidates.append(int(chat_id))
-            for candidate in candidates:
-                if candidate in obj:
-                    return obj[candidate]
-            return None
-
-        raw_profile = None
-        for key in ("profile_routes", "chat_profiles", "channel_profiles"):
-            routes = platform_cfg.get(key)
-            raw_profile = _candidate_from_mapping(routes)
-            if raw_profile:
-                break
-            if isinstance(routes, list):
-                for item in routes:
-                    if not isinstance(item, dict):
-                        continue
-                    chats = item.get("chats") or item.get("chat_ids") or item.get("channels") or []
-                    if isinstance(chats, (str, int)):
-                        chats = [chats]
-                    chat_matches = chat_id in {str(c) for c in chats}
-                    threads = item.get("threads") or item.get("thread_ids")
-                    if threads is not None:
-                        if isinstance(threads, (str, int)):
-                            threads = [threads]
-                        chat_matches = chat_matches and thread_id in {str(t) for t in threads}
-                    if chat_matches:
-                        raw_profile = item.get("profile") or item.get("name")
-                        break
-            if raw_profile:
-                break
-
-        if not raw_profile:
-            return None, None
-
-        from hermes_cli.profiles import normalize_profile_name, profile_exists, get_profile_dir
-        profile_name = normalize_profile_name(str(raw_profile))
-        if not profile_exists(profile_name):
-            logger.warning("Gateway profile route for chat %s points to missing profile %r", chat_id, profile_name)
-            return None, None
-        return profile_name, get_profile_dir(profile_name)
-    except Exception as exc:
-        logger.warning("Gateway profile route resolution failed: %s", exc)
-        return None, None
-
-
-_AUTO_PO_CONTROL_RE = re.compile(
-    r"\b(hermes|gateway|config|profile|profiles|skill|skills|quick[_ -]?command|po_quick|promptoptimizer|prompt optimizer|/po)\b",
-    re.IGNORECASE,
-)
-
-
-def _auto_po_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (str, int)):
-        return [value]
-    if isinstance(value, (list, tuple, set)):
-        return list(value)
-    return []
-
-
-def _auto_po_route_matches(source: Any, route: Any) -> bool:
-    """Return True when a Telegram source matches an auto-/po route entry."""
-    chat_id = str(getattr(source, "chat_id", "") or "")
-    thread_id = str(getattr(source, "thread_id", "") or "")
-    if not chat_id:
-        return False
-
-    if isinstance(route, dict):
-        chats = _auto_po_list(route.get("chats") or route.get("chat_ids") or route.get("chat_id"))
-        if not chats:
-            return False
-        if chat_id not in {str(c) for c in chats}:
-            return False
-        threads = route.get("threads") or route.get("thread_ids") or route.get("thread_id")
-        if threads is None:
-            return True
-        return bool(thread_id and thread_id in {str(t) for t in _auto_po_list(threads)})
-
-    raw = str(route).strip()
-    if not raw:
-        return False
-    if ":" in raw:
-        route_chat, route_thread = raw.rsplit(":", 1)
-        return chat_id == route_chat and bool(thread_id) and thread_id == route_thread
-    return chat_id == raw
-
-
-def _looks_like_auto_po_payload(text: str) -> bool:
-    """Conservative guard so meta/control chatter in the PO room stays normal."""
-    body = str(text or "").strip()
-    if not body:
-        return False
-    if body.startswith("/"):
-        return False
-    lowered = body.lower()
-    if lowered in {"да", "нет", "ок", "окей", "го", "давай", "yes", "no", "ok"}:
-        return False
-    if _AUTO_PO_CONTROL_RE.search(body):
-        return False
-    return True
-
-
-def _should_auto_po_route(user_config: dict, source: Any, text: str) -> bool:
-    """Config-driven Telegram route that rewrites plain text into /po."""
-    try:
-        platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", "") or "")
-        if platform != "telegram":
-            return False
-        if not _looks_like_auto_po_payload(text):
-            return False
-        telegram_cfg = (user_config or {}).get("telegram") or {}
-        if not isinstance(telegram_cfg, dict):
-            return False
-        routes = telegram_cfg.get("auto_po_routes") or telegram_cfg.get("prompt_optimizer_routes") or []
-        for route in _auto_po_list(routes):
-            if _auto_po_route_matches(source, route):
-                return True
-    except Exception as exc:
-        logger.debug("auto /po route check failed: %s", exc)
-    return False
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -1411,6 +1539,17 @@ if _config_path.exists():
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
+        # Managed scope: overlay administrator-pinned values BEFORE bridging to
+        # env vars, so a managed timezone / redact_secrets / max_turns / terminal
+        # setting wins over the user's value at the env layer too. This bridge
+        # reads config.yaml directly (not via load_config), so without the
+        # overlay every HERMES_*/TERMINAL_* env var below would carry the user's
+        # value even when an administrator pinned it. Fail-open via the helper.
+        try:
+            from hermes_cli import managed_scope
+            _cfg = managed_scope.apply_managed_overlay(_cfg)
+        except Exception:
+            pass
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
@@ -1443,6 +1582,7 @@ if _config_path.exists():
                 "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
                 "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
                 "docker_env": "TERMINAL_DOCKER_ENV",
+                "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
                 "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
                 "docker_network": "TERMINAL_DOCKER_NETWORK",
                 "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
@@ -1591,6 +1731,18 @@ if _config_path.exists():
             _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
             if _trust_recent_seconds is not None:
                 os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
+            # Bridge gateway.platform_connect_timeout → the internal env var the
+            # connect path + Discord adapter ready-wait both read (#19776).
+            # Unlike the agent.*/display.* bridges above (config-authoritative),
+            # this env var is the manual-override escape hatch, so it WINS if
+            # already set explicitly; otherwise config.yaml supplies the value.
+            if (
+                "platform_connect_timeout" in _gateway_cfg
+                and not os.environ.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
+            ):
+                os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(
+                    _gateway_cfg["platform_connect_timeout"]
+                )
     except Exception as _bridge_err:
         # Previously this was silent (`except Exception: pass`), which
         # hid partial bridge failures and let .env defaults shadow
@@ -1644,6 +1796,7 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 # by the config bridge above).  Placeholder values are resolved per-backend —
 # see gateway/cwd_placeholder.py for the three-case contract (local vs docker
 # mount-off vs docker mount-on).  MESSAGING_CWD is a backward-compat fallback.
+from gateway import goal_launch
 from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
@@ -1673,6 +1826,7 @@ from gateway.config import (
     load_gateway_config,
 )
 from gateway.session import (
+    AsyncSessionStore,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -1681,7 +1835,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from gateway.delivery import DeliveryRouter
+from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -1697,25 +1851,19 @@ from gateway.platforms.base import (
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
 
 
 def _append_recent_context_prompt(context_prompt: str, event: Any) -> str:
-    """Append ephemeral same-chat/platform context to the system prompt.
-
-    Adapters may attach a short recent-context block to ``MessageEvent`` so the
-    agent can answer follow-ups like "what about the message above?" without
-    polluting persisted transcript history or the user message text.
-    """
+    """Append ephemeral same-chat context without persisting it as history."""
     recent_context = str(getattr(event, "recent_context", "") or "").strip()
     if not recent_context:
         return context_prompt
     base = str(context_prompt or "").rstrip()
-    if not base:
-        return recent_context
-    return f"{base}\n\n{recent_context}"
+    return f"{base}\n\n{recent_context}" if base else recent_context
 
 
 from gateway.whatsapp_identity import (
@@ -1726,6 +1874,48 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_OWN_POLICY_OPEN_ENV = {
+    Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
+    Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
+    Platform.YUANBAO: ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY", "YUANBAO_ALLOW_ALL_USERS"),
+    Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
+    Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS"),
+}
+
+
+def _own_policy_open_startup_violation(config) -> Optional[str]:
+    """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    for platform, platform_config in getattr(config, "platforms", {}).items():
+        if not getattr(platform_config, "enabled", False):
+            continue
+        open_env = _OWN_POLICY_OPEN_ENV.get(platform)
+        if not open_env:
+            continue
+        dm_env, group_env, allow_all_env = open_env
+        extra = getattr(platform_config, "extra", None) or {}
+        dm_policy = str(
+            extra.get("dm_policy")
+            or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
+        ).strip().lower()
+        group_policy = str(
+            extra.get("group_policy")
+            or (os.getenv(group_env, "pairing") if group_env else "pairing")
+        ).strip().lower()
+        if dm_policy != "open" and group_policy != "open":
+            continue
+        gateway_allow_all = os.getenv(
+            "GATEWAY_ALLOW_ALL_USERS", ""
+        ).lower() in {"true", "1", "yes"}
+        platform_opted_in = gateway_allow_all or (
+            allow_all_env
+            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+        )
+        if platform_opted_in:
+            continue
+        return f"{platform.value}: open policy without allow-all opt-in"
+    return None
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -1897,6 +2087,47 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
+def _event_media_type_at(event, index: int) -> str:
+    """Return the per-attachment MIME for the attachment at *index*.
+
+    Empty string when the platform didn't populate a per-file MIME for
+    that slot (some adapters only set a message-level type).
+    """
+    media_types = getattr(event, "media_types", None) or []
+    return media_types[index] if index < len(media_types) else ""
+
+
+def _event_media_is_image(event, index: int) -> bool:
+    """True if the attachment at *index* is an image.
+
+    Trust the per-attachment MIME when present. Only fall back to the
+    message-level ``PHOTO`` type when this attachment's MIME is unknown --
+    otherwise a document (or any non-image) uploaded alongside an image in
+    the same message gets mis-routed as an image, base64'd into a vision
+    content part, and the provider 400s ("Could not process image").
+    """
+    mtype = _event_media_type_at(event, index)
+    if mtype:
+        return mtype.startswith("image/")
+    return getattr(event, "message_type", None) == MessageType.PHOTO
+
+
+def _event_media_is_audio(event, index: int) -> bool:
+    """True if the attachment at *index* is audio (per-attachment MIME first)."""
+    mtype = _event_media_type_at(event, index)
+    if mtype:
+        return mtype.startswith("audio/")
+    return getattr(event, "message_type", None) in {MessageType.VOICE, MessageType.AUDIO}
+
+
+def _event_media_is_video(event, index: int) -> bool:
+    """True if the attachment at *index* is video (per-attachment MIME first)."""
+    mtype = _event_media_type_at(event, index)
+    if mtype:
+        return mtype.startswith("video/")
+    return getattr(event, "message_type", None) == MessageType.VIDEO
+
+
 def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
@@ -1907,14 +2138,12 @@ def _build_media_placeholder(event) -> str:
     """
     parts = []
     media_urls = getattr(event, "media_urls", None) or []
-    media_types = getattr(event, "media_types", None) or []
     for i, url in enumerate(media_urls):
-        mtype = media_types[i] if i < len(media_types) else ""
-        if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
+        if _event_media_is_image(event, i):
             parts.append(f"[User sent an image: {url}]")
-        elif mtype.startswith("audio/"):
+        elif _event_media_is_audio(event, i):
             parts.append(f"[User sent audio: {url}]")
-        elif mtype.startswith("video/") or getattr(event, "message_type", None) == MessageType.VIDEO:
+        elif _event_media_is_video(event, i):
             parts.append(f"[User sent a video: {url}]")
         else:
             parts.append(f"[User sent a file: {url}]")
@@ -2180,8 +2409,15 @@ def _load_gateway_config() -> dict:
     Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
     still see their fixture) and shares the mtime-keyed raw-yaml cache
     from ``hermes_cli.config.read_raw_config`` when the paths match.
+
+    Managed scope is overlaid on the result (via the shared helper) so the
+    gateway honors administrator-pinned values — neither read_raw_config nor a
+    direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    config_home = _gateway_config_home()
+    config_path = config_home / 'config.yaml'
+    raw: dict = {}
+    used_canonical = False
     try:
         from hermes_cli.config import get_config_path, read_raw_config
         # Fast path: if _hermes_home agrees with the canonical config
@@ -2189,18 +2425,44 @@ def _load_gateway_config() -> dict:
         # direct read (keeps test fixtures with a monkeypatched
         # _hermes_home working).
         if config_path == get_config_path():
-            return read_raw_config()
+            raw = read_raw_config()
+            used_canonical = True
     except Exception:
         pass
 
+    if not used_canonical:
+        try:
+            if config_path.exists():
+                import yaml
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    raw = yaml.safe_load(f) or {}
+        except Exception:
+            logger.debug("Could not load gateway config from %s", config_path)
+            raw = {}
+
+    # Overlay managed scope. read_raw_config() returns the user's raw YAML
+    # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
+    # so the overlay is required on both paths for the gateway to honor pinned
+    # values. Helper is fail-open and a no-op when no managed scope exists.
     try:
-        if config_path.exists():
-            import yaml
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
+        from hermes_cli import managed_scope
+        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
     except Exception:
-        logger.debug("Could not load gateway config from %s", config_path)
-    return {}
+        pass
+    if not isinstance(raw, dict):
+        return {}
+    # Canonicalize model-id aliases (model.name / model.model → model.default)
+    # and migrate stale root-level provider/base_url into the model section.
+    # The gateway bypasses load_config() (it reads raw YAML for speed), so the
+    # normalization that load_config() applies must be replayed here or the
+    # gateway would resolve an empty model for ``model: {name: <id>}`` configs
+    # while the CLI resolves it correctly. See issue #34500. Fail-open.
+    try:
+        from hermes_cli.config import _normalize_root_model_keys
+        raw = _normalize_root_model_keys(raw)
+    except Exception:
+        pass
+    return raw
 
 
 def _load_gateway_runtime_config() -> dict:
@@ -2245,7 +2507,11 @@ def _channel_override_lookup_keys(
     thread_id: Optional[str] = None,
     parent_id: Optional[str] = None,
 ) -> list[str]:
-    """Ordered, de-duplicated keys for ``channel_overrides`` lookup."""
+    """Ordered, de-duplicated keys for ``channel_overrides`` lookup.
+
+    Matches ``resolve_channel_prompt`` semantics: exact thread/channel id first,
+    then parent channel/forum id (Discord threads inherit parent overrides).
+    """
     keys: list[str] = []
     seen: set[str] = set()
     for key in (chat_id, thread_id, parent_id):
@@ -2267,7 +2533,11 @@ def _get_channel_override(
     thread_id: Optional[str] = None,
     parent_id: Optional[str] = None,
 ) -> Optional[ChannelOverride]:
-    """Return per-channel override for this platform/chat_id, or None."""
+    """Return per-channel override for this platform/chat_id, or None.
+
+    Looks up ``channel_overrides`` by ``chat_id``, then ``thread_id``, then
+    ``parent_id`` (forum threads / child channels inherit the parent entry).
+    """
     platforms = getattr(config, "platforms", None)
     if not platforms:
         return None
@@ -2285,7 +2555,6 @@ def _get_channel_override(
 
 
 def _format_status_count(value: Any) -> str:
-    """Format compact counts for gateway status (1.4k, 2.1m)."""
     try:
         number = float(value or 0)
     except (TypeError, ValueError):
@@ -2302,7 +2571,6 @@ def _format_status_count(value: Any) -> str:
 
 
 def _format_status_duration(seconds: Any) -> str:
-    """Human compact duration for /status uptime fields."""
     try:
         total = max(0, int(float(seconds or 0)))
     except (TypeError, ValueError):
@@ -2327,7 +2595,6 @@ def _read_system_uptime_seconds() -> Optional[float]:
 
 
 def _status_git_revision() -> str:
-    """Best-effort short git SHA for the active checkout; never blocks status."""
     try:
         import subprocess
 
@@ -2346,19 +2613,15 @@ def _status_git_revision() -> str:
 
 
 def _gateway_status_model_parts(config: dict) -> tuple[str, str, str, Optional[int]]:
-    """Return (model, provider, base_url, configured context length)."""
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
     if isinstance(model_cfg, str):
         return model_cfg, "", "", None
     if not isinstance(model_cfg, dict):
         return "", "", "", None
-    ctx_len: Optional[int] = None
-    raw_ctx = model_cfg.get("context_length")
-    if raw_ctx is not None:
-        try:
-            ctx_len = int(raw_ctx)
-        except (TypeError, ValueError):
-            ctx_len = None
+    try:
+        ctx_len = int(model_cfg["context_length"]) if model_cfg.get("context_length") is not None else None
+    except (TypeError, ValueError):
+        ctx_len = None
     return (
         str(model_cfg.get("default") or model_cfg.get("model") or ""),
         str(model_cfg.get("provider") or ""),
@@ -2397,9 +2660,7 @@ def _gateway_status_runtime_label(provider: str, base_url: str) -> str:
         return "MiniMax"
     if provider_key:
         return provider_key
-    if base_url:
-        return "custom"
-    return "unknown"
+    return "custom" if base_url else "unknown"
 
 
 def _gateway_status_fallbacks(chain: Any) -> str:
@@ -2417,7 +2678,7 @@ def _gateway_status_fallbacks(chain: Any) -> str:
             labels.append(str(item))
     if len(chain) > 4:
         labels.append(f"+{len(chain) - 4}")
-    return " → ".join([label for label in labels if label]) or "none"
+    return " → ".join(label for label in labels if label) or "none"
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -2497,7 +2758,40 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
+    if evt_type == "async_delegation":
+        # Reuse the shared rich formatter (self-contained task-source block).
+        from tools.process_registry import format_process_notification
+        return format_process_notification(evt)
+
     return None
+
+
+def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
+    """Drain gateway-owned watch events without spinning on requeued events.
+
+    Watch events are handled by the post-turn gateway drain. Process
+    completions are owned by their per-process watcher task, and async
+    delegation completions are owned by ``_async_delegation_watcher``.
+    Requeueing async events inside ``while not queue.empty()`` would make the
+    loop non-terminating, so detach the current batch first, then requeue any
+    events this drain does not own after the queue is empty.
+    """
+    watch_events: list[dict] = []
+    requeue: list[dict] = []
+    while not completion_queue.empty():
+        try:
+            evt = completion_queue.get_nowait()
+        except Exception:
+            break
+        evt_type = evt.get("type", "completion")
+        if evt_type in {"watch_match", "watch_disabled"}:
+            watch_events.append(evt)
+        elif evt_type == "async_delegation":
+            requeue.append(evt)
+        # else: process completion events are handled by the watcher task
+    for evt in requeue:
+        completion_queue.put(evt)
+    return watch_events
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -2518,6 +2812,12 @@ def _normalize_empty_agent_response(
     Consolidates the existing ``failed`` handler and adds a catch-all for
     the case where the agent did work (api_calls > 0) but returned no text.
     Fix for #18765.
+
+    Also surfaces a retry hint when the agent never ran at all
+    (api_calls == 0) for a non-interrupted, non-failed turn -- this is the
+    silent-drop pattern observed after ``/stop`` where the next user
+    message hits a stale generation token and returns an empty result,
+    leaving the platform with nothing to send. (#31884)
     """
     if response:
         return response
@@ -2563,6 +2863,22 @@ def _normalize_empty_agent_response(
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
+        )
+
+    # api_calls == 0, not failed, not interrupted: the agent never ran for
+    # this turn. This is the post-/stop generation-race pattern where the
+    # gateway would otherwise silently drop the turn (response=0 chars) and
+    # the user sees no reply at all. Surface a short retry hint so the
+    # message isn't lost in silence. (#31884)
+    if (
+        api_calls == 0
+        and not agent_result.get("interrupted")
+        and not agent_result.get("failed")
+        and not agent_result.get("partial")
+    ):
+        return (
+            "⚠️ Your message wasn't processed (the previous turn was still "
+            "being cleaned up). Please send it again."
         )
 
     return response
@@ -2690,12 +3006,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
+    _external_drain_active: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _detached_restart_helper_started: bool = False
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
+    _restart_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
@@ -2703,7 +3022,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
+        # Mark the process as a profile multiplexer when configured. This flips
+        # agent.secret_scope.get_secret() to fail-closed on any unscoped
+        # credential read, so a missed migration crashes loudly instead of
+        # leaking a cross-profile value (Workstream A). Inert when off.
+        try:
+            from agent.secret_scope import set_multiplex_active
+            set_multiplex_active(bool(getattr(self.config, "multiplex_profiles", False)))
+        except Exception:
+            logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Multi-profile multiplexing: adapters for NON-default profiles live
+        # here, keyed by profile name then Platform. self.adapters stays the
+        # default/active profile's map so the ~93 existing self.adapters[...]
+        # sites are untouched when multiplexing is off (this dict is empty).
+        # Populated by _start_secondary_profile_adapters().
+        self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -2720,12 +3054,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
-        # Wire process registry into session store for reset protection
+        # Wire process registry into session store for reset protection.
+        # A background process older than the configured threshold (default 24h,
+        # session_reset.bg_process_max_age_hours) is treated as stale and no
+        # longer blocks session idle / daily reset — see #29177. The process is
+        # NOT killed, only ignored by the reset guard.
         from tools.process_registry import process_registry
+        _bg_max_age_hours = getattr(
+            self.config.default_reset_policy, "bg_process_max_age_hours", 24
+        )
+        _bg_max_age_seconds = (
+            _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
+        )
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
-            has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
+            has_active_processes_fn=lambda key: process_registry.has_active_for_session(
+                key, max_active_age=_bg_max_age_seconds,
+            ),
         )
+        # One enforced loop-side boundary for the synchronous SessionStore.
+        # Sync helpers keep using ``session_store`` directly; async gateway
+        # handlers call this facade and await every operation.
+        self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2735,6 +3085,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
         self._draining = False
+        # External (NAS-driven) drain state — distinct from the shutdown
+        # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
+        # ``.drain_request.json`` marker is present: the gateway flips
+        # ``gateway_state -> draining`` and refuses NEW turns, but the process
+        # does NOT exit (the whole point — quiesce-without-restart, D4a). It is
+        # fully reversible: removing the marker reverts to ``running`` and
+        # re-accepts turns. ``_draining`` (shutdown) is one-way and ends in
+        # process exit; this one is a steady state NAS polls during its
+        # request -> poll -> proceed loop.
+        self._external_drain_active = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -2749,10 +3109,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task_started = False
         self._restart_detached = False
         self._restart_via_service = False
+        self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None
+        # Monotonic-ish wall clock of when this GatewayRunner was constructed.
+        # Used by the /restart redelivery guard to bound the window in which a
+        # missing dedup marker is treated as a stale redelivery.
+        self._startup_time: float = time.time()
+        # Set True at startup when this process booted as the result of a
+        # chat-originated /restart (i.e. .restart_notify.json existed on boot).
+        # A one-shot signal consumed by _is_stale_restart_redelivery so the
+        # marker-missing fallback only suppresses a /restart when we KNOW we
+        # just came out of a restart cycle — never on a genuine fresh boot.
+        self._booted_from_restart: bool = False
         self._stop_task: Optional[asyncio.Task] = None
-        self._gateway_started_at = time.time()
-        
+        self._restart_task: Optional[asyncio.Task] = None
+        self._executor_lock = threading.Lock()
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Set on gateway stop so the recreate-on-shutdown path can't resurrect
+        # the pool during a real shutdown.
+        self._executor_closing = False
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -2794,6 +3169,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cannot grow unbounded over a long-running gateway lifetime.
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
+        # Completion delivery is intentionally lifecycle-scoped. This closes
+        # duplicate queue/watcher races inside one gateway without pretending
+        # the adapter call and a persistence write can be exactly-once across
+        # a process crash. Any durable async-delegation replay state remains
+        # owned by tools.async_delegation, not a parallel gateway ledger.
+        self._completion_delivery_lock = threading.Lock()
+        self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
+        self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
+        self._completion_delivery_retention = 2048
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -2815,11 +3199,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
-        # Sessions whose active /goal was started from a Telegram clarify
-        # callback while the planning turn is still running. The next post-turn
-        # hook for that same session must not judge the pre-goal planning answer
-        # as the first goal turn.
-        self._goal_callback_started_sessions = set()
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -2887,8 +3266,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Initialize session database for session_search tool support
         self._session_db = None
         try:
-            from hermes_state import SessionDB
-            self._session_db = SessionDB()
+            from hermes_state import AsyncSessionDB, SessionDB
+            self._session_db = AsyncSessionDB(SessionDB())
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
@@ -2909,7 +3288,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.config import load_config as _load_full_config
                 _sess_cfg = (_load_full_config().get("sessions") or {})
                 if _sess_cfg.get("auto_prune", False):
-                    self._session_db.maybe_auto_prune_and_vacuum(
+                    # Construction-time, before the loop serves traffic; sync DB is fine.
+                    self._session_db._db.maybe_auto_prune_and_vacuum(
                         retention_days=int(_sess_cfg.get("retention_days", 90)),
                         min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
@@ -2958,6 +3338,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+        # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
+        # There is no such clock today (only a per-agent _last_activity_ts), so the
+        # idle predicate needs this. Stamped in _handle_message (the single inbound
+        # chokepoint all adapters call); seeded to "now" so a fresh gateway isn't
+        # considered idle from epoch. The scale-to-zero watcher (started only when
+        # the instance is opted in + relay-only + has a wakeUrl) reads it.
+        self._last_inbound_at: float = time.time()
+        # Set after a wake (re-arm cooldown, 0.F) so we don't immediately re-go
+        # dormant before the drained backlog has a chance to update the clock.
+        self._scale_to_zero_cooldown_until: float = 0.0
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -3199,6 +3590,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 e,
             )
 
+    async def _bounded_adapter_teardown(
+        self, adapter, platform, *, profile: Optional[str] = None
+    ) -> None:
+        """Tear down one adapter on the shutdown path with bounded awaits.
+
+        Both ``cancel_background_tasks()`` and ``disconnect()`` can block
+        indefinitely when a platform's network state is half-dead (e.g. a
+        wedged Feishu/Lark WebSocket thread waiting on I/O). An unbounded
+        await here stalls the entire shutdown sequence past systemd's
+        ``TimeoutStopSec``; the resulting SIGKILL skips ``atexit`` PID-file
+        cleanup, so the next start dies with "PID file race lost" (#14128).
+
+        Each await is wrapped in the existing per-adapter timeout budget
+        (``HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT``). On timeout we log
+        and force forward progress; the loop never hangs regardless of any
+        adapter's internal behavior. Never raises.
+        """
+        timeout = self._adapter_disconnect_timeout_secs()
+        suffix = f" (profile: {profile})" if profile else ""
+        started_at = time.monotonic()
+        try:
+            if timeout <= 0:
+                await adapter.cancel_background_tasks()
+            else:
+                await asyncio.wait_for(
+                    adapter.cancel_background_tasks(), timeout=timeout
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
+                platform.value, timeout, suffix,
+            )
+        except Exception as e:
+            logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        try:
+            if timeout <= 0:
+                await adapter.disconnect()
+            else:
+                await asyncio.wait_for(adapter.disconnect(), timeout=timeout)
+            logger.info(
+                "✓ %s disconnected (%.2fs)%s",
+                platform.value, time.monotonic() - started_at, suffix,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "✗ %s disconnect timed out after %.1fs - forcing continue%s",
+                platform.value, timeout, suffix,
+            )
+        except Exception as e:
+            logger.error(
+                "✗ %s disconnect error after %.2fs%s: %s",
+                platform.value, time.monotonic() - started_at, suffix, e,
+            )
+
     def _adapter_disconnect_timeout_secs(self) -> float:
         """Return the per-adapter disconnect timeout used during shutdown."""
         raw = os.getenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "").strip()
@@ -3229,13 +3674,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return max(0.0, timeout)
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
-    async def _connect_adapter_with_timeout(self, adapter, platform) -> bool:
-        """Connect an adapter without allowing one platform to block others."""
+    async def _connect_adapter_with_timeout(
+        self, adapter, platform, *, is_reconnect: bool = False
+    ) -> bool:
+        """Connect an adapter without allowing one platform to block others.
+
+        ``is_reconnect`` is forwarded to ``adapter.connect()`` so platform
+        adapters can distinguish a cold first boot (drop any stale
+        server-side queue) from a watcher reconnect after a prolonged outage
+        (preserve the queue so messages sent during the outage are delivered
+        rather than silently dropped — #46621).
+        """
         timeout = self._platform_connect_timeout_secs()
         if timeout <= 0:
-            return await adapter.connect()
+            return await adapter.connect(is_reconnect=is_reconnect)
         try:
-            return await asyncio.wait_for(adapter.connect(), timeout=timeout)
+            return await asyncio.wait_for(
+                adapter.connect(is_reconnect=is_reconnect), timeout=timeout
+            )
         except asyncio.TimeoutError as exc:
             raise TimeoutError(
                 f"{platform.value} connect timed out after {timeout:g}s"
@@ -3267,10 +3723,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         config = getattr(self, "config", None)
+        # Mirror SessionStore._resolve_profile_for_key so this fallback path
+        # produces the same namespace as the primary path: None (legacy
+        # agent:main) unless multiplexing is on, then the active profile.
+        _profile = None
+        if getattr(config, "multiplex_profiles", False):
+            if source.profile:
+                _profile = source.profile
+            else:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name() or "default"
+                except Exception:
+                    _profile = None
         return build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            profile=_profile,
         )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
@@ -3280,6 +3750,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return False
+        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        session_db = getattr(session_db, "_db", session_db)
         try:
             raw = session_db.is_telegram_topic_mode_enabled(
                 chat_id=str(source.chat_id),
@@ -3377,6 +3849,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None or not source.chat_id or not source.thread_id:
             return
+        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        session_db = getattr(session_db, "_db", session_db)
         session_db.bind_telegram_topic(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
@@ -3445,6 +3919,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return None
+        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        session_db = getattr(session_db, "_db", session_db)
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
                 chat_id=str(source.chat_id),
@@ -3684,57 +4160,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route["request_overrides"] = overrides or {}
         return route
 
-    @staticmethod
-    def _is_use_xhigh_gpt55_trigger(message: str) -> bool:
-        """Return True when the user explicitly asks for GPT-5.5 xhigh.
+    def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
+        """Persist the runtime model/provider actually used by a gateway turn.
 
-        Telegram group messages may arrive as ``[Sender] text`` and can also
-        be wrapped after a channel-context preface with ``[New message]``.
-        Detect only a leading operator directive so incidental mentions of
-        "use xhigh" inside a task body don't silently reroute the model.
+        Provider fallback can switch ``agent.model``/``agent.provider`` after the
+        session row was created. Keep the session DB metadata in sync so session
+        lists, desktop/dashboard details, and follow-up session tooling report the
+        backend that actually answered the latest turn.
+
+        Called from the ``run_sync`` closure, which executes off the event loop
+        in the executor thread — so the synchronous ``SessionDB`` (``_db``) is
+        used directly rather than awaiting the AsyncSessionDB forwarder.
         """
-        text = str(message or "").strip()
-        if not text:
-            return False
-        if "[New message]" in text:
-            text = text.rsplit("[New message]", 1)[-1].strip()
-        text = re.sub(r"^\[[^\]\n]{1,120}\]\s*", "", text).strip()
-        return bool(
-            re.match(
-                r"(?is)^(?:"
-                r"use\s+xhigh(?:\s+reasoning)?"
-                r"|"
-                r"xhigh(?:\s+reasoning)?(?:\s+(?:gpt|gptt|gpt-?5(?:\.5)?|codex))?"
-                r")(?:\b|\s*[:—\-.,;?])",
-                text,
-            )
-        )
-
-    @staticmethod
-    def _gpt55_xhigh_reasoning_config() -> dict:
-        """Runtime reasoning override for explicit `use xhigh` turns."""
-        return {"enabled": True, "effort": "xhigh"}
-
-    @staticmethod
-    def _resolve_gpt55_openai_codex_runtime(previous_runtime: Optional[dict] = None) -> tuple[str, dict]:
-        """Resolve the exact GPT-5.5/OpenAI-Codex runtime for one turn."""
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
-        runtime = resolve_runtime_provider(
-            requested="openai-codex",
-            target_model="gpt-5.5",
-        )
-        previous_runtime = previous_runtime or {}
-        return "gpt-5.5", {
-            "api_key": runtime.get("api_key"),
-            "base_url": runtime.get("base_url"),
-            "provider": runtime.get("provider") or "openai-codex",
-            "api_mode": runtime.get("api_mode"),
-            "command": runtime.get("command"),
-            "args": list(runtime.get("args") or []),
-            "credential_pool": runtime.get("credential_pool"),
-            "max_tokens": previous_runtime.get("max_tokens"),
+        if not session_id or agent is None:
+            return
+        model = getattr(agent, "model", None)
+        if not model:
+            return
+        runtime = {
+            "provider": getattr(agent, "provider", None),
+            "base_url": getattr(agent, "base_url", None),
+            "api_mode": getattr(agent, "api_mode", None),
+            "fallback_active": bool(getattr(agent, "_fallback_activated", False)),
         }
+        runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
+
+        try:
+            db = getattr(self.session_store, "_db", None)
+            get_session = getattr(db, "get_session", None)
+            update_session_meta = getattr(db, "update_session_meta", None)
+            if not callable(get_session) or not callable(update_session_meta):
+                return
+            row = get_session(session_id)
+            if not row:
+                return
+            current_model = row.get("model")
+            raw_config = row.get("model_config")
+            try:
+                config = json.loads(raw_config) if raw_config else {}
+            except Exception:
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            gateway_runtime = dict(config.get("gateway_runtime") or {})
+            if current_model == model and all(
+                gateway_runtime.get(k) == v for k, v in runtime.items()
+            ):
+                return
+            config["gateway_runtime"] = runtime
+            update_session_meta(session_id, json.dumps(config), model=model)
+        except Exception:
+            logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -3742,26 +4218,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
+        # Snapshot the current owner of this platform slot before doing
+        # anything else. If it's neither this adapter nor empty, a different
+        # adapter has already taken over (e.g. this is a delayed notification
+        # from a background retry chain that raced with, and lost to, a
+        # reconnect that already succeeded). Acting on a stale notification
+        # would overwrite an already-healthy platform's runtime status and
+        # incorrectly re-queue it for reconnection, so bail out before any of
+        # that happens.
+        existing = self.adapters.get(adapter.platform)
+        if existing is not None and existing is not adapter:
+            logger.debug(
+                "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+                adapter.platform.value,
+                adapter.fatal_error_code or "unknown",
+            )
+            return
+
         logger.error(
             "Fatal %s adapter error (%s): %s",
             adapter.platform.value,
             adapter.fatal_error_code or "unknown",
             adapter.fatal_error_message or "unknown error",
         )
+        # Phase 7 Unit 7d-B: a relay credential revoked by opt-out is not an
+        # error to retry — render it as a clean "disabled" state, not red
+        # "fatal"/"retrying". (The code is set non-retryable, so it also drops
+        # out of the reconnect queue below.)
+        if adapter.fatal_error_code == "relay_disabled":
+            platform_state = "disabled"
+        elif adapter.fatal_error_retryable:
+            platform_state = "retrying"
+        else:
+            platform_state = "fatal"
         self._update_platform_runtime_status(
             adapter.platform.value,
-            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            platform_state=platform_state,
             error_code=adapter.fatal_error_code,
             error_message=adapter.fatal_error_message,
         )
 
-        existing = self.adapters.get(adapter.platform)
         if existing is adapter:
-            try:
-                await adapter.disconnect()
-            finally:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+            # Claim this adapter for teardown before awaiting disconnect() —
+            # a second fatal-error notification for the same adapter (e.g.
+            # from a concurrent recovery path) would otherwise still see
+            # itself as "existing" during the await below and disconnect()
+            # the same object twice.
+            self.adapters.pop(adapter.platform, None)
+            self.delivery_router.adapters = self.adapters
+            await adapter.disconnect()
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -3770,7 +4275,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._failed_platforms[adapter.platform] = {
                     "config": platform_config,
                     "attempts": 0,
-                    "next_retry": time.monotonic() + 30,
+                    "next_retry": time.monotonic(),
                 }
                 logger.info(
                     "%s queued for background reconnection",
@@ -3811,26 +4316,292 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
-    def _active_cron_job_count(self) -> int:
-        """Count cron jobs currently executing outside ``_running_agents``.
+    def _active_work_count(self) -> int:
+        """All agent work the gateway must expose and drain as one total."""
+        return (
+            self._running_agent_count()
+            + self._active_cron_job_count()
+            + self._active_api_run_count()
+        )
 
-        Cron jobs run through ``cron.scheduler`` on its own worker pool, so a
-        cron-only workload is invisible to the regular running-agent drain.
-        This helper is best-effort and must never make gateway shutdown fail.
+    def _active_cron_job_count(self) -> int:
+        """Count of cron jobs currently executing, from the cron scheduler's
+        own in-flight tracking (``cron.scheduler._running_job_ids``).
+
+        Cron jobs run through a standalone ``AIAgent`` on the scheduler's own
+        thread pool (``cron/scheduler.py::run_job``), entirely outside
+        ``self._running_agents`` — the dict every OTHER active-work check on
+        this class (``_running_agent_count``, ``_drain_active_agents``) reads.
+        Without this, the shutdown drain is structurally blind to in-flight
+        cron work: it can report ``active_at_start=0`` and proceed straight
+        to killing tool subprocesses while a cron job's terminal command is
+        still running (#60432). Best-effort: returns 0 if the cron module
+        can't be imported (e.g. a minimal test double for this class).
         """
         try:
             from cron.scheduler import get_running_job_ids
-
             return len(get_running_job_ids())
         except Exception:
             return 0
 
-    def _pairing_store_for(self, source):
-        per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
-        if profile and profile in per_profile:
-            return per_profile[profile]
-        return getattr(self, "pairing_store", None)
+    def _active_api_run_count(self) -> int:
+        """Count API-server work that is outside ``_running_agents``.
+
+        The primary API server owns the sole HTTP listener. Secondary multiplex
+        profiles cannot create an ``api_server`` adapter because it binds a port,
+        so only the primary registry is a supported source of this work.
+        """
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            helper = getattr(adapter, "active_agent_work_count", None)
+            return max(0, int(helper())) if callable(helper) else 0
+        except Exception:
+            return 0
+
+    # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
+    # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
+    # (gateway-gateway Phase 5). Pure logic lives in gateway/scale_to_zero.py; the
+    # methods here bind it to the live runner/transport. See ~/nous/specs/
+    # scale-to-zero (decisions.md) for the design + the F12/F14 distinctions.
+
+    def _scale_to_zero_has_live_background_work(self) -> bool:
+        """Live background work that must block a suspend (D3/F7).
+
+        Backgrounded delegate_task / kanban / terminal(background=true) are NOT
+        counted by _running_agent_count(), but suspending mid-flight loses them.
+        Checks the runner's own tracked tasks + the process registry's running
+        processes + any pending process-completion watchers.
+        """
+        if any(not t.done() for t in self._background_tasks):
+            return True
+        try:
+            from tools.async_delegation import active_count
+
+            if active_count() > 0:
+                return True
+        except Exception:  # noqa: BLE001 - never let the idle check raise
+            logger.debug("scale-to-zero async-delegation check failed", exc_info=True)
+        try:
+            from tools.process_registry import process_registry
+
+            if process_registry.has_any_active():
+                return True
+            if process_registry.pending_watchers:
+                return True
+        except Exception:  # noqa: BLE001 - never let the idle check raise
+            logger.debug("scale-to-zero bg-work check failed", exc_info=True)
+        return False
+
+    def _scale_to_zero_idle_timeout_seconds(self) -> float:
+        from gateway.scale_to_zero import parse_idle_timeout_seconds
+
+        raw = None
+        try:
+            user_cfg = _load_gateway_config()
+            gw = user_cfg.get("gateway") if isinstance(user_cfg, dict) else None
+            stz = gw.get("scale_to_zero") if isinstance(gw, dict) else None
+            if isinstance(stz, dict):
+                raw = stz.get("idle_timeout_minutes")
+        except Exception:  # noqa: BLE001
+            raw = None
+        return parse_idle_timeout_seconds(raw)
+
+    def _restart_loop_guard_config(self) -> tuple:
+        """Return ``(max_restarts, window_seconds)`` for the auto-resume
+        restart-loop breaker (#30719, defense-3), read from
+        ``gateway.restart_loop_guard`` in config.yaml with the module defaults
+        as fallback. ``max_restarts <= 0`` disables the breaker.
+        """
+        from gateway import restart_loop_guard as _rlg
+
+        max_restarts = _rlg.DEFAULT_MAX_RESTARTS
+        window_seconds = _rlg.DEFAULT_WINDOW_SECONDS
+        try:
+            user_cfg = _load_gateway_config()
+            gw = user_cfg.get("gateway") if isinstance(user_cfg, dict) else None
+            rlg = gw.get("restart_loop_guard") if isinstance(gw, dict) else None
+            if isinstance(rlg, dict):
+                if isinstance(rlg.get("max_restarts"), int):
+                    max_restarts = rlg["max_restarts"]
+                if isinstance(rlg.get("window_seconds"), int) and rlg["window_seconds"] > 0:
+                    window_seconds = rlg["window_seconds"]
+        except Exception:  # noqa: BLE001
+            pass
+        return max_restarts, window_seconds
+
+    def _scale_to_zero_should_arm(self) -> bool:
+        """Whether to start the idle watcher (D1/D11/§3.4(1))."""
+        from gateway.relay import relay_wake_url
+        from gateway.scale_to_zero import (
+            messaging_is_relay_only_or_absent,
+            scale_to_zero_enabled,
+            should_arm,
+        )
+
+        try:
+            # Only ENABLED platforms count. `config.platforms` is pre-seeded with a
+            # disabled placeholder PlatformConfig for every KNOWN platform (telegram,
+            # discord, slack, …), so `.keys()` is the full ~20-entry catalog regardless
+            # of what this instance actually runs. Passing the bare keys made
+            # `messaging_is_relay_only_or_absent` see those placeholders as live
+            # direct-socket platforms and return False, so scale-to-zero NEVER armed on
+            # a real relay-only instance. Mirror the connect loop, which already gates on
+            # `platform_config.enabled` (see the `if not platform_config.enabled: continue`
+            # in the adapter-connect loop) — arm off the same notion of "active platform."
+            platforms = (
+                [p for p, pc in self.config.platforms.items() if getattr(pc, "enabled", False)]
+                if self.config
+                else []
+            )
+        except Exception:  # noqa: BLE001
+            platforms = []
+        try:
+            wake_url = relay_wake_url()
+        except Exception:  # noqa: BLE001
+            wake_url = None
+        return should_arm(
+            enabled=scale_to_zero_enabled(),
+            relay_only_or_absent=messaging_is_relay_only_or_absent(platforms),
+            wake_url=wake_url,
+        )
+
+    def _log_scale_to_zero_not_armed_reason(self) -> None:
+        """Log why the idle watcher did NOT arm — but only for an OPTED-IN instance.
+
+        A non-opted instance (no HERMES_SCALE_TO_ZERO stamp) not arming is the normal
+        case and must stay silent. When the Labs stamp IS set but the watcher still
+        didn't arm, that's the surprising case worth one INFO line so "why won't it
+        suspend/wake?" is a log grep, not a box-dive.
+        """
+        from gateway.relay import relay_wake_url
+        from gateway.scale_to_zero import (
+            messaging_is_relay_only_or_absent,
+            scale_to_zero_enabled,
+        )
+
+        try:
+            enabled = scale_to_zero_enabled()
+            if not enabled:
+                return  # not opted in — normal, stay quiet
+            try:
+                active = (
+                    [
+                        getattr(p, "value", p)
+                        for p, pc in self.config.platforms.items()
+                        if getattr(pc, "enabled", False)
+                    ]
+                    if self.config
+                    else []
+                )
+            except Exception:  # noqa: BLE001
+                active = []
+            relay_only = messaging_is_relay_only_or_absent(active)
+            try:
+                wake_url = relay_wake_url()
+            except Exception:  # noqa: BLE001
+                wake_url = None
+            logger.info(
+                "scale-to-zero: NOT armed despite opt-in — "
+                "relay_only_or_absent=%s (enabled platforms=%s), wake_url=%s. "
+                "Need relay-only messaging + a registered wake URL.",
+                relay_only,
+                active or "none",
+                "set" if wake_url else "MISSING",
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never block startup
+            logger.debug("scale-to-zero: not-armed reason logging failed", exc_info=True)
+
+    def _scale_to_zero_is_idle(self) -> bool:
+        from gateway.scale_to_zero import is_idle
+
+        return is_idle(
+            running_agent_count=self._running_agent_count(),
+            seconds_since_last_inbound=time.time() - self._last_inbound_at,
+            idle_timeout_seconds=self._scale_to_zero_idle_timeout_seconds(),
+            has_live_background_work=self._scale_to_zero_has_live_background_work(),
+        )
+
+    def _scale_to_zero_note_real_inbound(self) -> None:
+        """Stamp real inbound and restore lifecycle after a dormant wake.
+
+        The watcher marks runtime status `draining` as it quiesces the relay, but
+        dormancy is not the stop/restart drain path: the process remains alive and
+        should present as running once real traffic wakes it and re-enters the
+        gateway. Internal completion/replay events intentionally do not call this
+        helper, so they do not keep an otherwise idle gateway awake.
+        """
+        self._last_inbound_at = time.time()
+        if getattr(self, "_scale_to_zero_cooldown_until", 0.0) > 0:
+            try:
+                self._update_runtime_status("running")
+            except Exception:  # noqa: BLE001 - status restoration is best-effort
+                logger.debug("scale-to-zero: status restore failed", exc_info=True)
+            self._scale_to_zero_cooldown_until = 0.0
+
+    def _relay_adapter_for_dormancy(self):
+        """Return the connected RELAY adapter, if any (the one go_dormant targets)."""
+        try:
+            from gateway.platforms.base import Platform
+        except Exception:  # noqa: BLE001
+            return None
+        return self.adapters.get(Platform.RELAY)
+
+    async def _scale_to_zero_watcher(self, interval: float = 30.0) -> None:
+        """Watch for idle and drive the relay dormant so the platform can suspend.
+
+        Started ONLY when _scale_to_zero_should_arm() (opted in via the Labs
+        HERMES_SCALE_TO_ZERO stamp + relay-only/absent messaging + a wakeUrl).
+        On a sustained idle window it runs the DORMANT sequence (D12/F12/F14):
+          - mark runtime status `draining` (composes with the existing state
+            machine, §3.4(6); does NOT set _running=False),
+          - relay adapter.go_dormant() — going_idle->ack + supervisor-preserving
+            socket close (NOT disconnect(), NOT the run.py stop path),
+          - deliberately NO mark_resume_pending (D13 — suspend preserves RAM).
+        The process stays alive; the platform (Fly autostop:"suspend") suspends
+        the now-traffic-idle machine and autostart wakes it on the wakeUrl poke,
+        at which point the preserved reconnect supervisor re-dials and the
+        connector drains the buffered backlog. After driving dormant we set a
+        re-arm cooldown so a wake's drained backlog isn't immediately re-quiesced.
+        """
+        await asyncio.sleep(min(interval, 30.0))  # let startup settle
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    return
+                if time.time() < self._scale_to_zero_cooldown_until:
+                    continue
+                if not self._scale_to_zero_is_idle():
+                    continue
+                adapter = self._relay_adapter_for_dormancy()
+                if adapter is None:
+                    continue
+                go_dormant = getattr(adapter, "go_dormant", None)
+                if not callable(go_dormant):
+                    continue
+                logger.info(
+                    "scale-to-zero: gateway idle for >= %.0fs — going dormant "
+                    "(relay buffered, socket closed, awaiting platform suspend)",
+                    self._scale_to_zero_idle_timeout_seconds(),
+                )
+                try:
+                    self._update_runtime_status("draining")
+                except Exception:  # noqa: BLE001 - status is best-effort
+                    logger.debug("scale-to-zero: status mark failed", exc_info=True)
+                try:
+                    result = go_dormant()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:  # noqa: BLE001 - dormancy is best-effort
+                    logger.debug("scale-to-zero: go_dormant failed", exc_info=True)
+                # 0.F: after a wake the drained inbound updates _last_inbound_at,
+                # but give it a window so we don't immediately re-go-dormant on the
+                # same idle reading before traffic lands.
+                self._scale_to_zero_cooldown_until = time.time() + max(interval, 60.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the watcher must never crash the gateway
+                logger.debug("scale-to-zero watcher iteration error", exc_info=True)
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
@@ -3926,17 +4697,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
     def _gateway_ledger_origin_type(self, event: MessageEvent) -> str:
-        """Classify gateway ledger origin without storing full message bodies."""
         if self._is_goal_continuation_event(event):
             return "internal_goal"
         if getattr(event, "internal", False):
-            if not (getattr(event, "text", "") or "").strip():
-                return "startup_recovery"
-            return "internal_goal"
+            return (
+                "startup_recovery"
+                if not (getattr(event, "text", "") or "").strip()
+                else "internal_goal"
+            )
         return "real_user"
 
     def _gateway_ledger_snippet(self, event: MessageEvent) -> Optional[str]:
-        """Short redacted snippet for operator recovery; never full text."""
         origin_type = self._gateway_ledger_origin_type(event)
         if origin_type == "internal_goal":
             return "[internal goal continuation]"
@@ -3947,11 +4718,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         try:
             from agent.redact import redact_sensitive_text
+
             text = redact_sensitive_text(text)
         except Exception:
             pass
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:160] if text else None
+        return re.sub(r"\s+", " ", text).strip()[:160] or None
 
     def _record_gateway_ledger_received(
         self,
@@ -3961,14 +4732,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> Optional[int]:
-        """Best-effort receive marker for the gateway message ledger."""
-        db = getattr(self, "_session_db", None)
+        """Record receipt best-effort; ledger failures never break intake."""
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
         source = getattr(event, "source", None)
         if db is None or source is None:
             return None
         try:
             ledger_id = db.record_gateway_message_received(
-                platform=getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+                platform=getattr(
+                    getattr(source, "platform", None),
+                    "value",
+                    getattr(source, "platform", None),
+                ),
                 chat_id=getattr(source, "chat_id", None),
                 thread_id=getattr(source, "thread_id", None),
                 message_id=getattr(event, "message_id", None),
@@ -3978,16 +4754,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 origin_type=self._gateway_ledger_origin_type(event),
                 reason=reason,
                 metadata={
-                    "message_type": getattr(getattr(event, "message_type", None), "value", str(getattr(event, "message_type", ""))),
+                    "message_type": getattr(
+                        getattr(event, "message_type", None),
+                        "value",
+                        str(getattr(event, "message_type", "")),
+                    ),
                     "platform_update_id": getattr(event, "platform_update_id", None),
                     "internal": bool(getattr(event, "internal", False)),
                 },
                 snippet=self._gateway_ledger_snippet(event),
             )
-            try:
-                setattr(event, "_hermes_gateway_ledger_id", ledger_id)
-            except Exception:
-                pass
+            setattr(event, "_hermes_gateway_ledger_id", ledger_id)
             return ledger_id
         except Exception as exc:
             logger.debug("gateway message ledger receive failed: %s", exc, exc_info=True)
@@ -4003,8 +4780,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reason: Optional[str] = None,
         metadata: Any = None,
     ) -> bool:
-        """Best-effort ledger lifecycle update; never breaks dispatch."""
-        db = getattr(self, "_session_db", None)
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
         source = getattr(event, "source", None)
         if db is None or source is None:
             return False
@@ -4012,7 +4789,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             ok = db.update_gateway_message_ledger(
                 ledger_id=ledger_id,
-                platform=getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+                platform=getattr(
+                    getattr(source, "platform", None),
+                    "value",
+                    getattr(source, "platform", None),
+                ),
                 chat_id=getattr(source, "chat_id", None),
                 thread_id=getattr(source, "thread_id", None),
                 message_id=getattr(event, "message_id", None),
@@ -4023,13 +4804,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
             if not ok and ledger_id is None:
-                self._record_gateway_ledger_received(
+                ledger_id = self._record_gateway_ledger_received(
                     event,
                     session_key=session_key,
                     session_id=session_id,
                     reason="late-ledger-create",
                 )
-                ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
                 if ledger_id is not None:
                     ok = db.update_gateway_message_ledger(
                         ledger_id=ledger_id,
@@ -4052,43 +4832,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> None:
-        """Mark a claimed turn completed/failed/drained without replay risk."""
         if isinstance(agent_result, dict):
+            result_session_id = session_id or agent_result.get("session_id")
             if _should_clear_resume_pending_after_turn(agent_result):
                 self._update_gateway_ledger(
                     event,
                     "completed",
                     session_key=session_key,
-                    session_id=session_id or agent_result.get("session_id"),
+                    session_id=result_session_id,
                     reason="turn-completed",
                     metadata={"completed": True},
                 )
-                return
-            if agent_result.get("interrupted") or agent_result.get("partial"):
+            elif agent_result.get("interrupted") or agent_result.get("partial"):
                 self._update_gateway_ledger(
                     event,
                     "drained",
                     session_key=session_key,
-                    session_id=session_id or agent_result.get("session_id"),
+                    session_id=result_session_id,
                     reason="turn-interrupted",
                     metadata={
                         "interrupted": bool(agent_result.get("interrupted")),
                         "partial": bool(agent_result.get("partial")),
                     },
                 )
-                return
-            if agent_result.get("failed") or agent_result.get("error"):
+            elif agent_result.get("failed") or agent_result.get("error"):
                 self._update_gateway_ledger(
                     event,
                     "failed",
                     session_key=session_key,
-                    session_id=session_id or agent_result.get("session_id"),
+                    session_id=result_session_id,
                     reason=str(agent_result.get("error") or "turn-failed")[:500],
                     metadata={"failed": bool(agent_result.get("failed"))},
                 )
-                return
-            return
-        if isinstance(agent_result, str) and agent_result.strip():
+        elif isinstance(agent_result, str) and agent_result.strip():
             self._update_gateway_ledger(
                 event,
                 "completed",
@@ -4099,18 +4875,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     def _mark_gateway_ledger_session_drained(
-        self,
-        session_key: str,
-        *,
-        reason: str,
+        self, session_key: str, *, reason: str
     ) -> None:
-        db = getattr(self, "_session_db", None)
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
         if db is None or not session_key:
             return
         try:
             db.mark_gateway_session_messages_drained(session_key, reason=reason)
         except Exception as exc:
-            logger.debug("gateway message ledger drain mark failed for %s: %s", session_key, exc, exc_info=True)
+            logger.debug(
+                "gateway message ledger drain mark failed for %s: %s",
+                session_key,
+                exc,
+                exc_info=True,
+            )
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
@@ -4161,10 +4940,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
-                active_agents=self._running_agent_count(),
+                active_agents=self._active_work_count(),
             )
         except Exception:
             pass
+
+    def _persist_active_agents(self) -> None:
+        """Persist the live in-flight agent count to ``gateway_state.json``.
+
+        Called at every turn boundary (a running-agent slot is claimed or
+        released) so the dashboard ``/api/status`` readout reflects in-flight
+        gateway turns in near-real-time.  Without this the file is only
+        rewritten on lifecycle transitions, so any ``active_agents`` read
+        between transitions is stale (a turn could start and finish without the
+        file ever moving).
+
+        Deliberately passes ONLY ``active_agents`` — ``gateway_state`` and the
+        other fields stay ``_UNSET`` so ``write_runtime_status``'s
+        read-merge-write preserves the current lifecycle state (``running`` /
+        ``draining`` / …).  Passing ``gateway_state=None`` here would clobber it.
+        Best-effort: a failed status write must never disrupt a turn.
+        """
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(active_agents=self._active_work_count())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # External drain control (NAS-driven quiesce-without-restart, Phase 2).
+    # The dashboard's begin/cancel-drain endpoint writes/removes the
+    # ``.drain_request.json`` marker (gateway/drain_control.py); this watcher
+    # observes the marker and flips the gateway between accepting and refusing
+    # NEW turns, WITHOUT exiting the process. Reversible by design (D4a): NAS
+    # POSTs begin-drain, polls /api/status until active_agents hits 0, proceeds
+    # with its lifecycle action, then (on cancel/abort) the marker is removed
+    # and the gateway re-accepts turns.
+    # ------------------------------------------------------------------
+    def _enter_external_drain(self) -> None:
+        """Begin external drain: stop accepting new turns, flip state.
+
+        Idempotent — re-entering while already draining is a no-op beyond a
+        best-effort status re-write. In-flight turns are NOT interrupted (the
+        whole point is to let them finish); only NEW turns are refused.
+        """
+        if self._external_drain_active:
+            return
+        self._external_drain_active = True
+        logger.info(
+            "External drain ENGAGED (.drain_request.json present) — refusing "
+            "new turns; %d in-flight turn(s) will finish. Process stays up.",
+            self._active_work_count(),
+        )
+        # Flip the persisted lifecycle state so /api/status.gateway_busy /
+        # gateway_drainable track the drain. Preserve active_agents (the
+        # read-merge keeps the live count); only the state changes.
+        self._update_runtime_status("draining")
+
+    def _exit_external_drain(self) -> None:
+        """Cancel external drain: revert state, re-accept new turns.
+
+        Idempotent. Only reverts to ``running`` when we are actually mid-drain
+        AND not also shutting down (a real shutdown ``_draining`` must win —
+        never resurrect a stopping gateway to ``running``).
+        """
+        if not self._external_drain_active:
+            return
+        self._external_drain_active = False
+        if self._draining or not self._running:
+            # A shutdown drain is in progress / the loop has stopped — do not
+            # clobber the terminal state back to running.
+            logger.info(
+                "External drain marker cleared during shutdown — not reverting "
+                "to running (shutdown takes precedence)."
+            )
+            return
+        logger.info(
+            "External drain RELEASED (.drain_request.json removed) — "
+            "re-accepting new turns; gateway_state -> running."
+        )
+        self._update_runtime_status("running")
+
+    async def _drain_control_watcher(self, interval: float = 1.0) -> None:
+        """Background task: reconcile gateway accept-state with the drain marker.
+
+        Polls ``.drain_request.json`` (presence-based contract,
+        gateway/drain_control.py). Marker present -> ``_enter_external_drain``;
+        marker absent -> ``_exit_external_drain``. The 1s cadence bounds the
+        observe-the-marker latency the live-validation gate checks (point a).
+        Reconciles once at startup. A marker stamped with a PRIOR
+        instantiation epoch (one that survived a machine restart on the durable
+        HERMES_HOME volume — NS-570) is treated as absent by ``drain_requested``
+        and is NOT honoured; only a marker from the current instantiation flips
+        the gateway into drain. Best-effort: any tick error is logged and the
+        loop continues (a transient stat() failure must not wedge the gateway).
+        """
+        from gateway.drain_control import drain_requested
+
+        while self._running:
+            try:
+                if drain_requested():
+                    self._enter_external_drain()
+                    # API and cron work live outside messaging's
+                    # _running_agents map. Refresh the aggregate while an
+                    # external caller polls this reversible drain state.
+                    self._persist_active_agents()
+                else:
+                    self._exit_external_drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Drain-control watcher tick error: %s", exc, exc_info=True)
+            await asyncio.sleep(interval)
 
     def _update_platform_runtime_status(
         self,
@@ -4357,7 +5244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load reasoning effort from config.yaml.
 
         Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultra". Returns None to use
         default (medium).
         """
         from hermes_constants import parse_reasoning_effort
@@ -4397,6 +5284,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 value_tokens.append(token)
         return " ".join(value_tokens).strip().lower(), persist_global
 
+    @staticmethod
+    def _is_use_xhigh_gpt55_trigger(message: str) -> bool:
+        """Detect an explicit leading request for an xhigh GPT turn."""
+        text = str(message or "").strip()
+        if not text:
+            return False
+        if "[New message]" in text:
+            text = text.rsplit("[New message]", 1)[-1].strip()
+        text = re.sub(r"^\[[^\]\n]{1,120}\]\s*", "", text).strip()
+        return bool(
+            re.match(
+                r"(?is)^(?:"
+                r"use\s+xhigh(?:\s+reasoning)?"
+                r"|"
+                r"xhigh(?:\s+reasoning)?(?:\s+(?:gpt|gptt|gpt-?5(?:\.5)?|codex))?"
+                r")(?:\b|\s*[:—\-.,;?])",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _gpt55_xhigh_reasoning_config() -> dict:
+        return {"enabled": True, "effort": "xhigh"}
+
+    @staticmethod
+    def _resolve_gpt55_openai_codex_runtime(
+        previous_runtime: Optional[dict] = None,
+    ) -> tuple[str, dict]:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested="openai-codex",
+            target_model="gpt-5.5",
+        )
+        previous_runtime = previous_runtime or {}
+        return "gpt-5.5", {
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider") or "openai-codex",
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+            "max_tokens": previous_runtime.get("max_tokens"),
+        }
+
     def _resolve_session_reasoning_config(
         self,
         *,
@@ -4430,26 +5363,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
-
-    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
-        """Suppress one post-turn judge pass after a callback starts /goal."""
-        if not session_key:
-            return
-        sessions = getattr(self, "_goal_callback_started_sessions", None)
-        if sessions is None:
-            sessions = set()
-            self._goal_callback_started_sessions = sessions
-        sessions.add(session_key)
-
-    def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
-        """Return True once for sessions started by a clarify callback."""
-        if not session_key:
-            return False
-        sessions = getattr(self, "_goal_callback_started_sessions", None)
-        if not sessions or session_key not in sessions:
-            return False
-        sessions.discard(session_key)
-        return True
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -4598,6 +5511,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return None
 
+    def _refresh_fallback_model(self) -> list | None:
+        """Re-read fallback_providers from disk for the next agent create/reuse.
+
+        Cron already does this per job via ``get_fallback_chain``; the gateway
+        previously froze ``self._fallback_model`` at process start, so a chain
+        configured (or changed) after ``hermes gateway`` was running never
+        reached messaging sessions even though the same process's cron jobs
+        fell back correctly. Fixes #60955.
+
+        A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
+        non-atomic write) keeps the last known-good chain instead of wiping a
+        cached agent's working fallback for that turn.  Only a successful read
+        that genuinely lacks the key clears the chain.
+        """
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if not cfg_path.exists():
+                self._fallback_model = None
+                return self._fallback_model
+            with open(cfg_path, encoding="utf-8") as _f:
+                cfg = _y.safe_load(_f) or {}
+        except Exception:
+            # Transient failure — keep last known-good chain.
+            logger.debug(
+                "fallback_providers refresh: config.yaml read failed; "
+                "keeping last known-good chain", exc_info=True,
+            )
+            return self._fallback_model
+        self._fallback_model = get_fallback_chain(cfg) or None
+        return self._fallback_model
+
+    @staticmethod
+    def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
+        """Keep a cached agent's fallback chain aligned with current config.
+
+        Skips rewrite while a cooldown is holding the agent on an already-
+        activated fallback provider — ``restore_primary_runtime`` owns that
+        turn-scoped lifecycle. When primary is active (or cooldown expired),
+        replace the chain so mid-uptime ``fallback_providers`` edits take
+        effect without requiring a gateway restart (#60955).
+        """
+        if agent is None:
+            return
+        new_chain = list(chain or [])
+        rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
+        if (
+            getattr(agent, "_fallback_activated", False)
+            and rate_limited_until > time.monotonic()
+        ):
+            return
+        old_chain = list(getattr(agent, "_fallback_chain", []) or [])
+        agent._fallback_chain = new_chain
+        agent._fallback_model = new_chain[0] if new_chain else None
+        if not getattr(agent, "_fallback_activated", False):
+            agent._fallback_index = 0
+        # A config edit signals the user changed something — drop the
+        # session-scoped unavailability memo so re-configured entries
+        # (e.g. credentials added mid-uptime for a previously-failing
+        # provider) get retried instead of staying suppressed for the
+        # cached agent's lifetime.  Only on actual content change, so
+        # the per-message no-op refresh keeps the memo's rate-limiting
+        # benefit (#60955).
+        if new_chain != old_chain:
+            unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+            if unavailable:
+                unavailable.clear()
+
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
             session_key: agent
@@ -4696,6 +5677,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return False
 
+    async def _session_has_compression_in_flight(self, session_key: str) -> bool:
+        """Return True when a compression lock is held for this session's id.
+
+        Context compression is interrupt-protected (#23975) but gateway
+        ``interrupt`` busy-input mode can still start a follow-up turn against
+        the pre-rotation parent while compression is mid-flight, producing
+        orphaned compression siblings (#56391). Callers demote interrupt to
+        queue when this returns True.
+
+        Both blocking sources — the ``session_store`` lock + JSON load, and the
+        SQLite ``get_compression_lock_holder`` SELECT — are offloaded to a
+        worker thread so a large state.db never freezes the event loop (#5).
+        """
+        session_store = getattr(self, "session_store", None)
+        if not session_key or session_store is None:
+            return False
+        try:
+            session_id = await asyncio.to_thread(
+                self._lookup_session_id_under_store_lock, session_store, session_key
+            )
+        except Exception:
+            return False
+        if not session_id:
+            return False
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return False
+        raw_db = getattr(session_db, "_db", session_db)
+        try:
+            holder = await asyncio.to_thread(
+                raw_db.get_compression_lock_holder, str(session_id)
+            )
+            return bool(holder)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _lookup_session_id_under_store_lock(session_store, session_key: str):
+        """Sync helper run in the thread pool: read session_id under the store lock."""
+        # noqa: SLF001 — intentional private access; runs off the event loop.
+        with session_store._lock:  # noqa: SLF001
+            session_store._ensure_loaded_locked()  # noqa: SLF001
+            entry = session_store._entries.get(session_key)  # noqa: SLF001
+        return getattr(entry, "session_id", None) if entry is not None else None
+
     # Hard cap on per-session pending follow-ups for busy_input_mode=queue
     # (and the draining/steer-fallback/subagent-demotion paths that share
     # this entry point).  Without a cap, a stuck agent + a rapid-fire user
@@ -4705,7 +5731,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _BUSY_QUEUE_MAX_PENDING = 32
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
         # #28503 — Previously this called ``merge_pending_message_event``
@@ -4762,7 +5788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             if not adapter:
                 return True
 
@@ -4788,10 +5814,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
+        # --- Approval response routing (#46866) ---
+        # When the agent is blocked waiting for a dangerous-command approval,
+        # plain-text responses like "yes" or "approve" must be routed to the
+        # approval handler instead of being steered/queued/interrupted.
+        # Otherwise approval via messaging platforms never succeeds — the
+        # reply is queued behind a turn that can't start until the approval
+        # resolves, so the approval times out and auto-denies (a deadlock).
+        #
+        # Slash forms (/approve, /deny) already bypass to the runner at the
+        # base-adapter guard.  This handles the bare-word forms (Signal/SMS
+        # users naturally type "yes" rather than "/approve").  Gating on
+        # has_blocking_approval(session_key) is the disambiguator that keeps
+        # a conversational "yes" from triggering a dangerous command when no
+        # approval is actually pending (design intent — see run.py "Pending
+        # exec approvals are handled by /approve and /deny" note).
+        #
+        # We reuse the canonical /approve and /deny handlers rather than
+        # re-deriving the resolution + i18n messaging: they resolve the
+        # waiting thread, resume typing, AND return a localized confirmation
+        # string.  The busy-handler path does not auto-send that return, so
+        # we deliver it ourselves (mirroring the draining-case send above).
+        try:
+            from tools.approval import has_blocking_approval
+            if has_blocking_approval(session_key):
+                _raw_text = (event.text or "").strip().lower()
+                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
+                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
+                _approval_handler = None
+                _normalized_args = ""
+                if _raw_text in _approve_words:
+                    _approval_handler = self._handle_approve_command
+                elif _raw_text in _deny_words:
+                    _approval_handler = self._handle_deny_command
+                elif _raw_text in {"always", "approve always", "always approve"}:
+                    _approval_handler = self._handle_approve_command
+                    _normalized_args = "always"
+                elif _raw_text in {"session", "approve session", "session approve"}:
+                    _approval_handler = self._handle_approve_command
+                    _normalized_args = "session"
+                if _approval_handler is not None:
+                    # Synthesize the canonical "/approve [args]" / "/deny"
+                    # command text so the slash handlers parse modifiers via
+                    # event.get_command_args().  Always use a literal "/" —
+                    # MessageEvent.is_command()/get_command_args() only
+                    # recognize the "/" prefix, not the per-platform display
+                    # prefix ("!" on Slack/Matrix).
+                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
+                    _synth = f"/{_verb}"
+                    if _normalized_args:
+                        _synth = f"{_synth} {_normalized_args}"
+                    event.text = _synth
+                    _reply = await _approval_handler(event)
+                    logger.info(
+                        "Approval response via plain text: session=%s verb=%s args=%r",
+                        session_key, _verb, _normalized_args,
+                    )
+                    _adapter = self._adapter_for_source(event.source)
+                    if _adapter and _reply:
+                        _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
+                        if _text:
+                            _anchor = self._reply_anchor_for_event(event)
+                            await _adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=_text,
+                                reply_to=_anchor,
+                                metadata=self._thread_metadata_for_source(event.source, _anchor),
+                            )
+                    return True
+        except Exception:
+            logger.warning(
+                "Plain-text approval routing failed for session %s; "
+                "falling through to busy handling",
+                session_key, exc_info=True,
+            )
+
         # Normal busy case (agent actively running a task)
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
+
+        # --- Internal synthetic events must never interrupt/steer ---
+        # Async-delegation completions (delegate_task(background=true)) and
+        # background-process completions (terminal notify_on_complete) re-enter
+        # the originating session as internal MessageEvents. When the session
+        # is busy, treating them like a user TEXT message means interrupt-mode
+        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
+        # Interrupting current task" ack — exactly the opposite of the design
+        # invariant that a completion surfaces as a NEW turn only when idle and
+        # never splices into a running turn. Fall through to the base adapter,
+        # which queues internal events silently (no interrupt, no ack) so they
+        # cascade after the current turn finishes.
+        if getattr(event, "internal", False):
+            return False
 
         running_agent = self._running_agents.get(session_key)
 
@@ -4827,6 +5942,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        demoted_for_compression = (
+            effective_mode == "interrupt"
+            and await self._session_has_compression_in_flight(session_key)
+        )
+        if demoted_for_compression:
+            logger.info(
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "because context compression is in flight (#56391)",
+                session_key,
+            )
+            effective_mode = "queue"
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -4850,13 +5976,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
+        #
+        # Route through _queue_or_replace_pending_event (the same FIFO
+        # infrastructure used by busy queue-mode and /queue) rather than a
+        # raw merge_pending_message_event(merge_text=True). The raw merge
+        # newline-joins consecutive TEXT follow-ups into a SINGLE pending
+        # turn, destroying message boundaries — so two separate user
+        # messages sent while the agent was busy (interrupt mode, or a
+        # steer that fell back to queue) arrived as one mashed-together
+        # turn (#43066 sub-bug 2). The FIFO path gives each text its own
+        # turn in arrival order while still preserving photo-burst / album
+        # merge semantics for media.
         if not steered:
-            merge_pending_message_event(
-                adapter._pending_messages,
-                session_key,
-                event,
-                merge_text=event.message_type == MessageType.TEXT,
-            )
+            self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -4958,6 +6090,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"⏳ Subagent working{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
             )
+        elif is_queue_mode and demoted_for_compression:
+            message = (
+                f"⏳ Compressing context{status_detail} — your message is queued for "
+                f"when it finishes (use /stop to cancel everything)."
+            )
         elif is_queue_mode:
             message = (
                 f"⏳ Queued for the next turn{status_detail}. "
@@ -5020,22 +6157,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
+        last_api_count = self._active_api_run_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
+            api_count = self._active_api_run_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
+                or api_count != last_api_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
+                last_api_count = api_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -5043,7 +6184,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same wait/timeout this method already applies to chat sessions,
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
-        if not self._running_agents and last_cron_count == 0:
+        # API-server / desk sessions have the same structural gap (#63529).
+        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -5053,12 +6195,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         deadline = asyncio.get_running_loop().time() + timeout
         while (
-            (self._running_agents or self._active_cron_job_count())
+            (
+                self._running_agents
+                or self._active_cron_job_count()
+                or self._active_api_run_count()
+            )
             and asyncio.get_running_loop().time() < deadline
         ):
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = bool(self._running_agents) or bool(self._active_cron_job_count())
+        timed_out = (
+            bool(self._running_agents)
+            or bool(self._active_cron_job_count())
+            or bool(self._active_api_run_count())
+        )
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
@@ -5096,7 +6246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = None
             try:
                 if getattr(self, "session_store", None) is not None:
-                    self.session_store._ensure_loaded()
+                    await self.async_session_store._ensure_loaded()
                     entry = self.session_store._entries.get(session_key)
                     source = getattr(entry, "origin", None) if entry else None
             except Exception as e:
@@ -5189,6 +6339,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
 
+        # Suppress ONLY the home-channel broadcast when the drain that is ending
+        # in this shutdown asked us to be quiet (e.g. a NAS auto-update image
+        # migration — drain-gated, then the machine is recreated). On the
+        # always-on Hermes Cloud fleet that broadcast would otherwise fire on
+        # every routine auto-update, spamming home channels with operator-
+        # flavoured "gateway shutting down" pings the user doesn't care about.
+        # The per-active-session interrupt pings above are deliberately NOT
+        # gated: on a drained shutdown they're empty by construction, and in the
+        # force-interrupt (deadline-exceeded) case they carry the genuinely
+        # useful "your task was cut off, message me to resume" hint. The flag is
+        # only honoured for a CURRENT-epoch marker (drain_notification_suppressed
+        # reuses the NS-570 staleness check), so an orphaned marker can never
+        # silence a fresh gateway's legitimate broadcast.
+        try:
+            from gateway.drain_control import drain_notification_suppressed
+            if drain_notification_suppressed():
+                logger.info(
+                    "Home-channel shutdown broadcast suppressed by drain marker "
+                    "(suppress_notification=true)"
+                )
+                return
+        except Exception as e:
+            # Never let the suppression check block the shutdown broadcast —
+            # fail toward the louder, more-visible behaviour.
+            logger.debug("drain_notification_suppressed check failed: %s", e)
+
         # Snapshot adapters up front: adapter.send() can hit a fatal error
         # path that pops the adapter from self.adapters (see _handle_fatal
         # elsewhere), which would otherwise trigger
@@ -5245,8 +6421,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     e,
                 )
 
-    def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+    async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
+            # Persist any in-flight transcript to the SQLite session store
+            # before teardown (#13121).  An agent forcibly interrupted by the
+            # drain-timeout escalation may never reach
+            # ``turn_finalizer.finalize_turn`` (the only place that flushes the
+            # turn to state.db) — e.g. it was blocked in a tool call that did
+            # not abort within the post-interrupt grace window.  Its in-flight
+            # tool rounds live only in the in-memory ``_session_messages``
+            # (refreshed per tool round in ``conversation_loop`` but never
+            # written to SQLite mid-turn), so the immediate pre-restart turn is
+            # silently dropped from ``load_transcript()`` on resume.  Flushing
+            # here closes that gap; the resume_pending / fresh-tool-tail
+            # branches in ``_handle_message_with_agent`` already expect a
+            # transcript whose tail may be a pending tool result.  The flush is
+            # idempotent (identity-tracked in ``_flush_messages_to_session_db``),
+            # so agents that DID finish gracefully re-flush nothing.
+            try:
+                _flush = getattr(agent, "_flush_messages_to_session_db", None)
+                _session_messages = getattr(agent, "_session_messages", None)
+                if callable(_flush) and isinstance(_session_messages, list) and _session_messages:
+                    # Strip private empty-response retry scaffolding from the
+                    # tail first, mirroring the graceful ``_persist_session``
+                    # path, so a resumed turn doesn't replay synthetic recovery
+                    # nudges.
+                    _strip = getattr(
+                        agent, "_drop_trailing_empty_response_scaffolding", None
+                    )
+                    if callable(_strip):
+                        try:
+                            _strip(_session_messages)
+                        except Exception:
+                            pass
+                    _flush(_session_messages)
+            except Exception as _e:
+                logger.debug("Shutdown transcript flush failed: %s", _e)
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
@@ -5257,7 +6467,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 pass
-            self._cleanup_agent_resources(agent)
+            # Off-loop + bounded: a wedged memory provider here used to hang
+            # the whole shutdown so SIGTERM never completed (#53175).
+            await self._cleanup_agent_resources_off_loop(
+                agent, context="shutdown finalize"
+            )
+
+    def _should_emit_long_running_notification(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+        executor_task: Optional[Any],
+    ) -> bool:
+        """Only emit the heartbeat while this task still owns the live run.
+
+        Guards against a stale ``running: delegate_task`` heartbeat outliving the
+        run that started it: stop once the executor finishes, the agent is gone,
+        or the session key has been rebound to a different live agent (e.g. the
+        user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
+        """
+        if agent is None:
+            return False
+        if executor_task is not None and executor_task.done():
+            return False
+        if session_key and self._running_agents.get(session_key) is not agent:
+            return False
+        return True
+
+    # Upper bound on off-loop agent-resource cleanup invoked from coroutines
+    # running on the gateway's event loop (session-expiry sweep, in-turn
+    # cache-hygiene re-eviction). _cleanup_agent_resources is synchronous and
+    # can block for a long time (agent.close() does subprocess teardown;
+    # shutdown_memory_provider() may do network/SQLite IO via a memory plugin).
+    # Calling it inline wedges the whole loop — the bot goes silent, the
+    # runtime-status updated_at heartbeat freezes, and SIGTERM cannot be
+    # serviced (#53175). Offload to a worker thread under this timeout so the
+    # loop is never blocked; mirrors the /new reset path's fix (#35994).
+    _CLEANUP_TIMEOUT_S = 30.0
+
+    async def _cleanup_agent_resources_off_loop(
+        self, agent: Any, *, context: str = ""
+    ) -> None:
+        """Run _cleanup_agent_resources in a worker thread with a bounded wait.
+
+        Safe to await from coroutines on the gateway event loop: a slow or
+        wedged teardown (memory provider IO, subprocess close) can no longer
+        block message processing. On timeout the await is cancelled and the
+        worker thread is left to finish (or leak) on its own — the caller
+        proceeds regardless, exactly as the /new reset path does (#35994).
+        """
+        if agent is None:
+            return
+        if context.startswith("shutdown"):
+            try:
+                agent._end_session_on_close = False
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(
+                self._run_in_executor_with_context(
+                    self._cleanup_agent_resources, agent
+                ),
+                timeout=self._CLEANUP_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Agent resource cleanup%s exceeded %ss; proceeding without "
+                "blocking the event loop (the worker thread is left to finish "
+                "on its own). (#53175)",
+                f" ({context})" if context else "",
+                self._CLEANUP_TIMEOUT_S,
+            )
+        except Exception as cleanup_exc:
+            logger.warning(
+                "Agent resource cleanup%s failed: %s (#53175)",
+                f" ({context})" if context else "",
+                cleanup_exc,
+            )
 
     def _cleanup_agent_resources(self, agent: Any) -> None:
         """Best-effort cleanup for temporary or cached agent instances."""
@@ -5408,8 +6694,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
             return
+        if self._detached_restart_helper_started:
+            return
+        self._detached_restart_helper_started = True
 
         current_pid = os.getpid()
+        restart_after_s = max(float(getattr(self, "_restart_drain_timeout", 0.0) or 0.0) + 5.0, 5.0)
 
         # On Windows there's no bash/setsid chain — spawn a tiny Python
         # watcher directly via sys.executable instead.  The watcher polls
@@ -5424,9 +6714,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             watcher = textwrap.dedent(
                 """
                 import os, subprocess, sys, time
+                from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
                 pid = int(sys.argv[1])
-                cmd = sys.argv[2:]
-                deadline = time.monotonic() + 120
+                restart_after_s = float(sys.argv[2])
+                cmd = sys.argv[3:]
+                deadline = time.monotonic() + restart_after_s
 
                 def _alive(p):
                     # On Windows, os.kill(pid, 0) is NOT a no-op — it maps to
@@ -5459,14 +6751,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not _alive(pid):
                         break
                     time.sleep(0.2)
-                _CREATE_NEW_PROCESS_GROUP = 0x00000200
-                _DETACHED_PROCESS = 0x00000008
-                _CREATE_NO_WINDOW = 0x08000000
                 subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS | _CREATE_NO_WINDOW,
+                    creationflags=windows_detach_flags_without_breakaway(),
                 )
                 """
             ).strip()
@@ -5476,6 +6765,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # run as a self-restart loop guard and the gateway stays stopped.
             watcher_env.pop("_HERMES_GATEWAY", None)
             project_root = Path(__file__).resolve().parent.parent
+            watcher_python = sys.executable
+            try:
+                # Prefer a real GUI-subsystem interpreter for the watcher
+                # itself.  With uv venvs, ``python.exe`` can re-exec the base
+                # console interpreter and flash even when the Popen carries
+                # CREATE_NO_WINDOW; pythonw.exe avoids console allocation.
+                from hermes_cli.gateway_windows import _resolve_detached_python
+
+                watcher_python, _watcher_venv_dir, _watcher_site_packages = (
+                    _resolve_detached_python(sys.executable)
+                )
+            except Exception:
+                watcher_python = sys.executable
             venv_dir = Path(watcher_env.get("VIRTUAL_ENV") or project_root / "venv")
             site_packages = venv_dir / "Lib" / "site-packages"
             if site_packages.exists():
@@ -5485,7 +6787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pythonpath.append(watcher_env["PYTHONPATH"])
                 watcher_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
             subprocess.Popen(
-                [sys.executable, "-c", watcher, str(current_pid), *cmd_argv],
+                [watcher_python, "-c", watcher, str(current_pid), str(restart_after_s), *cmd_argv],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=watcher_env,
@@ -5495,7 +6797,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
-            f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
+            f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
+            f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
             f"{cmd} gateway restart"
         )
         # Same marker scrub as the Windows watcher above: this watcher runs
@@ -5553,34 +6856,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 service_name = "hermes-gateway"
 
             current_pid = os.getpid()
-            show = subprocess.run(
-                [
-                    systemctl,
-                    "--user",
-                    "show",
-                    service_name,
-                    "--property=MainPID",
-                    "--value",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if (show.stdout or "").strip() != str(current_pid):
+
+            # Detect whether the gateway unit is registered as a system or
+            # user service.  Daemon-style deployments are typically system
+            # units (e.g. /etc/systemd/system/hermes-gateway.service), while
+            # `hermes setup` under a non-root account may register a user
+            # unit.  Hard-coding ``--user`` broke system-unit deployments:
+            # systemctl returned an empty MainPID, the PID-equality check
+            # below failed, and the planned-restart helper was never
+            # launched — leaving the gateway dead until a manual reboot.
+            def _query_pid(scope_flags):
+                try:
+                    out = subprocess.run(
+                        [systemctl, *scope_flags, "show", service_name,
+                         "--property=MainPID", "--value"],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    return (out.stdout or "").strip()
+                except Exception:
+                    return ""
+
+            system_pid = _query_pid([])
+            user_pid = _query_pid(["--user"])
+            if str(current_pid) == system_pid:
+                scope_flags = []
+                systemctl_scope = "systemctl"
+            elif str(current_pid) == user_pid:
+                scope_flags = ["--user"]
+                systemctl_scope = "systemctl --user"
+            else:
+                # MainPID does not match in either scope — likely invoked
+                # outside of systemd or the unit was renamed.  Bail out
+                # rather than restart the wrong unit.
                 return
 
-            systemctl_user = "systemctl --user"
             service_arg = shlex.quote(service_name)
             shell_cmd = (
                 f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
-                f"{systemctl_user} reset-failed {service_arg}; "
-                f"{systemctl_user} restart {service_arg}"
+                f"{systemctl_scope} reset-failed {service_arg}; "
+                f"{systemctl_scope} restart {service_arg}"
             )
             unit_name = f"{service_name}-planned-restart-{current_pid}".replace(".", "-")
             subprocess.Popen(
                 [
                     systemd_run,
-                    "--user",
+                    *scope_flags,
                     "--collect",
                     "--unit",
                     unit_name,
@@ -5593,9 +6913,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 start_new_session=True,
             )
             logger.info(
-                "Launched systemd planned-restart helper for %s (pid=%s)",
+                "Launched systemd planned-restart helper for %s (pid=%s, scope=%s)",
                 service_name,
                 current_pid,
+                "user" if scope_flags else "system",
             )
         except Exception as e:
             logger.debug("Failed to launch systemd planned-restart helper: %s", e)
@@ -5609,26 +6930,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task_started = True
 
         async def _run_restart() -> None:
+            if detached:
+                try:
+                    await self._launch_detached_restart_command()
+                except Exception as e:
+                    logger.error("Failed to launch detached gateway restart helper: %s", e)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
-        task = asyncio.create_task(_run_restart())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        # _run_restart is a short-lived self-terminating task (calls stop()
+        # then returns).  Don't add it to _background_tasks — _stop_impl
+        # cancels all entries in that set, which would cancel _run_restart
+        # while it's awaiting _stop_task, propagating CancelledError into
+        # _stop_impl and preventing _shutdown_event.set() / _exit_code = 75.
+        # See #12875.
+        #
+        # We still hold a strong reference in self._restart_task: a bare
+        # asyncio.create_task() keeps only a weak reference, so the event
+        # loop may garbage-collect a still-pending task mid-flight.  The
+        # cancel loop in _stop_impl explicitly skips _restart_task for the
+        # same reason it skips _stop_task.
+        self._restart_task = asyncio.create_task(_run_restart())
         return True
 
-    # Drain-timeout reasons are set by _stop_impl() before interrupting an
-    # actually running agent during graceful gateway restart/shutdown.  These
-    # sessions remain resumable, but startup must not synthesize a new Telegram
-    # turn by default: it can look like Hermes is duplicating the user's last
-    # request after a restart.  The safer UX is to wait for the next real user
-    # message, where the existing resume_pending branch injects the recovery
-    # system note into that turn.
-    _AUTO_RESUME_REASONS = frozenset({
-        "restart_timeout",
-        "shutdown_timeout",
-        _STARTUP_GOAL_RECOVERY_REASON,
-    })
+    # Drain-timeout reasons set by _stop_impl() when a still-running turn is
+    # force-interrupted; "restart_interrupted" is set by
+    # SessionStore.suspend_recently_active() on crash recovery (no
+    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
+    # we killed it" — eligible for startup auto-resume.
+    _AUTO_RESUME_REASONS = frozenset(
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+    )
 
     @staticmethod
     def _goal_tool_names_from_message(msg: Dict[str, Any]) -> List[str]:
@@ -5655,73 +6987,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return names
 
     def _uncheckpointed_goal_side_effect_risk(self, session_id: str) -> Optional[str]:
-        """Return an alert reason when the latest turn has risky open tool work.
-
-        Startup recovery may safely continue an active goal after a completed
-        assistant checkpoint.  It must not blindly synthesize a continuation on
-        top of an unclosed terminal/send/write-style tool tail, because that can
-        duplicate side effects after a gateway drain.
-        """
-        db = getattr(self, "_session_db", None)
-        if db is None or not session_id:
+        raw_store = getattr(self, "_session_db", None)
+        if raw_store is None:
+            raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        if raw_store is None or not session_id:
             return None
         try:
-            messages = db.get_messages(session_id)
+            get_messages = getattr(raw_store, "get_messages", None)
+            if not callable(get_messages):
+                return None
+            messages = get_messages(session_id)
         except Exception as exc:
             logger.debug("startup goal recovery: message risk lookup failed for %s: %s", session_id, exc)
             return None
-        if not messages:
-            return None
-
         checkpoint_idx = -1
-        for idx, msg in enumerate(messages):
+        for idx, msg in enumerate(messages or []):
             if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
                 checkpoint_idx = idx
-        tail = messages[checkpoint_idx + 1:]
-        if not tail:
-            return None
-
-        for msg in tail:
+        for msg in (messages or [])[checkpoint_idx + 1:]:
             role = msg.get("role")
-            names = self._goal_tool_names_from_message(msg)
-            risky_names = sorted({name for name in names if name in _STARTUP_GOAL_RISKY_TOOLS})
+            risky_names = sorted({
+                name for name in self._goal_tool_names_from_message(msg)
+                if name in _STARTUP_GOAL_RISKY_TOOLS
+            })
             if role == "assistant" and msg.get("tool_calls"):
-                if risky_names:
-                    return f"uncheckpointed assistant tool call(s): {', '.join(risky_names)}"
-                return "uncheckpointed assistant tool call(s)"
+                suffix = f": {', '.join(risky_names)}" if risky_names else ""
+                return f"uncheckpointed assistant tool call(s){suffix}"
             if role == "tool":
-                if risky_names:
-                    return f"uncheckpointed tool result(s): {', '.join(risky_names)}"
-                # Tool result with no final assistant checkpoint is still not a
-                # clean active-goal boundary.  Read-only tools are lower risk,
-                # but alert-only keeps startup recovery from inventing state.
-                return "uncheckpointed tool result(s)"
+                suffix = f": {', '.join(risky_names)}" if risky_names else ""
+                return f"uncheckpointed tool result(s){suffix}"
         return None
 
     def _startup_goal_ledger_statuses(self, session_key: str) -> tuple[str, ...]:
-        db = getattr(self, "_session_db", None)
-        if db is None:
+        raw_store = getattr(self, "_session_db", None)
+        if raw_store is None:
+            raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        if raw_store is None:
             return ()
         try:
-            rows = db.list_gateway_message_ledger_for_session(session_key, limit=8)
-        except Exception as exc:
-            logger.debug("startup goal recovery: ledger lookup failed for %s: %s", session_key, exc)
+            list_ledger = getattr(raw_store, "list_gateway_message_ledger_for_session", None)
+            if not callable(list_ledger):
+                return ()
+            rows = list_ledger(session_key, limit=8)
+        except Exception:
             return ()
-        statuses: List[str] = []
-        for row in rows or []:
-            status = str((row or {}).get("status") or "").strip()
-            if status:
-                statuses.append(status)
-        return tuple(statuses)
+        return tuple(
+            str((row or {}).get("status") or "").strip()
+            for row in (rows or [])
+            if str((row or {}).get("status") or "").strip()
+        )
 
     def _telegram_policy_chat_ids(self, *, env_name: str, extra_key: str) -> set[str]:
-        """Return Telegram chat IDs from env plus live config extras.
-
-        Startup recovery can run before/after config→env bridges in tests and
-        in older long-lived gateway processes.  Reading both layers prevents a
-        configured private workroom from being treated as a public group and
-        stranding active goals after restart.
-        """
         ids: set[str] = set()
 
         def _add(raw: Any) -> None:
@@ -5731,10 +7047,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for item in raw:
                     _add(item)
                 return
-            for part in str(raw or "").split(","):
-                part = part.strip()
-                if part:
-                    ids.add(part)
+            ids.update(part.strip() for part in str(raw).split(",") if part.strip())
 
         _add(os.getenv(env_name, ""))
         try:
@@ -5758,26 +7071,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {}
 
     def _startup_chip_history_reconciliation(self, entry: Any) -> Optional[Any]:
-        """Read recent telegram-chip history for a startup recovery candidate.
-
-        This is intentionally read-only.  It never replays Telegram messages;
-        it only blocks blind auto-resume when the recent visible history shows
-        missed or unsafe messages around a restart.
-        """
         source = getattr(entry, "origin", None)
         db = getattr(self, "_session_db", None)
-        if source is None or db is None:
+        if source is None or db is None or getattr(source, "platform", None) != Platform.TELEGRAM:
             return None
-        if getattr(source, "platform", None) != Platform.TELEGRAM:
-            return None
-        # Telegram-chip reads private DM history through Chip's user account,
-        # while the gateway ledger records Bot API update IDs.  In 1:1 Telegram
-        # chats those message_id spaces are not comparable, so treating a
-        # telegram-chip-only DM record as ``missed_by_gateway`` is a false
-        # blocker that strands active /goal after every controlled restart.
-        # The Bot API will deliver real pending DM updates on startup; keep the
-        # extra telegram-chip reconciliation for groups/topics where message IDs
-        # are stable across viewers.
         if getattr(source, "chat_type", "dm") == "dm":
             return None
         try:
@@ -5792,7 +7089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not cfg.enabled:
                 return None
             client = build_telegram_chip_history_client(cfg_map)
-            result = reconcile_chip_history_against_ledger(
+            return reconcile_chip_history_against_ledger(
                 db,
                 client,
                 chat_id=getattr(source, "chat_id", ""),
@@ -5801,64 +7098,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 limit=cfg.limit,
                 chip_user_id=cfg.chip_user_id,
             )
-            if result.warning:
-                logger.warning("startup chip history recovery degraded for %s: %s", getattr(entry, "session_key", ""), result.warning)
-            return result
         except Exception as exc:
             logger.warning("startup chip history recovery failed for %s: %s", getattr(entry, "session_key", ""), exc)
             return None
 
     def _startup_recovery_source_is_trusted_private(self, source: Any) -> bool:
-        """Whether startup continuation may speak in this origin without a new user poke.
-
-        Telegram workrooms can be group/forum chats at the protocol level while
-        being private operator rooms in config.  Treat those configured private
-        chats like DMs for restart continuation; public/shared chats stay
-        alert-only to avoid surprising bystanders or duplicating side effects.
-        """
         if source is None:
             return False
         if getattr(source, "chat_type", "dm") == "dm":
             return True
         if getattr(source, "platform", None) != Platform.TELEGRAM:
             return False
-
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
-        if not chat_id:
-            return False
-
         private_ids = self._telegram_policy_chat_ids(
-            env_name="TELEGRAM_PRIVATE_CHATS",
-            extra_key="private_chats",
+            env_name="TELEGRAM_PRIVATE_CHATS", extra_key="private_chats"
         )
         public_ids = self._telegram_policy_chat_ids(
-            env_name="TELEGRAM_PUBLIC_CHATS",
-            extra_key="public_chats",
+            env_name="TELEGRAM_PUBLIC_CHATS", extra_key="public_chats"
         )
-        if chat_id in public_ids:
-            return False
-        return chat_id in private_ids
+        return bool(chat_id and chat_id in private_ids and chat_id not in public_ids)
 
     def _startup_recovery_source_is_configured_private_workroom(self, source: Any) -> bool:
-        """Configured private Telegram workroom, excluding one-to-one DMs."""
-        if source is None:
-            return False
-        if getattr(source, "chat_type", "dm") == "dm":
+        if source is None or getattr(source, "chat_type", "dm") == "dm":
             return False
         if getattr(source, "platform", None) != Platform.TELEGRAM:
             return False
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
-        if not chat_id:
-            return False
         private_ids = self._telegram_policy_chat_ids(
-            env_name="TELEGRAM_PRIVATE_CHATS",
-            extra_key="private_chats",
+            env_name="TELEGRAM_PRIVATE_CHATS", extra_key="private_chats"
         )
         public_ids = self._telegram_policy_chat_ids(
-            env_name="TELEGRAM_PUBLIC_CHATS",
-            extra_key="public_chats",
+            env_name="TELEGRAM_PUBLIC_CHATS", extra_key="public_chats"
         )
-        return chat_id in private_ids and chat_id not in public_ids
+        return bool(chat_id and chat_id in private_ids and chat_id not in public_ids)
 
     def _classify_startup_goal_recovery(
         self,
@@ -5893,7 +7165,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if source is None:
             return _decision("alert_only", "missing-session-origin")
 
-        goal_status: Optional[str] = None
         goal_mgr = None
         goal_state = None
         try:
@@ -5904,71 +7175,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(reconcile):
                 reconcile()
             goal_state = getattr(goal_mgr, "state", None)
-            goal_status = getattr(goal_state, "status", None) if goal_state is not None else None
         except Exception as exc:
             logger.debug("startup goal recovery: goal lookup failed for %s: %s", session_id, exc)
 
         if goal_state is not None:
+            goal_status = getattr(goal_state, "status", None)
             if goal_status != "active":
                 return _decision("skip", "goal-not-active", goal_status=goal_status)
             if session_key in getattr(self, "_running_agents", {}):
                 return _decision("alert_only", "agent-already-running", goal_status=goal_status)
             if not self._startup_recovery_source_is_trusted_private(source):
                 return _decision("alert_only", "active-goal-in-shared-chat", goal_status=goal_status)
-            adapter = self.adapters.get(source.platform)
-            if adapter is None:
+            if self.adapters.get(source.platform) is None:
                 return _decision("alert_only", "adapter-not-ready", goal_status=goal_status)
-
             marker = (
                 getattr(entry, "last_resume_marked_at", None)
                 or getattr(entry, "updated_at", None)
                 or getattr(goal_state, "last_turn_at", 0)
                 or getattr(goal_state, "created_at", 0)
             )
-            if not _is_fresh_gateway_interruption(
-                marker,
-                window_secs=_auto_continue_freshness_window(),
-            ):
+            if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
                 return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
 
             side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
-
             history_result = None
-            # Telegram DMs have different message_id spaces between Chip's
-            # telegram-chip user client and the bot's Bot API ledger.  Calling
-            # reconciliation here would fabricate ``missed_by_gateway`` rows and
-            # falsely withhold active /goal startup recovery.
             if getattr(source, "chat_type", "dm") != "dm":
                 history_result = self._startup_chip_history_reconciliation(entry)
             if history_result is not None:
-                unsafe = list(history_result.missed_by_gateway) + list(history_result.requeue_candidates) + list(history_result.alert_only)
+                unsafe = (
+                    list(history_result.missed_by_gateway)
+                    + list(history_result.requeue_candidates)
+                    + list(history_result.alert_only)
+                )
                 if unsafe:
-                    reason_bits = sorted({str(item.status) for item in unsafe if getattr(item, "status", None)})
+                    reason_bits = sorted({
+                        str(item.status) for item in unsafe if getattr(item, "status", None)
+                    })
                     reason = "telegram-chip recent history requires operator review"
                     if reason_bits:
                         reason += f": {', '.join(reason_bits)}"
                     return _decision("alert_only", reason, goal_status=goal_status)
-                logger.info(
-                    "startup chip history recovery checked %s recent message(s) for %s",
-                    getattr(history_result, "records_checked", 0),
-                    session_key,
-                )
-
-            prompt = ""
             try:
                 prompt = goal_mgr.next_continuation_prompt() if goal_mgr is not None else ""
-            except Exception as exc:
-                logger.debug("startup goal recovery: continuation prompt failed for %s: %s", session_id, exc)
+            except Exception:
+                prompt = ""
             if not prompt:
                 return _decision("alert_only", "active-goal-continuation-unavailable", goal_status=goal_status)
             if side_effect_risk:
                 prompt += (
-                    "\n\n[Startup recovery note]\n"
-                    "Gateway restarted while the prior turn had "
-                    f"{side_effect_risk}. Do not treat that as permission to "
-                    "repeat irreversible side effects blindly. Inspect persisted "
-                    "state/artifacts first, continue the active /goal from its "
-                    "canonical state file, and only redo idempotent or verified-safe steps."
+                    "\n\n[Startup recovery note]\nGateway restarted while the prior turn had "
+                    f"{side_effect_risk}. Do not repeat irreversible side effects blindly; "
+                    "inspect persisted state/artifacts first."
                 )
             return _decision(
                 "auto_resume",
@@ -5977,9 +7234,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt=prompt,
             )
 
-        # Legacy non-goal resume_pending path stays opt-in for public/shared
-        # chats.  Chip's configured private Telegram workrooms are allowed to
-        # recover like DMs so gateway reloads do not strand in-progress work.
         if generic_auto_resume_enabled is None:
             generic_auto_resume_enabled = os.environ.get(
                 "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
@@ -5996,104 +7250,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_key in getattr(self, "_running_agents", {}):
             return _decision("skip", "agent-already-running")
         return _decision("auto_resume", "generic-resume-pending")
-
-    def _startup_goal_recovery_hook_payload(self, platform: Any = None) -> List[Dict[str, Any]]:
-        generic_enabled = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() in {
-            "1", "true", "yes", "on"
-        }
-        try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                entries = list(self.session_store._entries.values())  # noqa: SLF001
-        except Exception as exc:
-            logger.debug("startup goal recovery: hook snapshot failed: %s", exc)
-            return []
-        payload: List[Dict[str, Any]] = []
-        for entry in entries:
-            decision = self._classify_startup_goal_recovery(
-                entry,
-                platform=platform,
-                generic_auto_resume_enabled=generic_enabled,
-            )
-            if decision.status != "skip":
-                payload.append(decision.to_hook_payload())
-        return payload
-
-    def _mark_active_goal_resume_pending(self, entry: Any) -> None:
-        if getattr(entry, "resume_pending", False):
-            return
-        marked = False
-        try:
-            marked = self.session_store.mark_resume_pending(  # type: ignore[attr-defined]
-                entry.session_key,
-                _STARTUP_GOAL_RECOVERY_REASON,
-            ) is True
-        except Exception as exc:
-            logger.debug("startup goal recovery: mark_resume_pending failed for %s: %s", entry.session_key, exc)
-        if marked:
-            return
-        try:
-            entry.resume_pending = True
-            entry.resume_reason = _STARTUP_GOAL_RECOVERY_REASON
-            entry.last_resume_marked_at = datetime.now()
-            save = getattr(self.session_store, "_save", None)
-            if callable(save):
-                save()
-        except Exception as exc:
-            logger.debug("startup goal recovery: local resume flag update failed for %s: %s", getattr(entry, "session_key", None), exc)
-
-    def _schedule_startup_goal_recovery_alert(self, decision: StartupGoalRecoveryDecision, source: Any) -> None:
-        alerted = getattr(self, "_startup_goal_recovery_alerted", None)
-        if alerted is None:
-            alerted = set()
-            self._startup_goal_recovery_alerted = alerted
-        key = (decision.session_key, decision.reason)
-        if key in alerted:
-            return
-        alerted.add(key)
-
-        if not self._startup_recovery_source_is_trusted_private(source):
-            logger.warning(
-                "Active /goal recovery withheld for %s (%s): %s",
-                decision.session_key,
-                getattr(source, "chat_type", "unknown"),
-                decision.reason,
-            )
-            return
-        adapter = self.adapters.get(source.platform)
-        if adapter is None:
-            logger.warning(
-                "Active /goal recovery withheld for %s: %s",
-                decision.session_key,
-                decision.reason,
-            )
-            return
-
-        async def _send() -> None:
-            try:
-                metadata = self._thread_metadata_for_source(source)
-            except Exception:
-                metadata = None
-            message = (
-                "⚠️ Active /goal was found after gateway startup, but auto-resume "
-                f"was withheld: {decision.reason}.\n"
-                "Send a new message or `/goal status` to inspect it."
-            )
-            try:
-                await adapter.send(source.chat_id, message, metadata=metadata)
-            except Exception as exc:
-                logger.warning("startup goal recovery alert send failed for %s: %s", decision.session_key, exc)
-
-        try:
-            task = asyncio.create_task(_send())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        except RuntimeError:
-            logger.warning(
-                "Active /goal recovery withheld for %s: %s",
-                decision.session_key,
-                decision.reason,
-            )
 
     async def _run_startup_resume_event(
         self,
@@ -6178,39 +7334,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(result), result, result.__traceback__),
                     )
         self._startup_restore_tasks = []
-        # Release the startup gate before the final drain.  Otherwise a fresh
-        # inbound message can append to the queue after the drain observes it
-        # empty but before `_startup_restore_in_progress` flips false, stranding
-        # that message forever.
-        self._startup_restore_in_progress = False
         drained = await self._drain_startup_restore_queue()
+        self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue safe startup recovery candidates.
+    def _mark_active_goal_resume_pending(self, entry: Any) -> None:
+        if getattr(entry, "resume_pending", False):
+            return
+        try:
+            if self.session_store.mark_resume_pending(
+                entry.session_key, _STARTUP_GOAL_RECOVERY_REASON
+            ) is True:
+                return
+        except Exception as exc:
+            logger.debug("startup goal recovery: mark_resume_pending failed: %s", exc)
+        entry.resume_pending = True
+        entry.resume_reason = _STARTUP_GOAL_RECOVERY_REASON
+        entry.last_resume_marked_at = datetime.now()
 
-        Legacy non-goal ``resume_pending`` startup replay still requires the
-        explicit ``HERMES_GATEWAY_STARTUP_AUTO_RESUME=1`` opt-in.  Active
-        ``/goal`` sessions are different: the standing objective already lives
-        in ``SessionDB.state_meta`` and the GoalManager is the canonical
-        continuation path, so fresh active goals may be resumed without that
-        global legacy flag.  Open tool tails add an in-band recovery note to
-        the synthetic goal turn instead of withholding active-goal recovery.
-        """
-        generic_enabled = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "").lower() in {
-            "1", "true", "yes", "on"
-        }
-        if not generic_enabled:
-            logger.info(
-                "Generic startup auto-resume disabled; active /goal recovery remains enabled"
+    def _schedule_startup_goal_recovery_alert(
+        self,
+        decision: StartupGoalRecoveryDecision,
+        source: Any,
+    ) -> None:
+        alerted = getattr(self, "_startup_goal_recovery_alerted", None)
+        if alerted is None:
+            alerted = set()
+            self._startup_goal_recovery_alerted = alerted
+        key = (decision.session_key, decision.reason)
+        if key in alerted:
+            return
+        alerted.add(key)
+        if not self._startup_recovery_source_is_trusted_private(source):
+            logger.warning("Active /goal recovery withheld for %s: %s", decision.session_key, decision.reason)
+            return
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return
+
+        async def _send() -> None:
+            try:
+                metadata = self._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            message = (
+                "⚠️ Active /goal was found after gateway startup, but auto-resume "
+                f"was withheld: {decision.reason}.\nSend a new message or `/goal status` to inspect it."
             )
+            try:
+                await adapter.send(source.chat_id, message, metadata=metadata)
+            except Exception as exc:
+                logger.warning("startup goal recovery alert send failed for %s: %s", decision.session_key, exc)
 
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            task = asyncio.create_task(_send())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            logger.warning("Active /goal recovery withheld for %s: %s", decision.session_key, decision.reason)
+
+    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+        """Auto-continue fresh private active goals and safe pending sessions."""
+        generic_enabled = os.environ.get(
+            "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        try:
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
                 candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    entry for entry in self.session_store._entries.values()
                     if not getattr(entry, "suspended", False)
                     and getattr(entry, "origin", None) is not None
                     and (platform is None or getattr(entry.origin, "platform", None) == platform)
@@ -6220,7 +7413,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         scheduled = 0
-        alert_only = 0
         for entry in candidates:
             decision = self._classify_startup_goal_recovery(
                 entry,
@@ -6229,29 +7421,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if decision.status == "skip":
                 continue
-
             source = entry.origin
             if decision.status == "alert_only":
-                alert_only += 1
                 self._schedule_startup_goal_recovery_alert(decision, source)
                 continue
-
             adapter = self.adapters.get(source.platform)
             if adapter is None:
                 continue
+            try:
+                if not self._is_user_authorized(source):
+                    logger.warning("Skipping startup recovery for unauthorized session %s", entry.session_key)
+                    continue
+            except Exception as exc:
+                logger.warning("Skipping startup recovery for %s: authorization check failed: %s", entry.session_key, exc)
+                continue
 
-            # Claim the session slot *before* spawning the task so that an
-            # inbound message arriving between task creation and the task's
-            # first await sees the slot as occupied and queues behind it.
             self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
             self._running_agents_ts[entry.session_key] = time.time()
-
-            event_text = decision.prompt or ""
+            self._persist_active_agents()
             if decision.goal_status == "active":
                 self._mark_active_goal_resume_pending(entry)
-
             event = MessageEvent(
-                text=event_text,
+                text=decision.prompt or "",
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -6268,18 +7459,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._startup_restore_tasks = tasks
                 tasks.append(task)
             scheduled += 1
-
         if scheduled:
-            logger.info(
-                "Scheduled startup recovery for %d session(s)",
-                scheduled,
-            )
-        if alert_only:
-            logger.warning(
-                "Startup recovery withheld for %d active /goal session(s); alert-only",
-                alert_only,
-            )
+            logger.info("Scheduled startup recovery for %d session(s)", scheduled)
         return scheduled
+
+    def _startup_should_abort(self) -> bool:
+        return (
+            self._restart_requested
+            or self._draining
+            or self._shutdown_event.is_set()
+        )
+
+    async def _abort_startup_if_shutdown_requested(
+        self,
+        adapter: Optional[BasePlatformAdapter] = None,
+        platform: Optional[Platform] = None,
+    ) -> bool:
+        """Clean up and exit startup when restart/shutdown begins mid-startup."""
+        if not self._startup_should_abort():
+            return False
+        if adapter is not None and platform is not None:
+            try:
+                await adapter.cancel_background_tasks()
+            except Exception as e:
+                logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
+            await self._safe_adapter_disconnect(adapter, platform)
+        stop_task = self._stop_task
+        current_task = asyncio.current_task()
+        if stop_task is not None and stop_task is not current_task:
+            await stop_task
+        elif not self._shutdown_event.is_set():
+            await self.stop(
+                restart=self._restart_requested,
+                detached_restart=self._restart_detached,
+                service_restart=self._restart_via_service,
+            )
+        return True
 
     async def start(self) -> bool:
         """
@@ -6306,7 +7521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning(
                     "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but "
                     "drain_timeout=%.0fs (expected >=%.0fs). systemd may SIGKILL the "
-                    "gateway mid-drain. Run `hermes gateway service install --replace` "
+                    "gateway mid-drain. Run `hermes gateway install --force` "
                     "to regenerate the unit, or shorten agent.restart_drain_timeout.",
                     _alignment.get("unit", "(unknown)"),
                     _alignment["timeout_stop_sec"],
@@ -6386,6 +7601,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "security advisory check failed at gateway startup",
                 exc_info=True,
             )
+        if await self._abort_startup_if_shutdown_requested():
+            return True
         
         # Warn if no user allowlists are configured and open access is not opted in
         _builtin_allowed_vars = (
@@ -6448,10 +7665,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
-                "No user allowlists configured. All unauthorized users will be denied. "
-                "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
-                "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
+                "No env user allowlists configured. Messaging platforms default to "
+                "pairing/allowlist policies and will deny unknown senders unless you "
+                "configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id) "
+                "or explicitly opt in with GATEWAY_ALLOW_ALL_USERS=true plus "
+                "dm_policy/group_policy: open on the platform."
             )
+
+        reason = _own_policy_open_startup_violation(self.config)
+        if reason:
+            platform_value = reason.split(":", 1)[0]
+            allow_all_env = None
+            for platform, open_env in _OWN_POLICY_OPEN_ENV.items():
+                if platform.value == platform_value:
+                    allow_all_env = open_env[2]
+                    break
+            logger.error(
+                "Refusing to start: %s has dm_policy/group_policy set to 'open' "
+                "but neither GATEWAY_ALLOW_ALL_USERS nor %s is enabled.",
+                platform_value,
+                allow_all_env or "a platform allow-all flag",
+            )
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+            except Exception:
+                pass
+            self._request_clean_exit(reason)
+            return True
         
         # Discover Python plugins before shell hooks so plugin block
         # decisions take precedence in tie cases.  The CLI startup path
@@ -6465,6 +7706,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
+            )
+
+        # Register the generic relay adapter when a connector relay URL is
+        # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
+        # direct/single-tenant deployments are unaffected. When configured, the
+        # adapter dials the connector over a WebSocket, negotiates its capability
+        # descriptor at handshake, and bridges inbound/outbound like any platform.
+        try:
+            from gateway.relay import (
+                register_relay_adapter,
+                relay_url,
+                self_provision_relay,
+                send_relay_policy,
+            )
+
+            # Boot-time relay self-provision: resolve the agent's NAS token ->
+            # POST /relay/provision -> set GATEWAY_RELAY_* in os.environ BEFORE
+            # registration reads them. No-op when relay is unconfigured, a secret
+            # is already pinned, or no NAS token resolves (self-hosted, unenrolled).
+            # Never raises.
+            self_provision_relay()
+
+            if register_relay_adapter():
+                logger.info("relay adapter registered (connector at %s)", relay_url())
+                # Declare this gateway's relevance policy (mention-gating /
+                # free-response / allow-bots) to the connector so the SAME
+                # behavior governs relay delivery (Phase 6 Unit ζ). Runs after
+                # the secret is resolved; never raises, never blocks boot.
+                send_relay_policy()
+        except Exception:
+            logger.warning(
+                "relay adapter registration failed at gateway startup", exc_info=True,
             )
 
         # Register declarative shell hooks from cli-config.yaml.  Gateway
@@ -6517,7 +7790,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         else:
             try:
-                suspended = self.session_store.suspend_recently_active()
+                suspended = await self.async_session_store.suspend_recently_active()
                 if suspended:
                     logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)
             except Exception as e:
@@ -6550,6 +7823,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Initialize and connect each configured platform
         for platform, platform_config in self.config.platforms.items():
+            if await self._abort_startup_if_shutdown_requested():
+                return True
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
@@ -6575,6 +7850,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -6587,6 +7863,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             try:
                 success = await self._connect_adapter_with_timeout(adapter, platform)
+                if await self._abort_startup_if_shutdown_requested(adapter, platform):
+                    return True
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
@@ -6666,7 +7944,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
                 }
-        
+            if await self._abort_startup_if_shutdown_requested():
+                return True
+
+        # Multi-profile multiplexing: bring up adapters for every OTHER profile
+        # this gateway serves. Each profile's adapters connect under that
+        # profile's home + credential scope and stamp their inbound events with
+        # the profile so the agent turn resolves correctly. No-op when off.
+        try:
+            _secondary_connected = await self._start_secondary_profile_adapters()
+            connected_count += _secondary_connected
+        except MultiplexConfigError as e:
+            # Invalid multiplexer config — abort startup cleanly so the operator
+            # fixes config.yaml rather than running a half-wired gateway.
+            reason = str(e)
+            logger.error("Gateway multiplexer config error: %s", reason)
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+            except Exception:
+                pass
+            self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+            self._request_clean_exit(reason)
+            self._startup_restore_in_progress = False
+            return True
+        except Exception as e:
+            logger.error("Secondary-profile adapter startup failed: %s", e, exc_info=True)
+
         if connected_count == 0:
             if startup_nonretryable_errors:
                 reason = "; ".join(startup_nonretryable_errors)
@@ -6676,6 +7980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
                 except Exception:
                     pass
+                self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
                 self._request_clean_exit(reason)
                 self._startup_restore_in_progress = False
                 return True
@@ -6722,6 +8027,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
+        if await self._abort_startup_if_shutdown_requested():
+            return True
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
 
@@ -6732,14 +8039,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
-        startup_recovery_payload = []
-        try:
-            startup_recovery_payload = self._startup_goal_recovery_hook_payload()
-        except Exception:
-            logger.debug("startup goal recovery hook payload failed", exc_info=True)
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
-            "startup_goal_recovery": startup_recovery_payload,
         })
         
         if connected_count > 0:
@@ -6774,6 +8075,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Notify the chat that initiated /restart that the gateway is back.
         planned_restart_notification_pending = _planned_restart_notification_pending()
+        # Capture, before _send_restart_notification() unlinks the marker,
+        # whether this process booted from a chat-originated /restart. Used as
+        # a one-shot signal by the /restart redelivery guard so a missing
+        # dedup marker only suppresses a /restart when we KNOW we just came out
+        # of a restart cycle (see _is_stale_restart_redelivery).
+        if _restart_notification_pending() or planned_restart_notification_pending:
+            self._booted_from_restart = True
         await self._send_restart_notification()
 
         # Broadcast a lightweight "gateway is back" message to configured home
@@ -6844,6 +8152,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
+        # Start background async-delegation watcher — drains completion events
+        # from delegate_task(background=true) subagents and injects each
+        # result back into its originating session as a new turn, covering the
+        # idle case where the subagent finishes with no agent turn running.
+        asyncio.create_task(self._async_delegation_watcher())
+
+        # Start the scale-to-zero idle watcher ONLY when this instance is opted
+        # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
+        # relay-only/absent, and a wakeUrl is registered (decisions.md D1/D11/
+        # §3.4(1)). A non-opted instance never starts it, so behaviour is exactly
+        # as today. When armed, the watcher drives the relay dormant on sustained
+        # idle so the platform (Fly autostop:"suspend") can suspend the machine.
+        try:
+            if self._scale_to_zero_should_arm():
+                logger.info(
+                    "scale-to-zero: armed (idle timeout %.0fs) — watching for idle",
+                    self._scale_to_zero_idle_timeout_seconds(),
+                )
+                asyncio.create_task(self._scale_to_zero_watcher())
+            else:
+                # Surface WHY an OPTED-IN instance didn't arm (a non-opted instance
+                # not arming is normal — stay silent there). Without this, a failed
+                # arm is invisible and "why won't it suspend/wake?" needs a box-dive.
+                self._log_scale_to_zero_not_armed_reason()
+        except Exception:  # noqa: BLE001 - arming must never block startup
+            logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
+
+        # Start background drain-control watcher — reconciles the gateway's
+        # new-turn accept-state with the external ``.drain_request.json`` marker
+        # the dashboard begin/cancel-drain endpoint writes (Phase 2). A marker
+        # left behind by a prior instantiation (durable-volume restart, NS-570)
+        # is ignored via its instantiation epoch; only a current-epoch marker
+        # engages drain on the first tick.
+        asyncio.create_task(self._drain_control_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -6875,23 +8218,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
-                pending = self._session_db.list_pending_handoffs()
+                pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")
                     if not session_id:
                         continue
-                    if not self._session_db.claim_handoff(session_id):
+                    if not await self._session_db.claim_handoff(session_id):
                         # Another tick or another gateway already claimed it.
                         continue
                     try:
                         await self._process_handoff(row)
-                        self._session_db.complete_handoff(session_id)
+                        await self._session_db.complete_handoff(session_id)
                     except Exception as exc:
                         logger.warning(
                             "Handoff for session %s failed: %s",
                             session_id, exc, exc_info=True,
                         )
-                        self._session_db.fail_handoff(session_id, str(exc))
+                        await self._session_db.fail_handoff(session_id, str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -6957,26 +8300,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             str(home.thread_id) if home.thread_id else None
         )
 
-        # Determine chat_type for the destination source. If we created a
-        # thread, key the session_key as a thread (build_session_key sets
-        # thread sessions to user-shared by default, which is what we
-        # want — the synthetic turn and any later real-user message both
-        # land on the same key without needing a user_id).
-        if new_thread_id:
+        # Determine chat_type/user_id for the destination source.
+        #
+        # Telegram private-chat DM topics are represented differently from
+        # group/forum threads by the inbound adapter. A handoff-created topic
+        # in a positive Telegram chat_id must therefore use the same DM-topic
+        # source shape as the user's next real message; otherwise the synthetic
+        # handoff turn binds a generic `thread` session key while real replies
+        # arrive on a `dm` session key.
+        home_chat_id = str(home.chat_id)
+        is_telegram_private_chat = (
+            platform == Platform.TELEGRAM
+            and looks_like_telegram_private_chat_id(home_chat_id)
+        )
+
+        if new_thread_id and not is_telegram_private_chat:
             dest_chat_type = "thread"
+            dest_user_id = "system:handoff"
         else:
-            # No thread — assume DM-style for the home channel. For
-            # group/channel home channels without thread support
-            # (Matrix/WhatsApp/Signal), the platform's own keying makes
-            # the synthetic turn shared anyway (single-DM platforms).
+            # No thread — assume DM-style for the home channel. For Telegram
+            # private-chat topics, use the real user id (same as chat_id) so
+            # topic-mode checks and binding persistence see the same identity as
+            # subsequent inbound user messages.
             dest_chat_type = "dm"
+            dest_user_id = home_chat_id if is_telegram_private_chat else "system:handoff"
 
         dest_source = SessionSource(
             platform=platform,
-            chat_id=str(home.chat_id),
+            chat_id=home_chat_id,
             chat_name=home.name,
             chat_type=dest_chat_type,
-            user_id="system:handoff",
+            user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
         )
@@ -6997,13 +8351,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Make sure there's an entry in the session_store for this key. If
         # the home channel has never been used, get_or_create_session
         # creates one; switch_session then re-points it.
-        self.session_store.get_or_create_session(dest_source)
+        await self.async_session_store.get_or_create_session(dest_source)
 
         # Re-bind the destination key to the CLI session_id. switch_session
         # ends the prior session in SQLite and reopens the CLI session under
         # the new key. The CLI's transcript becomes the active one for the
         # gateway from this moment on.
-        switched = self.session_store.switch_session(session_key, cli_session_id)
+        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
         if switched is None:
             raise RuntimeError(
                 f"could not switch session key {session_key} → {cli_session_id}"
@@ -7080,13 +8434,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _MAX_FINALIZE_RETRIES = 3
         while self._running:
             try:
-                self.session_store._ensure_loaded()
+                await self.async_session_store._ensure_loaded()
                 # Collect expired sessions first, then log a single summary.
                 _expired_entries = []
                 for key, entry in list(self.session_store._entries.items()):
                     if entry.expiry_finalized:
                         continue
-                    if not self.session_store._is_session_expired(entry):
+                    if not await self.async_session_store._is_session_expired(entry):
                         continue
                     _expired_entries.append((key, entry))
 
@@ -7134,7 +8488,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _cached_agent is None:
                             _cached_agent = self._running_agents.get(key)
                         if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
-                            self._cleanup_agent_resources(_cached_agent)
+                            await self._cleanup_agent_resources_off_loop(
+                                _cached_agent, context="session expiry"
+                            )
                         # Drop the cache entry so the AIAgent (and its LLM
                         # clients, tool schemas, memory provider refs) can
                         # be garbage-collected.  Otherwise the cache grows
@@ -7168,7 +8524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # state.db (single write-path, #9006) — also drops
                         # the persisted /model override, since finalization
                         # is a conversation boundary.
-                        self.session_store.set_expiry_finalized(entry)
+                        await self.async_session_store.set_expiry_finalized(entry)
                         logger.debug(
                             "Session expiry finalized for %s",
                             entry.session_id,
@@ -7183,7 +8539,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Marking as finalized to prevent infinite retry loop.",
                                 failures, entry.session_id, e,
                             )
-                            self.session_store.set_expiry_finalized(
+                            await self.async_session_store.set_expiry_finalized(
                                 entry, clear_model_override=False
                             )
                             _finalize_failures.pop(entry.session_id, None)
@@ -7236,7 +8592,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             getattr(self.config, "session_store_max_age_days", 0) or 0
                         )
                         if _max_age > 0:
-                            _pruned = self.session_store.prune_old_entries(_max_age)
+                            _pruned = await self.async_session_store.prune_old_entries(_max_age)
                             if _pruned:
                                 logger.info(
                                     "SessionStore prune: dropped %d stale entries",
@@ -7290,6 +8646,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for _ in range(30):
                     if not self._running:
                         return
+                    if self._failed_platforms:
+                        break
                     await asyncio.sleep(1)
                 continue
 
@@ -7328,9 +8686,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
-                    success = await self._connect_adapter_with_timeout(adapter, platform)
+                    # Reconnect after an outage: preserve the platform's
+                    # server-side update queue so messages sent while the bot
+                    # was offline are delivered rather than dropped (#46621).
+                    success = await self._connect_adapter_with_timeout(
+                        adapter, platform, is_reconnect=True
+                    )
                     if success:
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
@@ -7490,12 +8854,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
                 try:
-                    # Cron jobs run outside ``_running_agents``. If the global
-                    # process sweep just killed their tool subprocess, mark the
-                    # job interrupted so the scheduler cannot report success
-                    # from truncated tool output.
+                    # Any cron job still dispatched at this instant just had
+                    # its tool subprocess killed above (kill_all() has no
+                    # per-job-ID targeting — it's a global sweep). Its agent
+                    # thread is still alive in this process and may go on to
+                    # produce a plausible-looking final response from the
+                    # now-truncated tool output; mark the run interrupted so
+                    # the scheduler can never report that as success (#60432).
+                    # No-op when no cron job is in flight.
                     from cron.scheduler import mark_running_jobs_interrupted
-
                     _interrupted = mark_running_jobs_interrupted(
                         f"Gateway shutdown ({phase}) killed the job's tool "
                         "subprocess before the run finished."
@@ -7507,6 +8874,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _e:
                     logger.debug("mark_running_jobs_interrupted (%s) error: %s", phase, _e)
+                try:
+                    from tools.async_delegation import interrupt_all as _interrupt_async
+                    _async_n = _interrupt_async(reason=f"gateway shutdown ({phase})")
+                    if _async_n:
+                        logger.info(
+                            "Shutdown (%s): interrupted %d background delegation(s)",
+                            phase, _async_n,
+                        )
+                except Exception as _e:
+                    logger.debug("async interrupt_all (%s) error: %s", phase, _e)
                 try:
                     from tools.terminal_tool import cleanup_all_environments
                     cleanup_all_environments()
@@ -7549,7 +8926,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
-                    self.session_store.mark_resume_pending(
+                    await self.async_session_store.mark_resume_pending(
                         _sk,
                         "restart_timeout" if self._restart_requested else "shutdown_timeout",
                     )
@@ -7558,12 +8935,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _cron_at_start = self._active_cron_job_count()
+            _api_at_start = self._active_api_run_count()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
-                "cron_at_start=%d, cron_now=%d)",
+                "cron_at_start=%d, cron_now=%d, "
+                "api_at_start=%d, api_now=%d)",
                 _phase_elapsed(),
                 time.monotonic() - _drain_started_at,
                 timed_out,
@@ -7571,6 +8950,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._running_agent_count(),
                 _cron_at_start,
                 self._active_cron_job_count(),
+                _api_at_start,
+                self._active_api_run_count(),
             )
 
             if not timed_out:
@@ -7580,7 +8961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for _sk in _pre_drain_keys:
                     if _sk not in self._running_agents:
                         try:
-                            self.session_store.clear_resume_pending(_sk)
+                            await self.async_session_store.clear_resume_pending(_sk)
                         except Exception as _e:
                             logger.debug(
                                 "clear_resume_pending after drain failed for %s: %s",
@@ -7589,11 +8970,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if timed_out:
                 logger.warning(
-                    "Gateway drain timed out after %.1fs with %d active agent(s) "
-                    "and %d in-flight cron job(s); interrupting remaining work.",
+                    "Gateway drain timed out after %.1fs with %d active agent(s), "
+                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "interrupting remaining work.",
                     timeout,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
+                    self._active_api_run_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -7623,16 +9006,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
-                        self.session_store.mark_resume_pending(_sk, _resume_reason)
+                        await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
-                    self._mark_gateway_ledger_session_drained(
-                        _sk,
-                        reason=_resume_reason,
-                    )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -7661,7 +9040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart: %s", e)
 
-            self._finalize_shutdown_agents(active_agents)
+            await self._finalize_shutdown_agents(active_agents)
 
             # Also shut down memory providers on idle cached agents.
             # _finalize_shutdown_agents only handles agents that were
@@ -7678,28 +9057,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _agent = (
                         _entry[0] if isinstance(_entry, tuple) else _entry
                     )
-                    self._cleanup_agent_resources(_agent)
+                    # Bounded + off-loop so a wedged memory provider on one
+                    # idle agent can't hang shutdown indefinitely — that path
+                    # is why SIGTERM failed to kill the process (#53175).
+                    await self._cleanup_agent_resources_off_loop(
+                        _agent, context="shutdown idle-cache"
+                    )
 
             for platform, adapter in list(self.adapters.items()):
-                _adapter_started_at = time.monotonic()
-                try:
-                    await adapter.cancel_background_tasks()
-                except Exception as e:
-                    logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
-                try:
-                    await adapter.disconnect()
-                    logger.info(
-                        "✓ %s disconnected (%.2fs)",
-                        platform.value,
-                        time.monotonic() - _adapter_started_at,
+                await self._bounded_adapter_teardown(adapter, platform)
+
+            # Disconnect secondary-profile adapters (multiplex mode).
+            for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
+                for platform, adapter in list(_amap.items()):
+                    await self._bounded_adapter_teardown(
+                        adapter, platform, profile=_prof
                     )
-                except Exception as e:
-                    logger.error(
-                        "✗ %s disconnect error after %.2fs: %s",
-                        platform.value,
-                        time.monotonic() - _adapter_started_at,
-                        e,
-                    )
+                _amap.clear()
+            if hasattr(self, "_profile_adapters"):
+                self._profile_adapters.clear()
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
@@ -7707,6 +9083,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
+                    continue
+                if _task is self._restart_task:
+                    # The restart orchestration task is awaiting _stop_task
+                    # right now; cancelling it would propagate CancelledError
+                    # into this _stop_impl and skip _shutdown_event.set() /
+                    # _exit_code = 75 (#12875).  It self-terminates anyway.
                     continue
                 _task.cancel()
             self._background_tasks.clear()
@@ -7755,14 +9137,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # old gateway's connection holding the WAL lock until Python
             # actually exits — causing 'database is locked' errors when
             # the new gateway tries to open the same file.
-            for _db_holder in (self, getattr(self, "session_store", None)):
-                _db = getattr(_db_holder, "_db", None) if _db_holder else None
+            # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
+            # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+            _self_db = getattr(self, "_session_db", None)
+            _self_db = getattr(_self_db, "_db", _self_db)
+            for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
                 if _db is None or not hasattr(_db, "close"):
                     continue
                 try:
                     _db.close()
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
+            GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
                 _phase_elapsed(),
@@ -7816,17 +9202,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if self._restart_requested and self._restart_via_service:
                 self._launch_systemd_restart_shortcut()
-                # systemd units use Restart=always, so a planned restart should
-                # exit cleanly and still be relaunched.  Using TEMPFAIL here
-                # makes systemd treat the operator-requested restart as a
-                # failure and can trip stepped restart backoff.  launchd's
-                # KeepAlive.SuccessfulExit=false needs a non-zero exit to
-                # relaunch, so keep the old code on macOS.
-                self._exit_code = (
-                    GATEWAY_SERVICE_RESTART_EXIT_CODE
-                    if sys.platform == "darwin" or not os.environ.get("INVOCATION_ID")
-                    else 0
-                )
+                # Always exit with TEMPFAIL (75) on service-managed
+                # restarts.  The shortcut helper above is best-effort and
+                # commonly fails on real deployments: non-root gateway
+                # units hit Polkit denials when invoking ``systemd-run
+                # --system``, headless boxes have no user bus for
+                # ``--user``, and operator-managed unit files may use
+                # ``Restart=on-failure`` rather than ``Restart=always``.
+                # Exit 75 paired with ``RestartForceExitStatus=75`` makes
+                # systemd treat the planned restart as a controlled
+                # failure and revive the unit via ``Restart=on-failure``,
+                # regardless of whether the helper survived.  Without
+                # this, a clean exit (0) on Linux left the gateway dead
+                # until someone rebooted the host.  Only the planned code
+                # (75) is whitelisted via ``RestartForceExitStatus``; a
+                # genuine crash exits non-zero-but-not-75, so real crash
+                # loops are still governed by the unit's normal
+                # ``Restart=``/``RestartSec`` (and any StartLimit the
+                # operator sets) rather than force-restarted here.
+                self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
             self._draining = False
@@ -7868,6 +9262,196 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    async def _start_secondary_profile_adapters(self) -> int:
+        """Bring up adapters for every non-active profile this gateway serves.
+
+        Returns the number of secondary adapters that connected. No-op (returns
+        0) unless ``gateway.multiplex_profiles`` is on.
+
+        Each profile's adapters are created and connected under that profile's
+        HERMES_HOME + secret scope (``_profile_runtime_scope``), stored in
+        ``self._profile_adapters[profile]``, and given a message handler that
+        stamps ``source.profile`` before delegating to the shared
+        ``_handle_message`` — so the agent turn resolves that profile's config,
+        skills, and credentials. Same-platform credential collisions (two
+        profiles polling the same bot token) are detected and refused here, the
+        only point that sees every profile's resolved credentials together.
+        """
+        if not getattr(self.config, "multiplex_profiles", False):
+            return 0
+
+        try:
+            from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
+        except Exception:
+            return 0
+
+        active = get_active_profile_name() or "default"
+        connected = 0
+        # (platform, token-fingerprint) -> profile that claimed it. Detects two
+        # profiles trying to poll the same bot credential (impossible to do
+        # concurrently). Seed with the active profile's adapters.
+        claimed: Dict[tuple, str] = {}
+        for _plat, _ad in self.adapters.items():
+            fp = self._adapter_credential_fingerprint(_ad)
+            if fp is not None:
+                claimed[(_plat, fp)] = active
+
+        for profile_name, profile_home in profiles_to_serve(multiplex=True):
+            if profile_name == active:
+                continue  # handled by the primary startup loop
+            try:
+                connected += await self._start_one_profile_adapters(
+                    profile_name, profile_home, claimed
+                )
+            except MultiplexConfigError:
+                # Config error (e.g. a secondary profile binding a port) is not
+                # transient — propagate so startup aborts cleanly instead of
+                # limping along with a half-configured multiplexer.
+                raise
+            except Exception as e:
+                logger.error(
+                    "Failed to start adapters for profile '%s': %s",
+                    profile_name, e, exc_info=True,
+                )
+
+        # Record served profiles in runtime status for `hermes status`.
+        try:
+            from gateway.status import write_runtime_status
+            served = [active] + sorted(self._profile_adapters.keys())
+            # Per-profile PairingStores so authz_mixin can route pairing
+            # checks to the right whitelist. The active profile gets a store
+            # at its HERMES_HOME; additional served profiles get one under
+            # profiles/<name>/pairing/. See gateway.pairing.PairingStore.
+            for name in served:
+                if name and name not in self.pairing_stores:
+                    self.pairing_stores[name] = PairingStore(profile=name)
+            write_runtime_status(served_profiles=served)
+        except Exception:
+            logger.debug("could not record served_profiles", exc_info=True)
+
+        return connected
+
+    async def _start_one_profile_adapters(
+        self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
+    ) -> int:
+        """Create+connect one profile's adapters under its runtime scope."""
+        from gateway.config import load_gateway_config
+
+        with _profile_runtime_scope(profile_home):
+            profile_cfg = load_gateway_config()
+            violation = _own_policy_open_startup_violation(profile_cfg)
+        if violation:
+            raise MultiplexConfigError(
+                f"Profile '{profile_name}' enables {violation}. "
+                "Enable GATEWAY_ALLOW_ALL_USERS or the platform allow-all flag "
+                "for that profile, or change dm_policy/group_policy away from "
+                "'open'."
+            )
+
+        profile_map = self._profile_adapters.setdefault(profile_name, {})
+        connected = 0
+        for platform, platform_config in profile_cfg.platforms.items():
+            if not platform_config.enabled:
+                continue
+            # A secondary profile must NOT enable a port-binding platform: the
+            # default profile's listener already serves every profile via the
+            # /p/<profile>/ prefix, so a second bind can only collide. This is a
+            # config error, not a transient failure — fail fast and loud.
+            if platform.value in _PORT_BINDING_PLATFORM_VALUES:
+                raise MultiplexConfigError(
+                    f"Profile '{profile_name}' enables the port-binding platform "
+                    f"'{platform.value}', but gateway.multiplex_profiles is on. The "
+                    f"default profile owns the single shared HTTP listener and "
+                    f"serves every profile through the /p/{profile_name}/ URL "
+                    f"prefix — a secondary profile cannot bind its own port. "
+                    f"Remove platforms.{platform.value} from profile "
+                    f"'{profile_name}'s config.yaml (configure it only on the "
+                    f"default profile)."
+                )
+            with _profile_runtime_scope(profile_home):
+                adapter = self._create_adapter(platform, platform_config)
+            if not adapter:
+                continue
+
+            # Same-token conflict detection — refuse a duplicate poll.
+            fp = self._adapter_credential_fingerprint(adapter)
+            if fp is not None:
+                owner = claimed.get((platform, fp))
+                if owner is not None:
+                    logger.error(
+                        "Profile '%s' and '%s' both configure %s with the same "
+                        "credential — refusing to start the duplicate (a single "
+                        "bot token cannot be polled twice). Give each profile its "
+                        "own %s credential.",
+                        owner, profile_name, platform.value, platform.value,
+                    )
+                    await self._safe_adapter_disconnect(adapter, platform)
+                    continue
+                claimed[(platform, fp)] = profile_name
+
+            # Stamp every inbound event from this adapter with its profile so
+            # the agent turn (and session key) resolve to the right home.
+            adapter.set_message_handler(
+                self._make_profile_message_handler(profile_name)
+            )
+            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            adapter.set_session_store(self.session_store)
+            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter._busy_text_mode = self._busy_text_mode
+
+            try:
+                with _profile_runtime_scope(profile_home):
+                    success = await self._connect_adapter_with_timeout(adapter, platform)
+                if success:
+                    profile_map[platform] = adapter
+                    connected += 1
+                    logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
+                else:
+                    logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
+                    await self._safe_adapter_disconnect(adapter, platform)
+            except Exception as e:
+                logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
+                await self._safe_adapter_disconnect(adapter, platform)
+        return connected
+
+    def _make_profile_message_handler(self, profile_name: str):
+        """Return a message handler that stamps source.profile then delegates."""
+        async def _handler(event):
+            try:
+                if getattr(event, "source", None) is not None and not event.source.profile:
+                    event.source.profile = profile_name
+            except Exception:
+                pass
+            return await self._handle_message(event)
+        return _handler
+
+    @staticmethod
+    def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
+        """Return a stable, log-safe fingerprint of an adapter's credential.
+
+        Used only to detect two profiles claiming the same bot token. Returns a
+        salted hash (never the token itself) of the adapter's primary
+        credential, or None when no credential is discoverable (in which case
+        we don't attempt conflict detection for it).
+        """
+        token = None
+        for attr in ("token", "bot_token", "_token", "api_token", "_bot_token"):
+            val = getattr(adapter, attr, None)
+            if isinstance(val, str) and val.strip():
+                token = val.strip()
+                break
+        if not token:
+            config = getattr(adapter, "config", None)
+            val = getattr(config, "token", None)
+            if isinstance(val, str) and val.strip():
+                token = val.strip()
+        if not token:
+            return None
+        import hashlib
+        return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
         self, 
@@ -7914,43 +9498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Platform registry lookup for '%s' failed: %s", platform.value, e)
         # Fall through to built-in adapters below
 
-        if platform == Platform.TELEGRAM:
-            from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
-            if not check_telegram_requirements():
-                logger.warning("Telegram: python-telegram-bot not installed")
-                return None
-            adapter = TelegramAdapter(config)
-            # Apply Telegram notification mode from config.  Controls whether
-            # intermediate messages (tool progress, streaming, status) trigger
-            # push notifications.  Supports ENV override for quick testing.
-            _notify_mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
-            if not _notify_mode:
-                try:
-                    _gw_cfg = _load_gateway_config()
-                    _raw = cfg_get(_gw_cfg, "display", "platforms", "telegram", "notifications")
-                    if _raw not in {None, ""}:
-                        _notify_mode = str(_raw).strip().lower()
-                except Exception:
-                    pass
-            _notify_mode = _notify_mode or "important"
-            if _notify_mode not in {"all", "important"}:
-                logger.warning(
-                    "Unknown telegram notifications mode '%s', "
-                    "defaulting to 'important' (valid: all, important)",
-                    _notify_mode,
-                )
-                _notify_mode = "important"
-            adapter._notifications_mode = _notify_mode
-            return adapter
-        
-        elif platform == Platform.WHATSAPP:
-            from gateway.platforms.whatsapp import WhatsAppAdapter, check_whatsapp_requirements
-            if not check_whatsapp_requirements():
-                logger.warning("WhatsApp: Node.js not installed or bridge not configured")
-                return None
-            return WhatsAppAdapter(config)
-
-        elif platform == Platform.WHATSAPP_CLOUD:
+        if platform == Platform.WHATSAPP_CLOUD:
             from gateway.platforms.whatsapp_cloud import (
                 WhatsAppCloudAdapter,
                 check_whatsapp_cloud_requirements,
@@ -7962,13 +9510,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return WhatsAppCloudAdapter(config)
         
-        elif platform == Platform.SLACK:
-            from gateway.platforms.slack import SlackAdapter, check_slack_requirements
-            if not check_slack_requirements():
-                logger.warning("Slack: slack-bolt not installed. Run: pip install 'hermes-agent[slack]'")
-                return None
-            return SlackAdapter(config)
-
         elif platform == Platform.SIGNAL:
             from gateway.platforms.signal import SignalAdapter, check_signal_requirements
             if not check_signal_requirements():
@@ -7976,64 +9517,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return SignalAdapter(config)
 
-        elif platform == Platform.EMAIL:
-            from gateway.platforms.email import EmailAdapter, check_email_requirements
-            if not check_email_requirements():
-                logger.warning("Email: EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_IMAP_HOST, or EMAIL_SMTP_HOST not set")
-                return None
-            return EmailAdapter(config)
-
-        elif platform == Platform.SMS:
-            from gateway.platforms.sms import SmsAdapter, check_sms_requirements
-            if not check_sms_requirements():
-                logger.warning("SMS: aiohttp not installed or TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set")
-                return None
-            return SmsAdapter(config)
-
-        elif platform == Platform.DINGTALK:
-            from gateway.platforms.dingtalk import DingTalkAdapter, check_dingtalk_requirements
-            if not check_dingtalk_requirements():
-                logger.warning("DingTalk: dingtalk-stream not installed or DINGTALK_CLIENT_ID/SECRET not set")
-                return None
-            return DingTalkAdapter(config)
-
-        elif platform == Platform.FEISHU:
-            from gateway.platforms.feishu import FeishuAdapter, check_feishu_requirements
-            if not check_feishu_requirements():
-                logger.warning("Feishu: lark-oapi not installed or FEISHU_APP_ID/SECRET not set")
-                return None
-            return FeishuAdapter(config)
-
-        elif platform == Platform.WECOM_CALLBACK:
-            from gateway.platforms.wecom_callback import (
-                WecomCallbackAdapter,
-                check_wecom_callback_requirements,
-            )
-            if not check_wecom_callback_requirements():
-                logger.warning("WeComCallback: aiohttp/httpx/defusedxml not installed")
-                return None
-            return WecomCallbackAdapter(config)
-
-        elif platform == Platform.WECOM:
-            from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
-            if not check_wecom_requirements():
-                logger.warning("WeCom: aiohttp not installed or WECOM_BOT_ID/SECRET not set")
-                return None
-            return WeComAdapter(config)
-
         elif platform == Platform.WEIXIN:
             from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
             if not check_weixin_requirements():
                 logger.warning("Weixin: aiohttp/cryptography not installed")
                 return None
             return WeixinAdapter(config)
-
-        elif platform == Platform.MATRIX:
-            from gateway.platforms.matrix import MatrixAdapter, check_matrix_requirements
-            if not check_matrix_requirements():
-                logger.warning("Matrix: mautrix not installed or credentials not set. Run: pip install 'mautrix[encryption]'")
-                return None
-            return MatrixAdapter(config)
 
         elif platform == Platform.API_SERVER:
             from gateway.platforms.api_server import APIServerAdapter, check_api_server_requirements
@@ -8084,6 +9573,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return None
 
+    def _make_adapter_auth_check(
+        self,
+        platform: Platform,
+    ) -> Callable[[str, Optional[str], Optional[str]], bool]:
+        """Build a platform-bound auth callback for adapter use.
+
+        Adapters that fetch external context (e.g. Slack
+        ``conversations.replies``) call this through
+        ``BasePlatformAdapter._is_sender_authorized`` to mark non-allowlisted
+        senders as unverified in LLM context, mitigating indirect prompt
+        injection from third parties in shared threads/channels.
+
+        The returned callback delegates to :meth:`_is_user_authorized` so the
+        full auth chain — platform allowlists, group allowlists, pairing
+        store, allow-all flags — stays the single source of truth.
+        """
+        def check(
+            user_id: str,
+            chat_type: Optional[str] = None,
+            chat_id: Optional[str] = None,
+        ) -> bool:
+            if not user_id:
+                return False
+            source = SessionSource(
+                platform=platform,
+                chat_id=chat_id or "",
+                chat_type=chat_type or "group",
+                user_id=user_id,
+            )
+            return self._is_user_authorized(source)
+        return check
+
+
 
 
 
@@ -8133,25 +9655,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
-        self._record_gateway_ledger_received(event, reason="handle-message-entry")
+        await asyncio.to_thread(
+            self._record_gateway_ledger_received,
+            event,
+            reason="handle-message-entry",
+        )
+
+        # 🔴 Cross-session leak guard. This handler runs inside a per-message
+        # asyncio task created via create_task(), which snapshots the spawning
+        # context with copy_context(). If a *concurrent* message had already
+        # bound its session via set_session_vars() when this task was created,
+        # we inherited ITS HERMES_SESSION_* ContextVars. Until we bind our own
+        # (a few steps down, in _set_session_env), any subprocess spawned here
+        # would read the foreign session's identity via the subprocess-env
+        # bridge — the _UNSET-strip guard there can't help because the vars are
+        # set-to-foreign, not _UNSET. Reset to _UNSET now so that window strips
+        # safe (no session) instead of leaking the sibling's. See
+        # gateway/session_context.reset_session_vars + the inheritance test.
+        try:
+            from gateway.session_context import reset_session_vars
+            reset_session_vars()
+        except Exception:
+            logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not getattr(event, "internal", False)
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
-            self._update_gateway_ledger(
-                event,
-                "requeued",
-                reason="startup-restore-queue",
-                metadata={"queue": "startup_restore"},
-            )
             self._queue_startup_restore_event(event)
             return None
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+
+        # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
+        # clock for real (user-originated) inbound only. Internal/system events
+        # (background-process completions, startup-restore replays) are NOT
+        # traffic — counting them would keep a genuinely idle gateway awake. This
+        # clock is what the idle predicate (gateway/scale_to_zero.is_idle) reads.
+        if not is_internal:
+            self._scale_to_zero_note_real_inbound()
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
@@ -8209,7 +9754,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+            if (
+                source.chat_type == "dm"
+                and self._get_unauthorized_dm_behavior(
+                    source.platform,
+                    profile=source.profile,
+                )
+                == "pair"
+            ):
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
@@ -8220,7 +9772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -8230,7 +9782,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
                 else:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -8250,7 +9802,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
-        self._update_gateway_ledger(
+        await asyncio.to_thread(
+            self._update_gateway_ledger,
             event,
             "received",
             session_key=_quick_key,
@@ -8258,24 +9811,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if self._is_goal_continuation_event(event):
             try:
-                _goal_session_entry = self.session_store.get_or_create_session(source)
-                _goal_session_id = getattr(_goal_session_entry, "session_id", "") or ""
+                goal_entry = await self.async_session_store.get_or_create_session(source)
+                goal_session_id = getattr(goal_entry, "session_id", "") or ""
             except Exception:
-                _goal_session_id = ""
-            if not self._goal_still_active_for_session(_goal_session_id):
+                goal_session_id = ""
+            if not self._goal_still_active_for_session(goal_session_id):
                 logger.info(
-                    "Dropping stale internal /goal continuation for %s — goal is no longer active",
+                    "Dropping stale internal /goal continuation for %s — goal "
+                    "is no longer active",
                     _quick_key or "?",
                 )
-                self._update_gateway_ledger(
+                await asyncio.to_thread(
+                    self._update_gateway_ledger,
                     event,
                     "dropped",
                     session_key=_quick_key,
-                    session_id=_goal_session_id,
+                    session_id=goal_session_id,
                     reason="stale-internal-goal-continuation",
                 )
                 try:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter and _quick_key:
                         self._clear_goal_pending_continuations(_quick_key, adapter)
                 except Exception as exc:
@@ -8348,26 +9903,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 _update_prompts.pop(_quick_key, None)
 
-        # Intercept messages that are responses to a pending clarify
-        # request that is awaiting free-form text (either an open-ended
-        # clarify with no choices, or one where the user picked the
-        # "Other" button).  The first non-empty user message in the
-        # session resolves the clarify and unblocks the agent thread —
-        # we do NOT route it to the agent as a new turn.
+        # Intercept messages that are responses to a pending clarify.
+        # Open-ended prompts and "Other" responses are captured as free text;
+        # direct replies to multi-choice prompts are accepted too ("2" maps
+        # to the second option, arbitrary text becomes a custom answer). Slash
+        # commands still bypass this path so /stop and friends keep working.
+        _clarify_mod = None
         try:
             from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key)
+            _pending_clarify = _clarify_mod.get_pending_for_session(
+                _quick_key, include_choice_prompts=True,
+            )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None:
+        if _pending_clarify is not None and _clarify_mod is not None:
             _raw_clarify_reply = (event.text or "").strip()
             # Skip slash commands — the user clearly wanted to issue a
             # command, not answer the clarify.  Leave the clarify pending
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_gateway_clarify(
-                    _pending_clarify.clarify_id, _raw_clarify_reply,
+                _resolved = _clarify_mod.resolve_text_response_for_session(
+                    _quick_key, _raw_clarify_reply,
                 )
                 if _resolved:
                     logger.info(
@@ -8562,16 +10119,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # earlier /queue items) finishes.  Messages are NOT merged.
             if event.get_command() in {"queue", "q"}:
                 queued_text = event.get_command_args().strip()
-                if not queued_text:
+                # Preserve media/reply payloads: a /queue carrying a photo,
+                # document, or reply context is valid even with no prompt text
+                # (e.g. "/queue" as the caption of an image). Dropping these
+                # fields silently lost the attachment when the queued turn ran.
+                has_media = bool(getattr(event, "media_urls", None))
+                if not queued_text and not has_media:
                     return "Usage: /queue <prompt>"
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     queued_event = MessageEvent(
                         text=queued_text,
-                        message_type=MessageType.TEXT,
+                        message_type=event.message_type if has_media else MessageType.TEXT,
                         source=event.source,
+                        raw_message=event.raw_message,
                         message_id=event.message_id,
+                        media_urls=list(getattr(event, "media_urls", []) or []),
+                        media_types=list(getattr(event, "media_types", []) or []),
+                        reply_to_message_id=event.reply_to_message_id,
+                        reply_to_text=event.reply_to_text,
+                        reply_to_author_id=event.reply_to_author_id,
+                        reply_to_author_name=event.reply_to_author_name,
+                        reply_to_is_own_message=event.reply_to_is_own_message,
+                        auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
+                        internal=event.internal,
+                        timestamp=event.timestamp,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
@@ -8663,16 +10236,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
-            # /goal is safe mid-run for status/pause/clear (inspection and
-            # control-plane only — doesn't interrupt the running turn).
+            # /goal is safe mid-run for status/pause/clear/wait (inspection
+            # and control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
             # "wait or /stop" message as /model so we don't race a second
             # continuation prompt against the current turn.
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 _goal_arg = (event.get_command_args() or "").strip().lower()
-                if not _goal_arg or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done"}:
+                _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
+                # Exact-match control verbs (unchanged semantics), plus the
+                # wait/unwait barrier verbs which take a pid argument.
+                _is_control = (
+                    not _goal_arg
+                    or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
+                    or _goal_verb == "wait"
+                )
+                if _is_control:
                     return await self._handle_goal_command(event)
-                return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
+                return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
+
+            if _cmd_def_inner and _cmd_def_inner.name == "moa":
+                return "Agent is running — wait or /stop first, then run /moa."
 
             # /subgoal is safe mid-run — it only modifies the goal's
             # subgoals list, which the judge reads at the next turn
@@ -8834,7 +10418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the id out from under it, forking orphaned compression
             # siblings. Demote to queue semantics so the follow-up waits
             # for the in-flight compression + rotation to land.
-            if self._session_has_compression_in_flight(_quick_key):
+            if await self._session_has_compression_in_flight(_quick_key):
                 logger.info(
                     "PRIORITY interrupt demoted to queue for session %s "
                     "because context compression is in flight (#56391)",
@@ -8851,23 +10435,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Check for commands
         command = event.get_command()
-        if not command:
-            try:
-                user_config_for_auto_po = _load_gateway_config()
-                if _should_auto_po_route(user_config_for_auto_po, source, event.text):
-                    payload = str(event.text or "").strip()
-                    try:
-                        event = dataclasses.replace(event, text=f"/po {payload}")
-                    except Exception:
-                        event.text = f"/po {payload}"
-                    command = event.get_command()
-                    logger.info(
-                        "Auto /po route active: chat=%s thread=%s",
-                        getattr(source, "chat_id", None),
-                        getattr(source, "thread_id", None),
-                    )
-            except Exception as _auto_po_err:
-                logger.debug("Auto /po route failed: %s", _auto_po_err)
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -8879,23 +10446,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
-
-        # Telegram-safe Supergoal fallback: if the user pasted the whole
-        # assistant handoff message instead of replying with `/goal`, convert
-        # that paste into the same `/goal <body>` dispatch. This keeps the
-        # official GoalManager path and avoids sending the long text to the LLM
-        # as an ordinary chat turn.
-        if not command:
-            pasted_goal = self._goal_text_from_pasted_supergoal_handoff(event.text)
-            if pasted_goal:
-                try:
-                    event = dataclasses.replace(event, text=f"/goal {pasted_goal}")
-                except Exception:
-                    event.text = f"/goal {pasted_goal}"
-                command = event.get_command()
-                _cmd_def = _resolve_cmd(command) if command else None
-                canonical = _cmd_def.name if _cmd_def else command
-                logger.info("Detected pasted Supergoal handoff; dispatching as /goal")
 
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
@@ -8909,7 +10459,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(quick_commands, dict) and command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "alias":
-                    target = qcmd.get("target", "").strip()
+                    target = (qcmd.get("target") or "").strip()
                     if target:
                         target = target if target.startswith("/") else f"/{target}"
                         target_command = target.lstrip("/")
@@ -8986,7 +10536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
         if canonical == "new":
-            if self._is_telegram_topic_root_lobby(source):
+            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
                 return self._telegram_topic_root_new_message()
             async def _do_reset():
                 return await self._handle_reset_command(event)
@@ -9008,10 +10558,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_help_command(event)
 
         if canonical == "start":
-            start_message = os.environ.get("HERMES_GATEWAY_START_MESSAGE", "").strip()
-            if start_message:
-                logger.info("Replying to /start platform ping for session %s via HERMES_GATEWAY_START_MESSAGE", _quick_key)
-                return start_message
             logger.info("Ignoring /start platform ping for session %s", _quick_key)
             return ""
 
@@ -9047,6 +10593,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "skills":
             return await self._handle_skills_command(event)
+
+        if canonical == "learn":
+            # Open-ended: rewrite the turn to a standards-guided prompt and fall
+            # through to normal agent processing. The live agent gathers the
+            # sources the user described (dirs via read_file, URLs via
+            # web_extract, this conversation, pasted text) and authors the skill
+            # via skill_manage. Mirrors the /blueprint fall-through so role
+            # alternation is preserved. No engine, works on any backend.
+            from agent.learn_prompt import build_learn_prompt
+
+            _learn_req = event.get_command_args().strip()
+            _ack = (
+                "Learning a skill from what you described…"
+                if _learn_req
+                else "Learning a skill from this conversation…"
+            )
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    _ack_meta = self._thread_metadata_for_source(source)
+                    await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+            except Exception:
+                logger.debug("learn ack send failed", exc_info=True)
+            try:
+                event.text = build_learn_prompt(_learn_req)
+                # fall through to agent processing
+            except Exception:
+                return "Could not start /learn — please try again."
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
@@ -9174,6 +10748,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "resume":
             return await self._handle_resume_command(event)
 
+        if canonical == "sessions":
+            return await self._handle_sessions_command(event)
+
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
@@ -9201,6 +10778,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "goal":
             return await self._handle_goal_command(event)
 
+        if canonical == "moa":
+            # /moa is one-shot sugar only: run a single prompt through the
+            # default MoA preset, then restore the prior model. To *switch* to a
+            # MoA preset for the session, pick it from the model picker (MoA
+            # presets surface as a virtual "Mixture of Agents" provider).
+            from hermes_cli.moa_config import (
+                moa_usage,
+                normalize_moa_config,
+            )
+            from hermes_cli.config import load_config
+
+            moa_payload = event.get_command_args().strip()
+            if not moa_payload:
+                return moa_usage()
+            try:
+                cfg = load_config()
+                moa_cfg = normalize_moa_config(cfg.get("moa") if isinstance(cfg, dict) else {})
+            except Exception:
+                moa_cfg = normalize_moa_config({})
+            preset = moa_cfg["default_preset"]
+            try:
+                event.text = moa_payload
+                event._moa_restore_override = self._session_model_overrides.get(_quick_key)
+                self._session_model_overrides[_quick_key] = {
+                    "provider": "moa",
+                    "model": preset,
+                    "base_url": "moa://local",
+                    "api_key": "moa-virtual-provider",
+                    "api_mode": "chat_completions",
+                }
+                self._evict_cached_agent(_quick_key)
+                event._moa_disable_after_turn = True
+            except Exception:
+                return "Failed to prepare MoA turn."
+
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
 
@@ -9219,79 +10831,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not isinstance(quick_commands, dict):
                 quick_commands = {}
             if command in quick_commands:
+                # Quick commands are slash capabilities too — and type:exec
+                # ones run a shell command in the gateway process. The early
+                # gate above only fires for registry-known commands, so quick
+                # commands (never in the registry) would otherwise reach this
+                # dispatch sink unchecked. Apply the same admin/user policy to
+                # the raw typed name here so non-admins can't invoke admin-only
+                # quick commands. (#44727)
+                _denied = self._check_slash_access(source, command)
+                if _denied is not None:
+                    return _denied
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        env = os.environ.copy()
+                        env["HERMES_COMMAND_NAME"] = command
+                        env["HERMES_COMMAND_ARGS"] = user_args
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
-                            user_args = event.get_command_args().strip()
-                            run_cmd = exec_cmd
-                            if qcmd.get("append_args") and user_args:
-                                run_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
-                            sanitized_env["HERMES_COMMAND_NAME"] = command
-                            sanitized_env["HERMES_COMMAND_ARGS"] = user_args
-                            # Expose reply context to quick-command helpers.  This lets
-                            # commands like /saymm work when the user replies to a
-                            # message without typing explicit args, while keeping the
-                            # command shell argv empty unless append_args is used.
-                            sanitized_env["HERMES_REPLY_TO_TEXT"] = str(getattr(event, "reply_to_text", "") or "")
-                            sanitized_env["HERMES_REPLY_TO_MESSAGE_ID"] = str(getattr(event, "reply_to_message_id", "") or "")
-                            # Safe origin metadata for detached quick-command workers.
-                            # This lets launcher-style commands complete asynchronously
-                            # and deliver back to the same chat/topic without exposing
-                            # credentials in the subprocess env.
-                            try:
-                                _src = event.source
-                                if _src is not None:
-                                    sanitized_env["HERMES_ORIGIN_PLATFORM"] = getattr(_src.platform, "value", str(_src.platform))
-                                    sanitized_env["HERMES_ORIGIN_CHAT_ID"] = str(_src.chat_id or "")
-                                    sanitized_env["HERMES_ORIGIN_THREAD_ID"] = str(_src.thread_id or "")
-                                    sanitized_env["HERMES_ORIGIN_USER_ID"] = str(_src.user_id or "")
-                                    # Back-compat names used by deterministic quick-command scripts
-                                    # that deliver their own Telegram messages (e.g. /po).
-                                    sanitized_env["HERMES_CHAT_ID"] = str(_src.chat_id or "")
-                                    sanitized_env["HERMES_THREAD_ID"] = str(_src.thread_id or "")
-                            except Exception:
-                                pass
-                            sanitized_env["HERMES_RAW_TEXT"] = str(getattr(event, "text", "") or "")
-                            sanitized_env["HERMES_RAW_PLATFORM_TEXT"] = str(getattr(event, "text", "") or "")
+                            sanitized_env = _sanitize_subprocess_env(env)
                             proc = await asyncio.create_subprocess_shell(
-                                run_cmd,
+                                exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
+                                start_new_session=True,
                             )
-                            timeout_raw = qcmd.get("timeout_seconds", 30)
-                            try:
-                                timeout_seconds = max(1.0, float(timeout_raw))
-                            except (TypeError, ValueError):
-                                timeout_seconds = 30.0
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-                            stdout_text = (stdout or b"").decode().strip()
-                            stderr_text = (stderr or b"").decode().strip()
-                            output = (stdout_text or stderr_text).strip()
+                            communicate_task = asyncio.create_task(proc.communicate())
+                            stdout, stderr = await asyncio.wait_for(communicate_task, timeout=30)
+                            output = (stdout or stderr).decode().strip()
                             # Redact any remaining sensitive patterns in output
                             if output:
                                 from agent.redact import redact_sensitive_text
                                 output = redact_sensitive_text(output)
-                            if proc.returncode != 0:
-                                return output if output else f"Quick command failed with exit code {proc.returncode}."
-                            if qcmd.get("silent"):
-                                return None
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
-                            return "Quick command timed out."
+                            if proc.returncode is None:
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                except Exception:
+                                    try:
+                                        proc.kill()
+                                    except ProcessLookupError:
+                                        pass
+                            try:
+                                await communicate_task
+                            except Exception:
+                                pass
+                            return "Quick command timed out (30s)."
                         except Exception as e:
                             return f"Quick command error: {e}"
                     else:
                         return f"Quick command '/{command}' has no command defined."
                 elif qcmd.get("type") == "alias":
-                    target = qcmd.get("target", "").strip()
+                    target = (qcmd.get("target") or "").strip()
                     if target:
                         target = target if target.startswith("/") else f"/{target}"
                         target_command = target.lstrip("/")
@@ -9472,12 +11077,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if self._is_telegram_topic_root_lobby(source):
+        if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        # ── External-drain new-turn gate (Phase 2) ────────────────────
+        # When NAS has engaged an external drain (.drain_request.json present,
+        # observed by _drain_control_watcher), refuse to START a new turn so
+        # the in-flight set can only fall to zero — eliminating the TOCTOU race
+        # (D4a: stop accepting new turns FIRST, then NAS polls until
+        # active_agents==0). In-flight turns are untouched; this only blocks the
+        # claim of a NEW session slot. Internal/system events (restart-recovery
+        # replays, background-process completions) bypass the gate — they are
+        # not user-initiated new work and must still flow during a drain.
+        # Reversible: once the marker is removed the gate opens again.
+        if self._external_drain_active and not is_internal:
+            logger.info(
+                "Refusing new turn for session %s — external drain active.",
+                _quick_key,
+            )
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -9502,8 +11128,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._active_session_leases[_quick_key] = _active_session_lease
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
-        self._update_gateway_ledger(
+        await asyncio.to_thread(
+            self._update_gateway_ledger,
             event,
             "in_progress",
             session_key=_quick_key,
@@ -9526,35 +11154,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
                 if not _final_text:
-                    _final_text = str(getattr(event, "_hermes_final_response", "") or "")
+                    _final_text = str(
+                        getattr(event, "_hermes_final_response", "") or ""
+                    )
                 try:
-                    session_entry = self.session_store.get_or_create_session(source)
+                    session_entry = await self.async_session_store.get_or_create_session(
+                        source
+                    )
                 except Exception:
                     session_entry = None
                 if session_entry is not None:
-                    _auto_dispatched = False
-                    session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
-                    _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
-                    if _suppressed_callback_start:
-                        logger.info(
-                            "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
-                            session_key_for_goal,
-                        )
+                    auto_dispatched = False
+                    goal_session_key = (
+                        getattr(session_entry, "session_key", None) or _quick_key
+                    )
+                    callback_started = self._consume_goal_callback_started_session(
+                        goal_session_key
+                    )
+                    if callback_started:
                         await self._enqueue_goal_kickoff_prompt(
                             session_entry=session_entry,
                             source=source,
                         )
                     elif _final_text.strip():
-                        _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
+                        auto_dispatched = (
+                            await self._auto_dispatch_supergoal_from_response(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
                         )
-                    # Skip content-dependent judging for empty responses
-                    # (interrupted / errored), but still consume callback-start
-                    # markers above so button-started goals always get their
-                    # first kickoff even when the planning answer was streamed.
-                    if _final_text.strip() and not _auto_dispatched and not _suppressed_callback_start:
+                    if (
+                        _final_text.strip()
+                        and not auto_dispatched
+                        and not callback_started
+                    ):
                         await self._post_turn_goal_continuation(
                             session_entry=session_entry,
                             source=source,
@@ -9562,14 +11196,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
-            self._mark_gateway_ledger_after_agent_result(
+            await asyncio.to_thread(
+                self._mark_gateway_ledger_after_agent_result,
                 event,
                 _agent_result,
                 session_key=_quick_key,
             )
             return _agent_result
         except Exception as _agent_exc:
-            self._update_gateway_ledger(
+            await asyncio.to_thread(
+                self._update_gateway_ledger,
                 event,
                 "failed",
                 session_key=_quick_key,
@@ -9578,6 +11214,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             raise
         finally:
+            # MoA one-shot restore must run on EVERY exit path, not just
+            # success. The restore data lives on the per-turn event object
+            # (_moa_restore_override), which is discarded once the event goes
+            # out of scope — so if _handle_message_with_agent raises, a restore
+            # in the try block would be skipped and the MoA override would leak
+            # permanently (every later message silently fans out through MoA).
+            # Putting it in finally guarantees the revert on success, exception,
+            # and interrupt alike.
+            self._restore_moa_one_shot(event, _quick_key)
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -9586,6 +11231,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
             self._release_running_agent_state(_quick_key)
+
+    def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
+        """Revert a ``/moa <prompt>`` one-shot model override after its turn.
+
+        Called from the ``finally`` of the message-handling path so the revert
+        fires whether the turn succeeded, raised, or was interrupted. A no-op
+        unless ``event._moa_disable_after_turn`` is set. ``_moa_restore_override``
+        carries the prior per-session override (``None`` means the user had no
+        override, so the MoA override is cleared outright).
+        """
+        if not getattr(event, "_moa_disable_after_turn", False):
+            return
+        try:
+            _restore = getattr(event, "_moa_restore_override", None)
+            if _restore is None:
+                self._session_model_overrides.pop(quick_key, None)
+            else:
+                self._session_model_overrides[quick_key] = _restore
+            self._evict_cached_agent(quick_key)
+        except Exception:
+            pass
 
     async def _prepare_inbound_message_text(
         self,
@@ -9642,30 +11308,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if event.media_urls:
             image_paths = []
             audio_paths = []
-            _media_adapter = self.adapters.get(source.platform)
-            _route_check = getattr(_media_adapter, "_is_transcribe_route_chat", None) if _media_adapter is not None else None
-            _is_tg_transcribe_media = bool(callable(_route_check) and _route_check(source.chat_id))
+            media_adapter = self.adapters.get(source.platform)
+            route_check = (
+                getattr(media_adapter, "_is_transcribe_route_chat", None)
+                if media_adapter is not None
+                else None
+            )
+            is_transcribe_route = bool(
+                callable(route_check) and route_check(source.chat_id)
+            )
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
-                if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
+                # Classify images per-attachment: trust this attachment's own
+                # MIME, and only honour the message-level PHOTO type when the
+                # per-attachment MIME is unknown. Otherwise a document (or any
+                # non-image) sent alongside an image in the same message gets
+                # mis-routed here as an image and the provider 400s.
+                if _event_media_is_image(event, i):
                     image_paths.append(path)
-                # Normal chats do not auto-STT ordinary audio attachments because users
-                # may be sharing a file, not asking for transcription. Dedicated
-                # transcribe-route chats are different: any audio attachment is the task.
+                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
+                # MessageType.VOICE = voice message (Opus/OGG) — always STT
                 if event.message_type == MessageType.AUDIO:
-                    if _is_tg_transcribe_media:
+                    if is_transcribe_route:
                         audio_paths.append(path)
                     else:
                         audio_file_paths.append(path)
                 elif event.message_type == MessageType.VOICE or (
                     mtype.startswith("audio/")
                     and (
-                        _is_tg_transcribe_media
+                        is_transcribe_route
                         or event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
                     )
                 ):
                     audio_paths.append(path)
-                if mtype.startswith("video/") or event.message_type == MessageType.VIDEO:
+                if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
                     video_paths.append(path)
 
             if image_paths:
@@ -9697,75 +11373,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             if audio_paths:
-                # Telegram voice events can reach this path more than once during
-                # busy-session queueing, and some adapters may expose the same
-                # cached audio path twice.  Keep the agent transcript intact, but
-                # never echo the same STT result back to the user twice.
                 audio_paths = list(dict.fromkeys(audio_paths))
-                try:
-                    _ack_adapter = self.adapters.get(source.platform)
-                    _ack_is_transcribe = False
-                    if _ack_adapter is not None:
-                        _route_check = getattr(_ack_adapter, "_is_transcribe_route_chat", None)
-                        if callable(_route_check):
-                            _ack_is_transcribe = bool(_route_check(source.chat_id))
-                    if _ack_is_transcribe and _ack_adapter is not None:
-                        await _ack_adapter.send(
+                if is_transcribe_route and media_adapter is not None:
+                    try:
+                        anchor = self._reply_anchor_for_event(event)
+                        await media_adapter.send(
                             source.chat_id,
                             "Принял. Достаю медиа и транскрибирую. В конце пришлю 2 файла: транскрипт с таймкодами и /summ-саммари на русском.",
-                            reply_to=self._reply_anchor_for_event(event),
-                            metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                            reply_to=anchor,
+                            metadata=self._thread_metadata_for_source(source, anchor),
                         )
-                except Exception as exc:
-                    logger.debug("Transcribe-route ack send skipped: %s", exc)
-
+                    except Exception as exc:
+                        logger.debug("Transcribe-route ack send skipped: %s", exc)
                 message_text, _successful_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
-
-                # Echo each successful transcript back to the user immediately,
-                # before the agent loop runs. Lets the user verify STT quality
-                # in real-time and see the raw whisper output verbatim.
-                # Dedicated Telegram transcribe-route chats are different: their
-                # contract is two files only (transcript + Russian summary), so
-                # raw transcript chunks in chat are spam.
-                _echo_adapter = self.adapters.get(source.platform)
-                _suppress_transcript_echo = False
-                if _echo_adapter is not None:
-                    _route_check = getattr(_echo_adapter, "_is_transcribe_route_chat", None)
-                    if callable(_route_check):
-                        try:
-                            _suppress_transcript_echo = bool(_route_check(source.chat_id))
-                        except Exception:
-                            _suppress_transcript_echo = False
+                # Echo each successful transcript back to the user immediately
+                # when configured. Lets users verify STT quality in real-time,
+                # while allowing quiet STT for users who only want the agent to
+                # receive the transcription.
                 if (
                     _successful_transcripts
-                    and not _suppress_transcript_echo
-                    and getattr(self.config, "stt_echo_transcripts", True)
+                    and not is_transcribe_route
+                    and self._should_echo_stt_transcripts()
                 ):
+                    _echo_adapter = self._adapter_for_source(source)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        _seen = getattr(self, "_transcript_echo_seen", None)
-                        if _seen is None:
-                            _seen = set()
-                            self._transcript_echo_seen = _seen
                         for _tx in _successful_transcripts:
-                            _echo_key = (
-                                str(getattr(source.platform, "value", source.platform)),
-                                str(source.chat_id),
-                                str(getattr(source, "thread_id", None)),
-                                str(getattr(event, "message_id", None)),
-                                _tx,
-                            )
-                            if _echo_key in _seen:
-                                logger.debug("Transcript echo skipped as duplicate: chat=%s message=%s", source.chat_id, getattr(event, "message_id", None))
-                                continue
-                            if not self._claim_transcript_echo_once(source, event, _tx):
-                                continue
-                            _seen.add(_echo_key)
-                            if len(_seen) > 512:
-                                self._transcript_echo_seen = set(list(_seen)[-256:])
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
@@ -9776,70 +11412,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 logger.debug(
                                     "Transcript echo failed (non-fatal): %s", _echo_exc,
                                 )
-
-                # Transcription dropbox contract: after STT, immediately attach the
-                # raw transcript as a Telegram document. This is deterministic and
-                # does not depend on the LLM remembering to call write_file or to
-                # emit a MEDIA: directive in its final text.
-                try:
-                    _transcribe_adapter = self.adapters.get(source.platform)
-                    _is_tg_transcribe = False
-                    if _transcribe_adapter is not None:
-                        _route_check = getattr(_transcribe_adapter, "_is_transcribe_route_chat", None)
-                        if callable(_route_check):
-                            _is_tg_transcribe = bool(_route_check(source.chat_id))
-                    if _is_tg_transcribe and _transcribe_adapter is not None:
-                        _txt_paths = re.findall(r"\[Transcript text file was written to: ([^\]\n]+)\]", message_text or "")
-                        if _txt_paths and hasattr(_transcribe_adapter, "send_document"):
-                            _meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                            for _idx, _txt_path in enumerate(_txt_paths, 1):
-                                if os.path.exists(_txt_path):
-                                    _name = os.path.basename(_txt_path)
-                                    _cap = "Транскрипт с таймкодами .txt" if len(_txt_paths) == 1 else f"Транскрипт с таймкодами .txt ({_idx}/{len(_txt_paths)})"
-                                    await _transcribe_adapter.send_document(
-                                        source.chat_id,
-                                        _txt_path,
-                                        caption=_cap,
-                                        file_name=_name,
-                                        reply_to=self._reply_anchor_for_event(event),
-                                        metadata=_meta,
-                                    )
-                                    logger.info(
-                                        "Transcribe-route transcript document sent: chat=%s path=%s",
-                                        source.chat_id,
-                                        _txt_path,
-                                    )
-                except Exception as exc:
-                    logger.warning("Transcribe-route transcript document send failed: %s", exc, exc_info=True)
-                _stt_fail_markers = (
-                    "No STT provider",
-                    "STT is disabled",
-                    "can't listen",
-                    "VOICE_TOOLS_OPENAI_KEY",
-                )
-                if any(marker in message_text for marker in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`uv pip install faster-whisper` in the Hermes venv; "
-                                "`pip install faster-whisper` also works if pip is on PATH) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
+                if is_transcribe_route and media_adapter is not None:
+                    try:
+                        transcript_paths = re.findall(
+                            r"\[Transcript text file was written to: ([^\]\n]+)\]",
+                            message_text or "",
+                        )
+                        if not transcript_paths and _successful_transcripts:
+                            transcript_path = str(
+                                Path(audio_paths[0]).with_suffix(".transcript-timecoded.txt")
                             )
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id,
-                                _stt_msg,
-                                metadata=_stt_meta,
+                            Path(transcript_path).write_text(
+                                "\n\n".join(_successful_transcripts).strip() + "\n",
+                                encoding="utf-8",
                             )
-                        except Exception:
-                            pass
+                            transcript_paths = [transcript_path]
+                        if hasattr(media_adapter, "send_document"):
+                            anchor = self._reply_anchor_for_event(event)
+                            metadata = self._thread_metadata_for_source(source, anchor)
+                            for index, transcript_path in enumerate(transcript_paths, 1):
+                                if not os.path.exists(transcript_path):
+                                    continue
+                                caption = (
+                                    "Транскрипт с таймкодами .txt"
+                                    if len(transcript_paths) == 1
+                                    else f"Транскрипт с таймкодами .txt ({index}/{len(transcript_paths)})"
+                                )
+                                await media_adapter.send_document(
+                                    source.chat_id,
+                                    transcript_path,
+                                    caption=caption,
+                                    file_name=os.path.basename(transcript_path),
+                                    reply_to=anchor,
+                                    metadata=metadata,
+                                )
+                    except Exception as exc:
+                        logger.warning("Transcribe-route transcript document send failed: %s", exc)
+                # NOTE: Previously, when transcription failed (e.g. no STT
+                # provider configured), the gateway also emitted a hardcoded
+                # English notice via `_stt_adapter.send()`. That bypassed the
+                # LLM and produced two replies — one pre-canned English clip
+                # (which TTS then spoke aloud, in the wrong language) and one
+                # correct, localized LLM reply from the enriched message text.
+                # The enrichment step now leaves a single neutral marker in the
+                # prompt, so the LLM produces one coherent reply in the user's
+                # language. The hardcoded send has therefore been removed.
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
@@ -9849,22 +11466,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _display = _parts[2] if len(_parts) >= 3 else _basename
                 _display = re.sub(r'[^\w.\- ]', '_', _display)
                 _agent_path = _to_agent_path(_apath)
-                if "transcribe-route media recovered via telegram-chip" in message_text:
-                    _note = (
-                        f"[The user sent an audio file attachment: '{_display}'. "
-                        f"It is saved at: {_agent_path}. "
-                        f"Transcribe this file now and return the transcript first.]"
-                    )
-                else:
-                    _note = (
-                        f"[The user sent an audio file attachment: '{_display}'. "
-                        f"It is saved at: {_agent_path}. "
-                        f"Its content is not inlined here. If the user's request involves "
-                        f"what the audio contains, transcribe or process it yourself — for "
-                        f"example by passing the path to a transcription or media tool — "
-                        f"instead of asking the user to describe it. Only ask what to do "
-                        f"with it if their intent is genuinely unclear.]"
-                    )
+                _note = (
+                    f"[The user sent an audio file attachment: '{_display}'. "
+                    f"It is saved at: {_agent_path}. "
+                    f"Its content is not inlined here. If the user's request involves "
+                    f"what the audio contains, transcribe or process it yourself — for "
+                    f"example by passing the path to a transcription or media tool — "
+                    f"instead of asking the user to describe it. Only ask what to do "
+                    f"with it if their intent is genuinely unclear.]"
+                )
                 message_text = f"{_note}\n\n{message_text}"
 
         if video_paths:
@@ -9886,12 +11496,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 message_text = f"{_note}\n\n{message_text}"
 
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+        if event.media_urls:
             import mimetypes as _mimetypes
             from tools.credential_files import to_agent_visible_cache_path
 
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
+                # Per-attachment document handling. Skip anything already routed
+                # as image / audio / video by the buckets above — only genuine
+                # non-media files get a path-pointing context note. This makes a
+                # document mixed into a PHOTO/VOICE message (whole-message type
+                # != DOCUMENT) still reach the agent as a readable cached file,
+                # instead of being silently dropped because the message-level
+                # type wasn't DOCUMENT.
+                if (
+                    _event_media_is_image(event, i)
+                    or _event_media_is_audio(event, i)
+                    or _event_media_is_video(event, i)
+                ):
+                    continue
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype in {"", "application/octet-stream"}:
                     _ext = os.path.splitext(path)[1].lower()
@@ -9901,8 +11524,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         guessed, _ = _mimetypes.guess_type(path)
                         if guessed:
                             mtype = guessed
-                if not mtype.startswith(("application/", "text/")):
-                    continue
+                        else:
+                            mtype = "application/octet-stream"
+                # Any accepted file gets a path-pointing context note — we accept
+                # all file types now, so a non-text/non-application MIME (font/*,
+                # model/*, etc.) must still tell the agent the file exists.
 
                 basename = os.path.basename(path)
                 parts = basename.split("_", 2)
@@ -9917,34 +11543,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"
 
+        # Discord: surface the triggering message id per-turn on the user
+        # message rather than in the cached system prompt. message_id changes
+        # every turn, so baking it into build_session_context_prompt() would
+        # bust the agent-cache signature and rebuild the AIAgent every message
+        # (destroying prompt caching). The static IDs block points the agent
+        # here; the volatile id rides the per-turn user content.
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(event, "message_id", None)
+        ):
+            from gateway.session import _discord_tools_loaded as _disc_tools_loaded
+            if _disc_tools_loaded():
+                message_text = (
+                    f"[Triggering message id: `{event.message_id}` — use as "
+                    f"`message_id` for reply/react/pin via the discord tools.]\n\n"
+                    f"{message_text}"
+                )
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always preserve the reply-to pointer — even when the quoted text
-            # already appears in history. For replies to our own/bot-authored
-            # messages, keep the quote out of the persisted user turn: otherwise
-            # bot/tool/status text appears in transcripts as if the user authored
-            # it. Put that context into the ephemeral system prompt instead.
+            # Bot-authored quotes belong in ephemeral context, not in the
+            # persisted user turn where tool/status text would look as though
+            # the user authored it. Human-authored targets keep the compact
+            # disambiguation prefix in the turn itself.
             reply_snippet = str(event.reply_to_text or "")[:500]
             if getattr(event, "reply_to_is_own_message", False):
                 reply_note = (
-                    '[CURRENT TELEGRAM REPLY — use this context to interpret the current user message. '
-                    f'The user replied to previous bot/assistant message ID {event.reply_to_message_id}; '
-                    f'the quoted text is NOT user-authored: "{reply_snippet}"]'
+                    "[CURRENT TELEGRAM REPLY — use this context to interpret "
+                    "the current user message. The user replied to previous "
+                    f"bot/assistant message ID {event.reply_to_message_id}; "
+                    "the quoted text is NOT user-authored: "
+                    f'"{reply_snippet}"]'
                 )
-                existing_context = str(getattr(event, "recent_context", "") or "").strip()
-                event.recent_context = f"{existing_context}\n\n{reply_note}" if existing_context else reply_note
+                existing_context = str(
+                    getattr(event, "recent_context", "") or ""
+                ).strip()
+                event.recent_context = (
+                    f"{existing_context}\n\n{reply_note}"
+                    if existing_context
+                    else reply_note
+                )
             else:
-                # For human-authored reply targets, the prefix remains in the
-                # user turn as a compact disambiguation pointer.
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async
-                from agent.model_metadata import get_model_context_length
+                from agent.model_metadata import get_model_context_length_async
 
                 _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
-                _msg_runtime = _resolve_runtime_agent_kwargs()
                 _msg_config_ctx = None
+                _msg_cfg = None
+                _msg_model_cfg = {}
+                _msg_custom_providers = []
                 try:
                     _msg_cfg = _load_gateway_config()
                     _msg_model_cfg = _msg_cfg.get("model", {})
@@ -9952,13 +11604,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
                         if _msg_raw_ctx is not None:
                             _msg_config_ctx = int(_msg_raw_ctx)
+                    try:
+                        from hermes_cli.config import get_compatible_custom_providers
+
+                        _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+                    except Exception:
+                        _msg_custom_providers = _msg_cfg.get("custom_providers") or []
                 except Exception:
                     pass
-                _msg_ctx_len = get_model_context_length(
-                    self._model,
-                    base_url=self._base_url or _msg_runtime.get("base_url") or "",
+                # Resolve the session's actual model/provider/base_url the
+                # same way the hygiene compression block does (~11080).
+                # GatewayRunner has no self._model/self._base_url attrs
+                # (that was copy-pasted from HermesCLI, which does carry
+                # self.model/self.base_url), so using them here always raised
+                # AttributeError, silently caught below, meaning this feature
+                # never ran.
+                _msg_model, _msg_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=_msg_cfg,
+                )
+                _msg_base_url = _msg_runtime.get("base_url") or ""
+                # A global model.context_length belongs to the configured
+                # model, not a session /model or channel override. Prefer a
+                # matching per-custom-provider model limit when available.
+                _msg_configured_model = (
+                    _msg_model_cfg.get("default") or _msg_model_cfg.get("model")
+                    if isinstance(_msg_model_cfg, dict)
+                    else _msg_model_cfg
+                )
+                if _msg_model != _msg_configured_model:
+                    _msg_config_ctx = None
+                if _msg_custom_providers and _msg_base_url:
+                    try:
+                        from hermes_cli.config import get_custom_provider_context_length
+
+                        _msg_custom_ctx = get_custom_provider_context_length(
+                            model=_msg_model,
+                            base_url=_msg_base_url,
+                            custom_providers=_msg_custom_providers,
+                        )
+                        if _msg_custom_ctx:
+                            _msg_config_ctx = _msg_custom_ctx
+                    except Exception:
+                        pass
+                _msg_ctx_len = await get_model_context_length_async(
+                    _msg_model,
+                    base_url=_msg_base_url,
                     api_key=_msg_runtime.get("api_key") or "",
                     config_context_length=_msg_config_ctx,
+                    provider=_msg_runtime.get("provider") or "",
+                    custom_providers=_msg_custom_providers,
                 )
                 _ctx_result = await preprocess_context_references_async(
                     message_text,
@@ -9977,9 +11673,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _ctx_result.expanded:
                     message_text = _ctx_result.message
             except Exception as exc:
-                logger.debug("@ context reference expansion failed: %s", exc)
+                logger.warning("@ context reference expansion failed: %s", exc)
+                logger.debug("@ context reference expansion failure detail", exc_info=True)
 
         return message_text
+
+    async def _prepare_profile_scoped_inbound_message_text(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        history: List[Dict[str, Any]],
+        session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Run inbound preprocessing under the routed profile when multiplexed."""
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return await self._prepare_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=history,
+                    session_key=session_key,
+                )
+        return await self._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=history,
+            session_key=session_key,
+        )
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -10008,6 +11729,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    @property
+    def async_session_store(self) -> AsyncSessionStore:
+        """Return the single async facade for this runner's SessionStore."""
+        facade = getattr(self, "_async_session_store", None)
+        if facade is None or facade._store is not self.session_store:
+            facade = AsyncSessionStore(self.session_store)
+            self._async_session_store = facade
+        return facade
+
     def _get_cached_session_source(self, session_key: str):
         if not session_key:
             return None
@@ -10027,21 +11757,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _reply_id = getattr(event, "reply_to_message_id", None)
+        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s reply_to=%s reply_text=%s own_reply=%s msg=%r",
+            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown",
-            getattr(event, "reply_to_message_id", None) or "-",
-            bool(getattr(event, "reply_to_text", None)),
-            bool(getattr(event, "reply_to_is_own_message", False)),
-            _msg_preview,
+            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
         # doesn't fragment the conversation across sessions.
-        recovered = self._recover_telegram_topic_thread_id(source)
+        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
@@ -10053,22 +11781,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        self._update_gateway_ledger(
-            event,
-            "in_progress",
-            session_key=session_key,
-            session_id=session_entry.session_id,
-            reason="session-entry-resolved",
-        )
-        self._cache_session_source(session_key, source)
-        if self._is_telegram_topic_lane(source):
+        pinned_session_id = str(
+            (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
+        ).strip()
+        if pinned_session_id and pinned_session_id != session_entry.session_id:
+            # Fail closed (#55578): the spawning session may have ENDED since
+            # dispatch (user /new-reset, compression rotation whose parent was
+            # closed). switch_session() re-opens ended sessions, so pinning
+            # blindly would RESURRECT a conversation the user explicitly
+            # ended and inject into it — the same illicit-revival class as
+            # the ws_orphan_reap loop (#60609). A completion whose spawning
+            # session is dead is dropped from injection; the subagent's
+            # output remains in the delegation records.
+            pinned_row = None
             try:
-                binding = self._session_db.get_telegram_topic_binding(
+                if self._session_db is not None:
+                    # AsyncSessionDB already offloads to a thread.
+                    pinned_row = await self._session_db.get_session(pinned_session_id)
+            except Exception:
+                pinned_row = None
+            if pinned_row is None or pinned_row.get("ended_at"):
+                logger.warning(
+                    "Async-delegation completion pinned to session %s, which is "
+                    "%s — dropping injection instead of resurrecting it "
+                    "(#55578 fail-closed; result remains in the delegation "
+                    "records).",
+                    pinned_session_id,
+                    "unknown" if pinned_row is None else "ended",
+                )
+                return
+            prior_session_id = session_entry.session_id
+            switched = await self.async_session_store.switch_session(session_key, pinned_session_id)
+            if switched is not None:
+                session_entry = switched
+                logger.info(
+                    "Pinned async-delegation completion to spawning session %s "
+                    "(was %s) for routing key %s (#57498)",
+                    pinned_session_id,
+                    prior_session_id,
+                    session_key,
+                )
+        self._cache_session_source(session_key, source)
+        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+            try:
+                binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
-                ) if self._session_db else None
+                )) if self._session_db else None
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
                 binding = None
@@ -10082,7 +11843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # a compression parent, so this is cheap and safe.
                 if bound_session_id and self._session_db is not None:
                     try:
-                        canonical_session_id = self._session_db.get_compression_tip(
+                        canonical_session_id = await self._session_db.get_compression_tip(
                             bound_session_id,
                         )
                     except Exception:
@@ -10102,7 +11863,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # lane session is ended cleanly. Mutating session_entry in
                     # place here created a split-brain state where the JSON
                     # index pointed at one id but code downstream used another.
-                    switched = self.session_store.switch_session(session_key, bound_session_id)
+                    switched = await self.async_session_store.switch_session(session_key, bound_session_id)
                     if switched is not None:
                         session_entry = switched
                 # If the stored binding pointed at a parent, rewrite it to the
@@ -10111,15 +11872,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     bound_session_id
                     and bound_session_id != str(binding.get("session_id") or "")
                 ):
-                    self._sync_telegram_topic_binding(
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-tip-walk",
                     )
             else:
                 try:
-                    self._record_telegram_topic_binding(source, session_entry)
+                    await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
-        if getattr(session_entry, "was_auto_reset", False):
+        # Capture and immediately consume was_auto_reset so it does not
+        # re-fire on subsequent messages — preventing the cleanup from
+        # wiping model/reasoning overrides set between turns (Closes #48031).
+        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
+        if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
             # inherit the previous conversation's model/reasoning overrides
@@ -10128,11 +11894,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+            # Clear per-session model cache so the fresh session resolves
+            # from current config, not a stale fallback cached before the
+            # auto-reset (mirrors /new and the compression-exhausted
+            # auto-reset, #58403).
+            _lrm = getattr(self, "_last_resolved_model", None)
+            if _lrm is not None:
+                _lrm.pop(session_key, None)
+            # Evict the cached agent so the fresh session does not inherit the
+            # previous conversation's context_compressor._previous_summary —
+            # the cache is keyed on the stable session_key, so an auto-reset
+            # otherwise reuses the old agent and leaks prior history into new
+            # compaction summaries. Mirrors /reset and the compression-exhausted
+            # path (#9893). Covers daily/idle/suspended auto-reset.
+            self._evict_cached_agent(session_key)
+            session_entry.was_auto_reset = False
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
-            or getattr(session_entry, "was_auto_reset", False)
+            or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
         )
         # Consume the is_fresh_reset flag immediately so it doesn't leak
@@ -10155,6 +11936,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
+        persist_user_message = None
+        persist_user_timestamp = None
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -10166,7 +11949,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
-        if getattr(session_entry, 'was_auto_reset', False):
+        if _was_auto_reset:
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
@@ -10227,7 +12010,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
-            session_entry.was_auto_reset = False
+            # was_auto_reset is already consumed in the cleanup block above
+            # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
@@ -10267,7 +12051,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
         # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
+        history = await self.async_session_store.load_transcript(session_entry.session_id)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10287,7 +12071,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if history and len(history) >= 4:
             from agent.model_metadata import (
                 estimate_messages_tokens_rough,
-                get_model_context_length,
+                get_model_context_length_async,
             )
 
             # Read model + compression config from config.yaml.
@@ -10301,7 +12085,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
-            _hyg_hard_msg_limit = 400
+            _hyg_hard_msg_limit = 5000
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -10388,7 +12172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
             if _hyg_compression_enabled:
-                _hyg_context_length = get_model_context_length(
+                _hyg_context_length = await get_model_context_length_async(
                     _hyg_model,
                     base_url=_hyg_base_url or "",
                     api_key=_hyg_api_key or "",
@@ -10423,8 +12207,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # extreme, regardless of token estimates.  This breaks the
                 # death spiral where API disconnects prevent token data
                 # collection, which prevents compression, which causes more
-                # disconnects.  400 messages is well above normal sessions
-                # but catches runaway growth before it becomes unrecoverable.
+                # disconnects.  5000 messages is far above any normal session
+                # but catches truly runaway growth before it becomes
+                # unrecoverable.  Set well clear of legitimate large-context
+                # (1M+) sessions doing thousands of short turns — those
+                # compress on the token threshold, not this count-based floor.
                 # Threshold is configurable via
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
@@ -10470,6 +12257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             ]
 
                             if len(_hyg_msgs) >= 4:
+                                _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -10478,8 +12266,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
+                                    session_db=_hyg_session_db,
                                 )
                                 try:
+                                    # Gateway hygiene runs before the user turn
+                                    # starts and already owns the session binding.
+                                    # Prefer in-place compaction here: it archives
+                                    # old rows under the same session id instead of
+                                    # minting a continuation child that then has to
+                                    # be published back to SessionStore/topic
+                                    # bindings.  If no SessionDB is available,
+                                    # compress_context leaves this flag false and
+                                    # the guard below preserves the transcript.
+                                    _hyg_agent.compression_in_place = True
+                                    _bind_hyg_state = getattr(
+                                        getattr(_hyg_agent, "context_compressor", None),
+                                        "bind_session_state",
+                                        None,
+                                    )
+                                    if callable(_bind_hyg_state):
+                                        _bind_hyg_state(
+                                            _hyg_session_db,
+                                            session_entry.session_id,
+                                        )
+                                    # It must never finalize on close() — close()
+                                    # would end the live gateway session row.
+                                    _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
                                     loop = asyncio.get_running_loop()
@@ -10496,24 +12308,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # the NEW session so the old transcript stays intact
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
-                                    if _hyg_new_sid != session_entry.session_id:
+                                    _hyg_rotated = _hyg_new_sid != session_entry.session_id
+                                    _hyg_in_place = bool(
+                                        getattr(_hyg_agent, "_last_compaction_in_place", False)
+                                    )
+                                    if _hyg_rotated:
                                         session_entry.session_id = _hyg_new_sid
-                                        self.session_store._save()
-                                        self._sync_telegram_topic_binding(
+                                        await self.async_session_store._save()
+                                        await asyncio.to_thread(
+                                            self._sync_telegram_topic_binding,
                                             source, session_entry,
                                             reason="hygiene-compression",
                                         )
 
-                                    self.session_store.rewrite_transcript(
-                                        session_entry.session_id, _compressed
-                                    )
-                                    # Reset stored token count — transcript was rewritten
-                                    session_entry.last_prompt_tokens = 0
-                                    history = _compressed
-                                    _new_count = len(_compressed)
-                                    _new_tokens = estimate_messages_tokens_rough(
-                                        _compressed
-                                    )
+                                    # Only rewrite the transcript when rotation produced
+                                    # a NEW session id.  In-place compaction does NOT
+                                    # need a rewrite: archive_and_compact() has already
+                                    # soft-archived the previous active rows and inserted
+                                    # the compacted messages as the new active set inside
+                                    # _compress_context().  Calling rewrite_transcript()
+                                    # after in-place compaction would invoke
+                                    # replace_messages(active_only=False) which DELETEs
+                                    # ALL rows — including the archived turns that
+                                    # archive_and_compact() deliberately preserved
+                                    # (silent data loss, #61145).
+                                    #
+                                    # The danger this guards against (mirrors the
+                                    # /compress fix #44794/#39704): if _compress_context
+                                    # returns a summary but neither rotates nor completes
+                                    # archive_and_compact(), the session_id is unchanged
+                                    # for a FAILURE reason, and an unconditional
+                                    # rewrite_transcript() would DELETE the original
+                                    # messages and replace them with only the compressed
+                                    # summary (permanent data loss, #21301).
+                                    if _hyg_rotated:
+                                        await self.async_session_store.rewrite_transcript(
+                                            session_entry.session_id, _compressed
+                                        )
+                                        # Reset stored token count — transcript rewritten
+                                        session_entry.last_prompt_tokens = 0
+                                        history = _compressed
+                                        _new_count = len(_compressed)
+                                        _new_tokens = estimate_messages_tokens_rough(
+                                            _compressed
+                                        )
+                                    elif _hyg_in_place:
+                                        # archive_and_compact() already persisted the
+                                        # compacted transcript inside _compress_context.
+                                        # Reset counts to match the new active set.
+                                        session_entry.last_prompt_tokens = 0
+                                        history = _compressed
+                                        _new_count = len(_compressed)
+                                        _new_tokens = estimate_messages_tokens_rough(
+                                            _compressed
+                                        )
+                                    else:
+                                        # No rewrite happened — transcript preserved
+                                        # unchanged, so the post-compression counts equal
+                                        # the pre-compression ones.
+                                        _new_count = _msg_count
+                                        _new_tokens = _approx_tokens
+                                        logger.warning(
+                                            "Gateway hygiene compression for session %s "
+                                            "did not rotate or compact in place "
+                                            "(no session_db on the hygiene agent) — "
+                                            "preserving the original transcript instead "
+                                            "of overwriting it with the summary (#21301).",
+                                            session_entry.session_id,
+                                        )
 
                                     logger.info(
                                         "Session hygiene: compressed %s → %s msgs, "
@@ -10587,7 +12449,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.
                                     self._evict_cached_agent(session_key)
-                                    self._cleanup_agent_resources(_hyg_agent)
+                                    await self._cleanup_agent_resources_off_loop(
+                                        _hyg_agent, context="session hygiene"
+                                    )
 
                     except Exception as e:
                         logger.warning(
@@ -10595,7 +12459,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
         # First-message onboarding -- only on the very first interaction ever
-        if not history and not self.session_store.has_any_sessions():
+        if not history and not await self.async_session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
             _intro_note = (
                 "\n\n[System note: This is the user's very first message ever. "
@@ -10680,20 +12544,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            message_text = await self._prepare_profile_scoped_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
+        else:
+            message_text = await self._prepare_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
         if message_text is None:
             return
 
-        # Reply-to context is finalized by _prepare_inbound_message_text().
-        # Append it only now: doing this before preprocessing silently dropped
-        # bot-authored reply targets from the model prompt, so a Telegram reply
-        # like "Прочитай" arrived without the message it referenced.
         context_prompt = _append_recent_context_prompt(context_prompt, event)
+
+        # Capture the platform event time as message metadata and keep the
+        # persisted transcript clean (strip any leading timestamp prefix).
+        # This runs regardless of the toggle so storage stays clean and the
+        # send-time is preserved. Only the in-context RENDER (prepending the
+        # human-readable prefix the model sees) is gated behind
+        # gateway.message_timestamps.enabled — default OFF.
+        try:
+            from hermes_time import get_timezone as _get_evt_tz
+            from gateway.message_timestamps import (
+                coerce_message_timestamp as _coerce_msg_ts,
+                render_user_content_with_timestamp as _render_msg_ts,
+                strip_leading_message_timestamps as _strip_msg_ts,
+            )
+            _evt_tz = _get_evt_tz()
+            _evt_ts = getattr(event, "timestamp", None)
+            if message_text and isinstance(message_text, str):
+                _clean_message_text, _embedded_ts = _strip_msg_ts(
+                    message_text, tz=_evt_tz)
+                persist_user_message = _clean_message_text
+                _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
+                persist_user_timestamp = (
+                    _event_epoch if _event_epoch is not None else _embedded_ts
+                )
+                if _message_timestamps_enabled(_load_gateway_config()):
+                    message_text = _render_msg_ts(
+                        _clean_message_text,
+                        persist_user_timestamp,
+                        tz=_evt_tz,
+                    )
+                else:
+                    # Toggle off: model sees the clean message; the timestamp
+                    # is still stored as metadata for later opt-in.
+                    message_text = _clean_message_text
+        except Exception as _ts_err:
+            logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -10732,6 +12636,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                moa_config=getattr(event, "_moa_config", None),
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -10759,14 +12666,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
-            if agent_result.get("suppress_delivery"):
-                logger.info(
-                    "agent result suppressed delivery: platform=%s chat=%s error=%s",
-                    _platform_name,
-                    source.chat_id or "unknown",
-                    str(agent_result.get("error") or "")[:160],
-                )
-                return None
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -10796,19 +12695,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _response_time, _api_calls, _resp_len,
             )
 
-            # Re-baseline the cached agent's message_count snapshot now that
-            # this turn has completed and the agent has flushed its rows to
-            # the SessionDB.  The cross-process coherence guard (#45966)
-            # snapshots the count at agent-BUILD time (before this turn's own
-            # writes) and never refreshes it on reuse — so without this, this
-            # process's own turn would grow the count and the next turn would
-            # see a mismatch and rebuild the agent every turn, destroying
-            # prompt caching.  Refreshing here makes the guard fire only on a
-            # DIFFERENT process's writes.  Uses the (possibly compaction-
-            # updated) live session_id.  Fail-safe inside the helper.
-            self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
-            )
+            # NOTE: the cross-process cache-coherence re-baseline
+            # (_refresh_agent_cache_message_count) is intentionally deferred
+            # until AFTER this turn's transcript persistence block below — it
+            # must include the first-turn `session_meta` marker row and the
+            # compression session_id swap, both of which happen later.  See
+            # the call site after the `update_session(...)` write.
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
@@ -10821,7 +12713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
                 try:
-                    self.session_store.clear_resume_pending(session_key)
+                    await self.async_session_store.clear_resume_pending(session_key)
                 except Exception as _e:
                     logger.debug(
                         "clear_resume_pending failed for %s: %s",
@@ -10842,22 +12734,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 if session_entry.session_id == _run_start_session_id:
-                    old_session_id = session_entry.session_id
-                    new_session_id = agent_result["session_id"]
-                    try:
-                        from hermes_cli.goals import migrate_goal_to_session
-
-                        migrate_goal_to_session(old_session_id, new_session_id)
-                    except Exception as _goal_migrate_exc:
-                        logger.debug(
-                            "goal migration after agent-result compression failed %s -> %s: %s",
-                            old_session_id,
-                            new_session_id,
-                            _goal_migrate_exc,
-                        )
-                    session_entry.session_id = new_session_id
-                    self.session_store._save()
-                    self.session_store._record_gateway_session_peer(
+                    session_entry.session_id = agent_result["session_id"]
+                    await self.async_session_store._save()
+                    await self.async_session_store._record_gateway_session_peer(
                         session_entry.session_id,
                         session_key,
                         source,
@@ -10876,17 +12755,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_entry.session_id,
                     )
 
-            # Prepend reasoning/thinking if display is enabled (per-platform)
+            # Prepend reasoning/thinking if display is enabled (per-platform).
+            # Mattermost requires explicit per-platform opt-in because this is
+            # scratch text, not ordinary final-answer content.
             try:
-                from gateway.display_config import resolve_display_setting as _rds
-                _show_reasoning_effective = _rds(
+                _show_reasoning_effective = _resolve_gateway_display_bool(
                     _load_gateway_config(),
                     _platform_config_key(source.platform),
                     "show_reasoning",
-                    getattr(self, "_show_reasoning", False),
+                    default=bool(getattr(self, "_show_reasoning", False)),
+                    platform=source.platform,
+                    require_platform_override_for={Platform.MATTERMOST},
                 )
             except Exception:
-                _show_reasoning_effective = getattr(self, "_show_reasoning", False)
+                _show_reasoning_effective = (
+                    False
+                    if source.platform == Platform.MATTERMOST
+                    else getattr(self, "_show_reasoning", False)
+                )
             if _show_reasoning_effective and response and not _intentional_silence:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
@@ -10897,7 +12783,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
                     else:
                         display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+                    # Render style is per-platform: Discord defaults to "-# "
+                    # subtext (native small grey metadata text); other
+                    # platforms keep the fenced code block.
+                    try:
+                        from gateway.display_config import resolve_display_setting
+                        _reasoning_style = resolve_display_setting(
+                            _load_gateway_config(),
+                            _platform_config_key(source.platform),
+                            "reasoning_style",
+                            "code",
+                        )
+                    except Exception:
+                        _reasoning_style = "code"
+                    if _reasoning_style == "subtext":
+                        _quoted = "\n".join(
+                            f"-# {ln}" if ln else "-#" for ln in display_reasoning.splitlines()
+                        )
+                        response = f"-# 💭 Reasoning\n{_quoted}\n\n{response}"
+                    elif _reasoning_style == "blockquote":
+                        _quoted = "\n".join(
+                            f"> {ln}" if ln else ">" for ln in display_reasoning.splitlines()
+                        )
+                        response = f"> 💭 **Reasoning:**\n{_quoted}\n\n{response}"
+                    else:
+                        response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
@@ -10942,18 +12852,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.error("Process watcher setup error: %s", e)
 
             # Drain watch pattern notifications that arrived during the agent run.
-            # Watch events and completions share the same queue; completions are
-            # already handled by the per-process watcher task above, so we only
-            # inject watch-type events here.
+            # Watch events and completions share the same queue; process
+            # completions are already handled by the per-process watcher task
+            # above, so we only inject watch-type events here.
+            #
+            # Async-delegation completions ALSO ride this shared queue but are
+            # owned by the dedicated _async_delegation_watcher (started at
+            # boot), which covers both the idle and post-turn cases with a
+            # single consumer — so we leave them on the queue here.
             try:
                 from tools.process_registry import process_registry as _pr
-                _watch_events = []
-                while not _pr.completion_queue.empty():
-                    evt = _pr.completion_queue.get_nowait()
-                    evt_type = evt.get("type", "completion")
-                    if evt_type in {"watch_match", "watch_disabled"}:
-                        _watch_events.append(evt)
-                    # else: completion events are handled by the watcher task
+                _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
                 for evt in _watch_events:
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
@@ -11025,7 +12934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
                 )
-                new_entry = self.session_store.reset_session(session_key)
+                new_entry = await self.async_session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
                 self._session_model_overrides.pop(session_key, None)
                 self._set_session_reasoning_override(session_key, None)
@@ -11050,7 +12959,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # forever (#35809 — regression of the #9893/#10063 auto-reset).
                     # No-op on non-topic lanes.
                     session_entry = new_entry
-                    self._sync_telegram_topic_binding(
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-exhausted-reset",
                     )
                 response = (response or "") + (
@@ -11059,7 +12969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Your next message will start a fresh session."
                 )
 
-            ts = datetime.now().isoformat()
+            ts = time.time()  # Unix epoch float — consistent with DB storage
             
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
@@ -11068,7 +12978,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
-                self.session_store.append_to_transcript(
+                await self.async_session_store.append_to_transcript(
                     session_entry.session_id,
                     {
                         "role": "session_meta",
@@ -11081,8 +12991,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # The agent already persisted these messages to SQLite via
             # _flush_messages_to_session_db(), so skip the DB write here
-            # to prevent the duplicate-write bug (#860 / #42039).
-            agent_persisted = self._session_db is not None
+            # to prevent the duplicate-write bug (#860 / #42039). This holds
+            # for the codex app-server runtime too: although it early-returns
+            # and bypasses conversation_loop's per-step flushes, it flushes its
+            # own projected assistant/tool messages before returning and
+            # reports agent_persisted=True (see agent/codex_runtime.py). Reading
+            # the flag (default = self._session_db is not None) keeps the
+            # persistence contract explicit and lets any future non-persisting
+            # runtime opt into a gateway-side write by returning False.
+            agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
 
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
@@ -11095,30 +13012,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
                 # it's a gateway-generated hint, not model output. (#7100)
-                _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                _user_entry = {
+                    "role": "user",
+                    "content": (
+                        persist_user_message
+                        if persist_user_message is not None
+                        else message_text
+                    ),
+                    "timestamp": (
+                        persist_user_timestamp
+                        if persist_user_timestamp is not None
+                        else ts
+                    ),
+                }
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
-                self.session_store.append_to_transcript(
-                    session_entry.session_id,
-                    _user_entry,
-                    skip_db=agent_persisted,
+                # Dedupe: skip if this platform message_id is already in the
+                # transcript (prevents duplicate user turns on Telegram retries
+                # after transient failures). #47237
+                _skip_persist = (
+                    event.message_id
+                    and await self.async_session_store.has_platform_message_id(
+                        session_entry.session_id, str(event.message_id)
+                    )
                 )
+                if _skip_persist:
+                    logger.info(
+                        "Skipping duplicate user turn "
+                        "(message_id=%s) in session %s",
+                        event.message_id, session_entry.session_id,
+                    )
+                else:
+                    await self.async_session_store.append_to_transcript(
+                        session_entry.session_id,
+                        _user_entry,
+                        skip_db=agent_persisted,
+                    )
             else:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
-                    _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                    _user_entry = {
+                        "role": "user",
+                        "content": (
+                            persist_user_message
+                            if persist_user_message is not None
+                            else message_text
+                        ),
+                        "timestamp": (
+                            persist_user_timestamp
+                            if persist_user_timestamp is not None
+                            else ts
+                        ),
+                    }
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
-                    self.session_store.append_to_transcript(
+                    await self.async_session_store.append_to_transcript(
                         session_entry.session_id,
                         _user_entry,
                         skip_db=agent_persisted,
                     )
                     if response:
-                        self.session_store.append_to_transcript(
+                        await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
                             {"role": "assistant", "content": response, "timestamp": ts},
                             skip_db=agent_persisted,
@@ -11143,7 +13100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        self.session_store.append_to_transcript(
+                        await self.async_session_store.append_to_transcript(
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
                         )
@@ -11151,9 +13108,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
-            self.session_store.update_session(
+            await self.async_session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
+
+            # Re-baseline the cached agent's message_count snapshot now that
+            # ALL of this turn's transcript writes are done — the agent's
+            # flushed user/assistant/tool rows AND the first-turn `session_meta`
+            # marker appended above.  The cross-process coherence guard (#45966)
+            # snapshots the count at agent-BUILD time (before this turn's own
+            # writes) and never refreshes it on reuse, so without this the
+            # process's own turn grows message_count and the next turn sees a
+            # mismatch and rebuilds the agent — destroying prompt caching.
+            #
+            # This MUST run after the `session_meta` append: that row also
+            # increments message_count, so re-baselining before it (the old
+            # position) left the snapshot one short and the guard mis-fired on
+            # turn 2 of EVERY fresh gateway conversation, rebuilding the cached
+            # agent and busting the prompt cache.  Running here also uses the
+            # compaction-updated session_id (the agent_result session_id swap
+            # above), matching this function's documented contract.  Refreshing
+            # here makes the guard fire only on a DIFFERENT process's writes.
+            # Fail-safe inside the helper.
+            await self._refresh_agent_cache_message_count(
+                session_key, session_entry.session_id
             )
 
             # Intentional silence is a delivery decision, not a transcript
@@ -11184,41 +13163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            try:
-                _summary_adapter = self.adapters.get(source.platform)
-                _summary_is_transcribe = False
-                if _summary_adapter is not None:
-                    _route_check = getattr(_summary_adapter, "_is_transcribe_route_chat", None)
-                    if callable(_route_check):
-                        _summary_is_transcribe = bool(_route_check(source.chat_id))
-                if _summary_is_transcribe and "[Transcript text file was written to:" in (message_text or ""):
-                    _txt_paths = re.findall(r"\[Transcript text file was written to: ([^\]\n]+)\]", message_text or "")
-                    _meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _txt_paths and response and _summary_adapter is not None and hasattr(_summary_adapter, "send_document"):
-                        _summary_path = self._write_transcribe_route_summary_file(_txt_paths[0], response)
-                        if _summary_path and os.path.exists(_summary_path):
-                            await _summary_adapter.send_document(
-                                source.chat_id,
-                                _summary_path,
-                                caption="/summ — саммари на русском .md",
-                                file_name=os.path.basename(_summary_path),
-                                reply_to=self._reply_anchor_for_event(event),
-                                metadata=_meta,
-                            )
-                            logger.info(
-                                "Transcribe-route summary document sent: chat=%s path=%s",
-                                source.chat_id,
-                                _summary_path,
-                            )
-                            return None
-            except Exception as exc:
-                logger.warning("Transcribe-route summary document send failed: %s", exc, exc_info=True)
-
             if agent_result.get("already_sent") and not agent_result.get("failed"):
-                try:
-                    setattr(event, "_hermes_final_response", response)
-                except Exception:
-                    pass
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -11263,29 +13208,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if 'message_text' in locals() and message_text is not None and session_entry is not None:
                     _already_persisted = False
                     try:
-                        _recent_transcript = self.session_store.load_transcript(session_entry.session_id)
+                        _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
                     except Exception:
                         _recent_transcript = []
                     for _msg in reversed(_recent_transcript[-10:]):
                         if _msg.get("role") == "user":
-                            _already_persisted = (_msg.get("content") == message_text)
+                            _expected_user_content = (
+                                persist_user_message
+                                if persist_user_message is not None
+                                else message_text
+                            )
+                            _already_persisted = (_msg.get("content") == _expected_user_content)
                             break
                     if not _already_persisted:
                         _user_entry = {
                             "role": "user",
-                            "content": message_text,
-                            "timestamp": datetime.now().isoformat(),
+                            "content": (
+                                persist_user_message
+                                if persist_user_message is not None
+                                else message_text
+                            ),
+                            "timestamp": (
+                                persist_user_timestamp
+                                if persist_user_timestamp is not None
+                                else time.time()
+                            ),
                         }
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
-                        self.session_store.append_to_transcript(
+                        await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
                             _user_entry,
                         )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
-            error_type = type(e).__name__
-            error_detail = str(e)[:300] if str(e) else "no details available"
+            # Log full details server-side only; never expose raw exception
+            # types or messages to end users (info-leakage risk).
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
@@ -11329,9 +13287,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
             return (
-                f"Sorry, I encountered an error ({error_type}).\n"
-                f"{error_detail}\n"
-                f"{status_hint}"
+                f"Sorry, I encountered an unexpected error.{status_hint}\n"
                 "Try again or use /reset to start a fresh session."
             )
         finally:
@@ -11600,6 +13556,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
+                # Belt-and-suspenders for when the dedup marker goes missing
+                # (manually cleaned up, or the previous cycle's write failed).
+                # Without a marker the update_id comparison below can't run, so
+                # a redelivered /restart would sail through and re-restart the
+                # gateway — an infinite loop (issue #18528).
+                #
+                # Suppress ONLY when we can independently confirm we just came
+                # out of a restart cycle: this process booted from a
+                # chat-originated /restart (_booted_from_restart) AND is still
+                # within a short post-boot window. This never swallows a
+                # genuine first /restart on a fresh boot (no restart marker on
+                # boot → flag stays False). Consume the flag one-shot so a
+                # legitimate /restart sent later in the same session is honored.
+                if (
+                    getattr(self, "_booted_from_restart", False)
+                    and time.time() - getattr(self, "_startup_time", 0.0) < 60
+                ):
+                    self._booted_from_restart = False
+                    return True
                 return False
             data = json.loads(marker_path.read_text())
         except Exception:
@@ -11716,7 +13691,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 20
 
-    def _get_goal_manager_for_event(self, event: "MessageEvent"):
+    async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
 
         Returns ``(manager, session_entry)`` or ``(None, None)`` if the
@@ -11732,9 +13707,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry = None
             if forced_session_key:
                 try:
-                    ensure_loaded = getattr(self.session_store, "_ensure_loaded", None)
+                    ensure_loaded = getattr(self.async_session_store, "_ensure_loaded", None)
                     if callable(ensure_loaded):
-                        ensure_loaded()
+                        await ensure_loaded()
                     entries = getattr(self.session_store, "_entries", None)
                     if isinstance(entries, dict):
                         session_entry = entries.get(forced_session_key)
@@ -11743,18 +13718,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if session_entry is None:
                     source_key = None
                     try:
-                        generate = getattr(self.session_store, "_generate_session_key", None)
+                        generate = getattr(self.async_session_store, "_generate_session_key", None)
                         if callable(generate):
-                            source_key = generate(event.source)
+                            source_key = await generate(event.source)
                     except Exception:
                         source_key = None
                     if source_key == forced_session_key:
-                        session_entry = self.session_store.get_or_create_session(event.source)
+                        session_entry = await self.async_session_store.get_or_create_session(event.source)
                     else:
                         logger.debug("goal manager: forced session key not found: %s", forced_session_key)
                         return None, None
             else:
-                session_entry = self.session_store.get_or_create_session(event.source)
+                session_entry = await self.async_session_store.get_or_create_session(event.source)
         except Exception as exc:
             logger.debug("goal manager: session lookup failed: %s", exc)
             return None, None
@@ -11766,33 +13741,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _goal_text_from_supergoal_artifacts(raw: str) -> str:
-        """Compatibility shim for gateway SuperGoal launch extraction.
-
-        Extraction lives in ``gateway.goal_launch`` so this class keeps only the
-        adapter boundary; the returned text is still started by official
-        ``GoalManager`` code, not by a custom runner.
-        """
+        """Extract a launch goal from referenced SuperGoal artifacts."""
         return goal_launch.goal_text_from_supergoal_artifacts(raw)
 
     @staticmethod
     def _goal_text_from_reply_context(event: "MessageEvent") -> str:
-        """Compatibility shim for bare `/goal` reply launch extraction."""
+        """Extract a launch goal from a bare ``/goal`` reply."""
         return goal_launch.goal_text_from_reply_context(getattr(event, "reply_to_text", ""))
 
     @staticmethod
     def _extract_supergoal_body(text: str) -> str:
-        """Compatibility shim for explicit SuperGoal body launch extraction."""
         return goal_launch.extract_supergoal_body(text)
 
     @staticmethod
     def _goal_text_from_pasted_supergoal_handoff(text: str) -> str:
-        """Compatibility shim for pasted SuperGoal handoff launch extraction."""
         return goal_launch.goal_text_from_pasted_supergoal_handoff(text)
 
     @staticmethod
     def _is_supergoal_dispatch(goal_text: str, *, from_reply: bool = False) -> bool:
-        """Return True for SuperGoal launch payloads, not execution state."""
         return goal_launch.is_supergoal_dispatch(goal_text, from_reply=from_reply)
+
+    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+        if not session_key:
+            return
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if sessions is None:
+            sessions = set()
+            self._goal_callback_started_sessions = sessions
+        sessions.add(session_key)
+
+    def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
+        if not session_key:
+            return False
+        sessions = getattr(self, "_goal_callback_started_sessions", None)
+        if not sessions or session_key not in sessions:
+            return False
+        sessions.discard(session_key)
+        return True
 
     async def _enqueue_goal_kickoff_prompt(
         self,
@@ -11800,31 +13785,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
     ) -> bool:
-        """Queue the first official GoalManager continuation without judging."""
         try:
             from hermes_cli.goals import GoalManager
-        except Exception as exc:
-            logger.debug("goal kickoff enqueue: goals module unavailable: %s", exc)
-            return False
-        sid = getattr(session_entry, "session_id", None) or ""
-        if not sid or source is None:
-            return False
-        try:
-            mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
-            if not mgr.is_active():
+
+            sid = getattr(session_entry, "session_id", None) or ""
+            if not sid or source is None:
                 return False
-            prompt = mgr.next_continuation_prompt() or getattr(mgr.state, "goal", "")
-        except Exception as exc:
-            logger.debug("goal kickoff enqueue: manager lookup failed: %s", exc)
-            return False
-        if not prompt:
-            return False
-        try:
+            manager = GoalManager(sid, default_max_turns=self._goal_max_turns_from_config())
+            if not manager.is_active():
+                return False
+            prompt = manager.next_continuation_prompt() or manager.state.goal
             adapter = self.adapters.get(source.platform)
             session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
             if not adapter or not session_key:
                 return False
-            kickoff_event = MessageEvent(
+            event = MessageEvent(
                 text=prompt,
                 message_type=MessageType.TEXT,
                 source=source,
@@ -11832,85 +13807,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=None,
                 internal=True,
             )
-            self._enqueue_fifo(session_key, kickoff_event, adapter)
+            self._enqueue_fifo(session_key, event, adapter)
             return True
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
             return False
 
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
-        """Start `/goal` from an inline-button callback without replaying a slash command.
-
-        Clarify buttons are clicked while the planning agent is still blocked
-        inside the `clarify` tool. Queueing a synthetic `/goal ...` message for
-        the next turn is fragile because the post-run safety net intentionally
-        discards queued slash commands before they can be fed to the model. For
-        Supergoal's "button 1 starts goal" contract, call the official
-        GoalManager path directly and enqueue the first goal body turn.
-        """
+        """Start a SuperGoal directly in its clarify-owner session."""
         if event is None or event.get_command() != "goal":
             return False
         goal_text = (event.get_command_args() or "").strip()
         if not goal_text:
             return False
-
-        callback_session_key = getattr(event, "_session_key_override", None)
-        if not callback_session_key and getattr(event, "source", None) is not None:
-            try:
-                callback_session_key = self._session_key_for_source(event.source)
-            except Exception:
-                callback_session_key = None
-        running_agents = getattr(self, "_running_agents", {}) or {}
-        defer_kickoff = bool(callback_session_key and callback_session_key in running_agents)
-        if defer_kickoff:
-            setattr(event, "_defer_goal_kickoff_until_post_turn", True)
-
+        session_key = getattr(event, "_session_key_override", None)
+        if not session_key and getattr(event, "source", None) is not None:
+            session_key = self._session_key_for_source(event.source)
+        entry = None
+        entries = getattr(getattr(self, "session_store", None), "_entries", None)
+        if isinstance(entries, dict) and session_key:
+            entry = entries.get(session_key)
+        if entry is None:
+            get_or_create = getattr(getattr(self, "session_store", None), "get_or_create_session", None)
+            if callable(get_or_create):
+                entry = get_or_create(event.source)
+                if inspect.isawaitable(entry):
+                    entry = await entry
+        sid = getattr(entry, "session_id", None) or ""
+        if not sid:
+            return False
         try:
-            response = await self._handle_goal_command(event)
+            from hermes_cli.goals import GoalManager
+            from hermes_constants import parse_reasoning_effort
+
+            state = GoalManager(sid, default_max_turns=self._goal_max_turns_from_config()).set(goal_text)
+            reasoning_cfg = parse_reasoning_effort("xhigh")
+            if session_key and reasoning_cfg:
+                self._set_session_reasoning_override(session_key, reasoning_cfg)
+            self._mark_goal_callback_started_session(session_key)
+            # If the planning agent is not currently running, queue the kickoff
+            # immediately. Otherwise the post-turn path owns it.
+            if session_key not in (getattr(self, "_running_agents", {}) or {}):
+                await self._enqueue_goal_kickoff_prompt(session_entry=entry, source=event.source)
+            return bool(state and state.status == "active")
         except Exception as exc:
-            logger.warning("Supergoal callback: failed to start /goal: %s", exc, exc_info=True)
+            logger.warning("Supergoal callback: failed to start /goal: %s", exc)
             return False
 
-        try:
-            mgr, session_entry = self._get_goal_manager_for_event(event)
-            state = getattr(mgr, "state", None) if mgr is not None else None
-            started = bool(state and getattr(state, "status", "") == "active" and state.goal == goal_text)
-        except Exception:
-            session_entry = None
-            started = False
-
-        if started:
-            session_key = getattr(session_entry, "session_key", None) if session_entry is not None else None
-            if not session_key:
-                session_key = callback_session_key
-            if not session_key and getattr(event, "source", None) is not None:
-                try:
-                    session_key = self._session_key_for_source(event.source)
-                except Exception:
-                    session_key = None
-            if defer_kickoff:
-                self._mark_goal_callback_started_session(session_key)
-            logger.info("Supergoal callback: started official /goal from button press")
-        else:
-            logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
-        return started
-
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
-        """Handle /goal for gateway platforms.
-
-        Subcommands: ``/goal`` / ``/goal status`` / ``/goal pause`` /
-        ``/goal resume`` / ``/goal clear``. Any other text becomes the
-        new goal.
-
-        Setting a new goal queues the goal text as the next turn so the
-        agent starts working on it immediately — the post-turn
-        continuation hook then takes over from there.
-        """
+        """Handle private gateway goal launch/reply semantics."""
         args = (event.get_command_args() or "").strip()
-        # Gateway convenience: a bare `/goal` sent as a reply uses the replied-to
-        # text as the goal body. This avoids fragile Telegram copy/paste for
-        # long Supergoal dispatches. Explicit subcommands (`/goal status`, etc.)
-        # still win and never read reply context.
         goal_from_reply = False
         if not args:
             reply_goal = self._goal_text_from_reply_context(event)
@@ -11924,7 +13870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 args = extracted
                 lower = args.lower()
 
-        mgr, session_entry = self._get_goal_manager_for_event(event)
+        mgr, session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
 
@@ -11937,11 +13883,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return t("gateway.goal.no_goal_set")
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = getattr(session_entry, "session_key", None) or (
+                quick_key = getattr(session_entry, "session_key", None) or (
                     self._session_key_for_source(event.source) if event.source else None
                 )
-                if adapter and _quick_key:
-                    self._clear_goal_pending_continuations(_quick_key, adapter)
+                if adapter and quick_key:
+                    self._clear_goal_pending_continuations(quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal.paused", goal=state.goal)
@@ -11950,14 +13896,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
-            try:
-                if event.source is not None:
-                    await self._enqueue_goal_kickoff_prompt(
-                        session_entry=session_entry,
-                        source=event.source,
-                    )
-            except Exception as exc:
-                logger.debug("goal resume: continuation enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -11965,43 +13903,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             mgr.clear()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = getattr(session_entry, "session_key", None) or (
+                quick_key = getattr(session_entry, "session_key", None) or (
                     self._session_key_for_source(event.source) if event.source else None
                 )
-                if adapter and _quick_key:
-                    self._clear_goal_pending_continuations(_quick_key, adapter)
-                if _quick_key:
-                    self._set_session_reasoning_override(_quick_key, None)
+                if adapter and quick_key:
+                    self._clear_goal_pending_continuations(quick_key, adapter)
+                if quick_key:
+                    self._set_session_reasoning_override(quick_key, None)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
-        # Otherwise — treat the remaining text as the new goal.
         try:
             state = mgr.set(args)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
-        # Queue the canonical GoalManager continuation prompt as an immediate
-        # first turn so the agent sees that this is an official active /goal.
-        # Sending only the naked goal body makes SuperGoal agents reject their
-        # own kickoff as "body without /goal" in Telegram reply flows.
         adapter = self.adapters.get(event.source.platform) if event.source else None
-        _quick_key = getattr(session_entry, "session_key", None) or (
+        quick_key = getattr(session_entry, "session_key", None) or (
             self._session_key_for_source(event.source) if event.source else None
         )
-        defer_kickoff = bool(getattr(event, "_defer_goal_kickoff_until_post_turn", False))
-        if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
+        if quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
             try:
                 from hermes_constants import parse_reasoning_effort
 
                 reasoning_cfg = parse_reasoning_effort("xhigh")
                 if reasoning_cfg:
-                    self._set_session_reasoning_override(_quick_key, reasoning_cfg)
-                    logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
+                    self._set_session_reasoning_override(quick_key, reasoning_cfg)
             except Exception as exc:
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
-        if adapter and _quick_key and not defer_kickoff:
+        if adapter and quick_key:
             try:
                 kickoff_text = mgr.next_continuation_prompt() or state.goal
                 kickoff_event = MessageEvent(
@@ -12012,62 +13943,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     internal=True,
                 )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                self._enqueue_fifo(quick_key, kickoff_event, adapter)
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
 
-    async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
-        """Handle /subgoal for gateway platforms (mirror of CLI handler).
+    async def _auto_dispatch_supergoal_from_response(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        final_response: str,
+    ) -> bool:
+        """Start a goal only when an explicit internal autodispatch sentinel is present."""
+        if "SUPERGOAL_AUTODISPATCH: true" not in str(final_response or ""):
+            return False
+        goal_text = self._extract_supergoal_body(final_response)
+        if not goal_text or not self._is_supergoal_dispatch(goal_text):
+            return False
+        try:
+            from hermes_cli.goals import GoalManager
 
-        Subgoals are extra criteria appended to the active goal mid-loop.
-        They modify state read at the next turn boundary, so this is safe
-        to invoke while the agent is running.
-        """
-        args = (event.get_command_args() or "").strip()
-        mgr, _session_entry = self._get_goal_manager_for_event(event)
-        if mgr is None:
-            return t("gateway.goal.unavailable")
-        if not mgr.has_goal():
-            return "No active goal. Set one with /goal <text>."
-
-        # No args → list current subgoals.
-        if not args:
-            return f"{mgr.status_line()}\n{mgr.render_subgoals()}"
-
-        tokens = args.split(None, 1)
-        verb = tokens[0].lower()
-        rest = tokens[1].strip() if len(tokens) > 1 else ""
-
-        if verb == "remove":
-            if not rest:
-                return "Usage: /subgoal remove <n>"
-            try:
-                idx = int(rest.split()[0])
-            except ValueError:
-                return "/subgoal remove: <n> must be an integer (1-based index)."
-            try:
-                removed = mgr.remove_subgoal(idx)
-            except (IndexError, RuntimeError) as exc:
-                return f"/subgoal remove: {exc}"
-            return f"✓ Removed subgoal {idx}: {removed}"
-
-        if verb == "clear":
-            try:
-                prev = mgr.clear_subgoals()
-            except RuntimeError as exc:
-                return f"/subgoal clear: {exc}"
-            if prev:
-                return f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
-            return "No subgoals to clear."
+            sid = getattr(session_entry, "session_id", None) or ""
+            if not sid:
+                return False
+            goal_mgr = GoalManager(
+                session_id=sid,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            state = goal_mgr.set(goal_text)
+        except Exception as exc:
+            logger.warning("supergoal auto-dispatch: failed to set goal: %s", exc)
+            return False
 
         try:
-            text = mgr.add_subgoal(args)
-        except (ValueError, RuntimeError) as exc:
-            return f"/subgoal: {exc}"
-        idx = len(mgr.state.subgoals) if mgr.state else 0
-        return f"✓ Added subgoal {idx}: {text}"
+            quick_key = self._session_key_for_source(source)
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_cfg = parse_reasoning_effort("xhigh")
+            if quick_key and reasoning_cfg:
+                self._set_session_reasoning_override(quick_key, reasoning_cfg)
+            adapter = self.adapters.get(source.platform)
+            if adapter and quick_key:
+                try:
+                    kickoff_text = goal_mgr.next_continuation_prompt()
+                except Exception as exc:
+                    logger.debug(
+                        "supergoal auto-dispatch: continuation builder failed; "
+                        "using basic prompt: %s",
+                        exc,
+                    )
+                    kickoff_text = None
+                if not kickoff_text:
+                    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
+
+                    kickoff_text = CONTINUATION_PROMPT_TEMPLATE.format(goal=state.goal)
+                kickoff_event = MessageEvent(
+                    text=kickoff_text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                    internal=True,
+                )
+                self._enqueue_fifo(quick_key, kickoff_event, adapter)
+                return True
+        except Exception as exc:
+            logger.warning("supergoal auto-dispatch: kickoff enqueue failed: %s", exc)
+        return False
+
+
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
@@ -12131,78 +14077,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
-    async def _auto_dispatch_supergoal_from_response(
-        self,
-        *,
-        session_entry: Any,
-        source: Any,
-        final_response: str,
-    ) -> bool:
-        """Start an official /goal run when the assistant emits a Supergoal body.
-
-        This is the button-safe path for explicit internal starts only.  A
-        normal assistant handoff that merely prints `SUPERGOAL_GOAL_BODY:` must
-        not start `/goal` by itself; Chip expects to reply with `/goal`.
-        """
-        if "SUPERGOAL_AUTODISPATCH: true" not in str(final_response or ""):
-            return False
-        goal_text = self._extract_supergoal_body(final_response)
-        if not goal_text:
-            return False
-        if not self._is_supergoal_dispatch(goal_text):
-            return False
-
-        try:
-            from hermes_cli.goals import GoalManager
-        except Exception as exc:
-            logger.debug("supergoal auto-dispatch: goals module unavailable: %s", exc)
-            return False
-
-        sid = getattr(session_entry, "session_id", None) or ""
-        if not sid:
-            return False
-
-        max_turns = self._goal_max_turns_from_config()
-        try:
-            goal_mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
-            state = goal_mgr.set(goal_text)
-        except Exception as exc:
-            logger.warning("supergoal auto-dispatch: failed to set goal: %s", exc)
-            return False
-
-        try:
-            _quick_key = self._session_key_for_source(source)
-            from hermes_constants import parse_reasoning_effort
-
-            reasoning_cfg = parse_reasoning_effort("xhigh")
-            if _quick_key and reasoning_cfg:
-                self._set_session_reasoning_override(_quick_key, reasoning_cfg)
-        except Exception as exc:
-            logger.debug("supergoal auto-dispatch: high reasoning override failed: %s", exc)
-
-        if source is None:
-            return False
-
-        try:
-            adapter = self.adapters.get(source.platform)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                kickoff_text = goal_mgr.next_continuation_prompt() or state.goal
-                kickoff_event = MessageEvent(
-                    text=kickoff_text,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                    internal=True,
-                )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
-                logger.info("supergoal auto-dispatch: queued official /goal kickoff for %s", _quick_key)
-                return True
-        except Exception as exc:
-            logger.warning("supergoal auto-dispatch: kickoff enqueue failed: %s", exc)
-        return False
-
     async def _post_turn_goal_continuation(
         self,
         *,
@@ -12236,7 +14110,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not mgr.is_active():
             return
 
-        decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        try:
+            from hermes_cli.goals import gather_background_processes as _gather_bg
+            _bg_procs = _gather_bg()
+        except Exception:
+            _bg_procs = None
+
+        decision = mgr.evaluate_after_turn(
+            final_response or "",
+            user_initiated=True,
+            background_processes=_bg_procs,
+        )
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -12249,15 +14133,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
-            try:
-                adapter = self.adapters.get(source.platform) if source is not None else None
-                _quick_key = self._session_key_for_source(source) if source is not None else None
-                if adapter and _quick_key:
-                    self._clear_goal_pending_continuations(_quick_key, adapter)
-                if _quick_key and decision.get("status") in {"done", "blocked"}:
-                    self._set_session_reasoning_override(_quick_key, None)
-            except Exception as exc:
-                logger.debug("goal continuation: terminal cleanup failed: %s", exc)
             return
 
         prompt = decision.get("continuation_prompt") or ""
@@ -12276,7 +14151,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
-                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -12561,6 +14435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import uuid as _uuid
         audio_path = None
         actual_path = None
+        voice_dir = None
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -12571,11 +14446,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Telegram's adapter only sends native voice bubbles for OGG/Opus.
             # Other platforms keep the existing MP3 default.
             audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
+            # A fixed /tmp/hermes_voice directory can be owned by another
+            # service account on multi-user hosts.  Use a private directory
+            # for each reply so TTS cannot be blocked by that shared path.
+            voice_dir = tempfile.mkdtemp(prefix="hermes_voice_")
             audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}",
+                voice_dir, f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}"
             )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
             result_json = await asyncio.to_thread(
                 text_to_speech_tool, text=tts_text, output_path=audio_path
@@ -12629,6 +14506,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for p in {audio_path, actual_path} - {None}:
                 try:
                     os.unlink(p)
+                except OSError:
+                    pass
+            if voice_dir:
+                try:
+                    os.rmdir(voice_dir)
                 except OSError:
                     pass
 
@@ -12799,7 +14681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -12849,8 +14731,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
-                    session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    session_db=getattr(self._session_db, "_db", self._session_db),
+                    # Reload from disk — do not reuse the startup snapshot (#60955).
+                    fallback_model=self._refresh_fallback_model(),
                 )
                 try:
                     return agent.run_conversation(
@@ -13153,7 +15036,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
+        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
 
         # Operator can fully disable per-topic auto-rename via
@@ -13187,7 +15070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
             try:
-                binding = session_db.get_telegram_topic_binding(
+                binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )
@@ -13334,7 +15217,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "5. /topic <id> inside a topic restores an old session into it."
         )
 
-    def _disable_telegram_topic_mode_for_chat(self, source: SessionSource) -> str:
+    async def _disable_telegram_topic_mode_for_chat(self, source: SessionSource) -> str:
         """Cleanly disable topic mode for a chat via /topic off."""
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
@@ -13344,7 +15227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "Could not determine chat ID."
         # No-op if never enabled.
         try:
-            currently_enabled = self._session_db.is_telegram_topic_mode_enabled(
+            currently_enabled = await self._session_db.is_telegram_topic_mode_enabled(
                 chat_id=chat_id,
                 user_id=str(source.user_id or ""),
             )
@@ -13353,7 +15236,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not currently_enabled:
             return "Multi-session topic mode is not currently enabled for this chat."
         try:
-            self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
+            await self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
         except Exception as exc:
             logger.exception("Failed to disable Telegram topic mode")
             return f"Failed to disable topic mode: {exc}"
@@ -13371,7 +15254,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
 
-    def _telegram_topic_root_status_message(self, source: SessionSource) -> str:
+    async def _telegram_topic_root_status_message(self, source: SessionSource) -> str:
         lines = [
             "Telegram multi-session topics are enabled.",
             "",
@@ -13381,7 +15264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "",
         ]
         try:
-            sessions = self._session_db.list_unlinked_telegram_sessions_for_user(
+            sessions = await self._session_db.list_unlinked_telegram_sessions_for_user(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
                 limit=10,
@@ -13420,11 +15303,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _restore_telegram_topic_session(self, event: MessageEvent, raw_session_id: str) -> str:
         """Restore an existing Telegram-owned Hermes session into this topic."""
         source = event.source
-        session_id = self._session_db.resolve_session_id(raw_session_id.strip())
+        session_id = await self._session_db.resolve_session_id(raw_session_id.strip())
         if not session_id:
             return f"Session not found: {raw_session_id.strip()}"
 
-        session = self._session_db.get_session(session_id)
+        session = await self._session_db.get_session(session_id)
         if not session:
             return f"Session not found: {raw_session_id.strip()}"
         if str(session.get("source") or "") != "telegram":
@@ -13432,8 +15315,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if str(session.get("user_id") or "") != str(source.user_id):
             return "That session does not belong to this Telegram user."
 
-        linked = self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
-        current_binding = self._session_db.get_telegram_topic_binding(
+        linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
+        current_binding = await self._session_db.get_telegram_topic_binding(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
         )
@@ -13443,7 +15326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_key = self._session_key_for_source(source)
         try:
-            self._session_db.bind_telegram_topic(
+            await self._session_db.bind_telegram_topic(
                 chat_id=str(source.chat_id),
                 thread_id=str(source.thread_id),
                 user_id=str(source.user_id),
@@ -13456,10 +15339,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "That session is already linked to another Telegram topic."
             raise
 
-        title = self._session_db.get_session_title(session_id) or session_id
+        title = await self._session_db.get_session_title(session_id) or session_id
         last_assistant = None
         try:
-            for message in reversed(self._session_db.get_messages(session_id)):
+            for message in reversed(await self._session_db.get_messages(session_id)):
                 if message.get("role") == "assistant" and message.get("content"):
                     last_assistant = str(message.get("content"))
                     break
@@ -13526,7 +15409,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # consented to the prompt-cache invalidation via the slash-confirm
             # gate in _handle_reload_mcp_command before we reach this point.
             try:
-                from model_tools import get_tool_definitions
+                from tools.mcp_tool import refresh_agent_mcp_tools
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
@@ -13538,15 +15421,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 continue
                             if _agent is None:
                                 continue
-                            new_defs = get_tool_definitions(
-                                enabled_toolsets=getattr(_agent, "enabled_toolsets", None),
-                                disabled_toolsets=getattr(_agent, "disabled_toolsets", None),
-                                quiet_mode=True,
-                            )
-                            _agent.tools = new_defs
-                            _agent.valid_tool_names = {
-                                t["function"]["name"] for t in new_defs
-                            } if new_defs else set()
+                            # Preserve each cached agent's build-time toolset
+                            # selection EXACTLY: a gateway session built with a
+                            # restricted enabled_toolsets (e.g. ["safe"]) must
+                            # NOT silently gain tools after a reload. This is the
+                            # opposite of the interactive CLI/TUI /reload-mcp,
+                            # which is a single user re-applying their own config
+                            # edit; gateway agents are per-session and may be
+                            # deliberately locked down. (Contract is asserted by
+                            # test_reload_mcp_preserves_per_agent_toolset_overrides.)
+                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
             except Exception as _exc:
                 logger.debug(
                     "Failed to update cached agent tools after MCP reload: %s",
@@ -13570,8 +15454,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
             }
             try:
-                session_entry = self.session_store.get_or_create_session(event.source)
-                self.session_store.append_to_transcript(
+                session_entry = await self.async_session_store.get_or_create_session(event.source)
+                await self.async_session_store.append_to_transcript(
                     session_entry.session_id, reload_msg
                 )
             except Exception:
@@ -13988,7 +15872,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(chat_id, f"```\n{chunk}\n```", metadata=metadata)
+                    await adapter.send(
+                        chat_id,
+                        f"```\n{chunk}\n```",
+                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                    )
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
 
@@ -14011,12 +15899,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code_raw = exit_code_path.read_text().strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(chat_id, "✅ Hermes update finished.", metadata=metadata)
+                        await adapter.send(
+                            chat_id,
+                            "✅ Hermes update finished.",
+                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                        )
                     else:
                         await adapter.send(
                             chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=metadata,
+                            metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
@@ -14067,7 +15959,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
-                                    metadata=metadata,
+                                    metadata=_non_conversational_metadata(metadata, platform=platform),
                                 )
                                 sent_buttons = True
                             except Exception as btn_err:
@@ -14081,7 +15973,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=metadata,
+                                metadata=_non_conversational_metadata(metadata, platform=platform),
                             )
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
@@ -14105,7 +15997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.send(
                     chat_id,
                     "❌ Hermes update timed out after 30 minutes.",
-                    metadata=metadata,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
                 )
             except Exception:
                 pass
@@ -14211,7 +16103,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(chat_id, msg, metadata=metadata)
+                await adapter.send(
+                    chat_id,
+                    msg,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
                     platform_str,
@@ -14274,7 +16170,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await adapter.send(
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
-                metadata=metadata,
+                metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
@@ -14341,9 +16237,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
                 if metadata:
-                    result = await adapter.send(str(home.chat_id), message, metadata=metadata)
+                    result = await adapter.send(
+                        str(home.chat_id),
+                        message,
+                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                    )
                 else:
-                    result = await adapter.send(str(home.chat_id), message)
+                    _startup_meta = _non_conversational_metadata(platform=platform)
+                    if _startup_meta:
+                        result = await adapter.send(
+                            str(home.chat_id),
+                            message,
+                            metadata=_startup_meta,
+                        )
+                    else:
+                        result = await adapter.send(str(home.chat_id), message)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
@@ -14379,6 +16287,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+        # Propagate the adapter's async-delivery capability so async tools
+        # (terminal notify_on_complete / watch_patterns, delegate_task
+        # background=True) know whether this channel can wake a later turn.
+        # Default True keeps CLI / unknown paths working; stateless adapters
+        # (api_server) declare supports_async_delivery=False. Use getattr so
+        # bare runners built via object.__new__ (tests) without self.adapters
+        # don't blow up — they simply default to supported.
+        _adapters = getattr(self, "adapters", None) or {}
+        _adapter = _adapters.get(context.source.platform)
+        _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -14388,6 +16306,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
+            profile=getattr(context.source, "profile", "") or "",
+            async_delivery=_async_delivery,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -14399,7 +16319,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(None, ctx.run, func, *args)
+        return await loop.run_in_executor(
+            self._get_executor(),
+            ctx.run,
+            func,
+            *args,
+        )
+
+    def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the gateway-owned executor for blocking agent work."""
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._executor_lock = lock
+
+        with lock:
+            if getattr(self, "_executor_closing", False):
+                raise RuntimeError("Gateway is shutting down; executor unavailable")
+            executor = getattr(self, "_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10,
+                    thread_name_prefix="hermes-gateway",
+                )
+                self._executor = executor
+            return executor
+
+    def _shutdown_executor(self) -> None:
+        """Stop the gateway-owned executor without touching the loop default."""
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            return
+
+        with lock:
+            self._executor_closing = True
+            executor = getattr(self, "_executor", None)
+            self._executor = None
+
+        if executor is None:
+            return
+
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
 
     def _decide_image_input_mode(
         self,
@@ -14530,134 +16493,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return prefix
         return user_text
 
-
-    def _format_stt_timestamp(self, value) -> str:
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            seconds = 0.0
-        if seconds < 0:
-            seconds = 0.0
-        total = int(seconds)
-        ms = int(round((seconds - total) * 1000))
-        h, rem = divmod(total, 3600)
-        m, sec = divmod(rem, 60)
-        if h:
-            return f"{h:02d}:{m:02d}:{sec:02d}"
-        return f"{m:02d}:{sec:02d}"
-
-    def _stt_speaker_label(self, raw_speaker, default_index: int = 1) -> str:
-        if raw_speaker is None or str(raw_speaker).strip() == "":
-            return f"Спикер {default_index}"
-        value = str(raw_speaker).strip()
-        digits = re.findall(r"\d+", value)
-        if digits:
-            try:
-                num = int(digits[-1])
-                low = value.lower()
-                # Many diarizers emit zero-based labels like speaker_0/spk_0;
-                # human-facing files should start at Спикер 1. Labels like
-                # "Speaker 1" are already one-based and should stay as-is.
-                if re.search(r"(?:speaker|spk)[_-]\d+$", low):
-                    num += 1
-                elif num == 0:
-                    num = 1
-                return f"Спикер {num}"
-            except Exception:
-                pass
-        if value.lower().startswith(("speaker", "spk")):
-            return value.replace("speaker", "Спикер").replace("Speaker", "Спикер")
-        return value
-
-    def _format_timecoded_transcript(self, audio_path: str, result: Dict[str, Any]) -> str:
-        transcript = str(result.get("transcript") or "").strip()
-        segments = result.get("segments") or []
-        provider = str(result.get("provider") or "unknown")
-        lines = [
-            "Транскрипт с таймкодами",
-            f"Источник: {os.path.basename(audio_path)}",
-            f"STT: {provider}",
-            "Формат: [start–end] Спикер N: текст",
-            "",
-        ]
-        if segments:
-            has_speaker_data = any(seg.get("speaker") not in (None, "") for seg in segments if isinstance(seg, dict))
-            if not has_speaker_data:
-                lines.append("Примечание: STT не вернул diarization, поэтому речь помечена как Спикер 1.")
-                lines.append("")
-            for seg in segments:
-                if not isinstance(seg, dict):
-                    continue
-                text = str(seg.get("text") or "").strip()
-                if not text:
-                    continue
-                start = self._format_stt_timestamp(seg.get("start"))
-                end = self._format_stt_timestamp(seg.get("end"))
-                speaker = self._stt_speaker_label(seg.get("speaker"), 1)
-                lines.append(f"[{start}–{end}] {speaker}: {text}")
-        elif transcript:
-            lines.append("Примечание: STT не вернул сегменты/таймкоды, поэтому ниже один блок от 00:00.")
-            lines.append("")
-            lines.append(f"[00:00] Спикер 1: {transcript}")
-        return "\n".join(lines).rstrip() + "\n"
-
-    def _write_transcribe_route_summary_file(self, transcript_path: str, response: str) -> Optional[str]:
-        text = (response or "").strip()
-        if not text:
-            return None
-        path = Path(transcript_path).with_suffix(Path(transcript_path).suffix + ".summary.md")
-        content = "# /summ — саммари на русском\n\n" + text + "\n"
-        path.write_text(content, encoding="utf-8")
-        return str(path)
-
-
-    def _claim_transcript_echo_once(self, source, event, transcript: str, *, ttl_seconds: float = 300.0) -> bool:
-        """Return True exactly once for the same visible STT echo in a short window.
-
-        The in-memory guard is not enough when a voice message interrupts an
-        active turn: the fresh-message path and pending-message path can race
-        through different session agents.  This tiny SQLite claim is shared by
-        the gateway process and survives those races, so Telegram gets one
-        transcript bubble while the agent transcript can still be enriched.
-        """
-        tx = (transcript or "").strip()
-        if not tx:
-            return False
-        platform = str(getattr(source.platform, "value", source.platform))
-        material = json.dumps(
-            [platform, str(source.chat_id), str(getattr(source, "thread_id", None)), tx],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
-        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
-        db_path = home / "transcript_echo_dedupe.sqlite3"
-        now = time.time()
-        try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(str(db_path), timeout=2.0) as con:
-                con.execute(
-                    "CREATE TABLE IF NOT EXISTS transcript_echo_claims "
-                    "(dedupe_key TEXT PRIMARY KEY, ts REAL NOT NULL, chat_id TEXT, message_id TEXT)"
-                )
-                con.execute("DELETE FROM transcript_echo_claims WHERE ts < ?", (now - ttl_seconds,))
-                con.execute(
-                    "INSERT INTO transcript_echo_claims(dedupe_key, ts, chat_id, message_id) VALUES (?, ?, ?, ?)",
-                    (digest, now, str(source.chat_id), str(getattr(event, "message_id", ""))),
-                )
-            return True
-        except sqlite3.IntegrityError:
-            logger.debug(
-                "Transcript echo skipped by sqlite dedupe: chat=%s message=%s",
-                source.chat_id,
-                getattr(event, "message_id", None),
-            )
-            return False
-        except Exception as exc:
-            # Fail open: a broken dedupe store must not hide transcripts.
-            logger.debug("Transcript echo sqlite dedupe unavailable: %s", exc)
-            return True
-
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -14712,50 +16547,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if result["success"]:
                     transcript = result["transcript"]
                     successful_transcripts.append(transcript)
-                    transcript_path = None
-                    try:
-                        src = Path(path)
-                        transcript_path = str(src.with_suffix(src.suffix + ".transcript-timecoded.txt"))
-                        transcript_body = self._format_timecoded_transcript(path, result)
-                        Path(transcript_path).write_text(transcript_body, encoding="utf-8")
-                    except Exception as exc:
-                        logger.warning("Could not write STT transcript sidecar for %s: %s", path, exc)
-                    note = (
-                        f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
-                    )
-                    if transcript_path:
-                        note += f"\n[Transcript text file was written to: {transcript_path}]"
-                    enriched_parts.append(note)
+                    # Pass the transcript through as a plain quoted line. The
+                    # earlier wording ("The user sent a voice message~ Here's
+                    # what they said: ...") read as a meta-instruction and made
+                    # the LLM volunteer commentary about voice mode rather than
+                    # reply to the content.
+                    enriched_parts.append(f'"{transcript}"')
                 else:
                     error = result.get("error", "unknown error")
-                    if (
-                        "No STT provider" in error
-                        or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
-                    ):
-                        _no_stt_note = (
-                            "[The user sent a voice message but I can't listen "
-                            "to it right now — no STT provider is configured. "
-                            "A direct message has already been sent to the user "
-                            "with setup instructions."
-                        )
-                        if self._has_setup_skill():
-                            _no_stt_note += (
-                                " You have a skill called hermes-agent-setup "
-                                "that can help users configure Hermes features "
-                                "including voice, tools, and more."
-                            )
-                        _no_stt_note += "]"
-                        enriched_parts.append(_no_stt_note)
-                    else:
-                        logger.debug("Voice transcription failed: %s", error)
-                        enriched_parts.append("[voice message could not be transcribed]")
+                    # All failure branches: a single, minimal, neutral marker.
+                    # Do NOT mention "no STT provider configured", "setup
+                    # instructions", or the "hermes-agent-setup" skill, and do
+                    # NOT claim a direct message was sent — those phrases get
+                    # persisted in conversation history and poison every later
+                    # turn, so the model keeps volunteering STT-setup advice
+                    # even after transcription starts working. The cause is
+                    # logged for operator diagnosis but kept out of the
+                    # LLM-visible prompt.
+                    logger.info("Voice transcription failed for %s: %s", path, error)
+                    enriched_parts.append("[voice message could not be transcribed]")
             except Exception as e:
                 logger.error("Transcription error: %s", e)
-                enriched_parts.append(
-                    "[The user sent a voice message but something went wrong "
-                    "when I tried to listen to it~ Let them know!]"
-                )
+                enriched_parts.append("[voice message could not be transcribed]")
 
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
@@ -14808,49 +16621,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 audio_paths.append(path)
 
         if audio_paths:
-            audio_paths = list(dict.fromkeys(audio_paths))
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
-            # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages. Dedicated Telegram
-            # transcribe-route chats are file-only dropboxes, so suppress
-            # transcript chunk spam there too.
-            _suppress_transcript_echo = False
-            _route_check = getattr(adapter, "_is_transcribe_route_chat", None)
-            if callable(_route_check):
-                try:
-                    _suppress_transcript_echo = bool(_route_check(source.chat_id))
-                except Exception:
-                    _suppress_transcript_echo = False
-            if (
-                successful_transcripts
-                and not _suppress_transcript_echo
-                and getattr(self.config, "stt_echo_transcripts", True)
-            ):
-                echo_adapter = self.adapters.get(source.platform)
+            # Echo raw transcripts back to the user when configured so voice
+            # interrupts feel identical to fresh voice messages.
+            if successful_transcripts and self._should_echo_stt_transcripts():
+                echo_adapter = self._adapter_for_source(source)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
                     for tx in successful_transcripts:
-                        seen = getattr(self, "_transcript_echo_seen", None)
-                        if seen is None:
-                            seen = set()
-                            self._transcript_echo_seen = seen
-                        echo_key = (
-                            str(getattr(source.platform, "value", source.platform)),
-                            str(source.chat_id),
-                            str(getattr(source, "thread_id", None)),
-                            str(getattr(event, "message_id", None)),
-                            tx,
-                        )
-                        if echo_key in seen:
-                            logger.debug("Transcript echo skipped as duplicate: chat=%s message=%s", source.chat_id, getattr(event, "message_id", None))
-                            continue
-                        if not self._claim_transcript_echo_once(source, event, tx):
-                            continue
-                        seen.add(echo_key)
-                        if len(seen) > 512:
-                            self._transcript_echo_seen = set(list(seen)[-256:])
                         try:
                             await echo_adapter.send(
                                 source.chat_id,
@@ -14909,6 +16689,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
+            logger.warning(
+                "Synthetic event source unresolvable: "
+                "session_key=%r platform=%r chat_type=%r chat_id=%r "
+                "evt_type=%s",
+                session_key, platform_name, chat_type, chat_id,
+                evt.get("type", "?"),
+            )
             return None
 
         try:
@@ -14939,11 +16726,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
-    async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
-        """Inject a watch-pattern notification as a synthetic message event.
+    async def _inject_watch_notification(
+        self, synth_text: str, evt: dict,
+    ) -> Optional[bool]:
+        """Inject a watch/completion notification as a synthetic message event.
 
-        Routing must come from the queued watch event itself, not from whatever
+        Routing must come from the queued event itself, not from whatever
         foreground message happened to be active when the queue was drained.
+        Returns ``True`` after adapter acceptance, ``False`` after a retryable
+        adapter failure, and ``None`` when the event has no gateway route. This
+        is not a transactional boundary: a process crash after adapter
+        acceptance can still cause durable at-least-once replay.
         """
         source = self._build_process_event_source(evt)
         if not source:
@@ -14951,7 +16744,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
-            return
+            return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
         for p, a in self.adapters.items():
@@ -14959,14 +16752,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = a
                 break
         if not adapter:
-            return
+            return None
         try:
+            metadata = {}
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            if parent_session_id:
+                metadata["gateway_session_id"] = parent_session_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
+                metadata=metadata,
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -14975,8 +16773,189 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
+            return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+            return False
+
+    @staticmethod
+    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
+        """Return a producer-stable identity when one is available.
+
+        Delegation UUIDs identify one producer completion. Process session IDs
+        are normally unique too, but include the persisted spawn epoch so an
+        explicitly reused ID represents a distinct process incarnation. Legacy
+        process events without ``started_at`` are delivered without deduplication
+        rather than risking suppression of a real completion.
+        """
+        evt_type = str(evt.get("type") or "")
+        if evt_type == "async_delegation":
+            producer_id = str(evt.get("delegation_id") or "")
+            return (evt_type, producer_id, "") if producer_id else None
+        if evt_type == "completion":
+            producer_id = str(evt.get("session_id") or "")
+            started_at = evt.get("started_at")
+            if producer_id and started_at is not None:
+                return (evt_type, producer_id, started_at)
+        return None
+
+    async def _deliver_completion_notification(
+        self, synth_text: str, evt: dict,
+    ) -> Optional[bool]:
+        """Deliver once per live gateway, or return False for a retry.
+
+        ``True`` means this caller reached adapter acceptance, ``False`` means
+        injection failed and the claim was released for retry, and ``None``
+        means either another same-lifecycle caller owns/delivered the producer
+        event or the event has no gateway route. No cross-process exactly-once
+        guarantee is claimed.
+        """
+        identity = self._completion_delivery_identity(evt)
+        durable_claim_id = ""
+        durable_delegation_id = ""
+        if evt.get("type") == "async_delegation":
+            durable_delegation_id = str(evt.get("delegation_id") or "")
+            if durable_delegation_id:
+                try:
+                    from tools.async_delegation import claim_completion_delivery
+
+                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    if not claim_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    ):
+                        return None
+                except Exception as exc:
+                    logger.warning(
+                        "Could not claim durable async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+                    return False
+        if identity is not None:
+            with self._completion_delivery_lock:
+                if (
+                    identity in self._completion_deliveries_inflight
+                    or identity in self._completion_deliveries_delivered
+                ):
+                    return None
+                self._completion_deliveries_inflight.add(identity)
+
+        accepted = False
+        try:
+            injection_result = await self._inject_watch_notification(synth_text, evt)
+            if injection_result is not True:
+                return injection_result
+            accepted = True
+
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.discard(identity)
+                    self._completion_deliveries_delivered[identity] = None
+                    while (
+                        len(self._completion_deliveries_delivered)
+                        > self._completion_delivery_retention
+                    ):
+                        self._completion_deliveries_delivered.popitem(last=False)
+
+            # If the durable async-delegation producer branch is present, its
+            # SQLite row remains the authoritative replay state. Acknowledge it
+            # after adapter acceptance; this gateway keeps no parallel ledger.
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import complete_completion_delivery
+
+                    complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+            return True
+        finally:
+            if identity is not None and not accepted:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.discard(identity)
+            if durable_claim_id and not accepted:
+                try:
+                    from tools.async_delegation import release_completion_delivery
+
+                    release_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception:
+                    logger.debug("Could not release durable completion claim", exc_info=True)
+
+    def _enrich_async_delegation_routing(self, evt: dict) -> None:
+        """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
+
+        Async-delegation completion events only carry ``session_key`` (the
+        daemon worker has no access to the per-message routing metadata the
+        terminal background watcher captures at spawn time). Parse the
+        session_key into the routing fields ``_build_process_event_source``
+        expects. Best-effort: a CLI-origin event (empty session_key) is left
+        as-is and simply won't route on the gateway.
+        """
+        if evt.get("platform"):
+            return  # already enriched
+        parsed = _parse_session_key(evt.get("session_key", "") or "")
+        if not parsed:
+            return
+        evt["platform"] = parsed.get("platform", "")
+        evt["chat_type"] = parsed.get("chat_type", "")
+        evt["chat_id"] = parsed.get("chat_id", "")
+        if parsed.get("thread_id"):
+            evt["thread_id"] = parsed["thread_id"]
+
+    async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
+        """Drain async-delegation completions and inject them as new turns.
+
+        Background subagents (``delegate_task(background=true)``) run on the
+        async-delegation daemon executor — they have no per-process watcher
+        task, so their completion events would only be seen by the post-turn
+        queue drain. This watcher covers the IDLE case: when a background
+        subagent finishes while no agent turn is running, its result still
+        re-enters the originating session promptly.
+
+        Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
+        queue has nothing for us; ignores non-async event types (those are
+        handled by ``_run_process_watcher`` / the post-turn drain).
+        """
+        await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.process_registry import process_registry as _pr
+        while self._running:
+            try:
+                # Peek the queue for async-delegation events. We must NOT
+                # consume watch/completion events here (other drains own them),
+                # so requeue anything that isn't ours.
+                requeue = []
+                async_events = []
+                while not _pr.completion_queue.empty():
+                    try:
+                        evt = _pr.completion_queue.get_nowait()
+                    except Exception:
+                        break
+                    if evt.get("type") == "async_delegation":
+                        async_events.append(evt)
+                    else:
+                        requeue.append(evt)
+                for evt in requeue:
+                    _pr.completion_queue.put(evt)
+                for evt in async_events:
+                    self._enrich_async_delegation_routing(evt)
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._deliver_completion_notification(synth_text, evt)
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                    except Exception as e:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Async delegation injection error: %s", e)
+            except Exception as e:
+                logger.debug("Async delegation watcher error: %s", e)
+            await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
@@ -15033,11 +17012,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/poll/log
-                from tools.process_registry import process_registry as _pr_check
+                # Skip if the agent already consumed the result via wait/log.
+                # poll() is read-only and intentionally does NOT mark consumed
+                # (#10156) — a status check must not suppress this delivery turn.
+                from tools.process_registry import format_process_notification, process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                    from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
+                    _command = getattr(session, "command", "") or ""
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
+                    _raw = redact_terminal_output(_raw, _command)
+                    _command = _redact_gateway_user_facing_secrets(_command)
                     # Truncate at line boundaries so notifications never start
                     # mid-line (fixes #23284). Keep the last ~2000 chars but
                     # snap to the nearest preceding newline, then prepend a
@@ -15050,52 +17035,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    synth_text = (
-                        f"[IMPORTANT: Background process {session_id} completed "
-                        f"(exit code {session.exit_code}).\n"
-                        f"Command: {session.command}\n"
-                        f"Output:\n{_out}]"
-                    )
-                    source = self._build_process_event_source({
+                    completion_evt = {
+                        "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
                         "platform": platform_name,
+                        "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
                         "thread_id": thread_id,
                         "user_id": user_id,
                         "user_name": user_name,
-                    })
-                    if not source:
-                        logger.warning(
-                            "Dropping completion notification with no routing metadata for process %s",
-                            session_id,
-                        )
+                        "message_id": message_id,
+                        "started_at": getattr(session, "started_at", None),
+                        "command": _command,
+                        "exit_code": session.exit_code,
+                        "completion_reason": getattr(session, "completion_reason", "exited"),
+                        "termination_source": getattr(session, "termination_source", ""),
+                        "output": _out,
+                    }
+                    synth_text = format_process_notification(completion_evt)
+                    if not synth_text:
                         break
-
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p == source.platform:
-                            adapter = a
-                            break
-                    if adapter and source.chat_id:
-                        try:
-                            synth_event = MessageEvent(
-                                text=synth_text,
-                                message_type=MessageType.TEXT,
-                                source=source,
-                                internal=True,
-                                message_id=message_id,
-                            )
-                            logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
-                                session_id,
-                                session_key,
-                                source.chat_id,
-                                source.thread_id,
-                            )
-                            await adapter.handle_message(synth_event)
-                        except Exception as e:
-                            logger.error("Agent notify injection error: %s", e)
+                    delivered = await self._deliver_completion_notification(
+                        synth_text, completion_evt,
+                    )
+                    if delivered is False:
+                        # The process remains terminal; retry after failed
+                        # adapter injection instead of suppressing the result.
+                        continue
                     break
 
                 # --- Normal text-only notification ---
@@ -15106,6 +17073,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if should_notify:
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    if new_output:
+                        from agent.redact import redact_terminal_output
+                        new_output = redact_terminal_output(
+                            new_output, getattr(session, "command", "") or ""
+                        )
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
                         f"Here's the final output:\n{new_output}]"
@@ -15118,7 +17090,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(chat_id, message_text, metadata=send_meta)
+                            await adapter.send(
+                                chat_id,
+                                message_text,
+                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                            )
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
                 break
@@ -15127,6 +17103,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # New output available -- deliver status update (only in "all" mode)
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
+                if new_output:
+                    from agent.redact import redact_terminal_output
+                    new_output = redact_terminal_output(
+                        new_output, getattr(session, "command", "") or ""
+                    )
                 message_text = (
                     f"[Background process {session_id} is still running~ "
                     f"New output:\n{new_output}]"
@@ -15139,7 +17120,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter and chat_id:
                     try:
                         send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(chat_id, message_text, metadata=send_meta)
+                        await adapter.send(
+                            chat_id,
+                            message_text,
+                            metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                        )
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
 
@@ -15175,7 +17160,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, int | None, int | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -15189,10 +17176,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat_result = path.stat()
+                mtime_ns = stat_result.st_mtime_ns
+                size = stat_result.st_size
             except OSError:
                 mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                size = None
+            # Some filesystems can reuse an mtime for two rapid consecutive
+            # writes.  Include file size so those edits still invalidate the
+            # parsed Honcho identity config.
+            memo_key = (str(path), mtime_ns, size)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -15455,6 +17448,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        # Turn boundary: a running-agent slot was just released.  Persist the
+        # new (lower) in-flight count so the dashboard readout stays current
+        # between lifecycle transitions.  Preserves gateway_state (see
+        # _persist_active_agents).
+        self._persist_active_agents()
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
@@ -15592,7 +17590,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # when it unblocks.
             self._evict_cached_agent(session_key)
 
-    def _refresh_agent_cache_message_count(
+    async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
     ) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn.
@@ -15616,6 +17614,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         only when the same agent is still cached (no rebuild/eviction raced
         in between).  Fail-safe: any DB error leaves the snapshot as-is, which
         at worst costs one unnecessary rebuild on the next turn.
+
+        When the cache entry records a ``session_id`` (4-tuple form, #54947)
+        that differs from the current ``session_id`` — meaning the cache
+        was built for a DIFFERENT conversation under the same ``session_key``
+        — the snapshot is intentionally left untouched.  Overwriting it with
+        the current session's count would corrupt the original conversation's
+        baseline and cause the next switch back to fire the cross-process
+        guard spuriously.  Fail-safe: the legacy 3-tuple shape (no
+        ``session_id``) is still re-baselined as before.
         """
         if self._session_db is None or not session_id:
             return
@@ -15624,7 +17631,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not _cache_lock or _cache is None:
             return
         try:
-            _sess_row = self._session_db.get_session(session_id)
+            _sess_row = await self._session_db.get_session(session_id)
             _live = _sess_row.get("message_count", 0) if _sess_row else None
         except Exception:
             return
@@ -15640,8 +17647,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and len(cached) > 2
                 and cached[0] is not _AGENT_PENDING_SENTINEL
             ):
+                # If the snapshot was taken for a different session_id
+                # (same session_key, different conversation), leave the
+                # snapshot alone — the current session_id's count belongs
+                # to a different DB row (#54947).
+                _snapshot_sid = cached[3] if len(cached) > 3 else None
+                if _snapshot_sid is not None and _snapshot_sid != session_id:
+                    return
                 if cached[2] != _live:
-                    _cache[session_key] = (cached[0], cached[1], _live)
+                    if _snapshot_sid is None:
+                        # Legacy 3-tuple: preserve the original 3-element
+                        # shape so existing entries stay compatible with
+                        # callers that index ``cached[2]`` directly.
+                        _cache[session_key] = (cached[0], cached[1], _live)
+                    else:
+                        _cache[session_key] = (
+                            cached[0], cached[1], _live, _snapshot_sid,
+                        )
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc).
@@ -16009,7 +18031,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if url:
             return url.rstrip("/")
         cfg = _load_gateway_config()
-        url = (cfg.get("gateway") or {}).get("proxy_url", "").strip()
+        url = (cfg.get("gateway") or {}).get("proxy_url")
+        url = (url or "").strip()
         if url:
             return url.rstrip("/")
         return None
@@ -16126,6 +18149,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
+                    _pause_typing_before_finalize = None
+                    if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
+                        def _pause_typing_before_finalize(
+                            _adapter=_adapter,
+                            _chat_id=source.chat_id,
+                        ) -> None:
+                            _adapter.pause_typing_for_chat(_chat_id)
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                     _buffer_only = False
@@ -16155,7 +18185,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
+                        on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
+                        run_still_current=_run_still_current,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -16316,6 +18348,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        moa_config: Optional[dict] = None,
+        persist_user_message: Optional[str] = None,
+        persist_user_timestamp: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Profile-scoping wrapper around the agent run.
+
+        When multiplexing is active, resolve the inbound source's profile and
+        run the whole turn inside ``_profile_runtime_scope`` so config/skills/
+        memory resolve to that profile's home AND credentials resolve from that
+        profile's secret scope (never the process-global ``os.environ``). When
+        multiplexing is off this is a transparent pass-through — zero behavior
+        change for single-profile gateways.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._run_agent_inner(
+                message, context_prompt, history, source, session_id,
+                session_key=session_key, run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                channel_prompt=channel_prompt, moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            return await self._run_agent_inner(
+                message, context_prompt, history, source, session_id,
+                session_key=session_key, run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                channel_prompt=channel_prompt, moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+            )
+
+    def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
+        """Resolve which profile's HERMES_HOME should serve this inbound source.
+
+        Prefers the profile the source was routed to (``source.profile`` — set
+        by the /p/<profile>/ URL prefix or a per-credential adapter), falling
+        back to the active profile (the multiplexer's own home).
+        """
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        try:
+            name = (source.profile or "").strip() or get_active_profile_name() or "default"
+            return get_profile_dir(name)
+        except Exception:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home()
+
+    async def _run_agent_inner(
+        self,
+        message: str,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: SessionSource,
+        session_id: str,
+        session_key: str = None,
+        run_generation: Optional[int] = None,
+        _interrupt_depth: int = 0,
+        event_message_id: Optional[str] = None,
+        channel_prompt: Optional[str] = None,
+        moa_config: Optional[dict] = None,
+        persist_user_message: Optional[str] = None,
+        persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16351,19 +18447,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
-        routed_profile_name, routed_profile_home = _resolve_gateway_profile_route(user_config, source)
-        if routed_profile_home is not None:
-            profile_config = _load_config_from_home(routed_profile_home)
-            if profile_config:
-                user_config = profile_config
-            logger.info(
-                "Gateway profile route active: platform=%s chat=%s thread=%s profile=%s home=%s",
-                getattr(getattr(source, "platform", None), "value", source.platform),
-                getattr(source, "chat_id", None),
-                getattr(source, "thread_id", None),
-                routed_profile_name,
-                routed_profile_home,
-            )
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -16385,6 +18468,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.display import set_tool_preview_max_len
             _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
+        except Exception:
+            pass
+
+        # Apply friendly tool labels config (default on) — per-platform aware
+        try:
+            from agent.display import set_friendly_tool_labels
+            _ftl = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True)
+            set_friendly_tool_labels(bool(_ftl))
         except Exception:
             pass
 
@@ -16411,60 +18502,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
-        from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
-        log_queue = queue.Queue() if log_mode_enabled else None
-        suppress_tool_status_for_chat = False
-        if source.platform == Platform.TELEGRAM:
-            try:
-                telegram_cfg = user_config.get("telegram") or {}
-                chat_id = str(getattr(source, "chat_id", "") or "")
-                private_raw = telegram_cfg.get("private_chats") or []
-                public_raw = telegram_cfg.get("public_chats") or []
-                if isinstance(private_raw, str):
-                    private_ids = {part.strip() for part in private_raw.split(",") if part.strip()}
-                else:
-                    private_ids = {str(part).strip() for part in private_raw if str(part).strip()}
-                if isinstance(public_raw, str):
-                    public_ids = {part.strip() for part in public_raw.split(",") if part.strip()}
-                else:
-                    public_ids = {str(part).strip() for part in public_raw if str(part).strip()}
-                if private_ids or public_ids:
-                    # Intent policy wins over Telegram's raw chat_type: private work
-                    # groups can have negative Telegram ids but still need tool bubbles.
-                    suppress_tool_status_for_chat = chat_id not in private_ids
-                else:
-                    quiet_chats = telegram_cfg.get("suppress_tool_progress_chats") or []
-                    quiet_ids = {str(chat_id) for chat_id in quiet_chats}
-                    suppress_tool_status_for_chat = chat_id in quiet_ids
+        # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
+        progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        _generic_status_recent: List[str] = []
+        _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
 
-                # Exact Telegram topic override. This keeps shared/public groups quiet
-                # by default while allowing tool-progress bubbles in a specific
-                # forum topic, e.g. "-1003770669948:5413".
-                thread_id = str(getattr(source, "thread_id", "") or "")
-                visible_topics = telegram_cfg.get("tool_progress_topics") or []
-                if isinstance(visible_topics, str):
-                    visible_topic_ids = {part.strip() for part in visible_topics.split(",") if part.strip()}
-                else:
-                    visible_topic_ids = {str(part).strip() for part in visible_topics if str(part).strip()}
-                if thread_id and (
-                    f"{chat_id}:{thread_id}" in visible_topic_ids or thread_id in visible_topic_ids
-                ):
-                    suppress_tool_status_for_chat = False
-                    # Explicit topic allowlist wins over the global Telegram
-                    # default. This lets operators keep Telegram tool progress
-                    # globally quiet while enabling it in one debugging topic.
-                    if progress_mode == "off" and source.platform != Platform.WEBHOOK:
-                        progress_mode = "new"
-                        tool_progress_enabled = True
-
-                if tool_progress_enabled and suppress_tool_status_for_chat:
-                    tool_progress_enabled = False
-            except Exception:
-                pass
         def _display_surface_mode(
             setting: str,
             *,
@@ -16489,24 +18532,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "generic" if allow_generic else "off"
             return "raw" if bool(value) else "off"
 
-        _generic_status_recent: List[str] = []
-
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
             try:
-                from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-                catalog = resolve_status_phrase_catalog(user_config, platform_key)
                 return choose_status_phrase(
                     kind,
                     tool_name=tool_name,
                     preview=preview,
                     args=args,
                     recent=_generic_status_recent,
-                    catalog=catalog,
+                    catalog=_generic_status_catalog,
                 )
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
+        # Disable tool progress for webhooks - they don't support message editing,
+        # so each progress line would be sent as a separate message.
+        from gateway.config import Platform
+        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
+        # instead of the chat (#3459 / #3458). Gateway-only by design.
+        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
+        # Telegram workroom policy: public/shared chats stay quiet, while
+        # configured private rooms and explicitly enabled topics may show tool
+        # progress. Exact topic allowlisting wins over the platform default.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                telegram_cfg = user_config.get("telegram") or {}
+                chat_id = str(getattr(source, "chat_id", "") or "")
 
+                def _id_set(raw: Any) -> set[str]:
+                    if isinstance(raw, str):
+                        return {part.strip() for part in raw.split(",") if part.strip()}
+                    return {str(part).strip() for part in (raw or []) if str(part).strip()}
+
+                private_ids = _id_set(telegram_cfg.get("private_chats"))
+                public_ids = _id_set(telegram_cfg.get("public_chats"))
+                if private_ids or public_ids:
+                    suppress_tool_status_for_chat = chat_id not in private_ids
+                else:
+                    quiet_ids = _id_set(telegram_cfg.get("suppress_tool_progress_chats"))
+                    suppress_tool_status_for_chat = chat_id in quiet_ids
+
+                thread_id = str(getattr(source, "thread_id", "") or "")
+                visible_topics = _id_set(telegram_cfg.get("tool_progress_topics"))
+                if thread_id and (
+                    f"{chat_id}:{thread_id}" in visible_topics
+                    or thread_id in visible_topics
+                    or f"{chat_id}:*" in visible_topics
+                ):
+                    suppress_tool_status_for_chat = False
+                    if progress_mode == "off":
+                        progress_mode = "new"
+                        tool_progress_enabled = True
+                if tool_progress_enabled and suppress_tool_status_for_chat:
+                    tool_progress_enabled = False
+            except Exception as exc:
+                logger.debug("Telegram tool progress policy resolution failed: %s", exc)
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -16519,9 +18601,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
-        
+        # thinking_progress is independent — if enabled, we need the progress
+        # queue even when tool_progress is off (thinking relay uses same infra).
+        # Mattermost requires a per-platform opt-in: global scratch-text display
+        # is too easy to leak into busy public threads.
+        _thinking_mode = _display_surface_mode(
+            "thinking_progress",
+            default=False,
+            require_platform_override_for={Platform.MATTERMOST},
+        )
+        _thinking_enabled = _thinking_mode != "off"
+        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+
+
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        progress_queue = queue.Queue() if needs_progress_queue else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -16637,6 +18731,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
 
+            # "_thinking" is assistant scratch text between tool calls.  It
+            # is never ordinary tool progress: only relay it when the platform
+            # explicitly opted into thinking_progress.  Handle both legacy
+            # callback shapes: ("_thinking", text) and
+            # ("reasoning.available", "_thinking", text, ...).
+            if event_type == "_thinking" or tool_name == "_thinking":
+                if not _thinking_enabled:
+                    return
+                thinking_text = preview if tool_name == "_thinking" else tool_name
+                msg = f"💬 {thinking_text}" if thinking_text else None
+                if msg:
+                    progress_queue.put(msg)
+                return
+
+            # If tool_progress is off, only _thinking passes through (above).
+            # Regular tool calls are suppressed.
+            if not tool_progress_enabled:
+                return
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
@@ -16747,12 +18859,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
             elif preview:
-                from agent.display import get_tool_preview_max_len
+                from agent.display import (
+                    get_tool_preview_max_len,
+                    get_tool_verb,
+                    tool_verb_connector,
+                    verb_drops_preview,
+                )
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                # Friendly labels: render a human-phrased line for built-in
+                # tools ("🔍 Searching the web for ...") by prefixing the verb
+                # onto the preview the callback already computed (so the
+                # command/url/query is preserved).  Custom/plugin/MCP tools
+                # have no verb and fall back to the raw "tool_name: ..." form.
+                _verb = (
+                    None
+                    if source.platform == Platform.TELEGRAM
+                    else get_tool_verb(tool_name)
+                )
+                if _verb:
+                    if verb_drops_preview(tool_name):
+                        msg = f"{emoji} {_verb}"
+                    else:
+                        msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
+                else:
+                    msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
             else:
                 msg = f"{emoji} {tool_name}..."
@@ -16782,15 +18915,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # - Feishu only honors reply_in_thread when sending a reply, so topic
         #   progress uses the triggering event message as the reply target
         # - Other platforms should use explicit source.thread_id only
-        if source.platform == Platform.SLACK:
-            _progress_thread_id = source.thread_id or event_message_id
-        else:
-            _progress_thread_id = source.thread_id
+        _progress_thread_id = _resolve_progress_thread_id(
+            source.platform, source.thread_id, event_message_id,
+        )
         _progress_metadata = (
             self._thread_metadata_for_source(source, event_message_id)
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -16873,7 +19006,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -17219,6 +19352,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_message="agent:step hook scheduling error",
             )
 
+        # Bridge sync event_callback → async hooks.emit for lifecycle events
+        # (e.g. session:compress fires after context compression splits a session)
+        def _event_callback_sync(event_type: str, context: dict) -> None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _hooks_ref.emit(event_type, context),
+                    _loop_for_step,
+                )
+            except Exception as _e:
+                logger.debug("event_callback hook error: %s", _e)
+
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self._adapter_for_source(source)
         _status_chat_id = source.chat_id
@@ -17278,13 +19422,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is now set via contextvars in _set_session_env()
-            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
-            os.environ["HERMES_SESSION_KEY"] = session_key or ""
+            # session_key is propagated via contextvars in _set_session_env()
+            # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
+            # below — both concurrency-safe and inherited by tool worker threads.
+            # We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
+            # os.environ is process-global, so concurrent gateway sessions (e.g.
+            # two Discord threads) would clobber each other's value, and a tool
+            # thread whose contextvar is unset would fall back to os.environ and
+            # read the wrong session key — misrouting command-approval prompts to
+            # the wrong thread (#24100). The non-gateway surfaces don't depend on
+            # this write: CLI and cron bind the session via contextvars
+            # (set_current_session_key / session context), and only the TUI
+            # slash-worker *subprocess* exports HERMES_SESSION_KEY (from its own
+            # --session-key argv, a separate process) — so removing this in-process
+            # gateway write does not affect any of them.
 
-            # Read from env var or use default (same as CLI)
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
@@ -17305,24 +19457,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
-            # Re-read .env and config for fresh credentials (gateway is long-lived,
-            # keys may change without restart). Keep config.yaml authoritative for
-            # runtime budget settings bridged into env vars.
-            _reload_runtime_env_preserving_config_authority()
-            _profile_home_token = None
-            if routed_profile_home is not None:
-                try:
-                    from hermes_constants import set_hermes_home_override
-                    _profile_home_token = set_hermes_home_override(routed_profile_home)
-                    load_hermes_dotenv(
-                        hermes_home=Path(routed_profile_home),
-                        project_env=Path(__file__).resolve().parents[1] / '.env',
-                    )
-                    _profile_agent_cfg = (user_config.get("agent") or {}) if isinstance(user_config, dict) else {}
-                    if isinstance(_profile_agent_cfg, dict) and "max_turns" in _profile_agent_cfg:
-                        os.environ["HERMES_MAX_ITERATIONS"] = str(_profile_agent_cfg["max_turns"])
-                except Exception as _profile_env_exc:
-                    logger.warning("Gateway profile route env setup failed for %s: %s", routed_profile_home, _profile_env_exc)
+            max_iterations = _current_max_iterations()
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -17335,12 +19470,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
-                if _profile_home_token is not None:
-                    try:
-                        from hermes_constants import reset_hermes_home_override
-                        reset_hermes_home_override(_profile_home_token)
-                    except Exception:
-                        pass
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
@@ -17354,10 +19483,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
             )
             if self._is_use_xhigh_gpt55_trigger(message):
-                model, runtime_kwargs = self._resolve_gpt55_openai_codex_runtime(runtime_kwargs)
+                model, runtime_kwargs = self._resolve_gpt55_openai_codex_runtime(
+                    runtime_kwargs
+                )
                 reasoning_config = self._gpt55_xhigh_reasoning_config()
                 logger.info(
-                    "Explicit use-xhigh trigger: forcing model=%s provider=%s reasoning=%s session=%s",
+                    "Explicit use-xhigh trigger: forcing model=%s provider=%s "
+                    "reasoning=%s session=%s",
                     model,
                     runtime_kwargs.get("provider"),
                     reasoning_config.get("effort"),
@@ -17393,6 +19525,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self._adapter_for_source(source)
                     if _adapter:
+                        _pause_typing_before_finalize = None
+                        if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
+                            def _pause_typing_before_finalize(
+                                _adapter=_adapter,
+                                _chat_id=source.chat_id,
+                            ) -> None:
+                                _adapter.pause_typing_for_chat(_chat_id)
                         # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
                         # without edit support, the consumer sends a partial
@@ -17437,7 +19576,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if progress_queue is not None
                                 else None
                             ),
+                            on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
+                            run_still_current=_run_still_current,
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -17485,6 +19626,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
             agent = None
+            reused_cached_agent = False
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
 
@@ -17497,21 +19639,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _current_msg_count = None
             if self._session_db is not None and session_id:
                 try:
-                    _sess_row = self._session_db.get_session(session_id)
+                    # run_sync is off-loop (executor); sync DB is fine.
+                    _sess_row = self._session_db._db.get_session(session_id)
                     if _sess_row:
                         _current_msg_count = _sess_row.get("message_count", 0)
                 except Exception:
                     pass
 
+            _xproc_evicted_agent = None
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
                     if cached and cached[1] == _sig:
                         # cached[2] is the message_count at cache time;
                         # stale when a second process appended rows.
+                        # cached[3] (when present) is the session_id the
+                        # snapshot was taken for — used to skip the guard
+                        # when the active session_id differs (#54947).
                         _cached_mc = cached[2] if len(cached) > 2 else None
+                        _cached_sid = cached[3] if len(cached) > 3 else None
+                        # If the snapshot belongs to a different session_id
+                        # (same session_key, different conversation), the
+                        # message_count comparison is meaningless — the
+                        # counts track DIFFERENT DB rows.  REUSE the cached
+                        # agent rather than rebuild and bust the prompt cache
+                        # on every session switch (#54947).
+                        _session_id_mismatch = (
+                            _cached_sid is not None
+                            and session_id is not None
+                            and _cached_sid != session_id
+                        )
                         if (
-                            _cached_mc is not None
+                            not _session_id_mismatch
+                            and _cached_mc is not None
                             and _current_msg_count is not None
                             and _current_msg_count != _cached_mc
                         ):
@@ -17526,7 +19686,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             evicted = self._agent_cache.pop(session_key, None)
                             _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
                             if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
-                                self._cleanup_agent_resources(_ev_agent)
+                                # Defer cleanup until AFTER the lock is
+                                # released — _cleanup_agent_resources /
+                                # release_clients can block on memory-provider
+                                # shutdown and socket teardown, and running it
+                                # here would stall the gateway event loop while
+                                # _sweep_idle_cached_agents (session-expiry
+                                # watcher) waits on the same lock, blocking
+                                # Discord heartbeats (#52197).  The same session
+                                # rebuilds a fresh agent immediately below, so
+                                # use the SOFT release that preserves the
+                                # session's terminal sandbox / browser / bg
+                                # processes for the rebuilt agent to inherit —
+                                # mirrors _evict_cached_agent / idle-sweep.
+                                _xproc_evicted_agent = _ev_agent
                         else:
                             agent = cached[0]
                             # Refresh LRU order so the cap enforcement evicts
@@ -17537,7 +19710,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 except KeyError:
                                     pass
                             self._init_cached_agent_for_turn(agent, _interrupt_depth)
+                            # Refresh agent max_iterations from current config
+                            # (cached agent may have been created with old config)
+                            agent.max_iterations = max_iterations
                             logger.debug("Reusing cached agent for session %s", session_key)
+                            reused_cached_agent = True
+
+            # Lock released — refresh the fallback chain from disk for the
+            # reused agent OUTSIDE the cache lock (config.yaml read is disk
+            # I/O; the idle-sweep watcher contends on this lock and stalls
+            # Discord heartbeats — same reasoning as #52197).  A chain
+            # configured after this agent was cached (or after gateway start)
+            # must reach the next turn (#60955).  Per-session turn
+            # serialization (_running_agents) keeps this safe post-lock.
+            if reused_cached_agent and agent is not None:
+                self._apply_fallback_chain_to_agent(
+                    agent, self._refresh_fallback_model(),
+                )
+
+            # Lock released — now schedule cleanup of any cross-process-evicted
+            # agent on a daemon thread so memory-provider shutdown / socket
+            # teardown never blocks the gateway event loop or the cache lock
+            # the session-expiry watcher needs (#52197).
+            if _xproc_evicted_agent is not None:
+                try:
+                    threading.Thread(
+                        target=self._release_evicted_agent_soft,
+                        args=(_xproc_evicted_agent,),
+                        daemon=True,
+                        name=f"agent-xproc-evict-{str(session_key)[:24]}",
+                    ).start()
+                except Exception:
+                    # Interpreter shutdown or thread-spawn failure — release
+                    # inline as a best-effort fallback.
+                    try:
+                        self._release_evicted_agent_soft(_xproc_evicted_agent)
+                    except Exception:
+                        pass
 
             if agent is None:
                 # Config changed or first message — create fresh agent
@@ -17570,18 +19779,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
-                    session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    session_db=getattr(self._session_db, "_db", self._session_db),
+                    # Reload from disk — do not reuse the startup snapshot (#60955).
+                    fallback_model=self._refresh_fallback_model(),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
-                        _cache[session_key] = (agent, _sig, _current_msg_count)
+                        # Record the session_id the snapshot was taken for
+                        # alongside the message_count, so the cross-process
+                        # guard can skip the (meaningless) count comparison
+                        # when the active session_id later switches under
+                        # the same session_key (#54947).
+                        _cache[session_key] = (
+                            agent, _sig, _current_msg_count, session_id,
+                        )
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            # Gate on needs_progress_queue (tool_progress OR thinking_progress)
+            # rather than tool_progress alone: the progress_callback also relays
+            # _thinking assistant scratch text, which is gated on
+            # thinking_progress and is intentionally independent of tool
+            # progress. With the old `tool_progress_enabled`-only gate, a user
+            # who set thinking_progress:true but kept tool_progress:off got a
+            # None callback — so _thinking scratch bubbles never relayed even
+            # though the progress queue was created for them.
+            agent.tool_progress_callback = (
+                progress_callback if (needs_progress_queue or log_mode_enabled) else None
+            )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
@@ -17591,15 +19818,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
-
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
             # standalone push: render to a single plaintext line and deliver via
             # the shared _deliver_platform_notice rail (honors private/public +
             # thread metadata). Fires from the agent's sync worker thread, so we
-            # hop onto the gateway loop with safe_schedule_threadsafe — same
+            # hop onto the gateway loop with safe_schedule_threadsafe - same
             # pattern as _status_callback_sync. The fired-once latch lives on the
-            # cached agent and persists across turns, so a band crosses → one
+            # cached agent and persists across turns, so a band crosses -> one
             # push (no per-turn re-nag). Recovery ("✓ Credit access restored")
             # rides the same show path (it's emitted as a success notice, not a
             # clear). The clear callback is a no-op: a sent platform message
@@ -17623,6 +19849,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             agent.notice_callback = _notice_callback_sync
             agent.notice_clear_callback = None
+            agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -17638,7 +19865,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_status_thread_metadata,
+                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -17678,6 +19905,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pdc = getattr(_status_adapter, "_post_delivery_callbacks", None)
                     if _pdc is not None:
                         _pdc[session_key] = _release_bg_review_messages
+            # Memory update notifications in chat.  Config: display.memory_notifications
+            #   off     — no chat notification (still logged to stdout)
+            #   on      — generic "💾 Memory updated" (default)
+            #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
+            _mem_notif = user_config.get("display", {}).get("memory_notifications")
+            if isinstance(_mem_notif, bool):
+                _mem_notif = "on" if _mem_notif else "off"
+            agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
 
             # ------------------------------------------------------------------
             # Clarify callback: present a clarify prompt and block on a response.
@@ -17754,6 +19989,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             agent.clarify_callback = _clarify_callback_sync
 
+            # Show assistant thinking between tool calls — independent of
+            # tool_progress mode. Mattermost needs an explicit per-platform
+            # opt-in so global scratch-text display does not leak into threads.
+            agent.thinking_progress = _thinking_enabled
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -17776,18 +20015,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent_history, observed_group_context = _build_gateway_agent_history(
                 history,
                 channel_prompt=channel_prompt,
+                inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
             )
+
+            # FTS write-corruption guard (#50502): when message persistence
+            # fails silently through corrupt FTS triggers, the reloaded
+            # transcript above is stale/empty even though the SAME cached agent
+            # still holds the full live conversation in `_session_messages`.
+            # Replacing the live transcript with that shorter copy causes
+            # immediate same-session amnesia. Only applies when we reused a
+            # cached agent bound to this exact session_id.
+            if reused_cached_agent and getattr(agent, "session_id", None) == session_id:
+                _selected = _select_cached_agent_history(
+                    agent_history, getattr(agent, "_session_messages", None)
+                )
+                if _selected is not agent_history:
+                    logger.warning(
+                        "Persisted transcript lagged live cached history for "
+                        "session %s (disk=%d, memory=%d); preserving live "
+                        "conversation context (possible FTS write corruption)",
+                        session_key, len(agent_history), len(_selected),
+                    )
+                    # The live in-memory history bypassed the
+                    # _build_gateway_agent_history cleanup pipeline above —
+                    # re-apply the stale-confirmation expiry (#59607) so a
+                    # dangerous confirmation can't slip through this path
+                    # either. Idempotent; messages without timestamps are
+                    # untouched.
+                    agent_history = _strip_stale_dangerous_confirmations(
+                        _selected, now=time.time()
+                    )
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    for _p in _extract_deliverable_media_paths_from_tool_content(
-                        _hm.get("content", "")
-                    ):
-                        _history_media_paths.add(_p)
+            _history_media_paths: set = _collect_history_media_paths(agent_history)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -17820,6 +20082,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
 
+                # Redact credentials from the command before displaying it in
+                # the approval prompt — Tirith's findings are already redacted,
+                # but the raw command string still leaks secrets to the chat
+                # platform (#48456). Applied here so BOTH the button-based
+                # (send_exec_approval) and plain-text fallback paths below use
+                # the redacted value.
+                cmd = _redact_approval_command(cmd)
+
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
@@ -17832,6 +20102,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key=_approval_session_key,
                                 description=desc,
                                 metadata=_status_thread_metadata,
+                                allow_permanent=approval_data.get("allow_permanent", True),
+                                smart_denied=approval_data.get("smart_denied", False),
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -17856,13 +20128,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
                 _p = getattr(_status_adapter, "typed_command_prefix", "/")
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
-                    f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
+                msg = _format_exec_approval_fallback(
+                    cmd,
+                    desc,
+                    _p,
+                    allow_permanent=approval_data.get("allow_permanent", True),
+                    smart_denied=approval_data.get("smart_denied", False),
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
@@ -17883,7 +20154,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Keep real user text separate from API-only recovery guidance.  If
             # an auto-continue note is prepended below, persist the original
             # message so stale guidance never replays as user-authored text.
-            _persist_user_message_override: Optional[Any] = None
+            _persist_user_message_override: Optional[Any] = persist_user_message
+            _persist_user_timestamp_override: Optional[float] = persist_user_timestamp
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -17925,10 +20197,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _resume_entry = self.session_store._entries.get(session_key)
                 except Exception:
                     _resume_entry = None
+
+            # resume_pending freshness uses a SECOND signal in addition to the
+            # transcript clock above.  The restart watchdog stamps the session
+            # with ``last_resume_marked_at`` at interrupt time — that is the
+            # correct "when were we interrupted" signal.  The transcript clock
+            # (_interruption_is_fresh) can be far older: an active thread you
+            # return to may have its last persisted row hours back, even though
+            # the interruption itself just happened.  Gating resume_pending on
+            # the transcript clock alone makes the recovery note silently drop,
+            # and because the startup auto-resume turn carries empty text
+            # (_schedule_resume_pending_sessions), the model then receives a
+            # blank user message and replies with confused "the message came
+            # through blank" noise.  Treat the marker as fresh when
+            # EITHER signal is fresh so the two freshness checks agree.
+            _resume_mark_is_fresh = False
+            if _resume_entry is not None and getattr(_resume_entry, "resume_pending", False):
+                _resume_mark_is_fresh = _is_fresh_gateway_interruption(
+                    getattr(_resume_entry, "last_resume_marked_at", None),
+                    window_secs=_freshness_window,
+                )
             _is_resume_pending = bool(
                 _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
-                and _interruption_is_fresh
+                and (_interruption_is_fresh or _resume_mark_is_fresh)
             )
             _has_fresh_tool_tail = bool(
                 agent_history
@@ -17943,29 +20235,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _reason == "restart_timeout"
                     else "a gateway shutdown"
                     if _reason == "shutdown_timeout"
-                    else "active /goal startup recovery"
-                    if _reason == _STARTUP_GOAL_RECOVERY_REASON
                     else "a gateway interruption"
                 )
                 _persist_user_message_override = message
-                if self._is_goal_continuation_event(message):
-                    message = (
-                        f"[System note: The active /goal continuation below was scheduled "
-                        f"after {_reason_phrase}. Resume through the existing transcript and "
-                        f"verify before claiming completion. Do NOT blindly repeat "
-                        f"side-effectful tool calls from before the interruption.]\n\n"
-                        + message
+                # The empty-message case is the auto-resume startup turn
+                # synthesized by _schedule_resume_pending_sessions — there is
+                # no NEW user message to address, so tell the model to report
+                # recovery instead of the (nonexistent) "new message".
+                if message:
+                    _resume_guidance = (
+                        "Address the user's NEW message below FIRST and focus "
+                        "on what the user is asking now."
                     )
                 else:
-                    message = (
-                        f"[System note: A new message has arrived. The previous turn "
-                        f"was interrupted by {_reason_phrase}. "
-                        f"Address the user's NEW message below FIRST. "
-                        f"Do NOT re-execute old tool calls — skip any unfinished "
-                        f"work from the conversation history and focus on what the "
-                        f"user is asking now.]\n\n"
-                        + message
+                    _resume_guidance = (
+                        "Report to the user that the session was restored "
+                        "successfully and ask what they would like to do next."
                     )
+                message = (
+                    f"[System note: The previous turn was interrupted by "
+                    f"{_reason_phrase}; the gateway is now back online. "
+                    f"Any restart/shutdown command in the history has already "
+                    f"run — do NOT re-execute or verify it. {_resume_guidance} "
+                    f"Do NOT re-execute old tool calls — skip any unfinished "
+                    f"work from the conversation history.]"
+                    + (f"\n\n{message}" if message else "")
+                )
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
                 message = (
@@ -17986,6 +20281,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _srn = _pending_notes.pop(session_key, None)
                 if _srn:
                     message = _srn + "\n\n" + message
+
+            # Safety net: a startup auto-resume event carries empty
+            # text and relies on the resume_pending branch above to supply the
+            # recovery note.  If that branch did not fire for any reason (e.g.
+            # both freshness signals disagreed, or the marker was cleared
+            # between scheduling and dispatch) we must NOT hand the model a
+            # blank user turn — it responds with confused "the message came
+            # through blank" noise.  Restricted to resume_pending sessions so
+            # legitimately empty user turns (e.g. an image with no caption,
+            # wrapped as native content below) are untouched.
+            if (
+                isinstance(message, str)
+                and not message.strip()
+                and _resume_entry is not None
+                and getattr(_resume_entry, "resume_pending", False)
+            ):
+                _sn_reason = (
+                    getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
+                )
+                _sn_reason_phrase = (
+                    "a gateway restart"
+                    if _sn_reason == "restart_timeout"
+                    else "a gateway shutdown"
+                    if _sn_reason == "shutdown_timeout"
+                    else "a gateway interruption"
+                )
+                message = (
+                    f"[System note: The previous turn was interrupted by "
+                    f"{_sn_reason_phrase}; the gateway is now back online. "
+                    f"Any restart/shutdown command in the history has already "
+                    f"run — do NOT re-execute or verify it. Report to the user "
+                    f"that the session was restored successfully and ask what "
+                    f"they would like to do next. Do NOT re-execute old tool "
+                    f"calls — skip any unfinished work from the conversation "
+                    f"history.]"
+                )
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
@@ -18034,14 +20365,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_message"] = _persist_user_message_override
                 elif observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message
+                if moa_config is not None:
+                    _conversation_kwargs["moa_config"] = moa_config
+                if _persist_user_timestamp_override is not None:
+                    _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
-                if _profile_home_token is not None:
-                    try:
-                        from hermes_constants import reset_hermes_home_override
-                        reset_hermes_home_override(_profile_home_token)
-                    except Exception:
-                        pass
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -18079,6 +20408,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below must still point the gateway at the compressed child.
             agent = agent_holder[0]
             _session_was_split = False
+            # In-place compaction (compression.in_place / #38763) compacts the
+            # transcript WITHOUT rotating the id, so the id-change diff below
+            # can't detect it. compress_context() sets this rotation-independent
+            # flag on the agent; the gateway uses it to re-baseline transcript
+            # handling (history_offset=0 + rewrite the JSONL transcript) the
+            # same way a split would, even though the session_id is unchanged.
+            _compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False)) if agent else False
             agent_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
             if agent and session_key and agent_session_id != session_id:
                 _session_was_split = True
@@ -18086,17 +20422,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Session split detected: %s → %s (compression)",
                     session_id, agent_session_id,
                 )
-                try:
-                    from hermes_cli.goals import migrate_goal_to_session
-
-                    migrate_goal_to_session(session_id, agent_session_id)
-                except Exception as _goal_migrate_exc:
-                    logger.debug(
-                        "goal migration after session split failed %s -> %s: %s",
-                        session_id,
-                        agent_session_id,
-                        _goal_migrate_exc,
-                    )
                 entry = self.session_store._entries.get(session_key)
                 _session_split_entry_persisted = False
                 if entry:
@@ -18145,7 +20470,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and self._session_db is not None
                 ):
                     try:
-                        _binding = self._session_db.get_telegram_topic_binding_by_session(
+                        # run_sync is off-loop (executor); sync DB is fine.
+                        _binding = self._session_db._db.get_telegram_topic_binding_by_session(
                             session_id=agent_session_id,
                         )
                         if _binding and _binding.get("thread_id"):
@@ -18167,12 +20493,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             effective_session_id = agent_session_id
-            _effective_history_offset = 0 if _session_was_split else len(agent_history)
+            self._sync_session_model_from_agent(effective_session_id, agent)
+            # history_offset=0 whenever the agent's message list no longer has
+            # the original history prefix — i.e. on rotation (split) OR in-place
+            # compaction. In both cases the returned `messages` is the compacted
+            # set, so the gateway must persist all of it (offset 0), not slice
+            # past the pre-compaction length (which would drop everything).
+            _effective_history_offset = (
+                0 if (_session_was_split or _compacted_in_place) else len(agent_history)
+            )
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                final_response = _normalize_empty_agent_response(
+                    result, final_response or "", history_len=len(agent_history),
+                )
+                final_response = _sanitize_gateway_final_response(source.platform, final_response)
+                if not final_response:
+                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
-                    "final_response": error_msg,
+                    "final_response": final_response,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "failed": result.get("failed", False),
@@ -18184,6 +20523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": _effective_history_offset,
+                    "compacted_in_place": _compacted_in_place,
                     "session_id": effective_session_id,
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
@@ -18230,109 +20570,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
-            # Sync session_id: the agent may have created a new session during
-            # mid-run context compression (_compress_context splits sessions).
-            # If so, update the session store entry so the NEXT message loads
-            # the compressed transcript, not the stale pre-compression one.
-            agent = agent_holder[0]
-            _session_was_split = False
-            _agent_session_id = getattr(agent, "session_id", None) if agent else None
-            if agent and session_key and _agent_session_id and _agent_session_id != session_id:
-                _session_was_split = True
-                logger.info(
-                    "Session split detected: %s → %s (compression)",
-                    session_id, _agent_session_id,
-                )
-                try:
-                    from hermes_cli.goals import migrate_goal_to_session
-
-                    migrate_goal_to_session(session_id, _agent_session_id)
-                except Exception as _goal_migrate_exc:
-                    logger.debug(
-                        "goal migration after session split failed %s -> %s: %s",
-                        session_id,
-                        _agent_session_id,
-                        _goal_migrate_exc,
-                    )
-                entry = self.session_store._entries.get(session_key)
-                _session_split_entry_persisted = False
-                if entry:
-                    entry_session_id = getattr(entry, "session_id", None)
-                    if not _run_still_current():
-                        logger.info(
-                            "Skipping session split sync for stale run %s — "
-                            "generation %s is no longer current",
-                            session_key or "?",
-                            run_generation,
-                        )
-                    elif entry_session_id == _agent_session_id:
-                        _session_split_entry_persisted = True
-                    elif entry_session_id != session_id:
-                        logger.info(
-                            "Skipping session split sync for %s because the "
-                            "session binding moved from %s to %s before "
-                            "compression finished",
-                            session_key or "?",
-                            session_id,
-                            entry_session_id,
-                        )
-                    else:
-                        entry.session_id = _agent_session_id
-                        self.session_store._save()
-                        self.session_store._record_gateway_session_peer(
-                            _agent_session_id,
-                            session_key,
-                            source,
-                        )
-                        _session_split_entry_persisted = True
-
-                # If this is a Telegram DM and source.thread_id was lost during
-                # the session split (synthetic / recovered event), restore it
-                # from the binding so _thread_metadata_for_source produces the
-                # correct message_thread_id instead of routing to the General
-                # thread.  Failure here is non-fatal — we log and continue;
-                # worst case the message lands in General, which is the
-                # pre-fix behaviour. Only do this after this run successfully
-                # published its session split; a stale /stop→/new predecessor
-                # must not mutate routing/binding state for the fresh session.
-                if _session_split_entry_persisted and (
-                    getattr(source, "platform", None) == Platform.TELEGRAM
-                    and getattr(source, "chat_type", None) == "dm"
-                    and getattr(source, "thread_id", None) is None
-                    and self._session_db is not None
-                ):
-                    try:
-                        _binding = self._session_db.get_telegram_topic_binding_by_session(
-                            session_id=_agent_session_id,
-                        )
-                        if _binding and _binding.get("thread_id"):
-                            source.thread_id = str(_binding["thread_id"])
-                            logger.debug(
-                                "Restored source.thread_id=%s from binding after session split %s → %s",
-                                source.thread_id,
-                                session_id,
-                                _agent_session_id,
-                            )
-                    except Exception:
-                        logger.debug(
-                            "Failed to restore thread_id from binding after session split",
-                            exc_info=True,
-                        )
-                if _session_split_entry_persisted:
-                    self._sync_telegram_topic_binding(
-                        source, entry, reason="agent-run-compression",
-                    )
-
-            effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
-
-            # When compression created a new session, the messages list was
-            # shortened.  Using the original history offset would produce an
-            # empty new_messages slice, causing the gateway to write only a
-            # user/assistant pair — losing the compressed summary and tail.
-            # Reset to 0 so the gateway writes ALL compressed messages.
-            _effective_history_offset = 0 if _session_was_split else len(agent_history)
-
-
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:
                 try:
@@ -18371,7 +20608,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             title,
                         )
                     maybe_auto_title(
-                        self._session_db,
+                        getattr(self._session_db, "_db", self._session_db),
                         effective_session_id,
                         message,
                         final_response,
@@ -18393,6 +20630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
+                "compacted_in_place": _compacted_in_place,
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
@@ -18401,11 +20639,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                # Pass through the agent_persisted flag so the persistence block
+                # above can correctly determine whether the codex app-server path
+                # self-persisted (it didn't — see codex_runtime.py).  Default
+                # True preserves the skip-db behaviour for the standard runtime.
+                "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
             }
         
-        # Start progress message sender if enabled
+        # Start progress message sender if enabled. Gate on needs_progress_queue
+        # (tool_progress OR thinking_progress), not tool_progress alone: the
+        # sender drains BOTH tool-progress lines and _thinking scratch bubbles.
+        # With the old tool_progress-only gate, a thinking_progress:true /
+        # tool_progress:off user had the callback queue _thinking messages that
+        # no task ever drained — so they silently never appeared.
         progress_task = None
-        if tool_progress_enabled:
+        if needs_progress_queue:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start the tool-call log writer when tool_progress == "log".
@@ -18554,8 +20802,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if suppress_tool_status_for_chat:
-            _NOTIFY_INTERVAL = None
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
             default=True,
@@ -18579,6 +20825,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
+                # Stop heartbeating once this run no longer owns the session
+                # slot or the executor has finished — otherwise a stale
+                # "running: delegate_task" bubble can outlive the run that
+                # spawned it (#12029). _executor_task is a closure var bound
+                # just after this task is scheduled; tolerate the brief window
+                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
+                try:
+                    _exec_ref = _executor_task
+                except NameError:
+                    _exec_ref = None
+                if not self._should_emit_long_running_notification(
+                    session_key, agent_holder[0], _exec_ref
+                ):
+                    break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available. Default
                 # heartbeat is terse: elapsed + current tool. Verbose
@@ -18630,7 +20890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_status_thread_metadata,
+                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
@@ -18642,6 +20902,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
+
+        def _stream_confirmed_final_delivery(
+            consumer,
+            final_text: str,
+            *,
+            previewed: bool = False,
+        ) -> bool:
+            """Return True only when the actual final reply reached the user."""
+            if consumer is None:
+                return False
+            if getattr(consumer, "final_response_sent", False):
+                return True
+            if previewed:
+                has_delivered_text = getattr(consumer, "has_delivered_text", None)
+                if callable(has_delivered_text):
+                    try:
+                        return bool(has_delivered_text(final_text))
+                    except Exception:
+                        return False
+            return False
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -18831,6 +21111,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_failed = _result_for_fb.get("failed") if _result_for_fb else False
             if _agent is not None and hasattr(_agent, 'model') and not _run_failed:
                 _cfg_model = _resolve_gateway_model()
+                # Normalize _cfg_model the same way AIAgent.__init__ does, so a
+                # vendor-prefixed config value (e.g. "deepseek/deepseek-v4-pro")
+                # matches the agent's stripped model ("deepseek-v4-pro") on
+                # native providers. Without this, _agent.model != _cfg_model is
+                # always true for vendor-prefixed config and the cached agent is
+                # evicted on every successful turn — destroying prompt caching.
+                # Aggregators (openrouter, etc.) keep the vendor/model slug, so
+                # they're left untouched.
+                try:
+                    from hermes_cli.model_normalize import (
+                        _AGGREGATOR_PROVIDERS,
+                        normalize_model_for_provider,
+                    )
+                    _agent_provider = getattr(_agent, 'provider', '') or ''
+                    if _agent_provider and _agent_provider not in _AGGREGATOR_PROVIDERS:
+                        _cfg_model = normalize_model_for_provider(_cfg_model, _agent_provider)
+                except Exception:
+                    pass
                 if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
                     # Fallback activated on a successful run — evict cached
                     # agent so the next message retries the primary model.
@@ -18994,120 +21292,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
-                    _already_streamed = bool(
-                        (_sc and getattr(_sc, "final_response_sent", False))
-                        or _previewed
-                        or (_sc and getattr(_sc, "final_content_delivered", False))
-                    )
                     first_response = result.get("final_response", "")
+                    _already_streamed = _stream_confirmed_final_delivery(
+                        _sc,
+                        first_response,
+                        previewed=_previewed,
+                    )
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            first_response_text = first_response
-                            first_media_files = []
-                            first_local_files = []
-                            try:
-                                from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
-
-                                media_files, cleaned = adapter.extract_media(first_response)
-                                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                                _, cleaned = adapter.extract_images(cleaned)
-                                local_files, cleaned = adapter.extract_local_files(cleaned)
-                                local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
-                                if media_files or local_files:
-                                    first_response_text = cleaned.strip()
-                                    first_media_files = list(media_files)
-                                    first_local_files = list(local_files)
-                            except Exception as media_extract_err:
-                                logger.warning(
-                                    "Queued follow-up media extraction failed for session %s: %s",
-                                    session_key or "?",
-                                    media_extract_err,
-                                )
-
-                            if first_response_text:
-                                await adapter.send(
-                                    source.chat_id,
-                                    first_response_text,
-                                    metadata=_status_thread_metadata,
-                                )
-
-                            if first_media_files or first_local_files:
-                                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-                                from urllib.parse import quote as _quote
-                                image_paths = []
-                                non_image_media = []
-                                for media_path, is_voice in first_media_files:
-                                    ext = Path(media_path).suffix.lower()
-                                    if ext in _IMAGE_EXTS and not is_voice:
-                                        image_paths.append(media_path)
-                                    else:
-                                        non_image_media.append((media_path, is_voice))
-                                non_image_local = []
-                                for file_path in first_local_files:
-                                    if Path(file_path).suffix.lower() in _IMAGE_EXTS:
-                                        image_paths.append(file_path)
-                                    else:
-                                        non_image_local.append(file_path)
-                                if image_paths:
-                                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                                    await adapter.send_multiple_images(
-                                        chat_id=source.chat_id,
-                                        images=images,
-                                        metadata=_status_thread_metadata,
-                                    )
-                                for media_path, is_voice in non_image_media:
-                                    ext = Path(media_path).suffix.lower()
-                                    if _should_send_media_as_audio(source.platform, ext, is_voice=is_voice):
-                                        media_result = await adapter.send_voice(
-                                            chat_id=source.chat_id,
-                                            audio_path=media_path,
-                                            metadata=_status_thread_metadata,
-                                        )
-                                    elif ext in _VIDEO_EXTS:
-                                        media_result = await adapter.send_video(
-                                            chat_id=source.chat_id,
-                                            video_path=media_path,
-                                            metadata=_status_thread_metadata,
-                                        )
-                                    else:
-                                        media_result = await adapter.send_document(
-                                            chat_id=source.chat_id,
-                                            file_path=media_path,
-                                            metadata=_status_thread_metadata,
-                                        )
-                                    if not getattr(media_result, "success", False):
-                                        logger.warning(
-                                            "Queued follow-up media delivery failed for session %s (%s): %s",
-                                            session_key or "?",
-                                            ext,
-                                            getattr(media_result, "error", None),
-                                        )
-                                for file_path in non_image_local:
-                                    ext = Path(file_path).suffix.lower()
-                                    if ext in _VIDEO_EXTS:
-                                        file_result = await adapter.send_video(
-                                            chat_id=source.chat_id,
-                                            video_path=file_path,
-                                            metadata=_status_thread_metadata,
-                                        )
-                                    else:
-                                        file_result = await adapter.send_document(
-                                            chat_id=source.chat_id,
-                                            file_path=file_path,
-                                            metadata=_status_thread_metadata,
-                                        )
-                                    if not getattr(file_result, "success", False):
-                                        logger.warning(
-                                            "Queued follow-up file delivery failed for session %s (%s): %s",
-                                            session_key or "?",
-                                            ext,
-                                            getattr(file_result, "error", None),
-                                        )
+                            await adapter.send(
+                                source.chat_id,
+                                first_response,
+                                metadata=_status_thread_metadata,
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -19171,7 +21372,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
-                    next_message = await self._prepare_inbound_message_text(
+                    next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
@@ -19194,6 +21395,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         pass
+
+                # Re-baseline the cached agent's message_count snapshot before
+                # recursing into the in-band queued (/queue) follow-up turn.
+                # The first turn has completed and flushed its own user +
+                # assistant rows to the SessionDB, so the cross-process
+                # coherence guard (#45966) — which this recursive _run_agent
+                # call re-enters — would otherwise see the grown on-disk count
+                # against the stale build-time snapshot and rebuild the agent
+                # on THIS process's OWN writes, destroying the prompt-cache
+                # prefix #46237 was merged to preserve.  The existing
+                # re-baseline in _handle_message_with_agent only runs after the
+                # whole _run_agent chain unwinds — too late for the in-band
+                # follow-up.  Use the same (session_key, session_id) the
+                # recursive call runs under so the snapshot matches exactly
+                # what the follow-up's guard will consult.  Fail-safe in helper.
+                await self._refresh_agent_cache_message_count(session_key, session_id)
 
                 followup_result = await self._run_agent(
                     message=next_message,
@@ -19284,11 +21501,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
-            _streamed = bool(
-                _sc and getattr(_sc, "final_response_sent", False)
-            )
             # response_previewed means the interim_assistant_callback already
-            # sent the final text via the adapter (non-streaming path).
+            # saw the final text, but only suppress the normal send if that
+            # exact final text was delivered. Unrelated commentary/progress
+            # must not be mistaken for the final response (#14238).
             _previewed = bool(response.get("response_previewed"))
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
@@ -19297,34 +21513,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            _stream_delivery_matches_final = True
-            if _sc is not None and (_streamed or _content_delivered):
-                _matches_final = getattr(_sc, "final_delivery_matches", None)
-                if callable(_matches_final):
-                    try:
-                        _stream_delivery_matches_final = bool(_matches_final(_final))
-                    except Exception:
-                        logger.debug(
-                            "Stream final-delivery match check failed for session %s",
-                            session_key or "?",
-                            exc_info=True,
-                        )
-                        _stream_delivery_matches_final = True
-            if not _stream_delivery_matches_final:
-                logger.warning(
-                    "Stream final delivery mismatch for session %s: allowing normal final send "
-                    "(streamed=%s previewed=%s content_delivered=%s final_len=%d).",
-                    session_key or "?",
-                    _streamed,
-                    _previewed,
-                    _content_delivered,
-                    len(_final),
-                )
-            if (
-                not _is_empty_sentinel
-                and not _transformed
-                and (_previewed or ((_streamed or _content_delivered) and _stream_delivery_matches_final))
-            ):
+            # Only suppress the normal send when the actual final reply reached
+            # the user: the stream consumer streamed it (final_response_sent /
+            # final_content_delivered), or the interim preview delivered that
+            # *exact* final text. Unrelated commentary/progress shown during a
+            # compression/session split must not be mistaken for the final
+            # response (#14238).
+            _streamed = _stream_confirmed_final_delivery(
+                _sc,
+                _final,
+                previewed=_previewed,
+            )
+            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -19355,79 +21555,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
                         )
-
-            if (
-                not _is_empty_sentinel
-                and not response.get("already_sent")
-                and _sc is not None
-                and getattr(_sc, "already_sent", False)
-                and getattr(_sc, "message_id", None)
-                and adapter is not None
-                and hasattr(adapter, "register_post_delivery_callback")
-                and hasattr(getattr(_sc, "adapter", adapter), "delete_message")
-                and session_key
-            ):
-                # Streaming showed a partial preview, but final delivery was not
-                # confirmed (usually Telegram flood-control blocked the final
-                # edit). BasePlatformAdapter will now send the complete final
-                # response as a fresh message. Clean up the stale preview after
-                # that send lands so users do not see a frozen "... ▉" bubble
-                # above the real answer (#18219/#18220 regression).
-                _stale_stream_msg_id = str(getattr(_sc, "message_id"))
-                _stale_stream_adapter = getattr(_sc, "adapter", adapter)
-                _stale_stream_chat_id = source.chat_id
-                _stale_loop = asyncio.get_running_loop()
-
-                def _cleanup_stale_stream_preview() -> None:
-                    async def _delete_stale_preview() -> None:
-                        for _attempt in range(2):
-                            try:
-                                await _stale_stream_adapter.delete_message(
-                                    _stale_stream_chat_id,
-                                    _stale_stream_msg_id,
-                                )
-                                return
-                            except Exception as _delete_err:
-                                _retry_after = getattr(_delete_err, "retry_after", None)
-                                _err_s = str(_delete_err).lower()
-                                if _attempt == 0:
-                                    if _retry_after is not None:
-                                        _wait = float(_retry_after) + 0.5
-                                    elif "flood" in _err_s or "retry after" in _err_s:
-                                        _wait = 3.0
-                                    else:
-                                        _wait = 0.0
-                                    if 0.0 < _wait <= 60.0:
-                                        await asyncio.sleep(_wait)
-                                        continue
-                                logger.debug(
-                                    "Stale stream preview cleanup failed (%s): %s",
-                                    _stale_stream_msg_id,
-                                    _delete_err,
-                                )
-                                return
-
-                    try:
-                        asyncio.create_task(_delete_stale_preview())
-                    except RuntimeError:
-                        safe_schedule_threadsafe(
-                            _delete_stale_preview(),
-                            _stale_loop,
-                            logger=logger,
-                            log_message="Stale stream preview cleanup scheduling error",
-                        )
-
-                try:
-                    adapter.register_post_delivery_callback(
-                        session_key,
-                        _cleanup_stale_stream_preview,
-                        generation=run_generation,
-                    )
-                except Exception as _cleanup_reg_err:
-                    logger.debug(
-                        "Stale stream preview cleanup registration failed: %s",
-                        _cleanup_reg_err,
-                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
@@ -19567,21 +21694,20 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
-    """
-    Background thread that ticks the cron scheduler at a regular interval.
-    
-    Runs inside the gateway process so cronjobs fire automatically without
-    needing a separate `hermes cron daemon` or system cron entry.
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+    """Background thread for gateway-only periodic chores (NOT cron).
 
-    When ``adapters`` and ``loop`` are provided, passes them through to the
-    cron delivery path so live adapters can be used for E2EE rooms.
+    Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
+    can live behind the ``CronScheduler`` provider (built-in or external) while
+    these gateway-specific chores keep running independently of which provider
+    fires cron. An external scale-to-zero provider has no 60s loop at all, but
+    this housekeeping still wants its hourly cadence — so it owns its own loop.
 
-    Also refreshes the channel directory every 5 minutes and prunes the
-    image/audio/document cache + expired ``hermes debug share`` pastes
-    once per hour.
+    Refreshes the channel directory every 5 minutes and prunes the
+    image/audio/document cache + expired ``hermes debug share`` pastes once per
+    hour, and polls the curator hourly (its inner gate enforces the real
+    weekly cadence).
     """
-    from cron.scheduler import tick as cron_tick
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
     from hermes_cli.debug import _sweep_expired_pastes
 
@@ -19590,14 +21716,9 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
 
-    logger.info("Cron ticker started (interval=%ds)", interval)
+    logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
-        try:
-            cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
-        except Exception as e:
-            logger.debug("Cron tick error: %s", e)
-
         tick_count += 1
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
@@ -19605,9 +21726,9 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 from gateway.channel_directory import build_channel_directory
                 if loop is not None:
                     # build_channel_directory is async (Slack web calls), and
-                    # this ticker runs in a background thread. Schedule onto
-                    # the gateway event loop and wait briefly for completion
-                    # so refresh failures are still logged via the except.
+                    # this runs in a background thread. Schedule onto the
+                    # gateway event loop and wait briefly for completion so
+                    # refresh failures are still logged via the except.
                     fut = safe_schedule_threadsafe(
                         build_channel_directory(adapters), loop,
                         logger=logger,
@@ -19643,7 +21764,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
             except Exception as e:
                 logger.debug("Paste sweep error: %s", e)
 
-        # Curator — piggy-back on the existing cron ticker so long-running
+        # Curator — piggy-back on the housekeeping loop so long-running
         # gateways get weekly skill maintenance without needing restarts.
         # maybe_run_curator() is internally gated by config.interval_hours
         # (7 days by default), so CURATOR_EVERY is just the poll rate — the
@@ -19659,7 +21780,22 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 logger.debug("Curator tick error: %s", e)
 
         stop_event.wait(timeout=interval)
-    logger.info("Cron ticker stopped")
+    logger.info("Gateway housekeeping stopped")
+
+
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+    """DEPRECATED shim — preserved for backward compatibility.
+
+    The cron trigger now lives behind the ``CronScheduler`` provider
+    (``cron.scheduler_provider``); the gateway resolves a provider and runs its
+    ``start()`` directly (see ``start_gateway``). This shim runs ONLY the
+    built-in in-process tick loop, exactly as before, for any external caller
+    or test that still references this symbol (e.g. hermes_cli/debug.py). It no
+    longer runs gateway housekeeping — that moved to
+    ``_start_gateway_housekeeping``.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
 # Upper bound for cooperatively draining the cron ticker on shutdown. The cron
@@ -19718,6 +21854,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Snapshot the checkout revision now, while sys.modules still matches disk,
+    # so a later `git pull` under this long-lived process can be detected (and
+    # risky work like model switching refused) instead of crashing on a stale
+    # in-memory module.
+    from gateway.code_skew import record_boot_fingerprint
+    record_boot_fingerprint()
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
@@ -19866,6 +22009,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Startup security posture audit — warn-on-load, never blocks. Surfaces
+    # root / weak-SSH / ephemeral-container / unauthenticated-listener posture
+    # so operators get the "you're exposed" signal the June 2026 MCP-config
+    # persistence campaign victims never had.
+    try:
+        from hermes_cli.security_audit_startup import log_startup_security_warnings
+
+        _audit_cfg = None
+        try:
+            from hermes_cli.config import read_raw_config
+
+            _audit_cfg = read_raw_config()
+        except Exception:
+            _audit_cfg = None
+        log_startup_security_warnings(hermes_home=_hermes_home, config=_audit_cfg)
+    except Exception as _audit_exc:
+        logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
@@ -20073,6 +22234,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
+    try:
+        from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
+
+        start_nous_auth_keepalive()
+    except Exception as exc:
+        logger.debug("Nous auth keepalive did not start: %s", exc)
+
     _ensure_windows_gateway_venv_imports()
 
     # MCP tool discovery — run in an executor so the asyncio event loop
@@ -20095,31 +22263,107 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.should_exit_cleanly:
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
+        # A clean exit that carries an explicit exit code (e.g. a fatal
+        # config error stamped with GATEWAY_FATAL_CONFIG_EXIT_CODE) must
+        # propagate that code to the process so the s6 finish script can
+        # translate it (78 → 125) and stop the supervisor restart loop.
+        # Without this, the early `return True` below makes main() exit 0,
+        # the finish script's `[ "$1" = "78" ]` check never matches, and
+        # s6 crash-loops the gateway anyway (#51228).
+        if runner.exit_code is not None:
+            raise SystemExit(runner.exit_code)
+        return True
+    if not runner._running:
+        # Startup was intentionally aborted by restart/shutdown before entering
+        # running mode; preserve that lifecycle path without starting cron.
+        await runner.wait_for_shutdown()
+        if runner.should_exit_with_failure:
+            if runner.exit_reason:
+                logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+            return False
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
+        if runner.exit_code is not None:
+            raise SystemExit(runner.exit_code)
         return True
     
-    # Start background cron ticker so scheduled jobs fire automatically.
-    # Pass the event loop so cron delivery can use live adapters (E2EE support).
+    # Start the background cron scheduler via the resolved provider so
+    # scheduled jobs fire automatically. The built-in provider is the
+    # historical in-process 60s ticker; an external provider (e.g. chronos)
+    # may arm a schedule and return. Pass the event loop so cron delivery can
+    # use live adapters (E2EE support).
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
+    cron_provider = resolve_cron_scheduler()
+    cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    # External cron providers own their remote scheduling contract. Only the
+    # in-process ticker polls local due jobs, so only it receives the local
+    # external-drain dispatch gate.
+    if isinstance(cron_provider, InProcessCronScheduler):
+        cron_start_kwargs["can_dispatch"] = lambda: not (
+            runner._draining or runner._external_drain_active
+        )
     cron_thread = threading.Thread(
-        target=_start_cron_ticker,
+        target=cron_provider.start,
+        args=(cron_stop,),
+        kwargs=cron_start_kwargs,
+        daemon=True,
+        name="cron-scheduler",
+    )
+    cron_thread.start()
+
+    # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
+    # sweep, curator) — runs independently of which cron provider is active.
+    # Shares cron_stop as the shutdown signal.
+    housekeeping_thread = threading.Thread(
+        target=_start_gateway_housekeeping,
         args=(cron_stop,),
         kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
         daemon=True,
-        name="cron-ticker",
+        name="gateway-housekeeping",
     )
-    cron_thread.start()
+    housekeeping_thread.start()
     
     # Wait for shutdown
     await runner.wait_for_shutdown()
+
+    try:
+        from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
+
+        stop_nous_auth_keepalive()
+    except Exception:
+        pass
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
     
-    # Stop cron ticker cleanly
+    # Stop cron scheduler + housekeeping cleanly.
+    #
+    # These MUST be awaited cooperatively, not join()ed. A cron delivery in
+    # flight when the gateway restarts is a coroutine scheduled onto THIS event
+    # loop (safe_schedule_threadsafe); the ticker thread is blocked on its
+    # future.result(). A synchronous cron_thread.join() would block the loop,
+    # so that delivery could never run — it timed out and the message was
+    # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
+    # delivery finishes before we tear down.
     cron_stop.set()
-    cron_thread.join(timeout=5)
+    try:
+        cron_provider.stop()
+    except Exception as e:
+        logger.debug("Cron provider stop() error: %s", e)
+    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+        logger.warning(
+            "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+            "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+        )
+    await _await_thread_exit(
+        housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
+    )
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
@@ -20187,11 +22431,93 @@ def main():
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
-    # Run the gateway - exit with code 1 if no platforms connected,
-    # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config))
-    if not success:
-        sys.exit(1)
+    # start_gateway() performs the full graceful teardown (adapters
+    # disconnected, sessions saved + flushed, SQLite closed, cron/MCP stopped,
+    # PID file + runtime lock released) before it returns OR raises SystemExit
+    # with an explicit code. Force-exit afterwards so a wedged non-daemon worker
+    # thread (e.g. a ThreadPoolExecutor tool/LLM call blocked with no timeout)
+    # cannot block interpreter finalization (Py_FinalizeEx joins all non-daemon
+    # threads, incl. concurrent.futures' _python_exit) and strand the gateway
+    # half-shut down with the supervisor unable to restart it (#53107).
+    #
+    # SystemExit is caught explicitly: start_gateway raises it on the
+    # clean-fatal-config (#51228), planned-restart, and service-restart paths,
+    # all of which complete teardown first. Routing those codes through the
+    # same os._exit backstop means EVERY exit path is wedge-proof, not just the
+    # boolean-return ones.
+    try:
+        success = asyncio.run(start_gateway(config))
+        exit_code = 0 if success else 1
+    except SystemExit as e:
+        # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
+        if e.code is None:
+            exit_code = 0
+        elif isinstance(e.code, int):
+            exit_code = e.code
+        else:
+            exit_code = 1
+    _exit_after_graceful_shutdown(exit_code)
+
+
+def _exit_after_graceful_shutdown(exit_code: int) -> None:
+    """Flush stdio, release the PID file + runtime lock, then hard-exit.
+
+    Graceful teardown is already complete by the time this runs, so there is
+    nothing left that needs a clean interpreter shutdown. We deliberately use
+    ``os._exit`` (not ``sys.exit``): ``sys.exit`` raises ``SystemExit``, which
+    triggers ``Py_FinalizeEx`` → ``wait_for_thread_shutdown`` and joins every
+    non-daemon thread — exactly the hang (#53107) a wedged tool-worker causes.
+
+    ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the
+    ``atexit``-registered ``remove_pid_file`` / ``release_gateway_runtime_lock``
+    (registered in ``start_gateway``) to run. The full-shutdown path releases
+    both explicitly in ``_stop_impl``, but the EARLY exit paths —
+    clean-fatal-config (#51228) and startup-aborted-before-running — raise
+    ``SystemExit`` right after ``runner.start()`` without going through
+    ``_stop_impl``, so on those paths ``atexit`` was the only thing releasing
+    them. Now that those paths are routed through this backstop (#53107),
+    release both here explicitly. Both calls are idempotent —
+    ``remove_pid_file`` only unlinks a PID file that belongs to this process,
+    and ``release_gateway_runtime_lock`` no-ops when the lock is already
+    released — so this is a no-op on the normal shutdown path and the actual
+    cleanup on the early-exit paths.
+
+    Logging IS drained here: the rotating file handlers are driven by an
+    async ``QueueListener`` on a dedicated thread (see
+    ``hermes_logging._register_queued_handler``), so records emitted right
+    before shutdown may still be sitting in the in-memory queue. ``os._exit``
+    below bypasses ``atexit``, so the ``atexit``-registered listener drain
+    never runs on this path — we drain explicitly (bounded, via
+    ``drain_log_queue``) or lose the last log lines (including the shutdown
+    reason on the early-exit paths). Stdio is flushed too.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    # Release PID + runtime lock BEFORE the log drain: the drain is bounded but
+    # could still take up to its timeout on a wedged disk, and these locks must
+    # never be stranded. os._exit skips atexit, and the early SystemExit exit
+    # paths never run _stop_impl, so release here (idempotent).
+    try:
+        from gateway.status import remove_pid_file, release_gateway_runtime_lock
+        remove_pid_file()
+        release_gateway_runtime_lock()
+    except Exception:
+        pass
+    # Drain the async log queue: os._exit bypasses atexit, so the listener's
+    # atexit drain won't fire. Use drain_log_queue() (bounded, no restart), NOT
+    # flush_log_queue(): if the listener is wedged on the rotation lock — the
+    # exact failure this async-logging change survives — an unbounded stop()
+    # join would re-freeze the shutdown. drain_log_queue() no-ops when logging
+    # never initialized a queue (very early aborts), so this is always safe.
+    try:
+        from hermes_logging import drain_log_queue
+        drain_log_queue(timeout=1.0)
+    except Exception:
+        pass
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":

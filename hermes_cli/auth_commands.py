@@ -345,11 +345,8 @@ def auth_add_command(args) -> None:
         return
 
     if provider == "xai-oauth":
-        # Browser-mediated SuperGrok login often goes through X.com first and
-        # may require an interactive confirmation/2FA step. Keep the default
-        # aligned with the docs and long enough for remote relay sessions.
-        creds = auth_mod._xai_oauth_loopback_login(
-            timeout_seconds=getattr(args, "timeout", None) or 180.0,
+        creds = auth_mod._xai_oauth_device_code_login(
+            timeout_seconds=getattr(args, "timeout", None) or 20.0,
             open_browser=not getattr(args, "no_browser", False),
         )
         auth_mod._save_xai_oauth_tokens(

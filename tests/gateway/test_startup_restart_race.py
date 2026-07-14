@@ -89,6 +89,9 @@ def make_startup_runner(tmp_path):
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
     runner.session_store.suspend_recently_active.return_value = 0
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store.suspend_recently_active = AsyncMock(return_value=0)
     runner.delivery_router = MagicMock()
     runner.delivery_router.adapters = {}
 
@@ -167,7 +170,9 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     telegram.disconnect = disconnect_and_release
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    # Full shutdown now includes async persistence and subprocess cleanup;
+    # keep this race assertion deterministic on loaded production hosts.
+    result = await asyncio.wait_for(runner.start(), timeout=10)
 
     assert result is True
     assert telegram.disconnected is True
