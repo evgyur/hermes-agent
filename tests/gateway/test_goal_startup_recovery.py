@@ -23,6 +23,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionEntry
 from hermes_cli.goals import GoalManager
+from hermes_state import AsyncSessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -338,6 +339,19 @@ class _RiskyToolTailDB:
                 "tool_calls": [{"function": {"name": "terminal"}}],
             },
         ]
+
+
+def test_startup_goal_recovery_unwraps_async_session_db(hermes_home):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="async-db-goal-sid")
+    runner._session_db = AsyncSessionDB(_RiskyToolTailDB())
+    GoalManager(session_id=entry.session_id).set("recover through async DB facade")
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "auto_resume"
+    assert decision.reason == "active-goal-startup-recovery-with-open-tool-tail"
+    assert "terminal" in decision.prompt
 
 
 @pytest.mark.asyncio

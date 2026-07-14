@@ -6990,6 +6990,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_store = getattr(self, "_session_db", None)
         if raw_store is None:
             raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        raw_store = getattr(raw_store, "_db", raw_store)
         if raw_store is None or not session_id:
             return None
         try:
@@ -7022,6 +7023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_store = getattr(self, "_session_db", None)
         if raw_store is None:
             raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        raw_store = getattr(raw_store, "_db", raw_store)
         if raw_store is None:
             return ()
         try:
