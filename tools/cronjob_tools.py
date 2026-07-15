@@ -31,6 +31,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    trigger_job_if_active,
     update_job,
 )
 
@@ -680,7 +681,11 @@ def cronjob(
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
-    del task_id  # unused but kept for handler signature compatibility
+    # Model/tool invocations carry a task_id.  Keep that signal so a manual
+    # cron run can be queued without blocking the parent agent turn for the
+    # entire duration of the spawned cron agent.  Direct CLI/Python callers do
+    # not carry a task_id and retain the historical immediate/waiting behavior.
+    agent_invocation = bool(task_id)
 
     try:
         normalized = (action or "").strip().lower()
@@ -805,7 +810,7 @@ def cronjob(
                 indent=2,
             )
         # Resolve to canonical ID (supports name-based lookup)
-        job_id = job["id"]
+        job_id = str(job["id"])
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -836,6 +841,38 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
+            if agent_invocation:
+                # A cron agent can legitimately run for minutes.  Executing it
+                # inline here wedges the calling chat's tool invocation and
+                # trips the gateway inactivity watchdog.  Queue it for the
+                # scheduler instead; the gateway ticker dispatches due jobs on
+                # its persistent worker pool without blocking this turn.
+                queued_job, queue_status = trigger_job_if_active(job_id)
+                if queue_status == "paused":
+                    result = _format_job(queued_job or job)
+                    result["executed"] = False
+                    result["execution_state"] = "skipped"
+                    result["execution_success"] = False
+                    result["execution_skipped"] = (
+                        "Job is paused/disabled; resume it before running."
+                    )
+                    return json.dumps({"success": True, "job": result}, indent=2)
+                if queue_status == "missing" or not queued_job:
+                    return tool_error(
+                        f"Failed to queue cron job '{job_id}' for execution.",
+                        success=False,
+                    )
+                _notify_provider_jobs_changed_safe()
+                result = _format_job(queued_job)
+                result["executed"] = False
+                result["execution_state"] = "queued"
+                result["execution_success"] = None
+                result["message"] = (
+                    "Queued for the next scheduler tick; execution continues "
+                    "asynchronously. Inspect the job later with action='list'."
+                )
+                return json.dumps({"success": True, "job": result}, indent=2)
+
             # Execute the job immediately rather than only scheduling it for the
             # next scheduler tick — a manual `run` should actually run, even when
             # no gateway/ticker is active (the #41037 case). The claim inside
@@ -974,6 +1011,8 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+Agent-triggered `run` is non-blocking: it returns after queueing the job for the
+next scheduler tick. Use `list` later to inspect completion status/output.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 

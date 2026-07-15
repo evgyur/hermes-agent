@@ -1442,6 +1442,30 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def trigger_job_if_active(job_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Atomically queue an active job without re-enabling a paused one.
+
+    ``cronjob(action="run")`` uses this path from agent turns.  The active-state
+    check and ``next_run_at`` write share one jobs-file lock, so a concurrent
+    pause cannot win between a stale read and ``trigger_job()`` reactivating the
+    job.  ``job_id`` must already be the canonical ID.
+
+    Returns ``(job_snapshot, status)`` where status is ``queued``, ``paused``,
+    or ``missing``.  The paused snapshot is returned for truthful tool output.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return _apply_skill_fields(copy.deepcopy(job)), "paused"
+            job["next_run_at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return _apply_skill_fields(copy.deepcopy(job)), "queued"
+    return None, "missing"
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)

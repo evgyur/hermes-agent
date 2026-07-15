@@ -1,10 +1,9 @@
-"""Tests for cronjob action='run' immediate execution (#41037).
+"""Tests for cronjob action='run' execution modes (#41037).
 
-Before this fix, `cronjob(action='run')` only set next_run_at=now and returned
-success, relying on the scheduler ticker to actually run the job. With no
-gateway/ticker active (e.g. a CLI-only Windows setup) the job never executed and
-last_run_at stayed null forever. Now action='run' claims the job (at-most-once,
-blocking a concurrent tick) and fires it inline via the shared run_one_job body.
+Direct CLI/Python calls still claim and execute immediately so CLI-only setups do
+not report a false success when no scheduler is running. Agent tool calls carry a
+``task_id`` and instead queue the job for the gateway scheduler: a long cron agent
+must not block the parent chat turn or trip its inactivity watchdog.
 """
 import json
 from unittest.mock import patch
@@ -17,6 +16,65 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
 
 
 class TestCronjobRunExecutesImmediately:
+    def test_agent_run_queues_without_blocking_the_tool_call(self):
+        """Agent tool calls queue work; they must not wait for the cron agent."""
+        queued = dict(_JOB, next_run_at="2026-07-15T15:30:00+03:00")
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("tools.cronjob_tools._execute_job_now", return_value={
+                 "claimed": True, "success": True, "error": None,
+             }) as m_execute, \
+             patch("tools.cronjob_tools.trigger_job_if_active", return_value=(queued, "queued")) as m_trigger:
+            out = json.loads(
+                cronjob(action="run", job_id="job-run-1", task_id="gateway-turn-1")
+            )
+
+        assert out["success"] is True
+        assert out["job"]["execution_state"] == "queued"
+        assert out["job"]["executed"] is False
+        m_trigger.assert_called_once_with("job-run-1")
+        m_execute.assert_not_called()
+
+    def test_agent_run_does_not_reactivate_pause_that_wins_race(self):
+        """An atomic pause after initial lookup must beat the queued run request."""
+        paused = dict(_JOB, enabled=False, state="paused")
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("tools.cronjob_tools.trigger_job_if_active", return_value=(paused, "paused")) as m_safe_trigger, \
+             patch("cron.jobs.trigger_job", return_value=dict(_JOB)) as m_reactivating_trigger, \
+             patch("tools.cronjob_tools.get_job", return_value=paused):
+            out = json.loads(
+                cronjob(action="run", job_id="job-run-1", task_id="gateway-turn-1")
+            )
+
+        assert out["success"] is True
+        assert out["job"]["execution_state"] == "skipped"
+        assert "paused" in out["job"]["execution_skipped"].lower()
+        m_safe_trigger.assert_called_once_with("job-run-1")
+        m_reactivating_trigger.assert_not_called()
+
+    def test_atomic_agent_trigger_keeps_paused_job_paused(self):
+        """The store-level queue operation checks and updates under one lock."""
+        from cron.jobs import (
+            create_job,
+            get_job,
+            pause_job,
+            remove_job,
+            trigger_job_if_active,
+        )
+
+        job = create_job(name="paused race", schedule="0 9 * * *", prompt="hi")
+        try:
+            pause_job(job["id"])
+            snapshot, status = trigger_job_if_active(job["id"])
+            assert status == "paused"
+            assert snapshot is not None
+            assert snapshot["state"] == "paused"
+            stored = get_job(job["id"])
+            assert stored is not None
+            assert stored["enabled"] is False
+            assert stored["state"] == "paused"
+        finally:
+            remove_job(job["id"])
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
