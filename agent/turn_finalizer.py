@@ -126,6 +126,7 @@ def finalize_turn(
         final_response is not None
         and api_call_count < agent.max_iterations
         and not failed
+        and _turn_exit_reason != "guardrail_halt"
     )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal

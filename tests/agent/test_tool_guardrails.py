@@ -46,6 +46,38 @@ def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
     assert cfg.no_progress_block_after == 5
 
 
+def test_hard_stop_does_not_halt_a_legitimate_multi_step_team20_workflow():
+    """Distinct successful API calls are progress, not a tool loop.
+
+    Regression for Human20Bot: an eight-step Kanban operation was stopped by a
+    global call counter even though every call used different arguments and
+    returned useful results.
+    """
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=4,
+            no_progress_block_after=2,
+        )
+    )
+
+    for index in range(20):
+        args = {"method": "GET", "path": f"/cards/card-{index}"}
+        assert controller.before_call(
+            "mcp_team20_kanban_team20_rest_call", args
+        ).action == "allow"
+        decision = controller.after_call(
+            "mcp_team20_kanban_team20_rest_call",
+            args,
+            json.dumps({"status": 200, "card": index}),
+            failed=False,
+        )
+        assert decision.action == "allow"
+
+    assert controller.halt_decision is None
+
+
 def test_config_parses_nested_warn_and_hard_stop_thresholds():
     cfg = ToolCallGuardrailConfig.from_mapping(
         {

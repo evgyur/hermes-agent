@@ -323,8 +323,8 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert result["api_calls"] < agent.max_iterations
     assert result["turn_exit_reason"] == "guardrail_halt"
     assert "error" not in result
-    assert result["completed"] is True
-    assert "stopped retrying" in result["final_response"]
+    assert result["completed"] is False
+    assert "Не смог завершить" in result["final_response"]
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
 
@@ -333,6 +333,23 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
         following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
         assert len(following_results) == len(call_ids)
+
+
+def test_guardrail_halt_response_is_user_safe_and_does_not_leak_internals():
+    agent = _make_agent("web_search")
+    decision = SimpleNamespace(
+        tool_name="mcp_team20_kanban_team20_card_get",
+        code="repeated_exact_failure_block",
+        count=2,
+    )
+
+    response = agent._toolguard_controlled_halt_response(decision)
+
+    assert "не смог завершить" in response.lower()
+    assert "результат не подтверждён" in response.lower()
+    assert decision.tool_name not in response
+    assert decision.code not in response
+    assert "I stopped retrying" not in response
 
 
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
@@ -373,7 +390,7 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
 
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]
-    assert "stopped retrying" in halt_text
+    assert "Не смог завершить" in halt_text
 
     # The halt message must have been pushed through the callback at least
     # once.  Empty-queue SSE writers were the bug — clients saw no content
