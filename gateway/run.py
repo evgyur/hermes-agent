@@ -134,6 +134,31 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 )
 
 
+def _build_inactivity_warning_text(
+    *,
+    long_running_mode: str,
+    warning_after_seconds: float,
+    timeout_after_seconds: float,
+) -> Optional[str]:
+    """Build the staged inactivity warning for visible progress surfaces.
+
+    Final-answer-first surfaces still retain the hard inactivity timeout and
+    its final diagnostic; they merely suppress this intermediate chat bubble.
+    """
+    if long_running_mode == "off":
+        return None
+    elapsed_minutes = int(warning_after_seconds // 60) or 1
+    remaining_minutes = int(
+        (timeout_after_seconds - warning_after_seconds) // 60
+    ) or 1
+    return (
+        f"⚠️ No activity for {elapsed_minutes} min. "
+        f"If the agent does not respond soon, it will "
+        f"be timed out in {remaining_minutes} min. "
+        f"You can continue waiting or use /reset."
+    )
+
+
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
@@ -21002,16 +21027,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
                         _warn_adapter = self._adapter_for_source(source)
-                        if _warn_adapter:
-                            _elapsed_warn = int(_agent_warning // 60) or 1
-                            _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
+                        _warning_text = _build_inactivity_warning_text(
+                            long_running_mode=_long_running_mode,
+                            warning_after_seconds=_agent_warning,
+                            timeout_after_seconds=_agent_timeout,
+                        )
+                        if _warn_adapter and _warning_text:
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    _warning_text,
                                     metadata=_status_thread_metadata,
                                 )
                             except Exception as _warn_err:
