@@ -911,10 +911,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        # Adapter-level allow_from: when set, it is the sole authority.
+        # Adapter-level sender allowlists are scope-aware. ``allow_from`` is
+        # platform-wide for backward compatibility, while ``group_allow_from``
+        # adds group/forum-only senders and must never grant DM access. Keep the
+        # group decision as a union to match GatewayAuthzMixin semantics.
         adapter_allow_from = self.config.extra.get("allow_from")
+        adapter_group_allow_from = self.config.extra.get("group_allow_from")
+        configured_allowlists = []
         if adapter_allow_from is not None:
-            allowed = {str(u).strip() for u in adapter_allow_from if str(u).strip()}
+            configured_allowlists.append(adapter_allow_from)
+        if (
+            source.chat_type in {"group", "forum"}
+            and adapter_group_allow_from is not None
+        ):
+            configured_allowlists.append(adapter_group_allow_from)
+        if configured_allowlists:
+            allowed = {
+                str(user).strip()
+                for allowlist in configured_allowlists
+                for user in allowlist
+                if str(user).strip()
+            }
             return user_id in allowed or "*" in allowed
 
         # Test/custom injection only. The class method named

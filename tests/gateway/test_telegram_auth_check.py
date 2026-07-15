@@ -216,6 +216,23 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+def test_group_message_uses_group_allow_from_without_granting_dm_access():
+    """Group-only senders must pass intake without inheriting DM access."""
+    adapter = _make_adapter(
+        allow_from=["111"],
+        group_allow_from=["244"],
+    )
+
+    group_msg = _make_message(from_user_id=244, chat_type="group")
+    assert adapter._is_user_authorized_from_message(group_msg) is True
+
+    dm_msg = _make_message(from_user_id=244, chat_id=244, chat_type="private")
+    assert adapter._is_user_authorized_from_message(dm_msg) is False
+
+    platform_wide_group_msg = _make_message(from_user_id=111, chat_type="group")
+    assert adapter._is_user_authorized_from_message(platform_wide_group_msg) is True
+
+
 def test_is_user_authorized_from_message_wildcard():
     """_is_user_authorized_from_message should accept wildcard '*'."""
     adapter = _make_adapter(allow_from=["*"])
