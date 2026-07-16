@@ -206,3 +206,43 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
         resolve_codex_runtime_credentials()
 
     assert ei.value.code == "codex_auth_missing_access_token"
+
+
+def test_self_heals_missing_singleton_from_legacy_codex_section(tmp_path, monkeypatch):
+    """Private-fork legacy ``codex`` tokens survive the upstream auth schema migration.
+
+    Older Human20 builds mirrored the selected Codex account at top-level
+    ``auth.json.codex``.  Newer upstream builds read only
+    ``providers.openai-codex.tokens`` and ``credential_pool.openai-codex``.
+    After a restart that pruned an exhausted pool, a still-valid legacy token
+    pair must be adopted before asking the operator to re-authenticate.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"refresh_token": "stale-refresh"},
+                "auth_mode": "chatgpt",
+            },
+        },
+        "credential_pool": {"openai-codex": []},
+        "codex": {
+            "access_token": "legacy-access",
+            "refresh_token": "legacy-refresh",
+            "profile": "gptinvest23",
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+
+    resolved = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert resolved["api_key"] == "legacy-access"
+    assert resolved["source"] == "hermes-auth-store"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    state = stored["providers"]["openai-codex"]
+    assert state["tokens"]["access_token"] == "legacy-access"
+    assert state["tokens"]["refresh_token"] == "legacy-refresh"
+    assert state["label"] == "gptinvest23"
