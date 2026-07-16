@@ -160,7 +160,13 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        # A blocked duplicate idempotent read is a skipped call, not a reason to
+        # abort the user's whole turn. The synthetic tool result tells the model
+        # to reuse the result or change strategy. Deterministic failures and
+        # same-tool failure storms still halt exactly as before.
+        return self.action == "halt" or (
+            self.action == "block" and self.code != "idempotent_no_progress_block"
+        )
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {

@@ -154,6 +154,7 @@ def finalize_turn(
             api_call_count < agent.max_iterations
             or normal_text_response
         )
+        and _turn_exit_reason != "guardrail_halt"
     )
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
