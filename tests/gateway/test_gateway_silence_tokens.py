@@ -119,6 +119,32 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
 
 
 @pytest.mark.asyncio
+async def test_explicit_suppress_delivery_flag_returns_none(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "",
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": ""},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "completed": False,
+        "failed": True,
+        "error": "",
+        "suppress_delivery": True,
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response is None
+
+
+@pytest.mark.asyncio
 async def test_empty_success_still_gets_empty_response_warning(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={

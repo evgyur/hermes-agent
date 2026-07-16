@@ -12693,6 +12693,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            if agent_result.get("suppress_delivery"):
+                logger.info(
+                    "agent result suppressed delivery: platform=%s chat=%s error=%s",
+                    _platform_name,
+                    source.chat_id or "unknown",
+                    str(agent_result.get("error") or "")[:160],
+                )
+                return None
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
