@@ -3681,10 +3681,18 @@ class AIAgent:
 
     @staticmethod
     def _get_tool_call_id_static(tc) -> str:
-        """Extract call ID from a tool_call entry (dict or object)."""
+        """Extract the canonical logical call ID from a tool_call entry.
+
+        Codex Responses objects can expose a composite call_*|fc_* id.
+        Tool-result messages must use the logical call_* half so the
+        assistant call and its result survive sequence repair.
+        """
         if isinstance(tc, dict):
-            return (tc.get("call_id", "") or tc.get("id", "") or "").strip()
-        return (getattr(tc, "call_id", "") or getattr(tc, "id", "") or "").strip()
+            raw_id = tc.get("call_id", "") or tc.get("id", "") or ""
+        else:
+            raw_id = getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
+        call_id, _ = _codex_split_responses_tool_id(raw_id)
+        return call_id or raw_id
 
     @staticmethod
     def _get_tool_call_name_static(tc) -> str:

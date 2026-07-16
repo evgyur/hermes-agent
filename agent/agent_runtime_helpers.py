@@ -467,60 +467,92 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             continue
         collapsed.append(msg)
 
-    # Pass 1: drop stray tool messages that don't follow a known
-    # assistant tool_call_id. Uses a rolling set of known ids refreshed
-    # on each assistant message.
-    #
-    # Both ``id`` AND ``call_id`` are registered for every assistant
-    # tool_call. In the Codex Responses API format the two differ
-    # (``id`` = ``fc_...`` response-item id, ``call_id`` = ``call_...``
-    # the function-call id), and a tool result's ``tool_call_id`` may be
-    # matched against *either* depending on which code path built it
-    # (the OpenAI-compatible path stores ``tc.id``; codex paths store
-    # ``call_id``). Registering only ``id`` — as this pass did before —
-    # made a valid tool result look orphaned whenever the assistant
-    # tool_call carried a distinct ``call_id`` (or only ``call_id``); the
-    # pass then dropped it, leaving the assistant tool_call unanswered and
-    # producing an HTTP 400 on strict providers (DeepSeek, Kimi). Matching
-    # on the *superset* of both keys achieves the same tolerance as
-    # ``_get_tool_call_id_static``'s ``call_id || id`` — a match set must
-    # accept every legitimate reference, not just the canonical one (#58168).
-    known_tool_ids: set = set()
+    # Pass 1: make every assistant tool-call handshake provider-valid.
+    # Interrupted parallel execution can leave only a subset of results, while
+    # retry/resume paths can append a duplicate result.  Before the next
+    # user/assistant/system boundary, synthesize a deterministic cancelled
+    # result for each missing id and drop unknown/duplicate results.
+    pending_tool_ids: dict[str, str] = {}
+    tool_id_aliases: dict[str, str] = {}
+    completed_tool_ids: set[str] = set()
     filtered: List[Dict] = []
+
+    def close_pending_handshake() -> None:
+        nonlocal repairs, pending_tool_ids, tool_id_aliases, completed_tool_ids
+        for tool_call_id, tool_name in pending_tool_ids.items():
+            if tool_call_id in completed_tool_ids:
+                continue
+            filtered.append({
+                "role": "tool",
+                "name": tool_name or "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({
+                    "status": "cancelled",
+                    "reason_code": "interrupted_tool_handshake",
+                    "error": "Tool result was not produced because the prior execution was interrupted.",
+                }, ensure_ascii=False, sort_keys=True),
+            })
+            repairs += 1
+        pending_tool_ids = {}
+        tool_id_aliases = {}
+        completed_tool_ids = set()
+
     for msg in collapsed:
         if not isinstance(msg, dict):
+            close_pending_handshake()
             filtered.append(msg)
             continue
         role = msg.get("role")
         if role == "assistant":
-            known_tool_ids = set()
+            close_pending_handshake()
+            pending_tool_ids = {}
+            tool_id_aliases = {}
+            completed_tool_ids = set()
             for tc in (msg.get("tool_calls") or []):
                 if not isinstance(tc, dict):
                     continue
-                for key in ("id", "call_id"):
-                    tc_id = tc.get(key)
-                    if tc_id:
-                        known_tool_ids.add(tc_id)
+                tc_id = str(agent._get_tool_call_id_static(tc) or "").strip()
+                if not tc_id:
+                    continue
+                function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                pending_tool_ids[tc_id] = str(function.get("name") or "tool")
+                # Codex Responses calls can carry both an ``id`` (fc_*) and a
+                # ``call_id`` (call_*). Provider-valid tool results may refer
+                # to either, so retain both raw aliases while using the
+                # canonical ID for completion accounting and missing-result
+                # synthesis. Composite call_*|fc_* values also map to their
+                # normalized call_* half.
+                for alias in (tc_id, tc.get("id"), tc.get("call_id")):
+                    raw_alias = str(alias or "").strip()
+                    if not raw_alias:
+                        continue
+                    tool_id_aliases[raw_alias] = tc_id
+                    normalized_alias = str(
+                        agent._get_tool_call_id_static({"id": raw_alias}) or ""
+                    ).strip()
+                    if normalized_alias:
+                        tool_id_aliases[normalized_alias] = tc_id
             filtered.append(msg)
         elif role == "tool":
-            tc_id = msg.get("tool_call_id")
-            if tc_id and tc_id in known_tool_ids:
+            raw_tc_id = str(msg.get("tool_call_id") or "").strip()
+            normalized_tc_id = str(
+                agent._get_tool_call_id_static({"id": raw_tc_id}) or ""
+            ).strip()
+            tc_id = tool_id_aliases.get(raw_tc_id) or tool_id_aliases.get(normalized_tc_id)
+            if tc_id and tc_id in pending_tool_ids and tc_id not in completed_tool_ids:
+                if raw_tc_id != normalized_tc_id and normalized_tc_id == tc_id:
+                    msg = dict(msg)
+                    msg["tool_call_id"] = tc_id
+                    repairs += 1
                 filtered.append(msg)
-                # Consume the id so a SECOND tool result carrying the same
-                # tool_call_id (duplicate from a retry/crash/session-resume
-                # glitch) falls into the drop branch below instead of being
-                # replayed — strict providers (DeepSeek) reject a duplicate
-                # tool_call_id with HTTP 400 (#58327). Credit: #55436.
-                known_tool_ids.discard(tc_id)
+                completed_tool_ids.add(tc_id)
             else:
                 repairs += 1
         else:
-            if role == "user":
-                # A user turn closes the tool-result run; subsequent
-                # tool messages without a fresh assistant tool_call
-                # are orphans.
-                known_tool_ids = set()
+            close_pending_handshake()
             filtered.append(msg)
+
+    close_pending_handshake()
 
     # Pass 2: merge consecutive user messages. Preserves all user input
     # so nothing the user typed is lost.
@@ -2561,6 +2593,69 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     pass
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
+    # Drop stale assistant tool-call turns that were persisted without their
+    # tool results and then followed by a later user/assistant turn. This happens
+    # when a Telegram follow-up interrupts a run between the assistant tool-call
+    # message and tool-result append. Injecting "Result unavailable" stubs for
+    # those old calls poisons the next turn; they are not part of the current
+    # provider handshake anymore, so the safe repair is to remove the dangling
+    # assistant call message before the API request.
+    repaired_stale: list = []
+    dropped_stale_tool_calls = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not (isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls")):
+            repaired_stale.append(msg)
+            i += 1
+            continue
+
+        expected = {
+            _ra().AIAgent._get_tool_call_id_static(tc)
+            for tc in (msg.get("tool_calls") or [])
+        }
+        expected.discard("")
+        j = i + 1
+        seen: set = set()
+        partial_tool_indexes: list[int] = []
+        stale = False
+        while j < len(messages):
+            nxt = messages[j]
+            if not isinstance(nxt, dict):
+                break
+            role = nxt.get("role")
+            if role == "tool":
+                tcid = str(nxt.get("tool_call_id") or "")
+                if tcid in expected:
+                    seen.add(tcid)
+                    partial_tool_indexes.append(j)
+                j += 1
+                continue
+            if role in {"user", "assistant", "system"}:
+                stale = bool(expected and not expected.issubset(seen))
+                break
+            break
+
+        if stale:
+            dropped_stale_tool_calls += 1
+            # Keep any non-matching messages between i and j; drop matching
+            # partial tool rows too so they cannot become orphan tool results.
+            for k in range(i + 1, j):
+                if k in partial_tool_indexes:
+                    continue
+                repaired_stale.append(messages[k])
+            i = j
+            continue
+
+        repaired_stale.append(msg)
+        i += 1
+
+    if dropped_stale_tool_calls:
+        messages = repaired_stale
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d stale assistant tool-call message(s)",
+            dropped_stale_tool_calls,
+        )
 
     surviving_call_ids: set = set()
     for msg in messages:

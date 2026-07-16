@@ -2217,6 +2217,97 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_response={"thread_id": thread_id},
         )
 
+    @staticmethod
+    def _is_length_overflow_error(err: Exception) -> bool:
+        """Return whether Discord rejected text over its 2,000-char limit."""
+        text = str(err).lower()
+        return "error code: 50035" in text and (
+            "2000 or fewer" in text or "fewer in length" in text
+        )
+
+    async def _edit_overflow_split(
+        self,
+        channel: Any,
+        msg: Any,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """Deliver an oversized final edit across message and continuations."""
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if len(chunks) <= 1:
+            await msg.edit(content=chunks[0] if chunks else formatted)
+            return SendResult(success=True, message_id=message_id)
+
+        try:
+            await msg.edit(content=chunks[0])
+        except Exception as exc:
+            logger.error(
+                "[%s] Overflow split first-chunk edit failed: %s",
+                self.name,
+                type(exc).__name__,
+            )
+            return SendResult(success=False, error=str(exc))
+
+        continuation_ids: list[str] = []
+        delivered = 1
+        prev_msg = msg
+        for chunk in chunks[1:]:
+            reference = None
+            if hasattr(prev_msg, "to_reference"):
+                try:
+                    reference = prev_msg.to_reference(fail_if_not_exists=False)
+                except Exception:
+                    reference = None
+            try:
+                sent = await channel.send(content=chunk, reference=reference)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Overflow continuation failed (%s); retrying without reply",
+                    self.name,
+                    type(exc).__name__,
+                )
+                try:
+                    sent = await channel.send(content=chunk, reference=None)
+                except Exception as retry_exc:
+                    logger.warning(
+                        "[%s] Overflow split stopped at %d/%d chunks: %s",
+                        self.name,
+                        delivered,
+                        len(chunks),
+                        type(retry_exc).__name__,
+                    )
+                    last_id = continuation_ids[-1] if continuation_ids else message_id
+                    return SendResult(
+                        success=True,
+                        message_id=last_id,
+                        continuation_message_ids=tuple(continuation_ids),
+                        raw_response={
+                            "partial_overflow": True,
+                            "delivered_chunks": delivered,
+                            "total_chunks": len(chunks),
+                            "last_message_id": last_id,
+                            "continuation_message_ids": tuple(continuation_ids),
+                        },
+                    )
+            new_id = str(sent.id)
+            continuation_ids.append(new_id)
+            delivered += 1
+            prev_msg = sent
+
+        last_id = continuation_ids[-1] if continuation_ids else message_id
+        self._last_self_message_id[str(channel.id)] = last_id
+        logger.debug(
+            "[%s] Overflow split delivered %d chunks",
+            self.name,
+            delivered,
+        )
+        return SendResult(
+            success=True,
+            message_id=last_id,
+            continuation_message_ids=tuple(continuation_ids),
+        )
+
     async def edit_message(
         self,
         chat_id: str,
@@ -2224,6 +2315,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message.
 

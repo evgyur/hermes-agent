@@ -94,6 +94,40 @@ class GatewayAuthorizationMixin:
             return False
         return bool(getattr(adapter, "authorization_is_upstream", False))
 
+    def _check_human20_quick_command_access(
+        self,
+        source: SessionSource,
+        command_name: str,
+        command_config: dict,
+    ) -> str | None:
+        """Gate exec quick commands before subprocess creation.
+
+        Missing policy files preserve upstream behavior; a present invalid policy
+        fails closed with a stable reason code.
+        """
+        from agent.human20_capability_policy import (
+            CapabilityPolicy,
+            configured_policy_path,
+            evaluate_quick_command,
+        )
+
+        path = configured_policy_path()
+        if not path.exists():
+            return None
+        try:
+            policy = CapabilityPolicy.load(path)
+            actor = policy.context_for(
+                actor_id=source.user_id,
+                chat_type=source.chat_type,
+                chat_id=source.chat_id,
+            )
+            decision = evaluate_quick_command(policy, actor, command_name, command_config)
+        except Exception:
+            return "⛔ [H20_CAP_POLICY_INVALID] Capability policy could not be validated."
+        if decision.allowed:
+            return None
+        return f"⛔ [{decision.reason_code}] {decision.message}."
+
     def _adapter_enforces_own_access_policy(
         self,
         platform: Optional[Platform],

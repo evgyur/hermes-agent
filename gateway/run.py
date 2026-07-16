@@ -58,6 +58,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from privacy_utils import safe_log_event
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -114,6 +115,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|preflight\s+compression"
     r"|pre-api\s+compression"
     r"|session\s+compressed\s+\d+\s+times"
+    r"|near\s+the\s+context/output\s+limit.+compacting\s+before\s+the\s+next\s+model\s+call"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
@@ -3043,6 +3045,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+
+    async def _bounded_adapter_teardown(
+        self, adapter, platform, *, profile: Optional[str] = None
+    ) -> None:
+        """Cancel background tasks and disconnect without stalling shutdown."""
+        timeout = self._adapter_disconnect_timeout_secs()
+        started_at = time.monotonic()
+        platform_label = platform.value + (f" (profile: {profile})" if profile else "")
+        try:
+            if timeout <= 0:
+                await adapter.cancel_background_tasks()
+            else:
+                await asyncio.wait_for(adapter.cancel_background_tasks(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s background-task cancel timed out; %s",
+                platform_label,
+                safe_log_event("background_task_cancel", status="timeout", duration=timeout),
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s platform=%s",
+                safe_log_event(
+                    "background_task_cancel",
+                    status="failed",
+                    error_class=type(exc).__name__,
+                ),
+                platform_label,
+            )
+        try:
+            if timeout <= 0:
+                await adapter.disconnect()
+            else:
+                await asyncio.wait_for(adapter.disconnect(), timeout=timeout)
+            logger.info(
+                "%s platform=%s",
+                safe_log_event(
+                    "platform_disconnect",
+                    status="ok",
+                    duration=time.monotonic() - started_at,
+                ),
+                platform_label,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s disconnect timed out; %s",
+                platform_label,
+                safe_log_event("platform_disconnect", status="timeout", duration=timeout),
+            )
+        except Exception as exc:
+            logger.error(
+                "%s platform=%s",
+                safe_log_event(
+                    "platform_disconnect",
+                    status="failed",
+                    duration=time.monotonic() - started_at,
+                    error_class=type(exc).__name__,
+                ),
+                platform_label,
+            )
+
+    @staticmethod
+    def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
+        """Return a stable, log-safe fingerprint of an adapter credential."""
+        token = None
+        for attr in ("token", "bot_token", "_token", "api_token", "_bot_token"):
+            value = getattr(adapter, attr, None)
+            if isinstance(value, str) and value.strip():
+                token = value.strip()
+                break
+        if not token:
+            config = getattr(adapter, "config", None)
+            value = getattr(config, "token", None)
+            if isinstance(value, str) and value.strip():
+                token = value.strip()
+        if not token:
+            return None
+        import hashlib
+
+        return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -9820,6 +9902,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # Human20 operator shortcut: natural-language token-spend requests
+        # should hit the deterministic /h20usage report, not the agent/tool loop.
+        # This prevents repeat failures where a user asks "Дай отчет по токенам",
+        # then sends /h20usage while the LLM turn is still running and poisons the
+        # session with interrupted tool calls.
+        try:
+            _h20_text = (event.text or "").strip().lower()
+            if (
+                event.message_type == MessageType.TEXT
+                and not event.get_command()
+                and ("токен" in _h20_text or "token" in _h20_text)
+                and ("отчет" in _h20_text or "отчёт" in _h20_text or "usage" in _h20_text or "расход" in _h20_text)
+            ):
+                _period = "7d" if "7" in _h20_text or "нед" in _h20_text else "24h"
+                event = dataclasses.replace(event, text=f"/h20usage {_period}")
+                source = event.source
+        except Exception:
+            pass
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -10095,6 +10196,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _denied = self._check_slash_access(source, _cmd_def_inner.name)
                 if _denied is not None:
                     return _denied
+
+            # User-defined quick commands must bypass the running-agent guard.
+            # Otherwise commands like /h20usage sent while the agent is busy
+            # are treated as ordinary interrupt text and the LLM tries to
+            # reimplement them with terminal calls. Keep this before the
+            # generic interrupt/queue path so operator reports stay deterministic.
+            if _evt_cmd:
+                try:
+                    quick_commands = (
+                        self.config.get("quick_commands", {})
+                        if isinstance(self.config, dict)
+                        else getattr(self.config, "quick_commands", {})
+                    ) or {}
+                except Exception:
+                    quick_commands = {}
+                if isinstance(quick_commands, dict) and _evt_cmd in quick_commands:
+                    qcmd = quick_commands[_evt_cmd]
+                    if isinstance(qcmd, dict) and qcmd.get("type") == "exec":
+                        _h20_denied = self._check_human20_quick_command_access(source, _evt_cmd, qcmd)
+                        if _h20_denied is not None:
+                            return _h20_denied
+                        exec_cmd = str(qcmd.get("command", "") or "").strip()
+                        if not exec_cmd:
+                            return f"Quick command '/{_evt_cmd}' has no command defined."
+                        try:
+                            user_args = event.get_command_args().strip()
+                            run_cmd = exec_cmd
+                            if qcmd.get("append_args") and user_args:
+                                run_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
+                            from tools.environments.local import _sanitize_subprocess_env
+                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            sanitized_env["HERMES_COMMAND_NAME"] = _evt_cmd
+                            sanitized_env["HERMES_COMMAND_ARGS"] = user_args
+                            sanitized_env["HERMES_REPLY_TO_TEXT"] = str(getattr(event, "reply_to_text", "") or "")
+                            sanitized_env["HERMES_REPLY_TO_MESSAGE_ID"] = str(getattr(event, "reply_to_message_id", "") or "")
+                            try:
+                                _src = event.source
+                                if _src is not None:
+                                    sanitized_env["HERMES_ORIGIN_PLATFORM"] = getattr(_src.platform, "value", str(_src.platform))
+                                    sanitized_env["HERMES_ORIGIN_CHAT_ID"] = str(_src.chat_id or "")
+                                    sanitized_env["HERMES_ORIGIN_THREAD_ID"] = str(_src.thread_id or "")
+                                    sanitized_env["HERMES_ORIGIN_USER_ID"] = str(_src.user_id or "")
+                            except Exception:
+                                pass
+                            proc = await asyncio.create_subprocess_shell(
+                                run_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                env=sanitized_env,
+                            )
+                            timeout_raw = qcmd.get("timeout_seconds", 30)
+                            try:
+                                timeout_seconds = max(1.0, float(timeout_raw))
+                            except (TypeError, ValueError):
+                                timeout_seconds = 30.0
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+                            output = (stdout or stderr).decode().strip()
+                            if output:
+                                from agent.redact import redact_sensitive_text
+                                output = redact_sensitive_text(output)
+                            return output if output else "Command returned no output."
+                        except asyncio.TimeoutError:
+                            return "Quick command timed out."
+                        except Exception as e:
+                            return f"Quick command error: {e}"
+                    if isinstance(qcmd, dict) and qcmd.get("type") == "alias":
+                        # Alias quick commands need normal command dispatch, so keep
+                        # the existing busy guard semantics for their target.
+                        pass
 
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent
@@ -10870,6 +11040,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return _denied
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "exec":
+                    _h20_denied = self._check_human20_quick_command_access(source, command, qcmd)
+                    if _h20_denied is not None:
+                        return _h20_denied
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         user_args = event.get_command_args().strip()
@@ -19831,6 +20004,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            # Bind the actor-aware capability broker only to gateway session
+            # agents. Synthetic/local AIAgent instances retain upstream behavior.
+            from agent.human20_capability_policy import configured_policy_path
+            agent.human20_capability_policy_enabled = configured_policy_path().exists()
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -20537,6 +20715,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _effective_history_offset = (
                 0 if (_session_was_split or _compacted_in_place) else len(agent_history)
             )
+
+            # Human20 team usage ledger: per-turn Telegram attribution for /h20usage.
+            # Keep this local and best-effort; it must never break a user response.
+            if getattr(source, "platform", None) == Platform.TELEGRAM:
+                try:
+                    _usage_db = Path(os.getenv("H20_USAGE_DB") or "/home/human20team/.hermes/h20_usage.db")
+                    _usage_db.parent.mkdir(parents=True, exist_ok=True)
+                    _con = sqlite3.connect(str(_usage_db), timeout=5)
+                    try:
+                        _con.execute(
+                            """
+                            create table if not exists usage_events (
+                                id integer primary key autoincrement,
+                                ts real not null,
+                                session_id text,
+                                gateway_session_key text,
+                                platform text,
+                                chat_id text,
+                                chat_type text,
+                                chat_name text,
+                                thread_id text,
+                                user_id text,
+                                user_id_alt text,
+                                user_name text,
+                                model text,
+                                provider text,
+                                base_url text,
+                                input_tokens integer not null default 0,
+                                output_tokens integer not null default 0,
+                                cache_read_tokens integer not null default 0,
+                                cache_write_tokens integer not null default 0,
+                                reasoning_tokens integer not null default 0,
+                                total_tokens integer not null default 0,
+                                api_call_index integer not null default 0,
+                                latency_s real not null default 0
+                            )
+                            """
+                        )
+                        _cache_read = int(getattr(_agent, "session_cache_read_tokens", 0) or 0) if _agent else 0
+                        _cache_write = int(getattr(_agent, "session_cache_write_tokens", 0) or 0) if _agent else 0
+                        _reasoning = int(getattr(_agent, "session_reasoning_tokens", 0) or 0) if _agent else 0
+                        _api_calls = int((result_holder[0] or {}).get("api_calls", result.get("api_calls", 0)) or 0)
+                        _total_toks = int(_input_toks or 0) + int(_output_toks or 0) + _cache_read + _cache_write + _reasoning
+                        _con.execute(
+                            """
+                            insert into usage_events (
+                                ts, session_id, gateway_session_key, platform, chat_id, chat_type, chat_name,
+                                thread_id, user_id, user_id_alt, user_name, model, provider, base_url,
+                                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                                total_tokens, api_call_index, latency_s
+                            ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                time.time(), effective_session_id, session_key or "",
+                                getattr(getattr(source, "platform", None), "value", str(getattr(source, "platform", ""))),
+                                str(getattr(source, "chat_id", "") or ""),
+                                str(getattr(source, "chat_type", "") or ""),
+                                str(getattr(source, "chat_name", "") or ""),
+                                str(getattr(source, "thread_id", "") or ""),
+                                str(getattr(source, "user_id", "") or ""),
+                                str(getattr(source, "user_id_alt", "") or ""),
+                                str(getattr(source, "user_name", "") or ""),
+                                str(_resolved_model or getattr(_agent, "model", "") or ""),
+                                str(getattr(_agent, "provider", "") or "") if _agent else "",
+                                str(getattr(_agent, "base_url", "") or "") if _agent else "",
+                                int(_input_toks or 0), int(_output_toks or 0), _cache_read, _cache_write, _reasoning,
+                                _total_toks, _api_calls, 0.0,
+                            ),
+                        )
+                        _con.commit()
+                    finally:
+                        _con.close()
+                except Exception:
+                    logger.debug("Human20 usage ledger write failed", exc_info=True)
 
             if not final_response:
                 final_response = _normalize_empty_agent_response(

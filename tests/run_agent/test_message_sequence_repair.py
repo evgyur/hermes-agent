@@ -259,6 +259,50 @@ def test_repair_leaves_valid_conversation_unchanged():
     assert messages == original
 
 
+def test_tool_call_id_static_canonicalizes_codex_composite_id():
+    agent = _bare_agent()
+
+    assert AIAgent._get_tool_call_id_static(
+        {"id": "call_live|fc_response_item"}
+    ) == "call_live"
+
+
+def test_repair_preserves_real_result_with_codex_composite_tool_id():
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "call_live", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_live|fc_response_item",
+         "name": "f", "content": "REAL_RESULT"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 1
+    assert messages[-1]["tool_call_id"] == "call_live"
+    assert messages[-1]["content"] == "REAL_RESULT"
+    assert "interrupted_tool_handshake" not in str(messages)
+
+
+def test_repair_matches_composite_assistant_id_to_canonical_result():
+    agent = _bare_agent()
+    messages = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "call_live|fc_response_item", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_live",
+         "name": "f", "content": "REAL_RESULT"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages[-1]["content"] == "REAL_RESULT"
+    assert "interrupted_tool_handshake" not in str(messages)
+
+
 def test_repair_preserves_multimodal_user_content():
     """Multimodal (list) content must NOT be merged — risks mangling attachments."""
     agent = _bare_agent()

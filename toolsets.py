@@ -108,6 +108,16 @@ TOOLSETS = {
         "includes": []
     },
 
+
+    "telegram_chip": {
+        "description": "Read-only Telegram history access through the Human20Team @chipmanager telegram-chip session",
+        "tools": [
+            "telegram_chip_me", "telegram_chip_chats", "telegram_chip_messages",
+            "telegram_chip_search", "telegram_chip_resolve",
+        ],
+        "includes": []
+    },
+
     "x_search": {
         "description": (
             "Search X (Twitter) posts and threads via xAI's built-in "

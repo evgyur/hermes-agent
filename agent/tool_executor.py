@@ -140,6 +140,37 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
 
+def _human20_capability_block(agent, function_name: str, function_args: dict) -> str | None:
+    """Return a stable fail-closed block payload before any real dispatch.
+
+    The policy is opt-in by file presence so upstream/non-Human20 profiles keep
+    their existing behavior.  A present but malformed policy blocks rather than
+    silently disabling the boundary.
+    """
+    if not getattr(agent, "human20_capability_policy_enabled", False):
+        return None
+
+    from agent.human20_capability_policy import evaluate_agent_tool_if_configured
+
+    decision = evaluate_agent_tool_if_configured(agent, function_name, function_args)
+    if decision is None:
+        return None
+    if decision.allowed:
+        # Approval metadata is an authorization envelope, never a tool argument.
+        function_args.pop("approval_receipt", None)
+        return None
+    return json.dumps(
+        {
+            "status": "blocked",
+            "error": decision.message,
+            "reason_code": decision.reason_code,
+            "capability": decision.capability,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def _emit_terminal_post_tool_call(
     agent,
     *,
@@ -342,7 +373,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             messages.append(make_tool_result_message(
                 tc.function.name,
                 f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
-                tc.id,
+                agent._get_tool_call_id_static(tc),
                 effect_disposition="none",
             ))
             _flush_session_db_after_tool_progress(
@@ -422,6 +453,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        _h20_policy_block = _human20_capability_block(agent, function_name, function_args)
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
@@ -441,6 +473,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="tool_scope_block",
                 error_message=_ts_scope_block,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _h20_policy_block is not None:
+            block_result = _h20_policy_block
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="human20_capability_block",
+                error_message=_h20_policy_block,
                 middleware_trace=list(middleware_trace),
             )
         else:
@@ -972,7 +1018,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         tool_message = make_tool_result_message(
             name,
             _tool_content,
-            tc.id,
+            agent._get_tool_call_id_static(tc),
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
@@ -1094,6 +1140,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        _h20_policy_block = _human20_capability_block(agent, function_name, function_args)
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
@@ -1101,6 +1148,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
+        elif _h20_policy_block is not None:
+            _block_msg = _h20_policy_block
+            _block_error_type = "human20_capability_block"
         else:
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
@@ -1653,7 +1703,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            agent._get_tool_call_id_static(tool_call),
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
@@ -1701,7 +1755,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages.append(make_tool_result_message(
                     skipped_name,
                     f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
-                    skipped_tc.id,
+                    agent._get_tool_call_id_static(skipped_tc),
                     effect_disposition="none",
                 ))
                 _flush_session_db_after_tool_progress(

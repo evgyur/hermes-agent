@@ -272,7 +272,7 @@ async def test_send_replaces_inline_tg_preview_with_blocker_for_guarded_chat():
         "Источник: example"
     )
 
-    result = await adapter.send("123", post, metadata={"thread_id": "410"})
+    result = await adapter.send("123", post, reply_to="410", metadata={"thread_id": "410"})
 
     assert result.success is True
     sent_text = adapter._bot.send_message.await_args.kwargs["text"]
