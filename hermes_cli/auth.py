@@ -3229,6 +3229,76 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _recover_legacy_codex_state(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Adopt the private-fork top-level ``codex`` mirror when canonical auth is empty.
+
+    Human20 builds predating the upstream provider schema mirrored the selected
+    Codex OAuth account at ``auth.json.codex``.  Newer runtimes use
+    ``providers.openai-codex.tokens`` and the credential pool exclusively.  A
+    pool refresh/prune during an upgrade can therefore leave a valid legacy
+    token pair stranded while the gateway reports that ``access_token`` is
+    missing.  Recover only when the canonical pair is incomplete, and require
+    both access and refresh tokens so a partial legacy record cannot mask a
+    genuine re-auth requirement.
+    """
+    state = _load_provider_state(auth_store, "openai-codex")
+    state = dict(state) if isinstance(state, dict) else {}
+    current_tokens = state.get("tokens")
+    if (
+        isinstance(current_tokens, dict)
+        and str(current_tokens.get("access_token") or "").strip()
+        and str(current_tokens.get("refresh_token") or "").strip()
+    ):
+        return state
+
+    legacy = auth_store.get("codex")
+    if not isinstance(legacy, dict):
+        return state or None
+    access_token = str(legacy.get("access_token") or "").strip()
+    refresh_token = str(legacy.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        return state or None
+
+    tokens = {
+        key: legacy[key]
+        for key in (
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "account_id",
+            "profile",
+            "email",
+            "plan",
+        )
+        if legacy.get(key) not in (None, "")
+    }
+    previous_tokens = current_tokens if isinstance(current_tokens, dict) else None
+    last_refresh = str(
+        legacy.get("last_refresh")
+        or auth_store.get("updated_at")
+        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+    state["tokens"] = tokens
+    state["last_refresh"] = last_refresh
+    state["auth_mode"] = "chatgpt"
+    label = str(legacy.get("profile") or legacy.get("label") or "").strip()
+    if label:
+        state["label"] = label
+    state.pop("last_auth_error", None)
+    _save_provider_state(auth_store, "openai-codex", state)
+    _sync_codex_pool_entries(
+        auth_store,
+        tokens,
+        last_refresh,
+        previous_singleton_tokens=previous_tokens,
+    )
+    _save_auth_store(auth_store)
+    logger.warning(
+        "Recovered openai-codex OAuth credentials from the legacy auth.json.codex mirror."
+    )
+    return state
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -3238,9 +3308,10 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()
+            state = _recover_legacy_codex_state(auth_store)
     else:
         auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        state = _recover_legacy_codex_state(auth_store)
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
