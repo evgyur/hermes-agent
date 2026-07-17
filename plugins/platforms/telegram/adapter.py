@@ -7580,6 +7580,17 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
+    def _is_business_bot_dialog_mirror(self, message: Any) -> bool:
+        """Return True for a reflected owner DM keyed by this bot's own id.
+
+        Telegram may omit ``business_connection_id`` on the reflected text
+        update. A legitimate private user chat cannot have ``chat.id`` equal to
+        the receiving bot's id, so the id relationship is the reliable guard.
+        """
+        bot_id = str(getattr(getattr(self, "_bot", None), "id", "") or "")
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        return bool(bot_id and chat_id and chat_id == bot_id)
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -7602,6 +7613,12 @@ class TelegramAdapter(BasePlatformAdapter):
         mentioning the bot (``@botname /command``), both of which are
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
+        # Telegram Business mirrors the owner's DM with this bot into a second
+        # private chat keyed by the bot id.  Drop that mirror before it can create
+        # a second agent session; normal DMs and third-party Business chats remain.
+        if self._is_business_bot_dialog_mirror(message):
+            return False
+
         # Filter out the bot's own messages (returned by getUpdates in some
         # environments like groups/supergroups where the bot can see its own
         # messages).  Without this, outbound messages are counted as incoming

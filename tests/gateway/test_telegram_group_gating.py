@@ -720,6 +720,20 @@ def test_business_bot_dialog_mirror_is_dropped_even_with_trigger():
     assert adapter._should_process_message(message) is False
 
 
+def test_bot_dialog_mirror_without_business_id_is_dropped():
+    adapter = _make_adapter(require_mention=False)
+    message = _business_dm_message(
+        "🎙 Расшифровка голосового: тест",
+        from_user_id=617744661,
+    )
+    message.business_connection_id = None
+    # Telegram can omit business_connection_id on the reflected text update.
+    # A legitimate private user chat can never have chat.id equal to this bot's id.
+    message.chat.id = 999
+
+    assert adapter._should_process_message(message) is False
+
+
 def test_business_third_party_wake_still_dispatches():
     adapter = _make_adapter(require_mention=False)
     adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}

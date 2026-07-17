@@ -7168,17 +7168,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(getattr(message, "business_connection_id", None))
 
     def _is_business_bot_dialog_mirror(self, message: Any) -> bool:
-        """True for Telegram Business copies of the user's direct dialog with this bot.
+        """True for reflected copies of the user's direct dialog with this bot.
 
         Telegram can surface the same owner-authored DM twice: once as the normal
         bot DM (`chat.id == from_user.id`) and once through the Business inbox
         with `business_connection_id` and `chat.id == this bot's id`. Processing
         both makes Hermes answer twice; the Business reply can render in Telegram
-        as if it came from the connected account. Keep third-party Business
-        concierge chats alive, but drop this bot-dialog mirror.
+        as if it came from the connected account. Some reflected text updates omit
+        `business_connection_id`, but a legitimate user DM can never have a chat id
+        equal to the receiving bot's own id. Keep third-party Business concierge
+        chats alive, but drop this bot-dialog mirror regardless of that optional
+        field.
         """
-        if not self._is_telegram_business_message(message):
-            return False
         bot = getattr(self, "_bot", None)
         bot_id = str(getattr(bot, "id", "") or "")
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
@@ -8043,6 +8044,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._is_self_bot_message(message):
             return False
 
+        # Telegram Business may mirror an owner-authored DM back with this bot's
+        # own id as the private chat id, sometimes without business_connection_id.
+        # Drop it before normal-DM handling; otherwise one user message becomes a
+        # second agent turn and Hermes answers twice.
+        if self._is_business_bot_dialog_mirror(message):
+            return False
+
         # Check ignored_threads first — applies to both groups and DM topics
         if thread_id is not None:
             try:
@@ -8058,8 +8066,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not self._is_group_chat(message):
             if self._is_telegram_business_message(message):
-                if self._is_business_bot_dialog_mirror(message):
-                    return False
                 if explicit_policy and chat_id_str not in private_chats:
                     user = getattr(message, "from_user", None)
                     user_id = str(getattr(user, "id", "") or "")
