@@ -884,6 +884,7 @@ class TelegramAdapter(BasePlatformAdapter):
         keys = (
             "TELEGRAM_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
+            "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
             "TELEGRAM_ALLOW_ALL_USERS",
             "GATEWAY_ALLOWED_USERS",
@@ -910,6 +911,39 @@ class TelegramAdapter(BasePlatformAdapter):
         # _should_process_message gating handle them.
         if not user_id:
             return True
+
+        # A chat-specific group sender list is an explicit override. Apply it
+        # before the adapter-wide DM/group lists so a sender allowed only in one
+        # forum is not dropped at intake or granted access anywhere else.
+        if source.chat_type in {"group", "forum"} and source.chat_id:
+            raw_per_chat = os.getenv(
+                "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", ""
+            ).strip()
+            if raw_per_chat:
+                try:
+                    per_chat_mapping = json.loads(raw_per_chat)
+                except json.JSONDecodeError:
+                    per_chat_mapping = None
+                if isinstance(per_chat_mapping, dict):
+                    chat_allow = per_chat_mapping.get(str(source.chat_id))
+                    if isinstance(chat_allow, str):
+                        allowed_ids = {
+                            part.strip()
+                            for part in chat_allow.split(",")
+                            if part.strip()
+                        }
+                    elif isinstance(chat_allow, (list, tuple, set)):
+                        allowed_ids = {
+                            str(part).strip()
+                            for part in chat_allow
+                            if str(part).strip()
+                        }
+                    else:
+                        allowed_ids = None
+                    if allowed_ids is not None:
+                        return bool(allowed_ids) and (
+                            "*" in allowed_ids or user_id in allowed_ids
+                        )
 
         # Adapter-level sender allowlists are scope-aware. ``allow_from`` is
         # platform-wide for backward compatibility, while ``group_allow_from``
@@ -8960,6 +8994,14 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(group_allowed_users, list):
             group_allowed_users = ",".join(str(v) for v in group_allowed_users)
         os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
+    per_chat_group_allowed_users = telegram_cfg.get("per_chat_group_allow_from")
+    if (
+        per_chat_group_allowed_users is not None
+        and not os.getenv("TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS")
+    ):
+        os.environ["TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"] = _json.dumps(
+            per_chat_group_allowed_users
+        )
     group_allowed_chats = telegram_cfg.get("group_allowed_chats")
     if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
         if isinstance(group_allowed_chats, list):
