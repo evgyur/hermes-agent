@@ -7276,6 +7276,340 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
+    @staticmethod
+    def _goal_tool_names_from_message(msg: Dict[str, Any]) -> List[str]:
+        names: List[str] = []
+        tool_name = msg.get("tool_name")
+        if tool_name:
+            names.append(str(tool_name))
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except Exception:
+                tool_calls = []
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                function = call.get("function")
+                if not name and isinstance(function, dict):
+                    name = function.get("name")
+                if name:
+                    names.append(str(name))
+        return names
+
+    def _uncheckpointed_goal_side_effect_risk(self, session_id: str) -> Optional[str]:
+        raw_store = getattr(self, "_session_db", None)
+        if raw_store is None:
+            raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        raw_store = getattr(raw_store, "_db", raw_store)
+        if raw_store is None or not session_id:
+            return None
+        try:
+            get_messages = getattr(raw_store, "get_messages", None)
+            if not callable(get_messages):
+                return None
+            messages = get_messages(session_id)
+        except Exception as exc:
+            logger.debug("startup goal recovery: message risk lookup failed for %s: %s", session_id, exc)
+            return None
+        checkpoint_idx = -1
+        for idx, msg in enumerate(messages or []):
+            if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+                checkpoint_idx = idx
+        for msg in (messages or [])[checkpoint_idx + 1:]:
+            role = msg.get("role")
+            risky_names = sorted({
+                name for name in self._goal_tool_names_from_message(msg)
+                if name in _STARTUP_GOAL_RISKY_TOOLS
+            })
+            if role == "assistant" and msg.get("tool_calls"):
+                suffix = f": {', '.join(risky_names)}" if risky_names else ""
+                return f"uncheckpointed assistant tool call(s){suffix}"
+            if role == "tool":
+                suffix = f": {', '.join(risky_names)}" if risky_names else ""
+                return f"uncheckpointed tool result(s){suffix}"
+        return None
+
+    def _startup_goal_ledger_statuses(self, session_key: str) -> tuple[str, ...]:
+        raw_store = getattr(self, "_session_db", None)
+        if raw_store is None:
+            raw_store = getattr(getattr(self, "session_store", None), "_db", None)
+        raw_store = getattr(raw_store, "_db", raw_store)
+        if raw_store is None:
+            return ()
+        try:
+            list_ledger = getattr(raw_store, "list_gateway_message_ledger_for_session", None)
+            if not callable(list_ledger):
+                return ()
+            rows = list_ledger(session_key, limit=8)
+        except Exception:
+            return ()
+        return tuple(
+            str((row or {}).get("status") or "").strip()
+            for row in (rows or [])
+            if str((row or {}).get("status") or "").strip()
+        )
+
+    def _telegram_policy_chat_ids(self, *, env_name: str, extra_key: str) -> set[str]:
+        ids: set[str] = set()
+
+        def _add(raw: Any) -> None:
+            if raw is None:
+                return
+            if isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    _add(item)
+                return
+            ids.update(part.strip() for part in str(raw).split(",") if part.strip())
+
+        _add(os.getenv(env_name, ""))
+        try:
+            platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg is not None else {}
+            if isinstance(extra, dict):
+                _add(extra.get(extra_key))
+        except Exception as exc:
+            logger.debug("startup recovery: telegram policy lookup failed for %s: %s", extra_key, exc)
+        return ids
+
+    def _startup_chip_history_config_mapping(self) -> Dict[str, Any]:
+        try:
+            platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg is not None else {}
+            raw = extra.get("chip_history_recovery") if isinstance(extra, dict) else None
+            if isinstance(raw, dict):
+                return {"telegram": {"chip_history_recovery": raw}}
+        except Exception as exc:
+            logger.debug("startup chip history recovery: config lookup failed: %s", exc)
+        return {}
+
+    def _startup_chip_history_reconciliation(self, entry: Any) -> Optional[Any]:
+        source = getattr(entry, "origin", None)
+        db = getattr(self, "_session_db", None)
+        if source is None or db is None or getattr(source, "platform", None) != Platform.TELEGRAM:
+            return None
+        if getattr(source, "chat_type", "dm") == "dm":
+            return None
+        try:
+            from gateway.chip_history_recovery import (
+                TelegramChipHistoryConfig,
+                build_telegram_chip_history_client,
+                reconcile_chip_history_against_ledger,
+            )
+
+            cfg_map = self._startup_chip_history_config_mapping()
+            cfg = TelegramChipHistoryConfig.from_mapping(cfg_map)
+            if not cfg.enabled:
+                return None
+            client = build_telegram_chip_history_client(cfg_map)
+            return reconcile_chip_history_against_ledger(
+                db,
+                client,
+                chat_id=getattr(source, "chat_id", ""),
+                thread_id=getattr(source, "thread_id", None),
+                platform="telegram",
+                limit=cfg.limit,
+                chip_user_id=cfg.chip_user_id,
+            )
+        except Exception as exc:
+            logger.warning("startup chip history recovery failed for %s: %s", getattr(entry, "session_key", ""), exc)
+            return None
+
+    def _startup_recovery_source_is_trusted_private(self, source: Any) -> bool:
+        if source is None:
+            return False
+        if getattr(source, "chat_type", "dm") == "dm":
+            return True
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        private_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PRIVATE_CHATS", extra_key="private_chats"
+        )
+        public_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PUBLIC_CHATS", extra_key="public_chats"
+        )
+        return bool(chat_id and chat_id in private_ids and chat_id not in public_ids)
+
+    def _startup_recovery_source_is_configured_private_workroom(self, source: Any) -> bool:
+        if source is None or getattr(source, "chat_type", "dm") == "dm":
+            return False
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        private_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PRIVATE_CHATS", extra_key="private_chats"
+        )
+        public_ids = self._telegram_policy_chat_ids(
+            env_name="TELEGRAM_PUBLIC_CHATS", extra_key="public_chats"
+        )
+        return bool(chat_id and chat_id in private_ids and chat_id not in public_ids)
+
+    def _startup_recovery_source_is_business_owner_dm(self, source: Any) -> bool:
+        """Recognize owner-authored Telegram Business DM turns.
+
+        Business wake-text messages share the normal customer DM session key.
+        Their persisted source therefore looks like a DM, but the sender is the
+        business owner while the chat id belongs to the customer.  Generic DM
+        startup recovery is opt-in; without this narrower classification a
+        restart can leave an explicitly triggered owner task pending forever.
+
+        ``business.ignore_user_ids`` is the owner-id allowlist already used by
+        the Telegram adapter.  Requiring both an owner id and ``user_id !=
+        chat_id`` keeps ordinary customer DMs and shared chats outside this
+        automatic recovery lane.
+        """
+        if source is None:
+            return False
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        if getattr(source, "chat_type", "dm") != "dm":
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not chat_id or not user_id or chat_id == user_id:
+            return False
+
+        platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        business = extra.get("business") if isinstance(extra, dict) else None
+        if not isinstance(business, dict) or business.get("enabled") is not True:
+            return False
+        raw_owner_ids = business.get("ignore_user_ids") or []
+        if isinstance(raw_owner_ids, str):
+            raw_owner_ids = [item.strip() for item in raw_owner_ids.split(",")]
+        try:
+            owner_ids = {str(item).strip() for item in raw_owner_ids if str(item).strip()}
+        except TypeError:
+            return False
+        return user_id in owner_ids
+
+    def _classify_startup_goal_recovery(
+        self,
+        entry: Any,
+        *,
+        platform: Any = None,
+        generic_auto_resume_enabled: Optional[bool] = None,
+    ) -> StartupGoalRecoveryDecision:
+        session_key = str(getattr(entry, "session_key", "") or "")
+        session_id = str(getattr(entry, "session_id", "") or "")
+        resume_reason = getattr(entry, "resume_reason", None)
+        ledger_statuses = self._startup_goal_ledger_statuses(session_key)
+
+        def _decision(status: str, reason: str, **extra: Any) -> StartupGoalRecoveryDecision:
+            return StartupGoalRecoveryDecision(
+                status=status,
+                session_key=session_key,
+                session_id=session_id,
+                reason=reason,
+                resume_reason=resume_reason,
+                ledger_statuses=ledger_statuses,
+                **extra,
+            )
+
+        if platform is not None and getattr(getattr(entry, "origin", None), "platform", None) != platform:
+            return _decision("skip", "platform-scope-mismatch")
+        if not session_key or not session_id:
+            return _decision("skip", "missing-session-identity")
+        if getattr(entry, "suspended", False):
+            return _decision("skip", "session-suspended")
+        source = getattr(entry, "origin", None)
+        if source is None:
+            return _decision("alert_only", "missing-session-origin")
+
+        goal_mgr = None
+        goal_state = None
+        try:
+            from hermes_cli.goals import GoalManager
+
+            goal_mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
+            reconcile = getattr(goal_mgr, "reconcile_structured_completion_from_state", None)
+            if callable(reconcile):
+                reconcile()
+            goal_state = getattr(goal_mgr, "state", None)
+        except Exception as exc:
+            logger.debug("startup goal recovery: goal lookup failed for %s: %s", session_id, exc)
+
+        if goal_state is not None:
+            goal_status = getattr(goal_state, "status", None)
+            if goal_status != "active":
+                return _decision("skip", "goal-not-active", goal_status=goal_status)
+            if session_key in getattr(self, "_running_agents", {}):
+                return _decision("alert_only", "agent-already-running", goal_status=goal_status)
+            if not self._startup_recovery_source_is_trusted_private(source):
+                return _decision("alert_only", "active-goal-in-shared-chat", goal_status=goal_status)
+            if self.adapters.get(source.platform) is None:
+                return _decision("alert_only", "adapter-not-ready", goal_status=goal_status)
+            marker = (
+                getattr(entry, "last_resume_marked_at", None)
+                or getattr(entry, "updated_at", None)
+                or getattr(goal_state, "last_turn_at", 0)
+                or getattr(goal_state, "created_at", 0)
+            )
+            if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
+                return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
+
+            side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
+            history_result = None
+            if getattr(source, "chat_type", "dm") != "dm":
+                history_result = self._startup_chip_history_reconciliation(entry)
+            if history_result is not None:
+                unsafe = (
+                    list(history_result.missed_by_gateway)
+                    + list(history_result.requeue_candidates)
+                    + list(history_result.alert_only)
+                )
+                if unsafe:
+                    reason_bits = sorted({
+                        str(item.status) for item in unsafe if getattr(item, "status", None)
+                    })
+                    reason = "telegram-chip recent history requires operator review"
+                    if reason_bits:
+                        reason += f": {', '.join(reason_bits)}"
+                    return _decision("alert_only", reason, goal_status=goal_status)
+            try:
+                prompt = goal_mgr.next_continuation_prompt() if goal_mgr is not None else ""
+            except Exception:
+                prompt = ""
+            if not prompt:
+                return _decision("alert_only", "active-goal-continuation-unavailable", goal_status=goal_status)
+            if side_effect_risk:
+                prompt += (
+                    "\n\n[Startup recovery note]\nGateway restarted while the prior turn had "
+                    f"{side_effect_risk}. Do not repeat irreversible side effects blindly; "
+                    "inspect persisted state/artifacts first."
+                )
+            return _decision(
+                "auto_resume",
+                "active-goal-startup-recovery-with-open-tool-tail" if side_effect_risk else "active-goal-startup-recovery",
+                goal_status=goal_status,
+                prompt=prompt,
+            )
+
+        if generic_auto_resume_enabled is None:
+            generic_auto_resume_enabled = os.environ.get(
+                "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+            ).lower() in {"1", "true", "yes", "on"}
+        if (
+            not generic_auto_resume_enabled
+            and not self._startup_recovery_source_is_configured_private_workroom(source)
+            and not self._startup_recovery_source_is_business_owner_dm(source)
+        ):
+            return _decision("skip", "generic-auto-resume-disabled")
+        if not getattr(entry, "resume_pending", False):
+            return _decision("skip", "no-resume-pending")
+        if resume_reason not in self._AUTO_RESUME_REASONS:
+            return _decision("skip", "resume-reason-not-auto-resumable")
+        marker = getattr(entry, "last_resume_marked_at", None) or getattr(entry, "updated_at", None)
+        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
+            return _decision("skip", "resume-pending-stale")
+        if session_key in getattr(self, "_running_agents", {}):
+            return _decision("skip", "agent-already-running")
+        return _decision("auto_resume", "generic-resume-pending")
+
     async def _run_startup_resume_event(
         self,
         adapter: BasePlatformAdapter,
