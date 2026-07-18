@@ -7519,6 +7519,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_text = rich_sent_store.lookup(chat_id, reply_to_id)
             except Exception:
                 reply_to_text = None
+            if reply_to_text:
+                # The durable sent-message index is authoritative: only adapter
+                # outbound sends are recorded under this exact chat/message id.
+                # Do not require the short self-echo TTL as a second proof, or a
+                # legitimate reply stops triggering after fifteen minutes.
+                return True
         if not reply_to_text:
             reply_to_text = self._message_text_with_hidden_links(replied) or None
         if not reply_to_text:
@@ -8070,7 +8076,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     user = getattr(message, "from_user", None)
                     user_id = str(getattr(user, "id", "") or "")
                     if user_id not in private_chats:
-                        return False
+                        allow_reply = self._telegram_business_config().get(
+                            "allow_reply_trigger", False
+                        )
+                        if isinstance(allow_reply, str):
+                            allow_reply = allow_reply.strip().lower() in {
+                                "1", "true", "yes", "on"
+                            }
+                        if not (
+                            allow_reply
+                            and (
+                                self._is_reply_to_bot(message)
+                                or self._is_reply_to_own_outbound_text(message)
+                            )
+                        ):
+                            return False
                 return self._message_matches_business_trigger(message)
             # Root DM (non-topic): ignore if ignore_root_dm is configured
             if thread_id is None and self.config.extra.get("ignore_root_dm", False):
