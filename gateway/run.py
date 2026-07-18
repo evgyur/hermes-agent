@@ -7159,6 +7159,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return bool(chat_id and chat_id in private_ids and chat_id not in public_ids)
 
+    def _startup_recovery_source_is_business_owner_dm(self, source: Any) -> bool:
+        """Recognize owner-authored Telegram Business DM turns.
+
+        Business wake-text messages share the normal customer DM session key.
+        Their persisted source therefore looks like a DM, but the sender is the
+        business owner while the chat id belongs to the customer.  Generic DM
+        startup recovery is opt-in; without this narrower classification a
+        restart can leave an explicitly triggered owner task pending forever.
+
+        ``business.ignore_user_ids`` is the owner-id allowlist already used by
+        the Telegram adapter.  Requiring both an owner id and ``user_id !=
+        chat_id`` keeps ordinary customer DMs and shared chats outside this
+        automatic recovery lane.
+        """
+        if source is None:
+            return False
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        if getattr(source, "chat_type", "dm") != "dm":
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not chat_id or not user_id or chat_id == user_id:
+            return False
+
+        platform_cfg = self.config.platforms.get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        business = extra.get("business") if isinstance(extra, dict) else None
+        if not isinstance(business, dict) or business.get("enabled") is not True:
+            return False
+        raw_owner_ids = business.get("ignore_user_ids") or []
+        if isinstance(raw_owner_ids, str):
+            raw_owner_ids = [item.strip() for item in raw_owner_ids.split(",")]
+        try:
+            owner_ids = {str(item).strip() for item in raw_owner_ids if str(item).strip()}
+        except TypeError:
+            return False
+        return user_id in owner_ids
+
     def _classify_startup_goal_recovery(
         self,
         entry: Any,
@@ -7265,7 +7304,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             generic_auto_resume_enabled = os.environ.get(
                 "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
             ).lower() in {"1", "true", "yes", "on"}
-        if not generic_auto_resume_enabled and not self._startup_recovery_source_is_configured_private_workroom(source):
+        if (
+            not generic_auto_resume_enabled
+            and not self._startup_recovery_source_is_configured_private_workroom(source)
+            and not self._startup_recovery_source_is_business_owner_dm(source)
+        ):
             return _decision("skip", "generic-auto-resume-disabled")
         if not getattr(entry, "resume_pending", False):
             return _decision("skip", "no-resume-pending")

@@ -115,6 +115,54 @@ async def test_legacy_generic_resume_waits_without_flag_when_no_goal(hermes_home
 
 
 @pytest.mark.asyncio
+async def test_business_owner_dm_resume_pending_auto_resumes_without_global_flag(hermes_home):
+    runner, adapter = make_restart_runner()
+    now = datetime.now()
+    source = make_restart_source(chat_id="customer-chat")
+    source.user_id = "owner-id"
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:customer-chat",
+        session_id="business-owner-restart-sid",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    runner.config.platforms[Platform.TELEGRAM].extra["business"] = {
+        "enabled": True,
+        "ignore_user_ids": ["owner-id"],
+    }
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict("os.environ", {}, clear=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source == source
+    assert event.text == ""
+
+
+def test_customer_dm_is_not_misclassified_as_business_owner_dm(hermes_home):
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="customer-id")
+    source.user_id = "customer-id"
+    runner.config.platforms[Platform.TELEGRAM].extra["business"] = {
+        "enabled": True,
+        "ignore_user_ids": ["owner-id"],
+    }
+
+    assert runner._startup_recovery_source_is_business_owner_dm(source) is False
+
+
+@pytest.mark.asyncio
 async def test_paused_goal_resume_pending_does_not_auto_resume_even_when_generic_flag_enabled(hermes_home):
     runner, adapter = make_restart_runner()
     entry = _goal_entry(session_id="paused-goal-sid")
