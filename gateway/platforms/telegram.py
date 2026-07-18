@@ -1891,6 +1891,50 @@ class TelegramAdapter(BasePlatformAdapter):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _business_connection_store_path() -> Path:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "state" / "telegram_business_connections.json"
+
+    def _known_business_connection_id(self, chat_id: Any) -> Optional[str]:
+        """Return the last verified Business connection observed for a DM."""
+        path = self._business_connection_store_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value = payload.get(str(chat_id)) if isinstance(payload, dict) else None
+            return str(value) if value else None
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+
+    def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
+        """Persist a Business connection only after Telegram supplied it."""
+        if not chat_id or not connection_id:
+            return
+        path = self._business_connection_store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[str(chat_id)] = str(connection_id)
+            temp_path = path.with_suffix(f"{path.suffix}.tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to persist Telegram Business connection for chat %s: %s",
+                self.name,
+                chat_id,
+                exc,
+            )
+
     def _business_connection_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -9280,6 +9324,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Build source
         business_connection_id = getattr(message, "business_connection_id", None)
+        if not business_connection_id and getattr(message, "reply_to_message", None):
+            business_connection_id = getattr(
+                message.reply_to_message, "business_connection_id", None
+            )
+        if business_connection_id:
+            self._remember_business_connection_id(chat_id_text, business_connection_id)
+        elif self._is_reply_to_own_outbound_text(message):
+            # Owner-authored replies in a delegated Business inbox can arrive as
+            # ordinary ``message`` updates with no connection id. Recover only
+            # for replies to an indexed assistant message in this exact chat.
+            business_connection_id = self._known_business_connection_id(chat_id_text)
         source = self.build_source(
             chat_id=str(chat.id),
             chat_name=getattr(chat, "title", None) or (getattr(chat, "full_name", None) if hasattr(chat, "full_name") else None),

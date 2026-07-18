@@ -630,6 +630,42 @@ def test_business_reply_to_durable_sent_id_is_owned_after_echo_ttl(monkeypatch):
     assert adapter._is_reply_to_own_outbound_text(message) is True
 
 
+def test_business_owner_reply_recovers_cached_connection_for_response(monkeypatch):
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    message = _dm_message(
+        "Vladismango@gmail.com дай доступ",
+        from_user_id=617744661,
+        reply_to_user_id=617744661,
+        reply_to_text="Готово. Пришли Google-почту — открою адресно.",
+        reply_to_message_id=803228,
+    )
+    message.chat.id = 268754981
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(
+        rich_sent_store,
+        "lookup",
+        lambda chat_id, message_id: "Готово. Пришли Google-почту — открою адресно."
+        if (str(chat_id), str(message_id)) == ("268754981", "803228")
+        else None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_known_business_connection_id",
+        lambda chat_id: "biz-123" if str(chat_id) == "268754981" else None,
+        raising=False,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is True
+
+
 def test_business_dm_external_reply_to_assistant_bypasses_owner_only_private_policy(monkeypatch):
     adapter = _make_adapter(
         require_mention=False,
