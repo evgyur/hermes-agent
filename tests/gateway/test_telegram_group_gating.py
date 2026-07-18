@@ -610,11 +610,11 @@ def test_business_dm_private_chat_owner_reply_to_business_assistant_echo_dispatc
 def test_business_reply_to_durable_sent_id_is_owned_after_echo_ttl(monkeypatch):
     adapter = _make_adapter(require_mention=False)
     message = _business_dm_message(
-        "Vladismango@gmail.com",
-        from_user_id=268754981,
-        reply_to_user_id=617744661,
+        "customer@example.com",
+        from_user_id=70001,
+        reply_to_user_id=70002,
         reply_to_text="Готово. Пришли Google-почту — открою адресно.",
-        reply_to_message_id=803228,
+        reply_to_message_id=90001,
     )
     from gateway import rich_sent_store
 
@@ -622,7 +622,7 @@ def test_business_reply_to_durable_sent_id_is_owned_after_echo_ttl(monkeypatch):
         rich_sent_store,
         "lookup",
         lambda chat_id, message_id: "Готово. Пришли Google-почту — открою адресно."
-        if (str(chat_id), str(message_id)) == ("268754981", "803228")
+        if (str(chat_id), str(message_id)) == ("70001", "90001")
         else None,
     )
     monkeypatch.setattr(adapter, "_recent_outbound_echo_entries", lambda *_args, **_kwargs: [])
@@ -633,30 +633,30 @@ def test_business_reply_to_durable_sent_id_is_owned_after_echo_ttl(monkeypatch):
 def test_business_owner_reply_recovers_cached_connection_for_response(monkeypatch):
     adapter = _make_adapter(
         require_mention=False,
-        private_chats=["617744661"],
-        allow_from=["617744661"],
+        private_chats=["70002"],
+        allow_from=["70002"],
     )
     message = _dm_message(
-        "Vladismango@gmail.com дай доступ",
-        from_user_id=617744661,
-        reply_to_user_id=617744661,
+        "customer@example.com дай доступ",
+        from_user_id=70002,
+        reply_to_user_id=70002,
         reply_to_text="Готово. Пришли Google-почту — открою адресно.",
-        reply_to_message_id=803228,
+        reply_to_message_id=90001,
     )
-    message.chat.id = 268754981
+    message.chat.id = 70001
     from gateway import rich_sent_store
 
     monkeypatch.setattr(
         rich_sent_store,
         "lookup",
         lambda chat_id, message_id: "Готово. Пришли Google-почту — открою адресно."
-        if (str(chat_id), str(message_id)) == ("268754981", "803228")
+        if (str(chat_id), str(message_id)) == ("70001", "90001")
         else None,
     )
     monkeypatch.setattr(
         adapter,
         "_known_business_connection_id",
-        lambda chat_id: "biz-123" if str(chat_id) == "268754981" else None,
+        lambda chat_id: "biz-123" if str(chat_id) == "70001" else None,
         raising=False,
     )
 
@@ -669,8 +669,8 @@ def test_business_owner_reply_recovers_cached_connection_for_response(monkeypatc
 def test_business_dm_external_reply_to_assistant_bypasses_owner_only_private_policy(monkeypatch):
     adapter = _make_adapter(
         require_mention=False,
-        private_chats=["617744661"],
-        allow_from=["617744661"],
+        private_chats=["70002"],
+        allow_from=["70002"],
     )
     adapter.config.extra["business"] = {
         "enabled": True,
@@ -681,11 +681,11 @@ def test_business_dm_external_reply_to_assistant_bypasses_owner_only_private_pol
 
     assert adapter._should_process_message(
         _business_dm_message(
-            "Vladismango@gmail.com",
-            from_user_id=268754981,
-            reply_to_user_id=617744661,
+            "customer@example.com",
+            from_user_id=70001,
+            reply_to_user_id=70002,
             reply_to_text="Готово. Пришли Google-почту — открою адресно.",
-            reply_to_message_id=803228,
+            reply_to_message_id=90001,
         )
     ) is True
 
@@ -693,8 +693,8 @@ def test_business_dm_external_reply_to_assistant_bypasses_owner_only_private_pol
 def test_business_dm_external_wake_word_does_not_bypass_owner_only_private_policy():
     adapter = _make_adapter(
         require_mention=False,
-        private_chats=["617744661"],
-        allow_from=["617744661"],
+        private_chats=["70002"],
+        allow_from=["70002"],
     )
     adapter.config.extra["business"] = {
         "enabled": True,
@@ -703,7 +703,7 @@ def test_business_dm_external_wake_word_does_not_bypass_owner_only_private_polic
     }
 
     assert adapter._should_process_message(
-        _business_dm_message("Sigurd, unrelated customer", from_user_id=268754981)
+        _business_dm_message("Sigurd, unrelated customer", from_user_id=70001)
     ) is False
 
 
