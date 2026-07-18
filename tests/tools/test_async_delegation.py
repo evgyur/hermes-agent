@@ -142,6 +142,10 @@ def test_rich_reinjection_block_is_self_contained():
         "API calls: 7",
     ]:
         assert needle in text, f"missing {needle!r}"
+    assert "not a new user request" in text
+    assert "respond exactly NO_REPLY" in text
+    assert "Do not automatically re-dispatch" in text
+    assert "act on the result or re-dispatch" not in text
 
 
 def test_dispatch_rejected_at_capacity():
@@ -603,6 +607,10 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert text is not None
     assert "TASK 1/3" in text and "TASK 2/3" in text and "TASK 3/3" in text
     assert "done: a" in text and "done: b" in text and "done: c" in text
+    assert "not a new user request" in text
+    assert "respond exactly NO_REPLY" in text
+    assert "Do not automatically re-dispatch" in text
+    assert "act on these or re-dispatch" not in text
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
 
