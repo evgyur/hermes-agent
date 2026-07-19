@@ -22,6 +22,36 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
+_BUSINESS_CONNECTION_STORE_LOCK = threading.Lock()
+
+
+def _acquire_process_file_lock(lock_file: Any) -> None:
+    """Take a cross-process lock using only platform stdlib primitives."""
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _release_process_file_lock(lock_file: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -1799,21 +1829,31 @@ class TelegramAdapter(BasePlatformAdapter):
         if not chat_id or not connection_id:
             return
         path = self._business_connection_store_path()
+        temp_path: Optional[Path] = None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, OSError, ValueError, TypeError):
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            payload[str(chat_id)] = str(connection_id)
-            temp_path = path.with_suffix(f"{path.suffix}.tmp")
-            temp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                encoding="utf-8",
-            )
-            os.replace(temp_path, path)
+            with _BUSINESS_CONNECTION_STORE_LOCK:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lock_path = path.with_name(f".{path.name}.lock")
+                with lock_path.open("a+b") as lock_file:
+                    _acquire_process_file_lock(lock_file)
+                    try:
+                        try:
+                            payload = json.loads(path.read_text(encoding="utf-8"))
+                        except (FileNotFoundError, OSError, ValueError, TypeError):
+                            payload = {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        payload[str(chat_id)] = str(connection_id)
+                        temp_path = path.with_name(
+                            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                        )
+                        temp_path.write_text(
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        os.replace(temp_path, path)
+                    finally:
+                        _release_process_file_lock(lock_file)
         except Exception as exc:
             logger.debug(
                 "[%s] Failed to persist Telegram Business connection for chat %s: %s",
@@ -1821,6 +1861,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id,
                 exc,
             )
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def _business_owner_ids(self) -> set[str]:
         config = getattr(self, "config", None)
@@ -1858,23 +1901,30 @@ class TelegramAdapter(BasePlatformAdapter):
             words = [str(part).strip() for part in raw_words if str(part).strip()]
         else:
             words = []
+        text = text.lstrip()
         return any(
-            re.search(rf"(?i)(?<![\w@]){re.escape(word)}(?![\w@])", text)
+            re.match(rf"(?i)@?{re.escape(word)}(?=$|[\s,:;.!?\-—])", text)
             for word in words
         )
+
+    @staticmethod
+    def _telegram_supplied_business_connection_id(message: Any) -> Optional[str]:
+        """Return only a route attached by Telegram to this update or its reply."""
+        connection_id = getattr(message, "business_connection_id", None)
+        replied = getattr(message, "reply_to_message", None)
+        if not connection_id and replied is not None:
+            connection_id = getattr(replied, "business_connection_id", None)
+        return str(connection_id) if connection_id else None
 
     def _resolve_business_connection_id(
         self, message: Any, *, chat_type: str
     ) -> Optional[str]:
         """Resolve a safe outbound route for an inbound Telegram message."""
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
-        connection_id = getattr(message, "business_connection_id", None)
-        replied = getattr(message, "reply_to_message", None)
-        if not connection_id and replied is not None:
-            connection_id = getattr(replied, "business_connection_id", None)
+        connection_id = self._telegram_supplied_business_connection_id(message)
         if connection_id:
             self._remember_business_connection_id(chat_id, connection_id)
-            return str(connection_id)
+            return connection_id
         if chat_type == "dm" and self._is_business_owner_wake_trigger(message):
             return self._known_business_connection_id(chat_id)
         return None
@@ -2045,6 +2095,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_mode=self._reply_to_mode,
         )
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        payload.update(self._business_connection_kwargs(metadata))
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         try:
@@ -4257,6 +4308,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        business_kwargs = self._business_connection_kwargs(metadata)
+
         if (
             finalize
             and str(chat_id) in getattr(self, "_rich_message_chat_ids", set())
@@ -4323,6 +4376,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    **business_kwargs,
                 )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
@@ -4335,6 +4389,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **business_kwargs,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -4352,6 +4407,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
+                    **business_kwargs,
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -4380,6 +4436,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=truncated,
+                    **business_kwargs,
                 )
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
@@ -4405,6 +4462,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        **business_kwargs,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -4499,6 +4557,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Step 1 — edit the existing message with the first chunk.
         first_chunk = chunks[0]
+        business_kwargs = self._business_connection_kwargs(metadata)
         try:
             if finalize:
                 # Use format_message + parse_mode for the final chunk;
@@ -4512,6 +4571,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=formatted,
                         parse_mode=ParseMode.MARKDOWN_V2,
+                        **business_kwargs,
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
@@ -4524,12 +4584,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
                             text=_strip_mdv2(first_chunk),
+                            **business_kwargs,
                         )
             else:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=first_chunk,
+                    **business_kwargs,
                 )
         except Exception as e:
             err_str = str(e).lower()
@@ -4583,6 +4645,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         **thread_kwargs,
                         **self._link_preview_kwargs(),
                         **self._notification_kwargs(metadata),
+                        **business_kwargs,
                     )
                     break
                 except Exception as send_err:
@@ -4604,6 +4667,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **retry_thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **business_kwargs,
                             )
                             break
                         except Exception as _retry_err:
@@ -7763,12 +7827,12 @@ class TelegramAdapter(BasePlatformAdapter):
             # In a third-party peer chat, process only an explicit concierge wake
             # command; plain outgoing owner text is an echo, not an agent turn.
             if self._is_business_owner_wake_trigger(message):
-                return bool(
-                    getattr(message, "business_connection_id", None)
-                    or self._known_business_connection_id(
-                        str(getattr(getattr(message, "chat", None), "id", "") or "")
-                    )
-                )
+                chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+                connection_id = self._telegram_supplied_business_connection_id(message)
+                if connection_id:
+                    self._remember_business_connection_id(chat_id, connection_id)
+                    return True
+                return bool(self._known_business_connection_id(chat_id))
             user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
             chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
             if (
@@ -7776,8 +7840,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 and chat_id
                 and user_id != chat_id
                 and user_id in self._business_owner_ids()
-                and self._known_business_connection_id(chat_id)
+                and self._truthy_config_value(
+                    self._telegram_business_config().get("enabled", False)
+                )
             ):
+                self._remember_business_connection_id(
+                    chat_id, self._telegram_supplied_business_connection_id(message)
+                )
                 return False
             return True
 
