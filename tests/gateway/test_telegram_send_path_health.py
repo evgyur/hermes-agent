@@ -6,6 +6,7 @@ but nothing reaches the recipient.  ``_send_path_degraded`` short-circuits
 ``send()`` so cron's live-adapter branch falls through to standalone HTTP.
 """
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -69,6 +70,10 @@ async def test_external_safe_business_send_uses_bot_identity_not_business_accoun
     """External Telegram Business replies must not be sent as the human account."""
     adapter = _make_adapter()
     adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+    }
 
     result = await adapter.send(
         "8533179145",
@@ -120,6 +125,132 @@ async def test_business_send_as_account_requires_explicit_opt_in():
     assert result.success is True
     kwargs = adapter._bot.send_message.await_args.kwargs
     assert kwargs["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
+async def test_business_send_as_account_honors_trusted_adapter_config():
+    """The configured concierge route must not require an extra per-turn flag."""
+    adapter = _make_adapter()
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+    }
+
+    result = await adapter.send(
+        "700000002",
+        "ОК",
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
+async def test_business_rich_send_honors_trusted_adapter_config():
+    adapter = _make_adapter()
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+    }
+    adapter._bot.do_api_request = AsyncMock(return_value={"message_id": 43})
+
+    result = await adapter._try_send_rich(
+        "700000002",
+        "## Анализ",
+        None,
+        {"business_connection_id": "biz-123"},
+    )
+
+    assert result is not None and result.success is True
+    payload = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"]
+    assert payload["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
+async def test_business_document_send_honors_trusted_adapter_config(tmp_path):
+    adapter = _make_adapter()
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+    }
+    adapter._bot.send_document = AsyncMock(return_value=MagicMock(message_id=44))
+    artifact = tmp_path / "skill.zip"
+    artifact.write_bytes(b"zip")
+
+    result = await adapter.send_document(
+        "700000002",
+        str(artifact),
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_document.await_args.kwargs
+    assert kwargs["business_connection_id"] == "biz-123"
+
+
+def test_business_owner_wake_recovers_the_verified_connection_for_peer_chat(monkeypatch):
+    adapter = _make_adapter()
+    adapter.config.extra["allow_from"] = ["700000001"]
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+        "trigger_words": ["Sigurd", "Сигурд"],
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_known_business_connection_id",
+        lambda chat_id: "biz-123" if str(chat_id) == "700000002" else None,
+        raising=False,
+    )
+    wake = SimpleNamespace(
+        business_connection_id=None,
+        chat=SimpleNamespace(
+            id=700000002,
+            type="private",
+            title=None,
+            full_name="Peer",
+        ),
+        from_user=SimpleNamespace(
+            id=700000001,
+            is_bot=False,
+            full_name="Owner",
+        ),
+        text="Sigurd, пришли файл",
+        caption=None,
+        message_id=123,
+        message_thread_id=None,
+        reply_to_message=None,
+        date=None,
+    )
+    plain = SimpleNamespace(**{**vars(wake), "text": "Просто сообщение"})
+
+    assert adapter._resolve_business_connection_id(wake, chat_type="dm") == "biz-123"
+    assert adapter._resolve_business_connection_id(plain, chat_type="dm") is None
+    assert adapter._should_process_message(wake) is True
+    assert adapter._should_process_message(plain) is False
+
+    from gateway.platforms.base import MessageType
+
+    event = adapter._build_message_event(wake, MessageType.TEXT)
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is False
+
+
+def test_single_verified_business_connection_recovers_a_new_peer_chat(tmp_path, monkeypatch):
+    adapter = _make_adapter()
+    store = tmp_path / "telegram_business_connections.json"
+    monkeypatch.setattr(
+        adapter,
+        "_business_connection_store_path",
+        lambda: store,
+        raising=False,
+    )
+
+    adapter._remember_business_connection_id("700000002", "biz-123")
+
+    assert adapter._known_business_connection_id("700000003") == "biz-123"
 
 
 @pytest.mark.asyncio
