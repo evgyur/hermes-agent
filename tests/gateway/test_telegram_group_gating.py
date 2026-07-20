@@ -508,6 +508,49 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
+def test_live_plugin_adapter_honors_per_chat_mention_reply_gate():
+    """The plugin adapter loaded by production must honor require_mention_chats."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter as PluginTelegramAdapter
+
+    adapter = object.__new__(PluginTelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={
+            "require_mention": False,
+            "require_mention_chats": ["-100123"],
+            "free_response_chats": [],
+            "allowed_chats": [],
+            "allowed_topics": [],
+            "ignored_threads": [],
+            "group_allowed_chats": [],
+            "private_chats": [],
+            "public_chats": [],
+        },
+    )
+    adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+    adapter._dm_topic_chat_ids = set()
+    adapter._mention_patterns = adapter._compile_mention_patterns()
+
+    assert adapter._should_process_message(
+        _group_message("ordinary public chatter", chat_id=-100123)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("replying to Hermes", chat_id=-100123, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-100123,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("ordinary private-group chatter", chat_id=-100456)
+    ) is True
+
+
 def test_private_dms_remain_unrestricted_without_explicit_chat_policy():
     adapter = _make_adapter(require_mention=False)
 
