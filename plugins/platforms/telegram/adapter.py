@@ -7566,6 +7566,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return chats where mention/reply gating is enabled locally."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_chat_requires_mention(self, chat_id: str) -> bool:
+        if str(chat_id) in self._telegram_require_mention_chats():
+            return True
+        return self._telegram_require_mention()
+
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
 
@@ -7991,7 +8005,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._telegram_is_free_response_topic(message):
             return False
-        if not self._telegram_require_mention():
+        if not self._telegram_chat_requires_mention(chat_id_str):
             return False
         if self._is_reply_to_bot(message):
             return False
@@ -8389,7 +8403,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if self._telegram_is_free_response_topic(message):
             return True
-        if not self._telegram_require_mention():
+        if not self._telegram_chat_requires_mention(chat_id_str):
             return True
         if self._is_reply_to_bot(message):
             return True
