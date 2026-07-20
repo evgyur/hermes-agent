@@ -38,6 +38,7 @@ sidebar_position: 1
 | **OpenCode Zen** | `~/.hermes/.env` 中的 `OPENCODE_ZEN_API_KEY`（provider: `opencode-zen`） |
 | **OpenCode Go** | `~/.hermes/.env` 中的 `OPENCODE_GO_API_KEY`（provider: `opencode-go`） |
 | **DeepSeek** | `~/.hermes/.env` 中的 `DEEPSEEK_API_KEY`（provider: `deepseek`） |
+| **DeepInfra** | `~/.hermes/.env` 中的 `DEEPINFRA_API_KEY`（provider: `deepinfra`；别名：`deep-infra`、`deepinfra-ai`） |
 | **Hugging Face** | `~/.hermes/.env` 中的 `HF_TOKEN`（provider: `huggingface`，别名：`hf`） |
 | **Google / Gemini** | `~/.hermes/.env` 中的 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）（provider: `gemini`） |
 | **LM Studio** | `hermes model` → "LM Studio"（provider: `lmstudio`，可选 `LM_API_KEY`） |
@@ -195,6 +196,54 @@ model:
 | `COPILOT_GITHUB_TOKEN` | Copilot API 的 GitHub token（最高优先级） |
 | `HERMES_COPILOT_ACP_COMMAND` | 覆盖 Copilot CLI 二进制路径（默认：`copilot`） |
 | `HERMES_COPILOT_ACP_ARGS` | 覆盖 ACP 参数（默认：`--acp --stdio`） |
+
+### DeepInfra：一个 key，按 surface 显式选择
+
+DeepInfra 是一等 OpenAI-compatible 提供商，可用于 chat、图像、视频、STT 和 TTS。先在 [deepinfra.com/dash/api_keys](https://deepinfra.com/dash/api_keys) 创建 key，再通过 `hermes model` / `hermes tools` 或环境变量配置：
+
+```bash
+DEEPINFRA_API_KEY=***
+# 可选：兼容代理或私有端点
+# DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+```
+
+```yaml
+model:
+  provider: deepinfra
+  model: deepseek-ai/DeepSeek-V4-Flash
+```
+
+Hermes 从 `/models?filter=true&sort_by=hermes` 读取带 tag 的实时目录，并分别筛选 `chat`、`image-gen`、`video-gen`、`tts`、`stt`。通用目录不会混入 chat picker；目录不可达时也不会猜测可能已退役的模型。失败会负缓存 60 秒，避免一次操作连续发生多个五秒阻塞。
+
+| Surface | 选择与行为 |
+|---|---|
+| Chat / vision | 使用 `model.provider: deepinfra`；picker 只显示 chat 模型。默认 vision helper 选择同时带 `chat` 和 `vision` tag 的第一个实时模型。不同模型输出限制不同，因此没有 provider-wide `max_tokens` 默认值。 |
+| 图像生成 | 设置 `image_gen.provider: deepinfra`。当前 backend 仅支持 **text-to-image**；`image_url` 和 reference image 返回 `modality_unsupported`。模型优先级：`DEEPINFRA_IMAGE_MODEL` → `image_gen.deepinfra.model` → 第一个实时 `image-gen` 模型。 |
+| 视频生成 | 设置 `video_gen.provider: deepinfra`。支持 text-to-video 与 image-to-video，模型来自实时 `video-gen` 目录。显式配置未知/不可用 provider 时 fail closed，不会落到另一个付费 backend。 |
+| STT | 设置 `stt.provider: deepinfra`，可选固定 `stt.deepinfra.model`。未显式配置 STT 时，DeepInfra 只在 local、Groq、OpenAI、Mistral、xAI、ElevenLabs 之后作为最后候选。 |
+| TTS | 设置 `tts.provider: deepinfra`，可选固定 `tts.deepinfra.model` 和 `voice`。TTS 不继承当前 chat provider；未显式选择时保持免费的 Edge 默认值。 |
+
+```yaml
+image_gen:
+  provider: deepinfra
+  deepinfra:
+    model: ""
+video_gen:
+  provider: deepinfra
+stt:
+  provider: deepinfra
+  deepinfra:
+    model: ""
+tts:
+  provider: deepinfra
+  deepinfra:
+    model: ""
+    voice: default
+```
+
+:::warning 付费媒体 backend 必须显式 opt-in
+`DEEPINFRA_API_KEY` 可用于自动检测主推理 provider，并在其他 STT 路径都不可用时作为 STT 最后候选；它不会静默把图像生成或 TTS 切换到付费 backend。请在 `hermes tools` 中选择，或显式设置对应 `provider`。
+:::
 
 ### 一等 API Key 提供商
 

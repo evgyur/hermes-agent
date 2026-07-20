@@ -167,6 +167,12 @@ Multiple hermes processes (gateway + CLI sessions + worktree agents) share one
 This avoids the "convoy effect" where SQLite's deterministic internal backoff
 causes all competing writers to retry at the same intervals.
 
+### Cron initialization guard
+
+Cron's LLM execution path adds a separate bound around `SessionDB()` construction because that synchronous open/migration happens before the cron agent inactivity watchdog exists. Configure `cron.session_db_timeout_seconds` (default 10 seconds; `0` = unlimited) or use the legacy `HERMES_CRON_SESSION_DB_TIMEOUT` override. If initialization times out, that cron run continues without session persistence and releases its dispatch guard instead of staying permanently wedged as `running`.
+
+See [Cron Internals](./cron-internals.md#sessiondb-initialization-timeout) for resolution order and failure behavior.
+
 ```
 _WRITE_MAX_RETRIES = 15
 _WRITE_RETRY_MIN_S = 0.020   # 20ms

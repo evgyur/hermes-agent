@@ -39,6 +39,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
+| **DeepInfra** | `DEEPINFRA_API_KEY` in `~/.hermes/.env` (provider: `deepinfra`; aliases: `deep-infra`, `deepinfra-ai`) |
 | **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
 | **Google / Gemini** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `~/.hermes/.env` (provider: `gemini`) |
 | **Google Vertex AI** | `hermes model` → "Google Vertex AI" (provider: `vertex`; OAuth2 via service-account JSON or ADC, GCP billing) |
@@ -209,6 +210,60 @@ model:
 | `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
+
+### DeepInfra: one key, explicitly selected surfaces
+
+DeepInfra is a first-class OpenAI-compatible provider for chat plus image, video, speech-to-text, and text-to-speech tools. Create a key at [deepinfra.com/dash/api_keys](https://deepinfra.com/dash/api_keys), then configure it through `hermes model` / `hermes tools` or the environment:
+
+```bash
+DEEPINFRA_API_KEY=***
+# Optional for a compatible proxy or private endpoint:
+# DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+```
+
+```yaml
+model:
+  provider: deepinfra
+  # Choose an ID from the live chat catalog shown by `hermes model`.
+  model: deepseek-ai/DeepSeek-V4-Flash
+```
+
+Hermes reads DeepInfra's tagged live catalog at `/models?filter=true&sort_by=hermes` and separates `chat`, `image-gen`, `video-gen`, `tts`, and `stt` models. It does not mix the generic catalog into the chat picker and does not guess a retired model when the catalog is unavailable. Catalog failures are negatively cached for 60 seconds to prevent several consecutive five-second stalls.
+
+| Surface | Selection and behavior |
+|---|---|
+| Chat / vision | `model.provider: deepinfra`; the picker shows only chat-capable models. The default vision helper chooses the first live model tagged both `chat` and `vision`. Provider-wide `max_tokens` is intentionally unset because limits vary by model; an explicit `agent.max_tokens` still applies. |
+| Image generation | Set `image_gen.provider: deepinfra`. This backend is **text-to-image only**; `image_url` and reference images fail with `modality_unsupported`. Model priority: `DEEPINFRA_IMAGE_MODEL` → `image_gen.deepinfra.model` → first live `image-gen` model. |
+| Video generation | Set `video_gen.provider: deepinfra`. Supports text-to-video and image-to-video; models come from the live `video-gen` catalog. An explicit unknown/unavailable provider fails closed instead of falling through to another paid backend. |
+| Speech-to-text | Set `stt.provider: deepinfra`; optionally pin `stt.deepinfra.model`. With no explicit STT provider, DeepInfra is considered only after local, Groq, OpenAI, Mistral, xAI, and ElevenLabs, so a general DeepInfra chat key does not displace an existing STT route. |
+| Text-to-speech | Set `tts.provider: deepinfra`; optionally pin `tts.deepinfra.model` and `voice`. TTS never inherits the active chat provider automatically: without explicit selection Hermes keeps the free Edge default. |
+
+Example tool configuration:
+
+```yaml
+image_gen:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live image-gen model
+
+video_gen:
+  provider: deepinfra
+
+stt:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live stt model
+
+tts:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live tts model
+    voice: default
+```
+
+:::warning Paid media backends require explicit opt-in
+Possessing `DEEPINFRA_API_KEY` can auto-detect DeepInfra for the main inference provider and, as a last resort, for STT. It does **not** silently switch image generation or TTS to a paid backend. Select those surfaces in `hermes tools` or set their `provider` keys explicitly.
+:::
 
 ### First-Class API-Key Providers
 

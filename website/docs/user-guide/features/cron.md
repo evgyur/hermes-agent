@@ -590,6 +590,22 @@ cronjob(action="remove", job_id="...")
 
 For `update`, pass `skills=[]` to remove all attached skills.
 
+### What `cronjob(action="run")` means
+
+An agent-triggered manual run is intentionally **non-blocking**. The tool atomically moves the active job's `next_run_at` to now, returns `execution_state: "queued"`, and the persistent scheduler executes it on the next tick. The parent chat turn does not wait for the cron agent, which can run for minutes without wedging the tool call or tripping the chat inactivity watchdog.
+
+After queueing, use `cronjob(action="list")` to inspect `last_run_at`, `last_status`, and output. A queued response means accepted for scheduling, not already completed.
+
+Paused or disabled jobs stay paused: `action="run"` reports the skip and never re-enables them. The active-state check and queue write happen under the same jobs-file lock, so a concurrent pause wins safely.
+
+Direct CLI/Python runs are different:
+
+```bash
+hermes cron run <job_id>
+```
+
+The CLI has no parent agent turn to protect, so it claims the job and executes it inline. The shared fire claim prevents a simultaneous scheduler tick from double-running it.
+
 ## Toolsets available to cron jobs
 
 Cron runs each job in a fresh agent session with no chat platform attached. By default the cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun.
@@ -729,6 +745,19 @@ cronjob(action="create", name="daily-digest",
 The referenced jobs' most recent completed outputs are injected above the prompt as context for this run. Each upstream entry must be a valid job ID or name (see `cronjob action="list"`). Note: chaining reads the *most recent completed* output — it does not wait for upstream jobs that are running in the same tick.
 
 ## Job storage
+
+### Session database initialization guard
+
+LLM-backed cron runs initialize `SessionDB` before constructing the agent. A stalled SQLite open or migration is bounded separately from agent inactivity and pre-run script timeouts:
+
+```yaml
+cron:
+  session_db_timeout_seconds: 10   # default; 0 = unlimited, debugging only
+```
+
+`HERMES_CRON_SESSION_DB_TIMEOUT` overrides the config value for backward compatibility. Resolution order is environment → `cron.session_db_timeout_seconds` → 10 seconds.
+
+If initialization exceeds the limit, Hermes logs an error and continues that run without session persistence instead of leaving the job permanently stuck as `running`. The dispatch guard is released normally, so future ticks can try again. This setting does not limit the cron agent itself (`HERMES_CRON_TIMEOUT`) or a pre-run script (`cron.script_timeout_seconds`).
 
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
 
