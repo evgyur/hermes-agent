@@ -15754,14 +15754,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source,
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Build the metadata dict platforms need for thread-aware replies."""
-        return self._thread_metadata_for_target(
+        """Build routing metadata for synthetic replies and status messages.
+
+        Gateway-owned sends do not pass through BasePlatformAdapter's
+        source-metadata helper.  Preserve Telegram Business routing here even
+        for root DMs with no thread id; otherwise progress and long-running
+        notices silently target the ordinary bot chat while only the final
+        Business reply reaches the customer.
+        """
+        metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        metadata = dict(metadata or {})
+        business_connection_id = getattr(source, "business_connection_id", None)
+        if business_connection_id:
+            metadata["business_connection_id"] = str(business_connection_id)
+        if getattr(source, "external_safe_mode", False):
+            metadata["external_safe_mode"] = True
+            metadata["telegram_business_external_contact"] = True
+        return metadata or None
 
     def _thread_metadata_for_target(
         self,
