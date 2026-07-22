@@ -1916,6 +1916,13 @@ class TelegramAdapter(BasePlatformAdapter):
             connection_id = getattr(replied, "business_connection_id", None)
         return str(connection_id) if connection_id else None
 
+    def _remember_inbound_business_route(self, message: Any) -> None:
+        """Persist a Telegram-verified Business route before auth rejects content."""
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        connection_id = self._telegram_supplied_business_connection_id(message)
+        if chat_id and connection_id:
+            self._remember_business_connection_id(chat_id, connection_id)
+
     def _resolve_business_connection_id(
         self, message: Any, *, chat_type: str
     ) -> Optional[str]:
@@ -7962,6 +7969,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        self._remember_inbound_business_route(msg)
         # Early user-level auth check: reject unauthorized users before any
         # text batching, observe-buffer persistence, event building, or response
         # generation. This prevents removed/blocked users from injecting prompts
@@ -7990,6 +7998,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        self._remember_inbound_business_route(msg)
         if not self._should_process_message(msg, is_command=True):
             return
         if not self._is_user_authorized_from_message(msg):
@@ -8012,6 +8021,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg:
             return
+        self._remember_inbound_business_route(msg)
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
@@ -8213,6 +8223,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        inbound_message = self._effective_update_message(update)
+        if not inbound_message:
+            return
+        self._remember_inbound_business_route(inbound_message)
         if not update.message:
             return
         if not self._is_user_authorized_from_message(update.message):

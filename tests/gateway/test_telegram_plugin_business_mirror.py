@@ -6,9 +6,13 @@ so future core/plugin drift cannot reintroduce duplicate Telegram turns.
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 from gateway.config import Platform, PlatformConfig
 
@@ -88,3 +92,33 @@ def test_live_plugin_preserves_third_party_business_dm():
     )
 
     assert adapter._should_process_message(third_party_dm) is True
+
+@pytest.mark.asyncio
+async def test_live_plugin_retains_business_route_before_rejecting_unauthorized_text(
+    tmp_path, monkeypatch
+):
+    adapter = _adapter()
+    adapter.config.extra["allow_from"] = ["617744661"]
+    store = tmp_path / "telegram_business_connections.json"
+    monkeypatch.setattr(
+        adapter,
+        "_business_connection_store_path",
+        lambda: store,
+        raising=False,
+    )
+    adapter._build_message_event = MagicMock()
+    adapter._enqueue_text_event = MagicMock()
+    message = _dm(
+        chat_id=700000042,
+        from_user_id=700000042,
+        business_connection_id="business-external",
+    )
+    update = SimpleNamespace(update_id=7001, effective_message=message, message=None)
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+    assert json.loads(store.read_text(encoding="utf-8")) == {
+        "700000042": "business-external"
+    }
+    adapter._build_message_event.assert_not_called()
+    adapter._enqueue_text_event.assert_not_called()
