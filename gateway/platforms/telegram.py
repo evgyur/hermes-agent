@@ -7085,6 +7085,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_reply_trigger_disabled_chats(self) -> set[str]:
+        """Return chats where replying to this bot is not a wake trigger."""
+        raw = self.config.extra.get("reply_trigger_disabled_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS", "")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_reply_trigger_enabled(self, message: Message) -> bool:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        return chat_id not in self._telegram_reply_trigger_disabled_chats()
+
     def _telegram_chat_requires_mention(self, chat_id: str) -> bool:
         if str(chat_id) in self._telegram_require_mention_chats():
             return True
@@ -7188,7 +7201,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(os.getenv("TELEGRAM_PRIVATE_CHATS", "").strip() or os.getenv("TELEGRAM_PUBLIC_CHATS", "").strip())
 
     def _telegram_public_triggered(self, message: Message, *, guest_mention: Optional[bool] = None) -> bool:
-        if self._is_reply_to_bot(message):
+        if self._is_reply_to_bot(message) and self._telegram_reply_trigger_enabled(message):
             return True
         if guest_mention is True:
             return True
@@ -7832,7 +7845,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if not self._telegram_chat_requires_mention(chat_id_str):
             return False
-        if self._is_reply_to_bot(message):
+        if self._is_reply_to_bot(message) and self._telegram_reply_trigger_enabled(message):
             return False
         if self._message_mentions_bot(message):
             return False
@@ -8081,7 +8094,7 @@ class TelegramAdapter(BasePlatformAdapter):
           ``guest_mode`` is enabled and the bot is explicitly mentioned
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
-        - the message replies to the bot
+        - the message replies to the bot, unless reply triggers are disabled for that chat
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
 

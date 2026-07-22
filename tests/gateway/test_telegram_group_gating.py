@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     require_mention_chats=None,
+    reply_trigger_disabled_chats=None,
     free_response_chats=None,
     free_response_topics=None,
     private_chats=None,
@@ -34,6 +35,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if require_mention_chats is not None:
         extra["require_mention_chats"] = require_mention_chats
+    if reply_trigger_disabled_chats is not None:
+        extra["reply_trigger_disabled_chats"] = reply_trigger_disabled_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
@@ -807,6 +810,42 @@ def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
 
 
+def test_reply_trigger_disabled_chats_require_direct_mention_in_listed_chat():
+    adapter = _make_adapter(
+        require_mention=False,
+        require_mention_chats=["-200"],
+        reply_trigger_disabled_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(
+        _group_message("replying", chat_id=-200, reply_to_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            reply_to_bot=True,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("replying", chat_id=-201, reply_to_bot=True)
+    ) is True
+
+
+def test_reply_trigger_disabled_chat_still_allows_configured_wake_pattern():
+    adapter = _make_adapter(
+        require_mention=False,
+        require_mention_chats=["-200"],
+        reply_trigger_disabled_chats=["-200"],
+        mention_patterns=[r"^\s*human20\b"],
+    )
+
+    assert adapter._should_process_message(
+        _group_message("human20 status", chat_id=-200, reply_to_bot=True)
+    ) is True
+
+
 
 def test_explicit_chat_policy_private_public_and_unknown_chats():
     adapter = _make_adapter(
@@ -1103,6 +1142,25 @@ def test_top_level_require_mention_does_not_override_telegram_section(monkeypatc
     assert config is not None
     # The telegram-specific "false" must win over the top-level "true".
     assert __import__("os").environ.get("TELEGRAM_REQUIRE_MENTION") == "false"
+
+
+def test_config_bridges_reply_trigger_disabled_chats(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  reply_trigger_disabled_chats:\n"
+        "    - -1003770669948\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    assert __import__("os").environ["TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS"] == "-1003770669948"
 
 
 def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):
