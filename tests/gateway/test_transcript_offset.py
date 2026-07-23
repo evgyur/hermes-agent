@@ -13,7 +13,10 @@ to ``_run_agent``'s return dict and uses it for the slice.
 """
 
 
-from gateway.run import _preserve_queued_followup_history_offset
+from gateway.run import (
+    _latest_goal_technical_boundary,
+    _preserve_queued_followup_history_offset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +326,60 @@ class TestTranscriptHistoryOffset:
         )
 
         assert merged["history_offset"] == 3
+
+    def test_recursive_queued_followup_preserves_iteration_limit_boundary(self):
+        """A queued callback must not hide the prior turn's technical stop.
+
+        The outer gateway goal hook only sees the final result returned by the
+        recursive drain.  Preserve the max-iteration boundary (and its summary)
+        so an active /goal can schedule a fresh cycle after the callback.
+        """
+        current_result = {
+            "history_offset": 2,
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Work is incomplete; continue in a fresh cycle.",
+        }
+        followup_result = {
+            "history_offset": 4,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "NO_REPLY",
+            "messages": [],
+        }
+
+        merged = _preserve_queued_followup_history_offset(
+            current_result,
+            followup_result,
+        )
+
+        assert merged["goal_technical_boundaries"] == [
+            {
+                "turn_exit_reason": "max_iterations_reached(200/200)",
+                "final_response": "Work is incomplete; continue in a fresh cycle.",
+                "response_already_delivered": True,
+            }
+        ]
+
+    def test_direct_iteration_limit_is_a_not_yet_delivered_boundary(self):
+        boundary = _latest_goal_technical_boundary(
+            {
+                "turn_exit_reason": "max_iterations_reached(200/200)",
+                "final_response": "Checkpoint summary.",
+            }
+        )
+
+        assert boundary == {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Checkpoint summary.",
+            "response_already_delivered": False,
+        }
+
+    def test_normal_turn_has_no_goal_technical_boundary(self):
+        assert (
+            _latest_goal_technical_boundary(
+                {
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                    "final_response": "Done.",
+                }
+            )
+            is None
+        )

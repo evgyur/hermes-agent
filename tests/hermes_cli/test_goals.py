@@ -1232,6 +1232,47 @@ class TestGoalManager:
         assert mgr.state.status == "active"
         assert mgr.state.turns_used == 1
 
+    def test_technical_iteration_boundary_forces_fresh_goal_cycle(self, hermes_home):
+        """A per-turn tool cap is a checkpoint, never a completion verdict."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-technical-boundary", default_max_turns=5)
+        mgr.set("finish the production repair")
+
+        with patch.object(goals, "judge_goal") as judge:
+            decision = mgr.evaluate_after_turn(
+                "A partial summary that could be misread as terminal.",
+                technical_boundary="max_iterations_reached(200/200)",
+            )
+
+        judge.assert_not_called()
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert "finish the production repair" in decision["continuation_prompt"]
+        assert "technical iteration limit" in decision["reason"]
+        assert mgr.state.status == "active"
+        assert mgr.state.turns_used == 1
+
+    def test_technical_iteration_boundary_still_respects_goal_turn_budget(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-technical-budget", default_max_turns=1)
+        mgr.set("bounded goal")
+
+        with patch.object(goals, "judge_goal") as judge:
+            decision = mgr.evaluate_after_turn(
+                "Partial work.",
+                technical_boundary="max_iterations_reached(200/200)",
+            )
+
+        judge.assert_not_called()
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert mgr.state.turns_used == 1
+        assert "budget" in (mgr.state.paused_reason or "").lower()
+
     def test_evaluate_after_turn_budget_exhausted(self, hermes_home):
         """When turn budget hits ceiling, auto-pause instead of continuing."""
         from hermes_cli import goals

@@ -2949,16 +2949,74 @@ def _preserve_queued_followup_history_offset(
     if not isinstance(current_result, dict):
         return followup_result
 
+    merged = followup_result
     current_offset = current_result.get("history_offset")
     followup_offset = followup_result.get("history_offset")
-    if not isinstance(current_offset, int):
-        return followup_result
-    if isinstance(followup_offset, int) and followup_offset <= current_offset:
-        return followup_result
+    if isinstance(current_offset, int) and not (
+        isinstance(followup_offset, int) and followup_offset <= current_offset
+    ):
+        merged = dict(merged)
+        merged["history_offset"] = current_offset
 
-    merged = dict(followup_result)
-    merged["history_offset"] = current_offset
+    # A recursive queued follow-up returns only the *last* turn's result.  If
+    # the preceding turn ended at the per-turn iteration cap, that overwrites
+    # the only machine-readable signal the outer /goal hook has to resume in a
+    # fresh cycle.  Carry the boundary (plus its checkpoint summary) through
+    # the drain chain.  The first response has already been delivered before
+    # recursion starts, so the goal status can be sent immediately on unwind.
+    boundaries = []
+    existing_current = current_result.get("goal_technical_boundaries")
+    if isinstance(existing_current, list):
+        boundaries.extend(item for item in existing_current if isinstance(item, dict))
+
+    current_reason = str(current_result.get("turn_exit_reason") or "")
+    if current_reason.startswith("max_iterations_reached("):
+        boundaries.append(
+            {
+                "turn_exit_reason": current_reason,
+                "final_response": str(current_result.get("final_response") or ""),
+                "response_already_delivered": True,
+            }
+        )
+
+    existing_followup = followup_result.get("goal_technical_boundaries")
+    if isinstance(existing_followup, list):
+        boundaries.extend(item for item in existing_followup if isinstance(item, dict))
+
+    if boundaries:
+        if merged is followup_result:
+            merged = dict(merged)
+        merged["goal_technical_boundaries"] = boundaries
     return merged
+
+
+def _latest_goal_technical_boundary(agent_result: Any) -> Optional[Dict[str, Any]]:
+    """Return the newest iteration-cap boundary visible in an agent result."""
+    if not isinstance(agent_result, dict):
+        return None
+
+    reason = str(agent_result.get("turn_exit_reason") or "")
+    if reason.startswith("max_iterations_reached("):
+        return {
+            "turn_exit_reason": reason,
+            "final_response": str(agent_result.get("final_response") or ""),
+            "response_already_delivered": False,
+        }
+
+    boundaries = agent_result.get("goal_technical_boundaries")
+    if not isinstance(boundaries, list):
+        return None
+    for item in reversed(boundaries):
+        if not isinstance(item, dict):
+            continue
+        item_reason = str(item.get("turn_exit_reason") or "")
+        if item_reason.startswith("max_iterations_reached("):
+            return {
+                "turn_exit_reason": item_reason,
+                "final_response": str(item.get("final_response") or ""),
+                "response_already_delivered": bool(item.get("response_already_delivered")),
+            }
+    return None
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -11244,6 +11302,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(
                         getattr(event, "_hermes_final_response", "") or ""
                     )
+                _technical_boundary = _latest_goal_technical_boundary(_agent_result)
                 try:
                     session_entry = await self.async_session_store.get_or_create_session(
                         source
@@ -11272,7 +11331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         )
                     if (
-                        _final_text.strip()
+                        (_final_text.strip() or _technical_boundary is not None)
                         and not auto_dispatched
                         and not callback_started
                     ):
@@ -11280,6 +11339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            technical_boundary=_technical_boundary,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -14178,6 +14238,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        technical_boundary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -14211,10 +14272,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
+        boundary_reason = ""
+        boundary_response = ""
+        response_already_delivered = False
+        if isinstance(technical_boundary, dict):
+            boundary_reason = str(technical_boundary.get("turn_exit_reason") or "")
+            boundary_response = str(technical_boundary.get("final_response") or "")
+            response_already_delivered = bool(
+                technical_boundary.get("response_already_delivered")
+            )
+
         decision = mgr.evaluate_after_turn(
-            final_response or "",
+            boundary_response or final_response or "",
             user_initiated=True,
             background_processes=_bg_procs,
+            technical_boundary=boundary_reason or None,
         )
         msg = decision.get("message") or ""
 
@@ -14225,7 +14297,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if response_already_delivered:
+                await self._send_goal_status_notice(source, msg)
+            else:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
             return

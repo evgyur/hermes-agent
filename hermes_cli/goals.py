@@ -1607,6 +1607,7 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        technical_boundary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1618,6 +1619,12 @@ class GoalManager:
         snapshot for this session. It's handed to the judge so it can decide
         to WAIT on an in-flight process (CI poller, build, ...) instead of
         re-poking the agent — the automatic counterpart to ``/goal wait``.
+
+        ``technical_boundary`` identifies a deterministic per-turn runtime
+        boundary such as ``max_iterations_reached(...)``.  It is a checkpoint,
+        not evidence that the standing goal is done, so this path bypasses the
+        semantic judge and schedules a fresh cycle while still consuming one
+        goal turn from the configured budget.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1676,6 +1683,46 @@ class GoalManager:
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
+
+        if technical_boundary:
+            boundary = str(technical_boundary).strip()[:200]
+            reason = (
+                f"technical iteration limit reached ({boundary}); "
+                "starting a fresh goal cycle automatically"
+            )
+            state.last_verdict = "continue"
+            state.last_reason = reason
+            state.consecutive_parse_failures = 0
+
+            if state.turns_used >= state.max_turns:
+                state.status = "paused"
+                state.paused_reason = (
+                    f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+                )
+                save_goal(self.session_id, state)
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "continue",
+                    "reason": reason,
+                    "message": (
+                        f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
+                        "Use /goal resume to keep going, or /goal clear to stop."
+                    ),
+                }
+
+            save_goal(self.session_id, state)
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": self.next_continuation_prompt(),
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
+                ),
+            }
 
         judge_result = judge_goal(
             state.goal,

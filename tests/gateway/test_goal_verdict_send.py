@@ -152,6 +152,35 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_goal_iteration_limit_bypasses_judge_and_enqueues_fresh_cycle(hermes_home):
+    """A technical per-turn cap must resume /goal even if a queued callback ran next."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the live repair")
+    boundary = {
+        "turn_exit_reason": "max_iterations_reached(200/200)",
+        "final_response": "Partial checkpoint; work is not done.",
+        "response_already_delivered": True,
+    }
+
+    with patch.object(goals, "judge_goal") as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="NO_REPLY",
+            technical_boundary=boundary,
+        )
+
+    judge.assert_not_called()
+    assert len(adapter.sends) == 1
+    assert "technical iteration limit" in adapter.sends[0]["content"]
+    assert adapter._pending_messages, "a fresh goal cycle must be enqueued"
+
+
+@pytest.mark.asyncio
 async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""
