@@ -12447,6 +12447,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            # The normal anti-thrash breaker is
+                                            # useful between 85-95% context, but
+                                            # it must not permanently strand a
+                                            # gateway session once the transcript
+                                            # reaches the critical 95% safety
+                                            # threshold.  A stale fallback streak
+                                            # from an expired transient failure can
+                                            # otherwise make every hygiene pass a
+                                            # no-op until the next API call exceeds
+                                            # the model window.  Force one recovery
+                                            # attempt at the critical boundary;
+                                            # current auth/network failures still
+                                            # abort without dropping messages.
+                                            force=_approx_tokens >= _warn_token_threshold,
                                         ),
                                     )
 
@@ -12518,7 +12532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
                                             "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
+                                            "(compression made no persistent progress) — "
                                             "preserving the original transcript instead "
                                             "of overwriting it with the summary (#21301).",
                                             session_entry.session_id,

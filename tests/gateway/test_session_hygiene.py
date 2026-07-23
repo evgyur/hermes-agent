@@ -877,6 +877,11 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         def _compress_context(self, messages, *_args, **_kwargs):
             assert self.compression_in_place is True
             assert self._session_db is fake_db
+            # At >=95% of the model context, hygiene must bypass a stale
+            # anti-thrash/fallback breaker. Otherwise a persisted fallback
+            # streak can strand the session until the next API request exceeds
+            # the model window (regression: 398,608-token Telegram context).
+            assert _kwargs.get("force") is True
             self._last_compaction_in_place = True
             return ([{"role": "assistant", "content": "compressed in place"}], None)
 
