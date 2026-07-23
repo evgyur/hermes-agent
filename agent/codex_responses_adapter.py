@@ -288,12 +288,25 @@ _RESPONSES_BUILTIN_TOOL_TYPES = {
 
 _RESPONSE_MESSAGE_STATUSES = {"completed", "incomplete", "in_progress"}
 
-# The Responses API rejects input[].id longer than this with a non-retryable
-# HTTP 400 ("string too long"). Codex-issued assistant message ids are
-# server-assigned base64 blobs that can run 400+ chars, while Hermes-minted
-# ids (msg_...) stay well under this cap and are worth keeping for
-# prefix-cache hits. Drop only the oversized ones on replay.
+# The Responses API accepts only ASCII letters, digits, underscores, and
+# dashes in input[].id, capped at 64 chars. Persisted transcripts can contain
+# legacy redaction placeholders such as ``<REDACTED_SECRET:...>`` in this
+# protocol field; replaying one bricks every later turn with a non-retryable
+# HTTP 400. Keep valid short ids for prefix-cache hits and drop malformed or
+# oversized ids while preserving the message item itself.
 _MAX_RESPONSES_ITEM_ID_LENGTH = 64
+_RESPONSES_ITEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _valid_responses_item_id(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped) > _MAX_RESPONSES_ITEM_ID_LENGTH:
+        return None
+    if _RESPONSES_ITEM_ID_PATTERN.fullmatch(stripped) is None:
+        return None
+    return stripped
 
 
 def _normalize_responses_message_status(value: Any, *, default: str = "completed") -> str:
@@ -480,15 +493,9 @@ def _chat_messages_to_responses_input(
                             "status": _normalize_responses_message_status(raw_item.get("status")),
                             "content": normalized_content_parts,
                         }
-                        item_id = raw_item.get("id")
-                        if (
-                            not is_github_responses
-                            and isinstance(item_id, str)
-                            and item_id.strip()
-                        ):
-                            stripped_id = item_id.strip()
-                            if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
-                                replay_item["id"] = stripped_id
+                        item_id = _valid_responses_item_id(raw_item.get("id"))
+                        if not is_github_responses and item_id is not None:
+                            replay_item["id"] = item_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
@@ -744,15 +751,9 @@ def _preflight_codex_input_items(
                 "status": _normalize_responses_message_status(item.get("status")),
                 "content": normalized_content,
             }
-            item_id = item.get("id")
-            if (
-                not is_github_responses
-                and isinstance(item_id, str)
-                and item_id.strip()
-            ):
-                stripped_id = item_id.strip()
-                if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
-                    normalized_item["id"] = stripped_id
+            item_id = _valid_responses_item_id(item.get("id"))
+            if not is_github_responses and item_id is not None:
+                normalized_item["id"] = item_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()

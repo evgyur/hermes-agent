@@ -142,16 +142,16 @@ def test_normalize_codex_response_in_progress_message_still_incomplete():
 
 
 # ---------------------------------------------------------------------------
-# Replayed assistant message items with an oversized server-assigned ``id``
-# (Codex issues 400+ char base64 blobs) must never reach the API — the
-# Responses endpoint caps input[].id at 64 chars and rejects the whole
-# request with a non-retryable HTTP 400, permanently bricking the session
-# (every subsequent turn replays the same bad id). Short ids (msg_...) are
-# still worth keeping for prefix-cache hits, so this is a length guard, not
-# a blanket strip.
+# Replayed assistant message items with an invalid server-assigned ``id`` must
+# never reach the API: Responses accepts only ASCII letters, digits,
+# underscores, and dashes, capped at 64 chars. Oversized ids and legacy
+# ``<REDACTED_SECRET:...>`` placeholders otherwise cause a non-retryable HTTP
+# 400 on every subsequent turn. Valid short ids (msg_...) are still worth
+# keeping for prefix-cache hits, so this is a format guard, not a blanket strip.
 # ---------------------------------------------------------------------------
 
 _OVERSIZED_ITEM_ID = "x" * 408
+_MALFORMED_REDACTED_ITEM_ID = "<REDACTED_SECRET:e9e6dea8:len54>"
 _VALID_ITEM_ID = "msg_abc123"
 
 
@@ -177,6 +177,33 @@ def test_chat_messages_to_responses_input_drops_oversized_message_id():
 
     message_item = next(item for item in items if item.get("type") == "message")
     assert "id" not in message_item
+    assert message_item["phase"] == "final_answer"
+    assert message_item["content"] == [{"type": "output_text", "text": "pong"}]
+
+
+def test_chat_messages_to_responses_input_drops_malformed_message_id():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "pong",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "pong"}],
+                    "id": _MALFORMED_REDACTED_ITEM_ID,
+                    "phase": "final_answer",
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    message_item = next(item for item in items if item.get("type") == "message")
+    assert "id" not in message_item
+    assert message_item["status"] == "completed"
     assert message_item["phase"] == "final_answer"
     assert message_item["content"] == [{"type": "output_text", "text": "pong"}]
 
@@ -222,6 +249,26 @@ def test_preflight_codex_input_items_drops_oversized_message_id():
     assert items[0]["phase"] == "final_answer"
 
 
+def test_preflight_codex_input_items_drops_malformed_message_id():
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "pong"}],
+                "id": _MALFORMED_REDACTED_ITEM_ID,
+                "phase": "final_answer",
+            }
+        ]
+    )
+
+    assert "id" not in items[0]
+    assert items[0]["status"] == "completed"
+    assert items[0]["phase"] == "final_answer"
+    assert items[0]["content"] == [{"type": "output_text", "text": "pong"}]
+
+
 def test_preflight_codex_input_items_keeps_short_message_id():
     items = _preflight_codex_input_items(
         [
@@ -236,6 +283,41 @@ def test_preflight_codex_input_items_keeps_short_message_id():
     )
 
     assert items[0]["id"] == _VALID_ITEM_ID
+
+
+def test_preflight_codex_input_items_keeps_64_character_message_id():
+    boundary_id = "x" * 64
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "pong"}],
+                "id": boundary_id,
+            }
+        ]
+    )
+
+    assert items[0]["id"] == boundary_id
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    ["x" * 65, "msg.with.dot", "msg:with:colon", "msg_unicode_é", 123],
+)
+def test_preflight_codex_input_items_drops_invalid_message_id(invalid_id):
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "pong"}],
+                "id": invalid_id,
+            }
+        ]
+    )
+
+    assert "id" not in items[0]
 
 
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
