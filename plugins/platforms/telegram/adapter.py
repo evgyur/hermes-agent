@@ -6855,6 +6855,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return chats that require a direct trigger even when the global gate is off."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_reply_trigger_disabled_chats(self) -> set[str]:
+        """Return chats where replying to the bot alone must not trigger a turn."""
+        raw = self.config.extra.get("reply_trigger_disabled_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
 
@@ -7256,9 +7274,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # if require_mention is disabled, every group message is a request.
         if chat_id_str in self._telegram_free_response_chats():
             return False
-        if not self._telegram_require_mention():
+        requires_mention = (
+            self._telegram_require_mention()
+            or chat_id_str in self._telegram_require_mention_chats()
+        )
+        if not requires_mention:
             return False
-        if self._is_reply_to_bot(message):
+        if (
+            self._is_reply_to_bot(message)
+            and chat_id_str not in self._telegram_reply_trigger_disabled_chats()
+        ):
             return False
         if self._message_mentions_bot(message):
             return False
@@ -7621,9 +7646,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if chat_id_str in self._telegram_free_response_chats():
             return True
-        if not self._telegram_require_mention():
+        requires_mention = (
+            self._telegram_require_mention()
+            or chat_id_str in self._telegram_require_mention_chats()
+        )
+        if not requires_mention:
             return True
-        if self._is_reply_to_bot(message):
+        if (
+            self._is_reply_to_bot(message)
+            and chat_id_str not in self._telegram_reply_trigger_disabled_chats()
+        ):
             return True
         # When guest_mode is True, _is_guest_mention already called
         # _message_mentions_bot above — skip the redundant second call.
