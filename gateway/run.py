@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -2929,6 +2930,87 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _goal_turn_outcome(
+    result: Any,
+    *,
+    response_already_delivered: bool,
+) -> Optional[Dict[str, Any]]:
+    """Normalize one completed model turn for later /goal reconciliation."""
+    if not isinstance(result, dict):
+        return None
+    if "turn_exit_reason" not in result and "final_response" not in result:
+        return None
+
+    reason = str(result.get("turn_exit_reason") or "")
+    is_technical_cap = reason.startswith("max_iterations_reached(")
+    if not is_technical_cap and (
+        result.get("interrupted")
+        or result.get("failed")
+        or result.get("partial")
+        or result.get("error")
+        or result.get("completed") is False
+    ):
+        return None
+    response = str(result.get("final_response") or "")
+    messages = result.get("messages")
+    message_count = len(messages) if isinstance(messages, list) else None
+    offset = result.get("history_offset")
+    identity = str(result.get("outcome_id") or "")
+    if not identity:
+        payload = json.dumps(
+            {
+                "history_offset": offset if isinstance(offset, int) else None,
+                "message_count": message_count,
+                "turn_exit_reason": reason,
+                "final_response": response,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    silence_markers = {"NO_REPLY", "[SILENT]"}
+    return {
+        "outcome_id": identity,
+        "turn_exit_reason": reason,
+        "final_response": response,
+        "response_already_delivered": bool(
+            result.get("response_already_delivered", response_already_delivered)
+        ),
+        "delivery_suppressed": bool(result.get("delivery_suppressed"))
+        or bool(result.get("suppress_delivery"))
+        or response.strip() in silence_markers,
+    }
+
+
+def _goal_turn_outcomes(agent_result: Any) -> List[Dict[str, Any]]:
+    """Return every drained model-turn outcome in chronological order."""
+    if not isinstance(agent_result, dict):
+        return []
+
+    outcomes: List[Dict[str, Any]] = []
+    existing = agent_result.get("goal_turn_outcomes")
+    if isinstance(existing, list):
+        for item in existing:
+            normalized = _goal_turn_outcome(item, response_already_delivered=True)
+            if normalized is not None:
+                outcomes.append(normalized)
+
+    current = _goal_turn_outcome(agent_result, response_already_delivered=False)
+    if current is not None:
+        outcomes.append(current)
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for outcome in outcomes:
+        identity = outcome["outcome_id"]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(outcome)
+    return deduped
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -2958,65 +3040,39 @@ def _preserve_queued_followup_history_offset(
         merged = dict(merged)
         merged["history_offset"] = current_offset
 
-    # A recursive queued follow-up returns only the *last* turn's result.  If
-    # the preceding turn ended at the per-turn iteration cap, that overwrites
-    # the only machine-readable signal the outer /goal hook has to resume in a
-    # fresh cycle.  Carry the boundary (plus its checkpoint summary) through
-    # the drain chain.  The first response has already been delivered before
-    # recursion starts, so the goal status can be sent immediately on unwind.
-    boundaries = []
-    existing_current = current_result.get("goal_technical_boundaries")
+    # Recursive queued follow-up draining returns only the final turn's result.
+    # Preserve every preceding model turn in order so the outer /goal hook can
+    # account each turn, reconcile later semantic completion, and enqueue at
+    # most one continuation after the whole chain is understood.
+    outcomes: List[Dict[str, Any]] = []
+    existing_current = current_result.get("goal_turn_outcomes")
     if isinstance(existing_current, list):
-        boundaries.extend(item for item in existing_current if isinstance(item, dict))
+        outcomes.extend(item for item in existing_current if isinstance(item, dict))
 
-    current_reason = str(current_result.get("turn_exit_reason") or "")
-    if current_reason.startswith("max_iterations_reached("):
-        boundaries.append(
-            {
-                "turn_exit_reason": current_reason,
-                "final_response": str(current_result.get("final_response") or ""),
-                "response_already_delivered": True,
-            }
-        )
+    current_outcome = _goal_turn_outcome(
+        current_result,
+        response_already_delivered=True,
+    )
+    if current_outcome is not None:
+        outcomes.append(current_outcome)
 
-    existing_followup = followup_result.get("goal_technical_boundaries")
+    existing_followup = followup_result.get("goal_turn_outcomes")
     if isinstance(existing_followup, list):
-        boundaries.extend(item for item in existing_followup if isinstance(item, dict))
+        outcomes.extend(item for item in existing_followup if isinstance(item, dict))
 
-    if boundaries:
+    if outcomes:
+        deduped: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in outcomes:
+            normalized = _goal_turn_outcome(item, response_already_delivered=True)
+            if normalized is None or normalized["outcome_id"] in seen:
+                continue
+            seen.add(normalized["outcome_id"])
+            deduped.append(normalized)
         if merged is followup_result:
             merged = dict(merged)
-        merged["goal_technical_boundaries"] = boundaries
+        merged["goal_turn_outcomes"] = deduped
     return merged
-
-
-def _latest_goal_technical_boundary(agent_result: Any) -> Optional[Dict[str, Any]]:
-    """Return the newest iteration-cap boundary visible in an agent result."""
-    if not isinstance(agent_result, dict):
-        return None
-
-    reason = str(agent_result.get("turn_exit_reason") or "")
-    if reason.startswith("max_iterations_reached("):
-        return {
-            "turn_exit_reason": reason,
-            "final_response": str(agent_result.get("final_response") or ""),
-            "response_already_delivered": False,
-        }
-
-    boundaries = agent_result.get("goal_technical_boundaries")
-    if not isinstance(boundaries, list):
-        return None
-    for item in reversed(boundaries):
-        if not isinstance(item, dict):
-            continue
-        item_reason = str(item.get("turn_exit_reason") or "")
-        if item_reason.startswith("max_iterations_reached("):
-            return {
-                "turn_exit_reason": item_reason,
-                "final_response": str(item.get("final_response") or ""),
-                "response_already_delivered": bool(item.get("response_already_delivered")),
-            }
-    return None
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -11302,7 +11358,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(
                         getattr(event, "_hermes_final_response", "") or ""
                     )
-                _technical_boundary = _latest_goal_technical_boundary(_agent_result)
+                if isinstance(_agent_result, dict):
+                    _goal_outcomes = _goal_turn_outcomes(_agent_result)
+                else:
+                    _goal_outcomes = _goal_turn_outcomes(
+                        {"final_response": _final_text}
+                    )
+                if not _goal_outcomes and _final_text:
+                    _goal_outcomes = _goal_turn_outcomes(
+                        {"final_response": _final_text}
+                    )
                 try:
                     session_entry = await self.async_session_store.get_or_create_session(
                         source
@@ -11331,7 +11396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         )
                     if (
-                        (_final_text.strip() or _technical_boundary is not None)
+                        (_final_text.strip() or _goal_outcomes)
                         and not auto_dispatched
                         and not callback_started
                     ):
@@ -11339,7 +11404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
-                            technical_boundary=_technical_boundary,
+                            turn_outcomes=_goal_outcomes,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -14252,7 +14317,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
-        technical_boundary: Optional[Dict[str, Any]] = None,
+        turn_outcomes: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -14286,22 +14351,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
-        boundary_reason = ""
-        boundary_response = ""
-        response_already_delivered = False
-        if isinstance(technical_boundary, dict):
-            boundary_reason = str(technical_boundary.get("turn_exit_reason") or "")
-            boundary_response = str(technical_boundary.get("final_response") or "")
-            response_already_delivered = bool(
-                technical_boundary.get("response_already_delivered")
-            )
+        outcomes = [item for item in (turn_outcomes or []) if isinstance(item, dict)]
+        if not outcomes:
+            outcomes = [
+                {
+                    "turn_exit_reason": "",
+                    "final_response": final_response or "",
+                    "response_already_delivered": False,
+                    "delivery_suppressed": False,
+                }
+            ]
 
-        decision = mgr.evaluate_after_turn(
-            boundary_response or final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
-            technical_boundary=boundary_reason or None,
-        )
+        # Reconcile every completed model turn in chronological order.  A
+        # technical cap consumes one goal turn but cannot semantically finish
+        # the goal; a later normal queued turn must still reach the judge.
+        # Only the final reconciled decision is delivered/enqueued, preventing
+        # duplicate continuation prompts from a cap→cap drain chain.
+        decision: Optional[Dict[str, Any]] = None
+        ignore_wait_barrier = False
+        for index, outcome in enumerate(outcomes):
+            if not mgr.is_active():
+                break
+            reason = str(outcome.get("turn_exit_reason") or "")
+            technical_boundary = (
+                reason if reason.startswith("max_iterations_reached(") else None
+            )
+            current_decision = mgr.evaluate_after_turn(
+                str(outcome.get("final_response") or ""),
+                user_initiated=True,
+                background_processes=_bg_procs,
+                technical_boundary=technical_boundary,
+                defer_budget_pause=index < len(outcomes) - 1,
+                ignore_wait_barrier=ignore_wait_barrier,
+            )
+            decision = current_decision
+            if current_decision.get("verdict") == "wait":
+                ignore_wait_barrier = True
+            elif current_decision.get("verdict") == "waiting":
+                break
+            else:
+                ignore_wait_barrier = False
+
+        if decision is None:
+            return
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -14311,7 +14403,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            if response_already_delivered:
+            latest_outcome = outcomes[-1]
+            if bool(latest_outcome.get("response_already_delivered")) or bool(
+                latest_outcome.get("delivery_suppressed")
+            ):
                 await self._send_goal_status_notice(source, msg)
             else:
                 await self._defer_goal_status_notice_after_delivery(source, msg)

@@ -1608,6 +1608,8 @@ class GoalManager:
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         technical_boundary: Optional[str] = None,
+        defer_budget_pause: bool = False,
+        ignore_wait_barrier: bool = False,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1625,6 +1627,16 @@ class GoalManager:
         not evidence that the standing goal is done, so this path bypasses the
         semantic judge and schedules a fresh cycle while still consuming one
         goal turn from the configured budget.
+
+        ``defer_budget_pause`` is used while reconciling a queued drain chain.
+        Earlier outcomes still consume turns, but budget enforcement waits for
+        the final already-completed outcome so a later semantic completion is
+        not masked by an earlier technical checkpoint.
+
+        ``ignore_wait_barrier`` is used only for a later outcome that already
+        completed after an earlier outcome in the same drain chain set WAIT.
+        It clears that newly-created barrier so the later evidence is still
+        counted and judged; a barrier that predates the chain remains binding.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1648,7 +1660,10 @@ class GoalManager:
         # Wait barrier: if the loop is parked (on a live process OR a time
         # deadline that hasn't passed), quiesce — do NOT burn a turn or call
         # the judge. Resumes automatically once the barrier clears.
-        if self.is_waiting():
+        if self.is_waiting() and ignore_wait_barrier:
+            self.stop_waiting()
+            state = self._state
+        elif self.is_waiting():
             if state.waiting_on_session is not None:
                 tgt = f"session {state.waiting_on_session}"
             elif state.waiting_on_pid is not None:
@@ -1694,7 +1709,7 @@ class GoalManager:
             state.last_reason = reason
             state.consecutive_parse_failures = 0
 
-            if state.turns_used >= state.max_turns:
+            if state.turns_used >= state.max_turns and not defer_budget_pause:
                 state.status = "paused"
                 state.paused_reason = (
                     f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
@@ -1824,7 +1839,7 @@ class GoalManager:
                 ),
             }
 
-        if state.turns_used >= state.max_turns:
+        if state.turns_used >= state.max_turns and not defer_budget_pause:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
             save_goal(self.session_id, state)

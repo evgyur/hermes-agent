@@ -171,13 +171,233 @@ async def test_goal_iteration_limit_bypasses_judge_and_enqueues_fresh_cycle(herm
             session_entry=session_entry,
             source=src,
             final_response="NO_REPLY",
-            technical_boundary=boundary,
+            turn_outcomes=[boundary],
         )
 
     judge.assert_not_called()
     assert len(adapter.sends) == 1
     assert "technical iteration limit" in adapter.sends[0]["content"]
     assert adapter._pending_messages, "a fresh goal cycle must be enqueued"
+
+
+@pytest.mark.asyncio
+async def test_cap_then_normal_completion_accounts_both_and_judges_latest(hermes_home):
+    """A later completion wins even if an earlier cap hits the turn budget."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the live repair", max_turns=1)
+    outcomes = [
+        {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Partial checkpoint.",
+            "response_already_delivered": True,
+        },
+        {
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "The standing goal is complete.",
+            "response_already_delivered": False,
+        },
+    ]
+
+    with patch.object(
+        goals,
+        "judge_goal",
+        return_value=("done", "verified completion", False, None),
+    ) as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response=outcomes[-1]["final_response"],
+            turn_outcomes=outcomes,
+        )
+        await asyncio.sleep(0.05)
+
+    judge.assert_called_once()
+    state = goals.load_goal(session_entry.session_id)
+    assert state is not None
+    assert state.status == "done"
+    assert state.turns_used == 2
+    assert not adapter._pending_messages
+    assert len(adapter.sends) == 1
+    assert "Goal achieved" in adapter.sends[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_visible_latest_turn_defers_status_until_adapter_delivery(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    callbacks = []
+
+    def register_post_delivery_callback(_session_key, callback, generation=None):
+        callbacks.append(callback)
+
+    setattr(adapter, "register_post_delivery_callback", register_post_delivery_callback)
+    GoalManager(session_entry.session_id).set("finish the live repair", max_turns=5)
+    outcomes = [
+        {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Partial checkpoint.",
+            "response_already_delivered": True,
+        },
+        {
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "The standing goal is complete.",
+            "response_already_delivered": False,
+        },
+    ]
+
+    with patch.object(
+        goals,
+        "judge_goal",
+        return_value=("done", "verified completion", False, None),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response=outcomes[-1]["final_response"],
+            turn_outcomes=outcomes,
+        )
+
+    assert adapter.sends == []
+    assert len(callbacks) == 1
+    await callbacks[0]()
+    assert len(adapter.sends) == 1
+    assert "Goal achieved" in adapter.sends[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_two_caps_account_twice_and_enqueue_only_once(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the live repair", max_turns=5)
+    outcomes = [
+        {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Checkpoint one.",
+            "response_already_delivered": True,
+        },
+        {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Checkpoint two.",
+            "response_already_delivered": True,
+        },
+    ]
+
+    with patch.object(goals, "judge_goal") as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="NO_REPLY",
+            turn_outcomes=outcomes,
+        )
+
+    judge.assert_not_called()
+    state = goals.load_goal(session_entry.session_id)
+    assert state is not None
+    assert state.status == "active"
+    assert state.turns_used == 2
+    assert len(adapter._pending_messages) == 1
+    assert len(adapter.sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_cap_then_silent_callback_resumes_once_after_judging_latest(hermes_home):
+    """Production incident shape: cap summary, then an intentional-silence callback."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the live repair", max_turns=5)
+    outcomes = [
+        {
+            "turn_exit_reason": "max_iterations_reached(200/200)",
+            "final_response": "Partial checkpoint.",
+            "response_already_delivered": True,
+        },
+        {
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "",
+            "response_already_delivered": False,
+            "delivery_suppressed": True,
+        },
+    ]
+
+    with patch.object(
+        goals,
+        "judge_goal",
+        return_value=("continue", "callback did not complete the goal", False, None),
+    ) as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="",
+            turn_outcomes=outcomes,
+        )
+
+    judge.assert_called_once()
+    state = goals.load_goal(session_entry.session_id)
+    assert state is not None
+    assert state.status == "active"
+    assert state.turns_used == 2
+    assert len(adapter._pending_messages) == 1
+    assert len(adapter.sends) == 1
+    assert "Continuing toward goal" in adapter.sends[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_earlier_wait_does_not_mask_later_completed_queued_turn(hermes_home):
+    """A wait set by one drained turn is not a barrier to later drained evidence."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish after the worker returns", max_turns=5)
+    outcomes = [
+        {
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "The build is still running.",
+            "response_already_delivered": True,
+        },
+        {
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "final_response": "The build passed and deployment is verified.",
+            "response_already_delivered": False,
+        },
+    ]
+
+    with patch.object(
+        goals,
+        "judge_goal",
+        side_effect=[
+            ("wait", "build still running", False, {"seconds": 60}),
+            ("done", "deployment verified", False, None),
+        ],
+    ) as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response=outcomes[-1]["final_response"],
+            turn_outcomes=outcomes,
+        )
+
+    assert judge.call_count == 2
+    state = goals.load_goal(session_entry.session_id)
+    assert state is not None
+    assert state.status == "done"
+    assert state.turns_used == 2
+    assert not adapter._pending_messages
+    assert len(adapter.sends) == 1
 
 
 @pytest.mark.asyncio
