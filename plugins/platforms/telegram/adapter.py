@@ -1031,6 +1031,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "TELEGRAM_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS",
             "TELEGRAM_ALLOW_ALL_USERS",
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
@@ -1057,16 +1058,40 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        # Adapter-level allow_from / group_allow_from: when set, they are the
-        # sole authority.  Group chats use group_allow_from; DMs use allow_from.
+        # A chat-scoped sender policy is more specific than the global group
+        # allowlist. This is what lets one shared team forum accept every human
+        # participant without widening access in unrelated groups.
         chat_type = source.chat_type or ""
         if chat_type in ("group", "forum", "channel"):
-            adapter_allow_from = self.config.extra.get("group_allow_from")
+            raw_per_chat = os.getenv(
+                "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS", ""
+            ).strip()
+            if raw_per_chat:
+                try:
+                    per_chat = json.loads(raw_per_chat)
+                except (TypeError, json.JSONDecodeError):
+                    per_chat = None
+                if isinstance(per_chat, dict):
+                    chat_allow_from = per_chat.get(str(source.chat_id))
+                    if chat_allow_from is not None:
+                        allowed = _coerce_allow_set(chat_allow_from)
+                        return user_id in allowed or "*" in allowed
+
+        # Adapter-level allow_from / group_allow_from. The platform-wide
+        # allow_from list remains valid in groups; group_allow_from adds
+        # group-only senders without granting them DM access.
+        if chat_type in ("group", "forum", "channel"):
+            group_allow_from = self.config.extra.get("group_allow_from")
+            platform_allow_from = self.config.extra.get("allow_from")
+            if group_allow_from is not None or platform_allow_from is not None:
+                allowed = _coerce_allow_set(group_allow_from)
+                allowed.update(_coerce_allow_set(platform_allow_from))
+                return user_id in allowed or "*" in allowed
         else:
             adapter_allow_from = self.config.extra.get("allow_from")
-        if adapter_allow_from is not None:
-            allowed = _coerce_allow_set(adapter_allow_from)
-            return user_id in allowed or "*" in allowed
+            if adapter_allow_from is not None:
+                allowed = _coerce_allow_set(adapter_allow_from)
+                return user_id in allowed or "*" in allowed
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -9771,6 +9796,16 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(group_allowed_users, list):
             group_allowed_users = ",".join(str(v) for v in group_allowed_users)
         os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
+    per_chat_group_allowed_users = (
+        telegram_cfg.get("per_chat_group_allow_from")
+        or _telegram_extra.get("per_chat_group_allow_from")
+    )
+    if per_chat_group_allowed_users is not None and not os.getenv(
+        "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"
+    ):
+        os.environ["TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"] = _json.dumps(
+            per_chat_group_allowed_users
+        )
     group_allowed_chats = telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats")
     if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
         if isinstance(group_allowed_chats, list):
