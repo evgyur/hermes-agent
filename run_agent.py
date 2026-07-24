@@ -6387,6 +6387,7 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
+        bypass_ineffective_guard: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -6396,12 +6397,17 @@ class AIAgent:
         so users can bypass the summary-failure cooldown after an
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
+
+        ``bypass_ineffective_guard=True`` is narrower: critical gateway
+        hygiene may retry after the anti-thrash breaker trips, but it still
+        honors provider failure cooldowns and remains an automatic attempt.
         """
         from agent.conversation_compression import compress_context
         return compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
+            bypass_ineffective_guard=bypass_ineffective_guard,
             defer_context_engine_notification=defer_context_engine_notification,
             commit_fence=commit_fence,
         )

@@ -1117,6 +1117,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    bypass_ineffective_guard: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -1136,6 +1137,10 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        bypass_ineffective_guard: If True, bypass only the durable
+            anti-thrash/ineffective breaker. Active provider-failure cooldowns
+            remain authoritative. Used by critical gateway hygiene when the
+            transcript has reached the model-window safety boundary.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -1216,14 +1221,44 @@ def compress_context(
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.
-    if not force:
+    def _automatic_guard_blocks() -> bool:
+        """Evaluate the auto guard with a narrow critical-recovery escape.
+
+        Manual ``force`` retains its historical meaning and bypasses every
+        guard. Critical gateway hygiene is intentionally weaker: it may escape
+        an indefinite ``ineffective`` latch, but must not hammer a provider
+        while a transient-failure cooldown is active.
+        """
         _refresh_persisted_compression_guards(agent.context_compressor)
         blocked = getattr(
             type(agent.context_compressor),
             "_automatic_compression_blocked",
             None,
         )
-        if callable(blocked) and blocked(agent.context_compressor):
+        if not callable(blocked) or not blocked(agent.context_compressor):
+            return False
+        if bypass_ineffective_guard:
+            reason_fn = getattr(
+                type(agent.context_compressor),
+                "_compression_block_reason",
+                None,
+            )
+            reason = (
+                reason_fn(agent.context_compressor)
+                if callable(reason_fn)
+                else None
+            )
+            if reason == "ineffective":
+                logger.warning(
+                    "critical compression recovery bypassing ineffective "
+                    "breaker for session=%s",
+                    agent.session_id or "none",
+                )
+                return False
+        return True
+
+    if not force:
+        if _automatic_guard_blocks():
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -1510,13 +1545,7 @@ def compress_context(
     # stale snapshot loaded by bind_session_state().
     if not force:
         compressor = agent.context_compressor
-        _refresh_persisted_compression_guards(compressor)
-        blocked = getattr(
-            type(compressor),
-            "_automatic_compression_blocked",
-            None,
-        )
-        if callable(blocked) and blocked(compressor):
+        if _automatic_guard_blocks():
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:

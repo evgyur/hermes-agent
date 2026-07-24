@@ -14163,6 +14163,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            # The normal automatic-compression breaker
+                                            # prevents retry storms after ineffective
+                                            # summaries.  Once the live transcript is at
+                                            # the 95% safety boundary, however, preserving
+                                            # that breaker strands the session above the
+                                            # model window forever. Bypass only the
+                                            # ineffective breaker; provider failure
+                                            # cooldowns remain authoritative.
+                                            bypass_ineffective_guard=(
+                                                _approx_tokens >= _warn_token_threshold
+                                            ),
                                             commit_fence=_hyg_commit_fence,
                                         ),
                                     )
@@ -14303,7 +14314,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
                                             "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
+                                            "(compression made no persistent progress) — "
                                             "preserving the original transcript instead "
                                             "of overwriting it with the summary (#21301).",
                                             session_entry.session_id,
@@ -14322,6 +14333,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "compression",
                                             f"{_new_tokens:,}",
                                         )
+                                        # Whether persistence failed outright or an in-place
+                                        # compaction was too small, do not retry the same
+                                        # critical recovery on every subsequent message.
+                                        if _hyg_failure_cooldown_seconds >= 0:
+                                            self._hygiene_compression_failure_cooldowns[
+                                                session_entry.session_id
+                                            ] = (
+                                                time.time()
+                                                + _hyg_failure_cooldown_seconds
+                                            )
 
                                     # If summary generation failed, the
                                     # compressor aborts entirely and returns

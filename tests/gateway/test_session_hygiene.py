@@ -558,6 +558,12 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "test-model",
+            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
+        )
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -571,8 +577,8 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
 
@@ -594,6 +600,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     # The config says in_place=True, but the DB write failed (no session_db)
     # so _last_compaction_in_place is False. Transcript must NOT be rewritten.
     runner.session_store.rewrite_transcript.assert_not_called()
+    assert runner._hygiene_compression_failure_cooldowns["sess-1"] > time.time()
 
 
 @pytest.mark.asyncio
@@ -1122,9 +1129,13 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             # anti-thrash/fallback breaker. Otherwise a persisted fallback
             # streak can strand the session until the next API request exceeds
             # the model window (regression: 398,608-token Telegram context).
-            assert _kwargs.get("force") is True
+            assert _kwargs.get("force") is not True
+            assert _kwargs.get("bypass_ineffective_guard") is True
             self._last_compaction_in_place = True
-            return ([{"role": "assistant", "content": "compressed in place"}], None)
+            # Persisted compaction happened, but the remaining payload is still
+            # above the 95% safety boundary; gateway must apply its bounded
+            # retry cooldown instead of compressing again on the next turn.
+            return ([{"role": "assistant", "content": "x" * 500}], None)
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
@@ -1160,6 +1171,15 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    # Force the real hygiene branch to be eligible. The old regression only
+    # patched a legacy global resolver, so it could pass without ever invoking
+    # the helper agent (and therefore never exercised its ``force`` assertion).
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "test-model",
+            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
+        )
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -1175,8 +1195,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
     )
 
     event = MessageEvent(
@@ -1195,7 +1215,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
+    assert agent._last_compaction_in_place is True
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
+    assert runner._hygiene_compression_failure_cooldowns["sess-1"] > time.time()
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
