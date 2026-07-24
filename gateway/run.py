@@ -71,6 +71,38 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_STARTUP_GOAL_RECOVERY_REASON = "active_goal_startup_recovery"
+_STARTUP_GOAL_RISKY_TOOLS = frozenset({
+    "terminal", "send_message", "cronjob", "patch", "write_file",
+    "skill_manage", "memory", "tool_call",
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class StartupGoalRecoveryDecision:
+    """Startup decision for a durable /goal session."""
+
+    status: str
+    session_key: str
+    session_id: str
+    reason: str
+    prompt: str = ""
+    goal_status: Optional[str] = None
+    resume_reason: Optional[str] = None
+    ledger_statuses: tuple[str, ...] = ()
+
+    def to_hook_payload(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "session_key": self.session_key,
+            "session_id": self.session_id,
+            "reason": self.reason,
+            "goal_status": self.goal_status,
+            "resume_reason": self.resume_reason,
+            "ledger_statuses": list(self.ledger_statuses),
+        }
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
