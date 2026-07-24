@@ -177,6 +177,8 @@ class SessionSource:
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
+    business_connection_id: Optional[str] = None  # Telegram Business delegated inbox route
+    external_safe_mode: bool = False  # True for untrusted external Business contacts
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
     # None => the gateway's active/default profile. Drives both session-key
@@ -264,6 +266,10 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.business_connection_id:
+            d["business_connection_id"] = self.business_connection_id
+        if self.external_safe_mode:
+            d["external_safe_mode"] = True
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +295,11 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            business_connection_id=(
+                data.get("business_connection_id")
+                or data.get("telegram_business_connection_id")
+            ),
+            external_safe_mode=bool(data.get("external_safe_mode", False)),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
@@ -1066,6 +1077,20 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    if (
+        source.platform == Platform.TELEGRAM
+        and getattr(source, "business_connection_id", None)
+    ):
+        parts = [ns, platform, "business", source.chat_id]
+        if source.thread_id:
+            parts.append(source.thread_id)
+        parts.extend(
+            [
+                source.user_id or "unknown",
+                "external" if getattr(source, "external_safe_mode", False) else "trusted",
+            ]
+        )
+        return ":".join(str(part) for part in parts)
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
