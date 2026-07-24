@@ -10,13 +10,82 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
-    MessageType,
-    SUPPORTED_DOCUMENT_TYPES,
+    cache_audio_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
     safe_url_for_log,
     utf16_len,
+    validate_inbound_media_size,
     _log_safe_path,
     _prefix_within_utf16_limit,
 )
+
+
+def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
+    """Encrypted Bitwarden cache is covered by the media credential guard."""
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    path = hermes_home / "cache" / "bws_cache.enc.json"
+    path.parent.mkdir()
+    path.write_text("encrypted-secret-cache")
+
+    assert path in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(path)) is None
+
+
+class TestInboundMediaSizeCap:
+    """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
+
+    _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+
+    def test_default_cap_is_128_mib(self, monkeypatch):
+        # No config override -> default. Patch loader to return empty config.
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: base.DEFAULT_INBOUND_MEDIA_MAX_BYTES)
+        assert base.DEFAULT_INBOUND_MEDIA_MAX_BYTES == 128 * 1024 * 1024
+
+    def test_image_bytes_rejected_when_oversized(self, monkeypatch):
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 16)
+        with pytest.raises(ValueError, match="Inbound image payload is too large"):
+            cache_image_from_bytes(self._PNG, ext=".png")
+
+    def test_audio_bytes_rejected_when_oversized(self, monkeypatch):
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 4)
+        with pytest.raises(ValueError, match="Inbound audio payload is too large"):
+            cache_audio_from_bytes(b"x" * 8, ext=".ogg")
+
+    def test_video_bytes_rejected_when_oversized(self, monkeypatch):
+        # Video was the gap in the original report — verify it's covered.
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 4)
+        with pytest.raises(ValueError, match="Inbound video payload is too large"):
+            cache_video_from_bytes(b"x" * 8, ext=".mp4")
+
+    def test_legit_image_accepted_under_cap(self, monkeypatch):
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 128 * 1024 * 1024)
+        path = cache_image_from_bytes(self._PNG, ext=".png")
+        assert os.path.exists(path)
+        assert os.path.getsize(path) == len(self._PNG)
+
+    def test_cap_of_zero_disables_check(self, monkeypatch):
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "get_inbound_media_max_bytes", lambda: 0)
+        # A would-be-oversized video passes through when the cap is disabled.
+        path = cache_video_from_bytes(b"x" * 5000, ext=".mp4")
+        assert os.path.exists(path)
+
+    def test_validate_helper_respects_explicit_max_bytes(self):
+        # max_bytes arg overrides the configured cap.
+        validate_inbound_media_size(100, media_type="image", max_bytes=200)  # ok
+        with pytest.raises(ValueError, match="too large"):
+            validate_inbound_media_size(300, media_type="image", max_bytes=200)
 
 
 class TestSecretCaptureGuidance:
@@ -332,30 +401,6 @@ class TestExtractMedia:
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
 
-    def test_media_tag_accepts_supported_text_document_extensions(self):
-        content = "\n".join([
-            "MEDIA:/tmp/report.html",
-            "MEDIA:/tmp/notes.md",
-            "MEDIA:/tmp/debug.log",
-            "MEDIA:/tmp/config.yaml",
-            "MEDIA:/tmp/data.json",
-        ])
-        media, cleaned = BasePlatformAdapter.extract_media(content)
-        assert media == [
-            ("/tmp/report.html", False),
-            ("/tmp/notes.md", False),
-            ("/tmp/debug.log", False),
-            ("/tmp/config.yaml", False),
-            ("/tmp/data.json", False),
-        ]
-        assert cleaned == ""
-
-    def test_media_tag_uses_supported_document_types_as_source_of_truth(self):
-        for ext in SUPPORTED_DOCUMENT_TYPES:
-            media, cleaned = BasePlatformAdapter.extract_media(f"MEDIA:/tmp/artifact{ext}")
-            assert media == [(f"/tmp/artifact{ext}", False)]
-            assert cleaned == ""
-
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
         user-visible text just like [[audio_as_voice]]. Callers detect the
@@ -602,12 +647,15 @@ class TestMediaExtensionAllowlistParity:
 
     def test_unknown_extension_not_black_holed_by_cleanup(self):
         """A MEDIA: tag with an unknown extension is NOT stripped from the
-        body — it survives so extract_local_files can still see the bare path,
-        rather than vanishing entirely (the core of issue #34517)."""
+        body by the extension-anchored cleanup — and when the path does not
+        validate (nonexistent file here), it is not delivered either, so the
+        tag survives visibly instead of vanishing (the core of issue #34517).
+        Validated unknown-extension paths DO deliver — see
+        TestUniversalMediaEgress (#36060)."""
         from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
         text = "Saved to MEDIA:/tmp/data.weirdext done"
         media, _ = BasePlatformAdapter.extract_media(text)
-        assert media == []  # unknown extension is not a deliverable MEDIA tag
+        assert media == []  # nonexistent path fails validation, not delivered
         stripped = MEDIA_TAG_CLEANUP_RE.sub("", text)
         assert "/tmp/data.weirdext" in stripped  # path preserved, not dropped
 
@@ -681,6 +729,104 @@ class TestExtensionlessMediaDelivery:
         assert "[[as_document]]" not in (
             BasePlatformAdapter.strip_media_directives_for_display(text)
         )
+
+
+class TestUniversalMediaEgress:
+    """#36060: every MEDIA: path is deliverable regardless of file type.
+
+    Known extensions extract unconditionally (MEDIA_TAG_CLEANUP_RE); unknown
+    extensions and extension-less files extract via the validated pass —
+    delivered when validate_media_delivery_path accepts them, left visible
+    when it does not (nonexistent, denylisted).
+    """
+
+    def _patch_allow_root(self, monkeypatch, root):
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (str(root),),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+
+    @pytest.mark.parametrize("name", [
+        "script.py", "server.log", "notes.weirdext", "app.ts", "run.sh",
+        "config.toml", "styles.css", "contract.sol",
+    ])
+    def test_unknown_extension_delivered_when_file_validates(
+        self, tmp_path, monkeypatch, name,
+    ):
+        root = tmp_path / "output"
+        root.mkdir()
+        f = root / name
+        f.write_text("content", encoding="utf-8")
+        self._patch_allow_root(monkeypatch, root)
+
+        content = f"Here you go:\nMEDIA:{f}\nDone."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert len(media) == 1
+        assert media[0][0] == str(f.resolve())
+        assert "MEDIA:" not in cleaned
+        assert "Done." in cleaned
+
+    def test_unknown_extension_left_visible_when_not_on_disk(
+        self, tmp_path, monkeypatch,
+    ):
+        root = tmp_path / "output"
+        root.mkdir()
+        self._patch_allow_root(monkeypatch, root)
+
+        content = "MEDIA:/nonexistent/script.py"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:/nonexistent/script.py" in cleaned
+
+    def test_denylisted_paths_still_rejected_regardless_of_extension(
+        self, tmp_path, monkeypatch,
+    ):
+        # A denylisted path must not deliver even though .py/.log/etc now
+        # route through the validated pass. _media_delivery_denied_paths()
+        # reads _MEDIA_DELIVERY_DENIED_PREFIXES at call time, so patching the
+        # tuple exercises the real denylist logic.
+        secret_dir = tmp_path / "secrets"
+        secret_dir.mkdir()
+        f = secret_dir / "creds.py"
+        f.write_text("TOKEN = 'x'", encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(secret_dir),),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+
+        content = f"MEDIA:{f}"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:" in cleaned  # rejected tag stays visible
+
+    def test_strip_for_display_strips_validated_unknown_extension(
+        self, tmp_path, monkeypatch,
+    ):
+        root = tmp_path / "output"
+        root.mkdir()
+        f = root / "server.log"
+        f.write_text("x", encoding="utf-8")
+        self._patch_allow_root(monkeypatch, root)
+
+        text = f"MEDIA:{f}"
+        stripped = BasePlatformAdapter.strip_media_directives_for_display(text)
+        assert "MEDIA:" not in stripped
+
+    def test_strip_for_display_keeps_unvalidated_unknown_extension(self):
+        text = "MEDIA:/nonexistent/server.log"
+        stripped = BasePlatformAdapter.strip_media_directives_for_display(text)
+        assert "MEDIA:/nonexistent/server.log" in stripped
+
+    def test_known_extension_still_unconditional(self):
+        # Known extensions keep the pre-#36060 behavior: extracted (and the
+        # tag stripped) even when the file does not exist — downstream
+        # delivery surfaces the failure.
+        content = "MEDIA:/nonexistent/report.pdf"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/nonexistent/report.pdf", False)]
+        assert "MEDIA:" not in cleaned
 
 
 class TestMediaDeliveryPathValidation:
@@ -1055,6 +1201,105 @@ class TestMediaDeliveryDefaultMode:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(config_file)) is None
 
+    def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
+        """Integration credentials at the HERMES_HOME root (google_token.json)
+        must never be deliverable, even though they aren't the historically
+        enumerated .env/auth.json/config.yaml files. Regression for a
+        refreshed google_token.json being auto-attached to a Slack reply
+        (#50912).
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        hermes_dir.mkdir(parents=True)
+        token = hermes_dir / "google_token.json"
+        token.write_text('{"access_token": "***", "refresh_token": "***"}')
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(token)) is None
+
+    def test_denylist_blocks_google_token_even_when_freshly_refreshed(self, tmp_path, monkeypatch):
+        """The exploit was that the Google integration rewrites
+        google_token.json every turn, bumping its mtime to ~now, so the
+        strict-mode recency window (trust_recent_files) kept re-trusting it
+        and it re-sent on every reply. An explicit denylist entry must win
+        over recency trust.
+        """
+        self._patch_roots(monkeypatch)  # zero cache allowlist, strict mode on
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        hermes_dir.mkdir(parents=True)
+        token = hermes_dir / "google_token.json"
+        token.write_text('{"access_token": "***"}')  # mtime = now → "recent"
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(token)) is None
+
+    def test_denylist_blocks_pairing_directory_contents(self, tmp_path, monkeypatch):
+        """Files under ~/.hermes/pairing/ (platform pairing tokens) are
+        credential material and must not be deliverable.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        pairing = hermes_dir / "pairing"
+        pairing.mkdir(parents=True)
+        token = pairing / "telegram-approved.json"
+        token.write_text('{"approved": ["123"]}')
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(token)) is None
+
+    def test_hermes_cache_still_delivers_under_denied_home(self, tmp_path, monkeypatch):
+        """The targeted credential denylist must not break legitimate cache
+        deliveries: a generated artifact under the allowlisted cache root is
+        matched before the denylist and still delivers.
+        """
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        cache_dir = hermes_dir / "cache" / "documents"
+        cache_dir.mkdir(parents=True)
+        artifact = cache_dir / "report.pdf"
+        artifact.write_bytes(b"%PDF-1.4")
+        self._patch_roots(monkeypatch, cache_dir)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) == str(artifact.resolve())
+
+    def test_denylist_blocks_non_cache_file_under_hermes_home(self, tmp_path, monkeypatch):
+        """A non-credential file the agent wrote directly under ~/.hermes
+        (not in a cache subdir) is still deliverable via recency trust — we
+        did NOT blanket-deny the tree (per #32090/#34425). This guards against
+        accidentally re-introducing the rejected whole-tree deny.
+        """
+        self._patch_roots(monkeypatch)  # strict mode on
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        hermes_dir.mkdir(parents=True)
+        artifact = hermes_dir / "adhoc_report.pdf"
+        artifact.write_bytes(b"%PDF-1.4")  # fresh mtime
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) == str(artifact.resolve())
+
     def test_strict_mode_envvar_restores_legacy_behavior(self, tmp_path, monkeypatch):
         """Setting HERMES_MEDIA_DELIVERY_STRICT=1 reactivates the older
         allowlist+recency logic. A stale file outside the allowlist is
@@ -1328,7 +1573,7 @@ class TestTruncateMessage:
         """Create a minimal adapter instance for testing static/instance methods."""
 
         class StubAdapter(BasePlatformAdapter):
-            async def connect(self):
+            async def connect(self, *, is_reconnect: bool = False):
                 return True
 
             async def disconnect(self):
@@ -1373,6 +1618,76 @@ class TestTruncateMessage:
         chunks = adapter.truncate_message(msg, max_length=200)
         assert "(1/" in chunks[0]
         assert f"({len(chunks)}/{len(chunks)})" in chunks[-1]
+
+    @staticmethod
+    def _truncate_with_timeout(content, max_length, *, len_fn=None, timeout=3.0):
+        """Run truncate_message on a worker thread; fail if it doesn't return.
+
+        Guards against the regression where a pathologically small max_length
+        made the split loop never consume any input and spin forever.
+        """
+        import threading
+
+        box: dict = {}
+
+        def _run():
+            box["result"] = BasePlatformAdapter.truncate_message(
+                content, max_length, len_fn=len_fn
+            )
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        assert not t.is_alive(), (
+            f"truncate_message hung (infinite loop) for max_length={max_length}"
+        )
+        return box["result"]
+
+    def test_pathological_small_max_length_terminates(self):
+        # max_length 0 and 1 previously drove the split loop into an unbounded
+        # hang (headroom -> 0, split_at -> 0, remaining never shrinks). It must
+        # terminate and preserve every character across the chunks.
+        import re
+
+        for max_length in (0, 1, 2):
+            chunks = self._truncate_with_timeout("abcdefghij", max_length)
+            assert chunks, f"no chunks for max_length={max_length}"
+            reassembled = "".join(
+                re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks
+            )
+            for ch in "abcdefghij":
+                assert ch in reassembled, f"char {ch!r} lost at max_length={max_length}"
+
+    def test_pathological_small_max_length_utf16_terminates(self):
+        # Under utf16_len (Telegram), a surrogate-pair emoji is 2 units wide, so
+        # a budget below that maps to zero codepoints — the same stall vector.
+        from gateway.platforms.base import utf16_len
+
+        chunks = self._truncate_with_timeout("😀😀😀😀😀", 1, len_fn=utf16_len)
+        assert chunks
+        assert "😀" in "".join(chunks)
+
+    def test_sub_codepoint_budget_emits_whole_codepoints_without_data_loss(self):
+        """Length contract for a budget too small to fit one codepoint.
+
+        A codepoint is indivisible, so with max_length=1 and utf16_len a 2-unit
+        emoji cannot fit — the loop emits it whole rather than dropping it or
+        spinning. The documented, intentional consequence is that such a chunk
+        EXCEEDS max_length by that one codepoint; in return every codepoint is
+        preserved (no data loss) and the call terminates.
+        """
+        import re
+
+        from gateway.platforms.base import utf16_len
+
+        chunks = self._truncate_with_timeout("😀😀😀", 1, len_fn=utf16_len)
+        assert chunks
+        bodies = [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
+        # No data loss: all three emojis survive across the chunks.
+        assert "".join(bodies).count("😀") == 3
+        # Contract: a chunk carrying a 2-unit emoji necessarily exceeds the
+        # 1-unit budget — assert that explicitly so the behavior is pinned.
+        assert any(utf16_len(b) > 1 for b in bodies)
 
     def test_code_block_first_chunk_closed(self):
         adapter = self._adapter()
