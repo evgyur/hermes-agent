@@ -223,10 +223,10 @@ class TestJudgeGoal:
         )
         goal = "Run phases, then print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ):
-            verdict, reason, _ = goals.judge_goal(goal, "Phase 0 done, continuing")
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
+        ) as mock_call:
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "Phase 0 done, continuing")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -251,7 +251,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -349,7 +349,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "continue"
         assert "standalone SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -371,7 +371,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "continue"
         assert "standalone SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -393,7 +393,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert "FAILURE_HANDOFF" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -421,7 +421,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert marker in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -446,7 +446,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert "BLOCKED_BY_APPROVAL" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -479,7 +479,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert "BLOCKED_BY_APPROVAL" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -507,7 +507,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -536,7 +536,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "done"
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -566,7 +566,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "Goal complete: yes. Останавливаюсь.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "Goal complete: yes. Останавливаюсь.")
         assert verdict == "done"
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -602,7 +602,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "GOAL COMPLETE / AUDIT_COMPLETE. Останавливаюсь.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "GOAL COMPLETE / AUDIT_COMPLETE. Останавливаюсь.")
         assert verdict == "done"
         assert "STATE.md already audit-complete" in reason
         assert str(package) in reason
@@ -633,7 +633,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "SUPERGOAL_RUN_COMPLETE — already closed.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "SUPERGOAL_RUN_COMPLETE — already closed.")
         assert verdict == "done"
         assert "STATE.md already audit-complete" in reason
         assert str(package) in reason
@@ -669,7 +669,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — no-op.")
         assert verdict == "done"
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -693,7 +693,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — no-op.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -703,7 +703,7 @@ class TestJudgeGoal:
 
         goal = "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         response = "## AUDIT_COMPLETE\n\n- [x] SUPERGOAL_RUN_COMPLETE\n"
-        verdict, reason, _, _wd = goals.judge_goal(goal, response)
+        verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         # The deterministic guard must not block markdown-rendered markers as
         # missing; with no auxiliary client configured this falls through to the
         # normal judge-unavailable path instead of returning the marker-missing
@@ -726,10 +726,10 @@ class TestJudgeGoal:
         fake_client = MagicMock()
         goal = f"Execute `{root}/.supergoal/STATE.md`; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
+        ) as mock_call:
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — no-op.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -753,7 +753,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — no-op.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — no-op.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -774,17 +774,17 @@ class TestJudgeGoal:
         )
         goal = f"Execute `{root}/.supergoal/STATE.md`; finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ):
-            verdict, reason, _, _wd = goals.judge_goal(
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
+        ) as mock_call:
+            verdict, reason, _, _wd, _tf = goals.judge_goal(
                 goal,
                 "AUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE\n",
                 subgoals=["also provide docs evidence"],
             )
         assert verdict == "continue"
         assert reason == "subgoal missing"
-        fake_client.chat.completions.create.assert_called_once()
+        mock_call.assert_called_once()
 
     def test_supergoal_terminal_state_without_final_markers_does_not_stop(self, tmp_path):
         from hermes_cli import goals
@@ -802,10 +802,10 @@ class TestJudgeGoal:
             "Finish only after AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -826,7 +826,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "done"
         assert "STATE.md already complete" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -853,7 +853,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -887,7 +887,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -922,7 +922,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal(goal, "COMPLETE — stop.")
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, "COMPLETE — stop.")
         assert verdict == "continue"
         assert "SUPERGOAL_RUN_COMPLETE" in reason
         fake_client.chat.completions.create.assert_not_called()
@@ -941,10 +941,10 @@ class TestJudgeGoal:
         goal = "Run phases, then print AUDIT_COMPLETE and SUPERGOAL_RUN_COMPLETE."
         response = "AUDIT_COMPLETE\nSUPERGOAL_RUN_COMPLETE"
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
         ):
-            verdict, reason, _, _wd = goals.judge_goal(goal, response)
+            verdict, reason, _, _wd, _tf = goals.judge_goal(goal, response)
         assert verdict == "done"
         assert reason == "markers present"
 
