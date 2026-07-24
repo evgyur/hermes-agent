@@ -162,6 +162,12 @@ END;
 
 这避免了"护卫效应"——SQLite 确定性内部退避会导致所有竞争写入者在相同间隔重试。
 
+### Cron 初始化保护
+
+Cron 的 LLM 执行路径会对 `SessionDB()` 构造增加独立限制，因为同步 open/migration 发生在 cron agent inactivity watchdog 创建之前。可设置 `cron.session_db_timeout_seconds`（默认 10 秒；`0` = 无限制），或使用旧版 `HERMES_CRON_SESSION_DB_TIMEOUT` 覆盖。初始化超时时，本次 cron 在无 session persistence 的情况下继续，并释放 dispatch guard，不会永久卡在 `running`。
+
+解析顺序与失败行为见 [Cron Internals](./cron-internals.md#sessiondb-初始化超时)。
+
 ```
 _WRITE_MAX_RETRIES = 15
 _WRITE_RETRY_MIN_S = 0.020   # 20ms

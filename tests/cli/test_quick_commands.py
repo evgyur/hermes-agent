@@ -182,6 +182,34 @@ class TestGatewayQuickCommands:
         assert result == "2h"
 
     @pytest.mark.asyncio
+    async def test_exec_command_receives_message_origin(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "where": {
+                    "type": "exec",
+                    "command": (
+                        "printf '%s|%s|%s' "
+                        '"$HERMES_ORIGIN_PLATFORM" '
+                        '"$HERMES_ORIGIN_CHAT_ID" '
+                        '"$HERMES_ORIGIN_THREAD_ID"'
+                    ),
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("where")
+        event.source.thread_id = "456"
+        result = await runner._handle_message(event)
+
+        assert result == "telegram|123|456"
+
+    @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
         from gateway.run import GatewayRunner
         runner = GatewayRunner.__new__(GatewayRunner)

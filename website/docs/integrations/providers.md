@@ -39,6 +39,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
+| **DeepInfra** | `DEEPINFRA_API_KEY` in `~/.hermes/.env` (provider: `deepinfra`; aliases: `deep-infra`, `deepinfra-ai`) |
 | **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
 | **Google / Gemini** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `~/.hermes/.env` (provider: `gemini`) |
 | **Google Vertex AI** | `hermes model` → "Google Vertex AI" (provider: `vertex`; OAuth2 via service-account JSON or ADC, GCP billing) |
@@ -62,7 +63,7 @@ In the `model:` config section, you can use either `default:` or `model:` as the
 
 ### Nous Portal
 
-[Nous Portal](https://portal.nousresearch.com) is Nous Research's unified subscription gateway and **the recommended way to run Hermes Agent**. One OAuth login covers 300+ frontier agentic models (Claude, GPT, Gemini, DeepSeek, Qwen, Kimi, GLM, MiniMax, Grok, ...) plus the [Tool Gateway](/user-guide/features/tool-gateway) (web search, image generation, TTS, browser automation) plus [Nous Chat](https://chat.nousresearch.com) — billed against your Nous subscription instead of separate per-provider accounts.
+[Nous Portal](https://portal.nousresearch.com) is Nous Research's unified subscription gateway and **the recommended way to run Hermes Agent**. One OAuth login covers 300+ frontier agentic models (Claude, GPT, Gemini, DeepSeek, Qwen, Kimi, GLM, MiniMax, Grok, ...) plus the [Tool Gateway](/user-guide/features/tool-gateway) (web search, image generation, TTS, browser automation) — billed against your Nous subscription instead of separate per-provider accounts.
 
 ```bash
 hermes setup --portal     # fresh install — OAuth + provider + gateway in one command
@@ -82,7 +83,7 @@ Don't have a subscription yet? Get one at [portal.nousresearch.com/manage-subscr
 :::info Codex Note
 The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
 
-If a token refresh fails with a terminal error (HTTP 4xx, `invalid_grant`, revoked grant, etc.), Hermes marks the refresh token as dead and stops replaying it so you don't see a flood of identical auth failures. The next request surfaces a typed re-auth message instead. Run `hermes auth add codex-oauth` (or `hermes model` → OpenAI Codex) to start a fresh device-code login; the quarantine clears on the next successful exchange.
+If a token refresh fails with a terminal error (HTTP 4xx, `invalid_grant`, revoked grant, etc.), Hermes marks the refresh token as dead and stops replaying it so you don't see a flood of identical auth failures. The next request surfaces a typed re-auth message instead. Run `hermes auth add openai-codex` (or `hermes model` → OpenAI Codex) to start a fresh device-code login; the quarantine clears on the next successful exchange.
 :::
 
 :::warning
@@ -209,6 +210,60 @@ model:
 | `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
+
+### DeepInfra: one key, explicitly selected surfaces
+
+DeepInfra is a first-class OpenAI-compatible provider for chat plus image, video, speech-to-text, and text-to-speech tools. Create a key at [deepinfra.com/dash/api_keys](https://deepinfra.com/dash/api_keys), then configure it through `hermes model` / `hermes tools` or the environment:
+
+```bash
+DEEPINFRA_API_KEY=***
+# Optional for a compatible proxy or private endpoint:
+# DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+```
+
+```yaml
+model:
+  provider: deepinfra
+  # Choose an ID from the live chat catalog shown by `hermes model`.
+  model: deepseek-ai/DeepSeek-V4-Flash
+```
+
+Hermes reads DeepInfra's tagged live catalog at `/models?filter=true&sort_by=hermes` and separates `chat`, `image-gen`, `video-gen`, `tts`, and `stt` models. It does not mix the generic catalog into the chat picker and does not guess a retired model when the catalog is unavailable. Catalog failures are negatively cached for 60 seconds to prevent several consecutive five-second stalls.
+
+| Surface | Selection and behavior |
+|---|---|
+| Chat / vision | `model.provider: deepinfra`; the picker shows only chat-capable models. The default vision helper chooses the first live model tagged both `chat` and `vision`. Provider-wide `max_tokens` is intentionally unset because limits vary by model; an explicit `agent.max_tokens` still applies. |
+| Image generation | Set `image_gen.provider: deepinfra`. This backend is **text-to-image only**; `image_url` and reference images fail with `modality_unsupported`. Model priority: `DEEPINFRA_IMAGE_MODEL` → `image_gen.deepinfra.model` → first live `image-gen` model. |
+| Video generation | Set `video_gen.provider: deepinfra`. Supports text-to-video and image-to-video; models come from the live `video-gen` catalog. An explicit unknown/unavailable provider fails closed instead of falling through to another paid backend. |
+| Speech-to-text | Set `stt.provider: deepinfra`; optionally pin `stt.deepinfra.model`. With no explicit STT provider, DeepInfra is considered only after local, Groq, OpenAI, Mistral, xAI, and ElevenLabs, so a general DeepInfra chat key does not displace an existing STT route. |
+| Text-to-speech | Set `tts.provider: deepinfra`; optionally pin `tts.deepinfra.model` and `voice`. TTS never inherits the active chat provider automatically: without explicit selection Hermes keeps the free Edge default. |
+
+Example tool configuration:
+
+```yaml
+image_gen:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live image-gen model
+
+video_gen:
+  provider: deepinfra
+
+stt:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live stt model
+
+tts:
+  provider: deepinfra
+  deepinfra:
+    model: ""     # empty = first live tts model
+    voice: default
+```
+
+:::warning Paid media backends require explicit opt-in
+Possessing `DEEPINFRA_API_KEY` can auto-detect DeepInfra for the main inference provider and, as a last resort, for STT. It does **not** silently switch image generation or TTS to a paid backend. Select those surfaces in `hermes tools` or set their `provider` keys explicitly.
+:::
 
 ### First-Class API-Key Providers
 
@@ -403,7 +458,7 @@ vertex:
   region: "global"               # required for the Gemini 3.x previews
 ```
 
-`VERTEX_PROJECT_ID` / `VERTEX_REGION` env vars override the `config.yaml` values. Install with `pip install 'hermes-agent[vertex]'` (or let Hermes lazy-install `google-auth` on first use). See the [Google Vertex AI guide](/guides/google-vertex) for the full walkthrough, and the [Google Gemini guide](/guides/google-gemini) for the static-API-key AI Studio path instead.
+`VERTEX_PROJECT_ID` / `VERTEX_REGION` env vars override the `config.yaml` values. Hermes lazy-installs `google-auth` on first use; run `hermes setup` if the managed install needs repair. See the [Google Vertex AI guide](/guides/google-vertex) for the full walkthrough, and the [Google Gemini guide](/guides/google-gemini) for the static-API-key AI Studio path instead.
 
 ### Qwen Portal (OAuth)
 
@@ -844,7 +899,7 @@ hermes model
 # If LM Studio server auth is enabled, enter LM_API_KEY when prompted
 ```
 
-Hermes will automatically load a LM Studio model with 64K context length
+By default, Hermes explicitly asks LM Studio to load the selected model with 64K context length before the first request.
 
 To change context length in LM Studio:
 
@@ -859,6 +914,18 @@ You can use the CLI to estimate if the model will fit: `lms load model-name --co
 
 To set persistent per-model defaults: My Models tab → gear icon on the model → set context size.
 :::
+
+If you use LM Studio's Just-In-Time loading / Auto-Evict feature and want LM Studio to manage model loading and eviction from normal chat requests, skip Hermes' explicit preload step:
+
+```bash
+hermes config set model.lmstudio_load_mode jit
+```
+
+Set it back to the default explicit preload behavior with:
+
+```bash
+hermes config set model.lmstudio_load_mode explicit
+```
 
 **Tool calling:** Supported since LM Studio 0.3.6. Models with native tool-calling training (Qwen 2.5, Llama 3.x, Mistral, Hermes) are auto-detected and shown with a tool badge. Other models use a generic fallback that may be less reliable.
 

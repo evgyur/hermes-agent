@@ -289,6 +289,7 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
 
+
 def test_skill_view_is_treated_as_idempotent_and_blocked_on_repeated_no_progress():
     """Regression: Human20Bot must not reload the same skill forever."""
     controller = ToolCallGuardrailController(
@@ -310,3 +311,21 @@ def test_skill_view_is_treated_as_idempotent_and_blocked_on_repeated_no_progress
     blocked = controller.before_call("skill_view", args)
     assert blocked.action == "block"
     assert blocked.code == "idempotent_no_progress_block"
+
+
+def test_after_call_survives_lone_surrogates_in_result_and_args():
+    # Scraped text can contain unpaired UTF-16 surrogates; it must not crash
+    # the result hasher or conversation loop.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, no_progress_block_after=2)
+    )
+    dirty = "price \ud835 update"
+
+    decision = controller.after_call("web_search", {"query": dirty}, dirty, failed=False)
+    assert decision.action in {"allow", "warn"}
+
+    # hashing stays deterministic: the same dirty failure twice still trips
+    # the exact-failure guard, proving the hash is stable across calls
+    controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
+    controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
+    assert controller.before_call("web_search", {"query": dirty}).action == "block"

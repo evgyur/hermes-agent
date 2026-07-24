@@ -135,6 +135,56 @@ async def test_handle_message_wires_real_user_received_in_progress_completed(led
     assert "please check this" in row["snippet"]
 
 
+@pytest.mark.asyncio
+async def test_handle_message_wires_iteration_boundary_to_goal_resume(ledger_db):
+    runner, _adapter = make_restart_runner()
+    runner._session_db = ledger_db
+    setattr(runner.session_store, "_generate_session_key", lambda source: build_session_key(source))
+    setattr(runner, "_claim_active_session_slot", lambda session_key, source: (None, None))
+    setattr(runner, "_begin_session_run_generation", lambda session_key: 1)
+    setattr(runner, "_release_running_agent_state", lambda session_key, run_generation=None: True)
+    setattr(runner, "_is_telegram_topic_root_lobby", lambda source: False)
+    outcomes = [{
+        "outcome_id": "prior-cap",
+        "turn_exit_reason": "max_iterations_reached(200/200)",
+        "final_response": "Partial checkpoint.",
+        "response_already_delivered": True,
+        "delivery_suppressed": False,
+    }, {
+        "outcome_id": "latest-silence",
+        "turn_exit_reason": "text_response(finish_reason=stop)",
+        "final_response": "NO_REPLY",
+        "response_already_delivered": False,
+        "delivery_suppressed": True,
+    }]
+    runner._handle_message_with_agent = AsyncMock(
+        return_value={
+            "final_response": "",
+            "completed": True,
+            "session_id": "sid-goal-boundary",
+            "goal_turn_outcomes": outcomes[:-1],
+            "turn_exit_reason": outcomes[-1]["turn_exit_reason"],
+            "suppress_delivery": True,
+        }
+    )
+    runner._auto_dispatch_supergoal_from_response = AsyncMock(return_value=False)
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    await runner._handle_message(
+        _event(text="internal callback drained", message_id="msg-boundary")
+    )
+
+    runner._auto_dispatch_supergoal_from_response.assert_not_awaited()
+    runner._post_turn_goal_continuation.assert_awaited_once()
+    kwargs = runner._post_turn_goal_continuation.await_args.kwargs
+    wired = kwargs["turn_outcomes"]
+    assert len(wired) == 2
+    assert wired[0] == outcomes[0]
+    assert wired[1]["turn_exit_reason"] == outcomes[1]["turn_exit_reason"]
+    assert wired[1]["final_response"] == ""
+    assert wired[1]["delivery_suppressed"] is True
+
+
 def test_interrupted_turn_marks_drained_not_completed(ledger_db):
     runner = _runner_with_ledger(ledger_db)
     event = _event(text="long task", message_id="msg-drain")

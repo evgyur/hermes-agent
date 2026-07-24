@@ -9,6 +9,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 """
 
 import sys
+import socket
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1204,15 +1205,15 @@ async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(
         async def get(self, _url):
             return _FakeResponse()
 
-    monkeypatch.setitem(
-        sys.modules,
-        "httpx",
-        SimpleNamespace(AsyncClient=_FakeAsyncClient),
-    )
     adapter._bot = SimpleNamespace(send_photo=mock_send_photo)
     import tools.url_safety as url_safety
 
     monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        url_safety,
+        "create_ssrf_safe_async_client",
+        lambda **_kwargs: _FakeAsyncClient(),
+    )
 
     result = await adapter.send_image(
         chat_id="123",
@@ -1232,6 +1233,61 @@ async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(
     assert call_log[2]["reply_to_message_id"] is None
     assert "message_thread_id" not in call_log[2]
     assert "direct_messages_topic_id" not in call_log[2]
+
+
+@pytest.mark.asyncio
+async def test_send_image_upload_fallback_blocks_connect_time_rebind(monkeypatch):
+    import httpcore
+    from httpcore._backends.auto import AutoBackend
+    from gateway.platforms.base import BasePlatformAdapter
+
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(
+        send_photo=AsyncMock(side_effect=RuntimeError("force URL upload fallback"))
+    )
+
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
+
+    answers = iter(("93.184.216.34", "169.254.169.254"))
+
+    def fake_getaddrinfo(_host, port, *_args, **_kwargs):
+        ip = next(answers)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    connect_attempts = []
+
+    async def fake_connect_tcp(
+        _self,
+        host,
+        port,
+        timeout=None,
+        local_address=None,
+        socket_options=None,
+    ):
+        connect_attempts.append((host, port))
+        raise httpcore.ConnectError("stop before network")
+
+    async def fake_base_send_image(*_args, **_kwargs):
+        return SendResult(success=False, error="fallback")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(AutoBackend, "connect_tcp", fake_connect_tcp)
+    monkeypatch.setattr(BasePlatformAdapter, "send_image", fake_base_send_image)
+
+    await adapter.send_image(
+        chat_id="123",
+        image_url="http://rebind.example/photo.png",
+    )
+
+    assert connect_attempts == []
 
 
 @pytest.mark.asyncio
@@ -1650,3 +1706,90 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "bot_method_name", "path_kw", "filename", "payload"),
+    [
+        ("send_image_file", "send_photo", "image_path", "photo.png", b"png-data"),
+        ("send_document", "send_document", "file_path", "report.txt", b"report-data"),
+        ("send_video", "send_video", "video_path", "clip.mp4", b"video-data"),
+    ],
+)
+async def test_native_media_uses_bot_identity_for_business_metadata_by_default(
+    tmp_path,
+    method_name,
+    bot_method_name,
+    path_kw,
+    filename,
+    payload,
+):
+    """Business metadata must not make native media appear human-authored."""
+    adapter = _make_adapter()
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+    call_log = []
+
+    async def mock_send_media(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=790)
+
+    adapter._bot = SimpleNamespace(**{bot_method_name: mock_send_media})
+
+    result = await getattr(adapter, method_name)(
+        chat_id="244340834",
+        **{path_kw: str(media_path)},
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert result.success is True
+    assert "business_connection_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_native_media_business_send_as_account_requires_explicit_opt_in(tmp_path):
+    adapter = _make_adapter()
+    media_path = tmp_path / "report.txt"
+    media_path.write_bytes(b"report-data")
+    call_log = []
+
+    async def mock_send_document(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=790)
+
+    adapter._bot = SimpleNamespace(send_document=mock_send_document)
+
+    result = await adapter.send_document(
+        chat_id="244340834",
+        file_path=str(media_path),
+        metadata={
+            "business_connection_id": "biz-123",
+            "telegram_business_send_as_account": True,
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["business_connection_id"] == "biz-123"
+
+
+@pytest.mark.asyncio
+async def test_media_group_uses_bot_identity_for_business_metadata_by_default(tmp_path):
+    adapter = _make_adapter()
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"png-data")
+    call_log = []
+
+    async def mock_send_media_group(**kwargs):
+        call_log.append(dict(kwargs))
+        return [SimpleNamespace(message_id=791)]
+
+    adapter._bot = SimpleNamespace(send_media_group=mock_send_media_group)
+
+    await adapter.send_multiple_images(
+        chat_id="244340834",
+        images=[(f"file://{image_path}", "caption")],
+        metadata={"business_connection_id": "biz-123"},
+    )
+
+    assert "business_connection_id" not in call_log[0]

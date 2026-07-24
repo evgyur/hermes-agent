@@ -240,7 +240,7 @@ The gateway extracts `MEDIA:/path/to/file` tags from agent replies and ships the
 | **Archives** | `zip`, `rar`, `7z`, `tar`, `gz`, `bz2` |
 | **Books / packages** | `epub`, `apk`, `ipa` |
 
-Anything on this list delivered as a native attachment on platforms that support it (Telegram, Discord, Signal, Slack, WhatsApp, Feishu, Matrix, etc.); on platforms without native support it falls back to a link or plain-text indicator. The **bold** categories were added in the last few releases — if you were relying on the model saying `here is the file: /path/to/report.docx` instead, swap to `MEDIA:/path/to/report.docx` for native delivery.
+Anything on this list is delivered as a native attachment on platforms that support it (Telegram, Discord, Signal, Slack, WhatsApp, Feishu, Matrix, etc.); on platforms without native support it falls back to a link or plain-text indicator. The **bold** categories were added in the last few releases — if you were relying on the model saying `here is the file: /path/to/report.docx` instead, swap to `MEDIA:/path/to/report.docx` for native delivery.
 
 ## Webhook Mode
 
@@ -322,6 +322,73 @@ TELEGRAM_PROXY=socks5://127.0.0.1:1080
 Supported schemes: `http://`, `https://`, `socks5://`.
 
 The proxy applies to both the main Telegram connection and the fallback IP transport. If no Telegram-specific proxy is set, the gateway falls back to `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (or macOS system proxy auto-detection).
+
+## Telegram Business concierge mode
+
+Hermes can use Telegram Business connections so an authorized account owner can wake the agent from a customer DM and have the result routed back to that exact Business dialog. This is an advanced mode: normal bot DMs keep their usual behavior, while Business traffic is gated separately to prevent mirrored turns, duplicate replies, and replies sent through the wrong account.
+
+Configure it under `platforms.telegram.extra`:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      allow_from:
+        - "123456789"          # trusted owner Telegram user ID
+      business:
+        enabled: true
+        trigger_words:
+          - Hermes
+        ignore_user_ids:
+          - "123456789"        # owner IDs used by startup recovery
+        send_as_account: true   # opt in to official Business send-as-account
+```
+
+`TELEGRAM_ALLOWED_USERS` is also treated as an owner allowlist. Keep `ignore_user_ids` aligned with the owner IDs when you want interrupted owner-triggered Business turns to resume after a gateway restart.
+
+### Routing and trigger rules
+
+- A customer-authored Business DM remains an external-contact turn. It keeps the customer chat as its origin and runs in external-safe mode; it is never silently upgraded to an owner command.
+- An owner-authored message in a customer dialog wakes the agent only when it starts with a configured `trigger_words` value (for example, `Hermes, check this`). Plain owner text is treated as an outbound echo and ignored.
+- The connection route comes from Telegram's `business_connection_id` on the message or its replied-to message. Hermes persists only Telegram-supplied routes in `~/.hermes/state/telegram_business_connections.json`.
+- If Telegram omits the route on a later explicit owner wake, Hermes reuses an exact saved route. It may reuse the only known route when exactly one Business connection exists; multiple possible connections fail closed instead of guessing.
+- `send_as_account: true` (legacy alias: `reply_via_business_connection`) is required before an owner concierge reply is sent through the connected Business account. External customer turns stay bot-authored even when this option is enabled.
+- Telegram can mirror the same owner DM into the bot's own dialog. Hermes drops that mirror using the bot/chat identity relationship, including updates where Telegram omitted `business_connection_id`, so one user action produces one agent turn.
+- Reply context, quick commands, rich messages, edits, overflow chunks, and file deliveries preserve the original Business route.
+
+:::warning Send-as-account is explicit
+Messages sent with a Business connection appear as the connected human/business account. Leave `send_as_account` disabled unless this is the intended concierge behavior. A missing, ambiguous, unauthorized, or invalid route fails closed or falls back to a normal bot-authored send rather than choosing another Business account.
+:::
+
+### Recovery after a restart
+
+Fresh interrupted owner-triggered Business DM turns are eligible for startup recovery without enabling global DM auto-resume. Recovery requires all of the following:
+
+1. `business.enabled: true`
+2. the persisted source is a Telegram DM whose sender ID differs from the customer chat ID
+3. the sender is listed in `business.ignore_user_ids`
+4. the session is marked `resume_pending` for an auto-resumable gateway interruption
+
+Ordinary customer DMs and shared/public chats do not enter this recovery lane. If the interrupted turn ended on an uncheckpointed side-effectful tool call, the recovery prompt tells the agent to inspect live state before repeating the action.
+
+### Troubleshooting
+
+```bash
+# Confirm the adapter is connected and inspect recent Business routing logs
+hermes gateway status
+grep -Ei "business|mirror|startup recovery" ~/.hermes/logs/gateway.log | tail -100
+
+# Inspect remembered route keys without printing bot credentials
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path.home() / ".hermes/state/telegram_business_connections.json"
+data = json.loads(p.read_text()) if p.exists() else {}
+print({chat_id: bool(connection_id) for chat_id, connection_id in data.items()})
+PY
+```
+
+If replies duplicate, verify that only one gateway instance consumes the bot token and that the active plugin adapter is current. If a reply lands in the wrong dialog, disable `send_as_account`, inspect the saved route map, and wait for a new Telegram-supplied Business update before re-enabling it; do not hand-edit or guess a connection ID.
 
 ## Home Channel
 

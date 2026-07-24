@@ -1932,6 +1932,50 @@ class TelegramAdapter(BasePlatformAdapter):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _business_connection_store_path() -> Path:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "state" / "telegram_business_connections.json"
+
+    def _known_business_connection_id(self, chat_id: Any) -> Optional[str]:
+        """Return the last verified Business connection observed for a DM."""
+        path = self._business_connection_store_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value = payload.get(str(chat_id)) if isinstance(payload, dict) else None
+            return str(value) if value else None
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+
+    def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
+        """Persist a Business connection only after Telegram supplied it."""
+        if not chat_id or not connection_id:
+            return
+        path = self._business_connection_store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[str(chat_id)] = str(connection_id)
+            temp_path = path.with_suffix(f"{path.suffix}.tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to persist Telegram Business connection for chat %s: %s",
+                self.name,
+                chat_id,
+                exc,
+            )
+
     def _business_connection_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -5599,18 +5643,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 user_display = getattr(query.from_user, "first_name", "User")
                 label = label_map.get(choice, "Resolved")
 
-                await query.answer(text=label)
-
-                # Edit message to show decision, remove buttons
-                try:
-                    await query.edit_message_text(
-                        text=self.format_message(f"{label} by {user_display}"),
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass  # non-fatal if edit fails
-
                 # Resolve the approval — unblocks the agent thread
                 try:
                     from tools.approval import resolve_gateway_approval
@@ -5622,6 +5654,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
                     count = 0
+
+                if not count:
+                    label = "⌛ Approval expired"
+
+                await query.answer(text=label)
+
+                # Edit message to show decision, remove buttons
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} by {user_display}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass  # non-fatal if edit fails
 
                 # Resume the typing indicator — paused when the approval was
                 # sent (gateway/run.py).  The text /approve and /deny paths
@@ -7225,17 +7272,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(getattr(message, "business_connection_id", None))
 
     def _is_business_bot_dialog_mirror(self, message: Any) -> bool:
-        """True for Telegram Business copies of the user's direct dialog with this bot.
+        """True for reflected copies of the user's direct dialog with this bot.
 
         Telegram can surface the same owner-authored DM twice: once as the normal
         bot DM (`chat.id == from_user.id`) and once through the Business inbox
         with `business_connection_id` and `chat.id == this bot's id`. Processing
         both makes Hermes answer twice; the Business reply can render in Telegram
-        as if it came from the connected account. Keep third-party Business
-        concierge chats alive, but drop this bot-dialog mirror.
+        as if it came from the connected account. Some reflected text updates omit
+        `business_connection_id`, but a legitimate user DM can never have a chat id
+        equal to the receiving bot's own id. Keep third-party Business concierge
+        chats alive, but drop this bot-dialog mirror regardless of that optional
+        field.
         """
-        if not self._is_telegram_business_message(message):
-            return False
         bot = getattr(self, "_bot", None)
         bot_id = str(getattr(bot, "id", "") or "")
         chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
@@ -7591,6 +7639,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_text = rich_sent_store.lookup(chat_id, reply_to_id)
             except Exception:
                 reply_to_text = None
+            if reply_to_text:
+                # The durable sent-message index is authoritative: only adapter
+                # outbound sends are recorded under this exact chat/message id.
+                # Do not require the short self-echo TTL as a second proof, or a
+                # legitimate reply stops triggering after fifteen minutes.
+                return True
         if not reply_to_text:
             reply_to_text = self._message_text_with_hidden_links(replied) or None
         if not reply_to_text:
@@ -8116,6 +8170,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._is_self_bot_message(message):
             return False
 
+        # Telegram Business may mirror an owner-authored DM back with this bot's
+        # own id as the private chat id, sometimes without business_connection_id.
+        # Drop it before normal-DM handling; otherwise one user message becomes a
+        # second agent turn and Hermes answers twice.
+        if self._is_business_bot_dialog_mirror(message):
+            return False
+
         # Check ignored_threads first — applies to both groups and DM topics
         if thread_id is not None:
             try:
@@ -8131,13 +8192,25 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not self._is_group_chat(message):
             if self._is_telegram_business_message(message):
-                if self._is_business_bot_dialog_mirror(message):
-                    return False
                 if explicit_policy and chat_id_str not in private_chats:
                     user = getattr(message, "from_user", None)
                     user_id = str(getattr(user, "id", "") or "")
                     if user_id not in private_chats:
-                        return False
+                        allow_reply = self._telegram_business_config().get(
+                            "allow_reply_trigger", False
+                        )
+                        if isinstance(allow_reply, str):
+                            allow_reply = allow_reply.strip().lower() in {
+                                "1", "true", "yes", "on"
+                            }
+                        if not (
+                            allow_reply
+                            and (
+                                self._is_reply_to_bot(message)
+                                or self._is_reply_to_own_outbound_text(message)
+                            )
+                        ):
+                            return False
                 return self._message_matches_business_trigger(message)
             # Root DM (non-topic): ignore if ignore_root_dm is configured
             if thread_id is None and self.config.extra.get("ignore_root_dm", False):
@@ -9387,6 +9460,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Build source
         business_connection_id = getattr(message, "business_connection_id", None)
+        if not business_connection_id and getattr(message, "reply_to_message", None):
+            business_connection_id = getattr(
+                message.reply_to_message, "business_connection_id", None
+            )
+        if business_connection_id:
+            self._remember_business_connection_id(chat_id_text, business_connection_id)
+        elif self._is_reply_to_own_outbound_text(message):
+            # Owner-authored replies in a delegated Business inbox can arrive as
+            # ordinary ``message`` updates with no connection id. Recover only
+            # for replies to an indexed assistant message in this exact chat.
+            business_connection_id = self._known_business_connection_id(chat_id_text)
         source = self.build_source(
             chat_id=str(chat.id),
             chat_name=getattr(chat, "title", None) or (getattr(chat, "full_name", None) if hasattr(chat, "full_name") else None),

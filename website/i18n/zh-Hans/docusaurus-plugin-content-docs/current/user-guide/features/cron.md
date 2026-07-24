@@ -244,7 +244,13 @@ hermes cron status
 6. 投递最终响应
 7. 更新运行元数据和下次调度时间
 
-`~/.hermes/cron/.tick.lock` 处的文件锁防止重叠的调度器 tick 重复运行同一批任务。
+`~/.hermes/cron/.tick.lock` 文件锁可防止重叠的调度器 tick 重复运行同一批任务。
+
+### 执行历史
+
+Hermes 会在执行器或调度提供程序分派之前，将每次已领取的 cron 尝试记录到当前 profile 的 `~/.hermes/cron/executions.db`。尝试会依次进入 `claimed`、`running`，然后进入不可变的终态：`completed`、`failed` 或 `unknown`。重启后，只有原 PID 与进程启动时间指纹能够证明所有者已经消失时，Hermes 才会将遗留尝试标记为 `unknown`。未知尝试仅用于审计，绝不会自动重跑。
+
+使用 `hermes cron runs [job-id] --limit 20`（别名：`history`）查看最近的尝试。终态历史有界，活动尝试不会被清理；快速备份也包含该账本。
 
 ## 投递选项
 
@@ -593,6 +599,20 @@ cronjob(action="remove", job_id="...")
 
 对于 `update`，传入 `skills=[]` 可删除所有已附加的 skill。
 
+### `cronjob(action="run")` 的含义
+
+由 agent 触发的手动运行是**非阻塞**的。工具在同一个 jobs-file lock 中确认任务仍处于 active 状态，把 `next_run_at` 设为当前时间，返回 `execution_state: "queued"`，再由持久调度器在下一 tick 执行。父聊天轮次不会等待可能运行数分钟的 cron agent。
+
+`queued` 只表示已接受调度，不表示已完成。随后使用 `cronjob(action="list")` 检查 `last_run_at`、`last_status` 和输出。暂停或禁用的任务保持暂停；`action="run"` 不会重新启用它们。
+
+直接 CLI/Python 调用不同：
+
+```bash
+hermes cron run <job_id>
+```
+
+CLI 没有需要保护的父 agent 轮次，因此会取得 at-most-once fire claim 并内联执行。共享 claim 可防止调度器 tick 同时重复运行。
+
 ## Cron 任务可用的工具集
 
 Cron 在全新的 agent 会话中运行每个任务，不附加任何聊天平台。默认情况下，cron agent 获得**你在 `hermes tools` 中为 `cron` 平台配置的工具集**——不是 CLI 默认值，也不是所有工具。
@@ -732,6 +752,19 @@ cronjob(action="create", name="daily-digest",
 被引用任务最近一次完成的输出会作为上下文注入到本次运行的 prompt 之上。每个上游条目必须是有效的任务 ID 或名称（参见 `cronjob action="list"`）。注意：串联读取的是*最近一次完成*的输出——它不会等待同一 tick 中正在运行的上游任务。
 
 ## 任务存储
+
+### SessionDB 初始化保护
+
+LLM cron 任务在创建 agent 前初始化 `SessionDB`。卡住的 SQLite open/migration 使用独立超时限制：
+
+```yaml
+cron:
+  session_db_timeout_seconds: 10   # 默认；0 = 无限制，仅建议调试使用
+```
+
+`HERMES_CRON_SESSION_DB_TIMEOUT` 保留为环境变量覆盖。解析顺序是环境变量 → `cron.session_db_timeout_seconds` → 10 秒。
+
+超过限制时，Hermes 记录错误，并让本次任务在无 session persistence 的情况下继续，而不是永久卡在 `running`。dispatch guard 会正常释放，后续 tick 可以重试。该设置不限制 agent inactivity timeout（`HERMES_CRON_TIMEOUT`）或 pre-run script timeout（`cron.script_timeout_seconds`）。
 
 任务存储在 `~/.hermes/cron/jobs.json`。任务运行的输出保存到 `~/.hermes/cron/output/{job_id}/{timestamp}.md`。
 

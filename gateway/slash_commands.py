@@ -390,10 +390,14 @@ class GatewaySlashCommandsMixin:
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""
         from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
         display = display_hermes_home()
         profile_name = get_active_profile_name()
+        source_profile = str(getattr(getattr(event, "source", None), "profile", "") or "").strip()
+        if getattr(self.config, "multiplex_profiles", False) and source_profile:
+            profile_name = source_profile
+            display = str(get_profile_dir(source_profile))
 
         lines = [
             t("gateway.profile.header", profile=profile_name),

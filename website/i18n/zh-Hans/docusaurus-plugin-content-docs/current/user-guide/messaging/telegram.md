@@ -262,6 +262,63 @@ TELEGRAM_PROXY=socks5://127.0.0.1:1080
 
 代理同时适用于主 Telegram 连接和备用 IP 传输。如果未设置 Telegram 专用代理，gateway 会回退到 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（或 macOS 系统代理自动检测）。
 
+## Telegram Business 礼宾模式
+
+Hermes 可使用 Telegram Business 连接，让经过授权的账户所有者在客户私聊中显式唤醒 agent，并把结果路由回同一个 Business 对话。普通 bot 私聊保持原有行为；Business 流量使用独立门控，避免镜像轮次、重复回复或回复到错误账户。
+
+在 `platforms.telegram.extra` 下配置：
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      allow_from:
+        - "123456789"          # 可信所有者的 Telegram 用户 ID
+      business:
+        enabled: true
+        trigger_words:
+          - Hermes
+        ignore_user_ids:
+          - "123456789"        # startup recovery 使用的所有者 ID
+        send_as_account: true   # 显式允许以 Business 账户身份发送
+```
+
+`TELEGRAM_ALLOWED_USERS` 也会作为所有者 allowlist。若希望 gateway 重启后恢复被中断的所有者 Business 任务，请让 `ignore_user_ids` 与所有者 ID 保持一致。
+
+### 路由与触发规则
+
+- 客户发送的 Business 私聊始终是 external-contact 轮次，保留客户聊天作为 origin，并以 external-safe mode 运行。
+- 所有者在客户对话中的消息只有以 `trigger_words` 开头时才唤醒 agent，例如 `Hermes, check this`。普通所有者文本按出站回显处理并忽略。
+- 路由取自当前消息或被回复消息中由 Telegram 提供的 `business_connection_id`。Hermes 只把 Telegram 提供的路由保存到 `~/.hermes/state/telegram_business_connections.json`。
+- 后续显式唤醒若缺少 route，Hermes 仅复用精确保存的 route；只有本地恰好存在一个 Business 连接时才可复用唯一 route。多个候选时 fail closed，不猜测。
+- 只有启用 `send_as_account: true`（旧别名：`reply_via_business_connection`）后，所有者礼宾回复才通过已连接的 Business 账户发送。客户轮次即使启用此选项也保持 bot-authored。
+- Telegram 可能把同一条所有者私聊镜像到 bot 自己的对话。Hermes 使用 bot/chat 身份关系丢弃该镜像，即使更新中缺少 `business_connection_id`，一次用户操作也只生成一个 agent 轮次。
+- 回复上下文、quick command、rich message、编辑、overflow 分块和文件投递都会保留原始 Business route。
+
+:::warning send-as-account 必须显式启用
+使用 Business 连接发送的消息会显示为已连接的人类/商业账户。除非这正是预期的礼宾行为，否则请保持禁用。route 缺失、歧义、未授权或失效时，Hermes 会 fail closed 或回退为普通 bot-authored 发送，不会选择另一个 Business 账户。
+:::
+
+### 重启恢复
+
+最近中断的所有者触发 Business 私聊无需开启全局 DM auto-resume 即可进入 startup recovery，但必须同时满足：
+
+1. `business.enabled: true`
+2. 持久化 source 是 Telegram DM，且 sender ID 与客户 chat ID 不同
+3. sender 位于 `business.ignore_user_ids`
+4. session 因可自动恢复的 gateway 中断被标记为 `resume_pending`
+
+普通客户私聊和共享/公开聊天不会进入此恢复通道。若中断前最后是未 checkpoint 的副作用工具调用，恢复 prompt 会要求 agent 先检查实时状态再决定是否重试。
+
+### 故障排查
+
+```bash
+hermes gateway status
+grep -Ei "business|mirror|startup recovery" ~/.hermes/logs/gateway.log | tail -100
+```
+
+出现重复回复时，先确认只有一个 gateway 实例在消费 bot token。回复落入错误对话时，先关闭 `send_as_account`，检查保存的 route map，并等待新的 Telegram-supplied Business 更新；不要手工猜测或填写 connection ID。
+
 ## 主频道
 
 在任意 Telegram 聊天（私聊或群组）中使用 `/sethome` 命令，将其指定为**主频道**。定时任务（cron 任务）的结果会投递到此频道。

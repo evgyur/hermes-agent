@@ -1,7 +1,10 @@
+import asyncio
 import sys
+import threading
+import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gateway.config import Platform
-from gateway.platforms.base import MessageType
-from gateway.platforms.telegram import TelegramAdapter
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -36,54 +39,241 @@ def _runner(adapter=None):
     return runner
 
 
-def test_telegram_native_voice_transcript_followup_is_suppressed_after_voice():
-    adapter = object.__new__(TelegramAdapter)
-    adapter._recent_voice_message_keys = {}
+class _PendingVoiceAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+        self.sent = []
 
-    user = SimpleNamespace(id=617744661)
-    chat = SimpleNamespace(id=617744661)
-    voice_msg = SimpleNamespace(chat=chat, from_user=user)
-    transcript_msg = SimpleNamespace(
-        chat=chat,
-        from_user=user,
-        text="🎙 Расшифровка голосового:\n\nДавай проверим.",
-    )
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
 
-    assert adapter._is_native_voice_transcript_followup(transcript_msg) is False
-    adapter._remember_recent_voice_message(voice_msg)
-    assert adapter._is_native_voice_transcript_followup(transcript_msg) is True
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id="voice-echo")
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        return None
+
+    async def stop_typing(self, chat_id) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
 
 
-def test_telegram_native_voice_transcript_followup_matcher_stays_narrow():
-    assert TelegramAdapter._voice_transcript_followup_text("🎙 Расшифровка голосового:\n\nДавай проверим.") is True
-    assert TelegramAdapter._voice_transcript_followup_text("Давай проверим") is False
-    assert TelegramAdapter._voice_transcript_followup_text("🎙 Транскрипт:\nДавай проверим") is False
+class _PendingVoiceAgent:
+    messages = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.model = "test-model"
+        self.provider = "test-provider"
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        self._interrupted = threading.Event()
+
+    @property
+    def is_interrupted(self):
+        return self._interrupt_requested
+
+    def interrupt(self, message):
+        self._interrupt_requested = True
+        self._interrupt_message = message
+        self._interrupted.set()
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).messages.append(message)
+        if len(type(self).messages) == 1:
+            assert self._interrupted.wait(timeout=3), "pending voice interrupt was not delivered"
+            return {
+                "final_response": "interrupted",
+                "messages": [],
+                "api_calls": 1,
+                "interrupted": True,
+                "interrupt_message": self._interrupt_message,
+            }
+        return {
+            "final_response": "follow-up complete",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": False,
+        }
+
+
+def _run_agent_runner(adapter):
+    runner = _runner(adapter)
+    runner._voice_mode = {}
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner._queued_events = {}
+    runner._draining = False
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner._should_echo_stt_transcripts = lambda: True
+    return runner
 
 
 @pytest.mark.asyncio
-async def test_telegram_native_voice_transcript_followup_is_deleted_and_not_enqueued():
-    adapter = object.__new__(TelegramAdapter)
-    adapter.platform = Platform.TELEGRAM
-    adapter._recent_voice_message_keys = {}
-    adapter.delete_message = AsyncMock(return_value=True)
-    adapter._enqueue_text_event = Mock()
-
-    user = SimpleNamespace(id=617744661)
-    chat = SimpleNamespace(id=617744661)
-    voice_msg = SimpleNamespace(chat=chat, from_user=user)
-    transcript_msg = SimpleNamespace(
-        chat=chat,
-        from_user=user,
-        message_id=12762,
-        text="🎙 Расшифровка голосового:\n\nПривет.",
+async def test_pending_voice_interrupt_reuses_transcript_and_echo():
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = _runner(adapter)
+    source = _source()
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/telegram-voice.ogg"],
+        media_types=["audio/ogg"],
     )
-    update = SimpleNamespace(effective_message=transcript_msg, message=transcript_msg, update_id=1)
 
-    adapter._remember_recent_voice_message(voice_msg)
-    await TelegramAdapter._handle_text_message(adapter, update, SimpleNamespace())
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "hello once", "provider": "mock"},
+    ) as mock_transcribe:
+        interrupt_text, interrupt_transcripts = await runner._transcribe_pending_audio_event_once(
+            event,
+            event.text,
+        )
+        await runner._echo_pending_stt_transcripts_once(
+            event,
+            adapter,
+            source,
+            interrupt_transcripts,
+        )
 
-    adapter.delete_message.assert_awaited_once_with("617744661", "12762")
-    adapter._enqueue_text_event.assert_not_called()
+        drain_text, drain_transcripts = await runner._transcribe_pending_audio_event_once(
+            event,
+            event.text,
+        )
+        await runner._echo_pending_stt_transcripts_once(
+            event,
+            adapter,
+            source,
+            drain_transcripts,
+        )
+
+    assert interrupt_text == '"hello once"'
+    assert drain_text == interrupt_text
+    assert drain_transcripts == interrupt_transcripts == ["hello once"]
+    mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg")
+    adapter.send.assert_awaited_once_with(
+        "12345",
+        '🎙️ "hello once"',
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    monkeypatch.setenv("HERMES_GATEWAY_NOTIFY_INTERVAL", "0")
+    monkeypatch.setitem(sys.modules, "dotenv", types.SimpleNamespace(load_dotenv=lambda: None))
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=_PendingVoiceAgent))
+
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    source = _source()
+    session_key = "telegram:dm:12345"
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/telegram-pending-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    adapter._pending_messages[session_key] = event
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._active_sessions[session_key].set()
+    _PendingVoiceAgent.messages = []
+
+    with (
+        patch("gateway.run._hermes_home", tmp_path),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "fake"}),
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={"success": True, "transcript": "hello once", "provider": "mock"},
+        ) as mock_transcribe,
+    ):
+        result = await runner._run_agent(
+            message="initial turn",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="pending-voice-session",
+            session_key=session_key,
+        )
+
+    assert result["final_response"] == "follow-up complete"
+    assert _PendingVoiceAgent.messages == ["initial turn", '"hello once"']
+    mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg")
+    assert adapter.sent == [("12345", '🎙️ "hello once"', None)]
+
+
+@pytest.mark.asyncio
+async def test_busy_voice_interrupt_transcribes_before_pending_drain(monkeypatch):
+    adapter = SimpleNamespace(send=AsyncMock(), _pending_messages={})
+    runner = _runner(adapter)
+    runner._is_user_authorized = lambda _source: True
+    runner._draining = False
+    runner._running_agents = {}
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    runner._busy_ack_ts = {}
+    runner._queued_events = {}
+    runner._agent_has_active_subagents = lambda _agent: False
+    session_key = "telegram:dm:12345"
+    agent = MagicMock()
+    runner._running_agents[session_key] = agent
+    source = _source()
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/telegram-busy-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    with (
+        patch("tools.approval.has_blocking_approval", return_value=False),
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={"success": True, "transcript": "interrupt me", "provider": "mock"},
+        ) as mock_transcribe,
+    ):
+        handled = await runner._handle_active_session_busy_message(event, session_key)
+        drain_text, drain_transcripts = await runner._transcribe_pending_audio_event_once(
+            adapter._pending_messages[session_key],
+            event.text,
+        )
+        await runner._echo_pending_stt_transcripts_once(
+            adapter._pending_messages[session_key],
+            adapter,
+            source,
+            drain_transcripts,
+        )
+
+    assert handled is True
+    agent.interrupt.assert_called_once_with('"interrupt me"')
+    assert adapter._pending_messages[session_key] is event
+    assert drain_text == '"interrupt me"'
+    mock_transcribe.assert_called_once_with("/tmp/telegram-busy-voice.ogg")
+    adapter.send.assert_awaited_once_with(
+        "12345",
+        '🎙️ "interrupt me"',
+        metadata={},
+    )
 
 
 def test_telegram_audio_size_gate_rejects_oversized_media_before_download():
@@ -98,121 +288,6 @@ def test_telegram_audio_size_gate_rejects_oversized_media_before_download():
     assert allowed is False
     assert "exceeds" in note
     assert "voice message" in note
-
-
-class _BoomingTelegramFile:
-    async def get_file(self):  # pragma: no cover - test must not reach Bot API download
-        raise AssertionError("oversized transcribe-route audio must use telegram-chip before get_file")
-
-
-@pytest.mark.asyncio
-async def test_transcribe_route_oversized_audio_recovers_via_telegram_chip_before_rejecting():
-    adapter = object.__new__(TelegramAdapter)
-    adapter._max_doc_bytes = 1024
-    handled = []
-    recovered = []
-
-    event = SimpleNamespace(text="", media_urls=[], media_types=[], message_type=MessageType.AUDIO)
-    msg = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003918810557),
-        message_id=309,
-        caption=None,
-        photo=None,
-        sticker=None,
-        voice=None,
-        audio=_BoomingTelegramFile(),
-        video=None,
-        document=None,
-        media_group_id=None,
-    )
-    msg.audio.file_size = 67 * 1024 * 1024
-    update = SimpleNamespace(message=msg, update_id=777)
-
-    adapter._should_process_message = lambda _msg: True
-    adapter._media_message_type = lambda _msg: MessageType.AUDIO
-    adapter._build_message_event = lambda *_args, **_kwargs: event
-    adapter._apply_telegram_group_observe_attribution = lambda ev: ev
-    adapter._prepare_recent_visible_context = lambda ev: ev
-
-    async def fake_recover(_msg, ev, **kwargs):
-        recovered.append(kwargs)
-        ev.media_urls = ["/var/tmp/recovered.mp3"]
-        ev.media_types = [kwargs["mime_type"]]
-        ev.message_type = MessageType.VOICE
-        return True
-
-    async def fake_handle(ev):
-        handled.append(ev)
-
-    adapter._recover_transcribe_route_media_via_telegram_chip = fake_recover
-    adapter.handle_message = fake_handle
-
-    await TelegramAdapter._handle_media_message(adapter, update, SimpleNamespace())
-
-    assert recovered == [
-        {
-            "ext": ".mp3",
-            "mime_type": "audio/mpeg",
-            "message_type": MessageType.AUDIO,
-            "reason": recovered[0]["reason"],
-        }
-    ]
-    assert "exceeds" in recovered[0]["reason"]
-    assert handled == [event]
-    assert event.media_urls == ["/var/tmp/recovered.mp3"]
-    assert "skipped" not in (event.text or "")
-
-
-@pytest.mark.asyncio
-async def test_transcribe_route_oversized_voice_recovers_via_telegram_chip_before_rejecting():
-    adapter = object.__new__(TelegramAdapter)
-    adapter._max_doc_bytes = 1024
-    handled = []
-    recovered = []
-
-    event = SimpleNamespace(text="", media_urls=[], media_types=[], message_type=MessageType.VOICE)
-    msg = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003918810557),
-        message_id=310,
-        caption=None,
-        photo=None,
-        sticker=None,
-        voice=_BoomingTelegramFile(),
-        audio=None,
-        video=None,
-        document=None,
-        media_group_id=None,
-    )
-    msg.voice.file_size = 67 * 1024 * 1024
-    update = SimpleNamespace(message=msg, update_id=778)
-
-    adapter._should_process_message = lambda _msg: True
-    adapter._media_message_type = lambda _msg: MessageType.VOICE
-    adapter._build_message_event = lambda *_args, **_kwargs: event
-    adapter._apply_telegram_group_observe_attribution = lambda ev: ev
-    adapter._prepare_recent_visible_context = lambda ev: ev
-
-    async def fake_recover(_msg, ev, **kwargs):
-        recovered.append(kwargs)
-        ev.media_urls = ["/var/tmp/recovered.ogg"]
-        ev.media_types = [kwargs["mime_type"]]
-        return True
-
-    async def fake_handle(ev):
-        handled.append(ev)
-
-    adapter._recover_transcribe_route_media_via_telegram_chip = fake_recover
-    adapter.handle_message = fake_handle
-
-    await TelegramAdapter._handle_media_message(adapter, update, SimpleNamespace())
-
-    assert recovered[0]["ext"] == ".ogg"
-    assert recovered[0]["mime_type"] == "audio/ogg"
-    assert recovered[0]["message_type"] == MessageType.VOICE
-    assert "exceeds" in recovered[0]["reason"]
-    assert handled == [event]
-    assert event.media_urls == ["/var/tmp/recovered.ogg"]
-    assert "skipped" not in (event.text or "")
 
 
 @pytest.mark.asyncio

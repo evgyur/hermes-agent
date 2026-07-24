@@ -20,101 +20,6 @@ from agent.skill_preprocessing import (
 
 logger = logging.getLogger(__name__)
 
-
-POSTCRAFT_REASONING_CONFIG = {"enabled": True, "effort": "xhigh"}
-_POSTCRAFT_SKILL_NAME = "postcraft"
-_POSTCRAFT_ACTIVATION_MARKER = 'invoked the "postcraft" skill'
-_POSTCRAFT_AUTOLOAD_MARKER = "[IMPORTANT: The user's message matches the postcraft editorial-writing trigger"
-
-_POSTCRAFT_TRIGGER_RE = re.compile(
-    r"("
-    r"\bpostcraft\b|"
-    r"/(?:postcraft)(?:\s|$)|"
-    r"\b(?:rewrite|rewrit(?:e|ing)|humanize|deslop|shorten|copyedit|proofread)\b|"
-    r"(?:перепиш(?:и|ь|ите|ем)|переформулируй|отрерайт|рерайт|"
-    r"сделай\s+(?:текст\s+)?(?:живее|человечнее|короче|жёстче|жестче|острее|сильнее|чище)|"
-    r"очеловечь|сократи|ужми|вычисти|убери\s+(?:ai|ии|слоп|канцелярит)|"
-    r"напиши\s+(?:пост|текст|заметку)|сделай\s+пост|"
-    r"(?:пост|текст|черновик|заметк[ауи])\s+(?:надо\s+)?(?:переписать|улучшить|дожать|сократить|оживить))"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def postcraft_reasoning_config() -> dict[str, Any]:
-    """Return the hard rail for postcraft turns: reasoning=xhigh."""
-    return dict(POSTCRAFT_REASONING_CONFIG)
-
-
-def is_postcraft_loaded_message(message: Any) -> bool:
-    """Return True when a message already contains the loaded postcraft skill."""
-    if not isinstance(message, str):
-        return False
-    lowered = message.lower()
-    return (
-        _POSTCRAFT_ACTIVATION_MARKER in lowered
-        or _POSTCRAFT_AUTOLOAD_MARKER.lower() in lowered
-    )
-
-
-def is_postcraft_trigger_message(message: Any) -> bool:
-    """Deterministically catch common short-form writing/editing requests.
-
-    This is a safety net below model discretion: matching turns get the
-    postcraft skill injected before the LLM call, so editorial requests do not
-    depend on the model remembering to call ``skill_view``.
-    """
-    if not isinstance(message, str):
-        return False
-    text = message.strip()
-    if not text:
-        return False
-    # Do not hijack unrelated slash commands; their own skill/command router
-    # should decide. /postcraft is handled explicitly.
-    if text.startswith("/") and not text.lower().startswith("/postcraft"):
-        return False
-    return bool(_POSTCRAFT_TRIGGER_RE.search(text))
-
-
-def maybe_build_postcraft_autoload_message(
-    user_instruction: str,
-    task_id: str | None = None,
-) -> Optional[str]:
-    """Load postcraft for a matching natural-language writing/editing turn."""
-    if is_postcraft_loaded_message(user_instruction):
-        return None
-    if not is_postcraft_trigger_message(user_instruction):
-        return None
-
-    loaded = _load_skill_payload(_POSTCRAFT_SKILL_NAME, task_id=task_id)
-    if not loaded:
-        return None
-
-    loaded_skill, skill_dir, skill_name = loaded
-    try:
-        from tools.skill_usage import bump_use
-        bump_use(skill_name)
-    except Exception:
-        pass
-
-    activation_note = (
-        '[IMPORTANT: The user\'s message matches the postcraft editorial-writing trigger. '
-        'The "postcraft" skill has been loaded automatically; follow it as a hard rail, '
-        'not as optional style advice. This turn must run with reasoning=xhigh.]'
-    )
-    runtime_note = (
-        "Auto-loaded postcraft by deterministic pre-LLM trigger; "
-        "force reasoning_effort=xhigh for this turn."
-    )
-    return _build_skill_message(
-        loaded_skill,
-        skill_dir,
-        activation_note,
-        user_instruction=user_instruction,
-        runtime_note=runtime_note,
-        session_id=task_id,
-    )
-
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
@@ -423,7 +328,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, is_excluded_skill_dir
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
@@ -435,7 +341,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(is_excluded_skill_dir(part) for part in skill_md.parts):
+                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
@@ -469,7 +375,32 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
                         continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    # Skip if this skill's auto-generated /command collides
+                    # with a core Hermes slash command (name or alias). The
+                    # skill remains fully loadable via /skill <name>.
+                    # Uses resolve_command() so aliases and case variants are
+                    # covered without maintaining a separate cache.
+                    if resolve_command(cmd_name) is not None:
+                        logger.warning(
+                            "Skill %r generates slash command '/%s' which "
+                            "collides with a core Hermes command; skipping "
+                            "auto-registration. Use '/skill %s' instead.",
+                            name, cmd_name, name,
+                        )
+                        continue
+                    # Dedup on the resolved slug, not just the raw name: two
+                    # distinct frontmatter names can normalize to the same
+                    # slug (e.g. "git_helper" vs "git-helper"). First-wins
+                    # preserves local-before-external precedence.
+                    cmd_key = f"/{cmd_name}"
+                    if cmd_key in _skill_commands:
+                        logger.warning(
+                            "Skill %r maps to slash command %s already claimed "
+                            "by %r; keeping the first and skipping this one.",
+                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                        )
+                        continue
+                    _skill_commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -522,8 +453,8 @@ def reload_skills() -> Dict[str, Any]:
             }
 
         ``description`` is the skill's full SKILL.md frontmatter
-        ``description:`` field — the same string the system prompt renders
-        as ``    - name: description`` for pre-existing skills.
+        ``description:`` field. Note: the system prompt skill index
+        truncates this to the first 57 chars; see ``extract_skill_description``.
     """
     # Snapshot pre-reload state (name -> description) from the current
     # slash-command cache. Using dicts lets the post-rescan diff carry

@@ -225,6 +225,20 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
+### Execution history
+
+Hermes records each claimed cron attempt in the profile-local
+`~/.hermes/cron/executions.db` before executor or provider dispatch. Attempts
+move through `claimed`, `running`, and one immutable terminal state:
+`completed`, `failed`, or `unknown`. After restart, Hermes marks an abandoned
+attempt `unknown` only when the original PID and process-start fingerprint prove
+that its owner is gone. Unknown attempts are audit records and are never
+automatically rerun.
+
+Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
+`history`). Terminal history is bounded; active attempts are never pruned. The
+ledger is included in quick backups.
+
 ## Delivery options
 
 When scheduling jobs, you specify where the output goes:
@@ -590,6 +604,22 @@ cronjob(action="remove", job_id="...")
 
 For `update`, pass `skills=[]` to remove all attached skills.
 
+### What `cronjob(action="run")` means
+
+An agent-triggered manual run is intentionally **non-blocking**. The tool atomically moves the active job's `next_run_at` to now, returns `execution_state: "queued"`, and the persistent scheduler executes it on the next tick. The parent chat turn does not wait for the cron agent, which can run for minutes without wedging the tool call or tripping the chat inactivity watchdog.
+
+After queueing, use `cronjob(action="list")` to inspect `last_run_at`, `last_status`, and output. A queued response means accepted for scheduling, not already completed.
+
+Paused or disabled jobs stay paused: `action="run"` reports the skip and never re-enables them. The active-state check and queue write happen under the same jobs-file lock, so a concurrent pause wins safely.
+
+Direct CLI/Python runs are different:
+
+```bash
+hermes cron run <job_id>
+```
+
+The CLI has no parent agent turn to protect, so it claims the job and executes it inline. The shared fire claim prevents a simultaneous scheduler tick from double-running it.
+
 ## Toolsets available to cron jobs
 
 Cron runs each job in a fresh agent session with no chat platform attached. By default the cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun.
@@ -730,7 +760,24 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 
 ## Job storage
 
+### Session database initialization guard
+
+LLM-backed cron runs initialize `SessionDB` before constructing the agent. A stalled SQLite open or migration is bounded separately from agent inactivity and pre-run script timeouts:
+
+```yaml
+cron:
+  session_db_timeout_seconds: 10   # default; 0 = unlimited, debugging only
+```
+
+`HERMES_CRON_SESSION_DB_TIMEOUT` overrides the config value for backward compatibility. Resolution order is environment → `cron.session_db_timeout_seconds` → 10 seconds.
+
+If initialization exceeds the limit, Hermes logs an error and continues that run without session persistence instead of leaving the job permanently stuck as `running`. The dispatch guard is released normally, so future ticks can try again. This setting does not limit the cron agent itself (`HERMES_CRON_TIMEOUT`) or a pre-run script (`cron.script_timeout_seconds`).
+
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
+
+:::tip
+Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or `/cron` — not by patching `jobs.json` directly. Direct edits can fail silently when [file write safety](../security.md#file-write-safety) blocks the path (for example when `HERMES_WRITE_SAFE_ROOT` is set), and the [file-mutation verifier](../configuration.md#file-mutation-verifier) footer is the authoritative signal that nothing was saved.
+:::
 
 Jobs may store `model` and `provider` as `null`. When those fields are omitted, Hermes resolves them at execution time from the global configuration. They only appear in the job record when a per-job override is set.
 

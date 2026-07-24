@@ -115,6 +115,15 @@ tick()
 - prompt 必须自包含——cron 任务无法提出澄清性问题
 - `cronjob` 工具集已禁用（递归防护）
 
+### 手动运行的两种执行模式
+
+`cronjob(action="run")` 根据调用上下文选择模式：
+
+- **Agent/tool 调用**（存在 `task_id`）：`trigger_job_if_active()` 在同一个 lock 中确认任务 active 并把 `next_run_at` 设为当前时间。工具返回 `execution_state: "queued"`，持久调度器在下一 tick 异步执行；暂停任务不会被重新启用。
+- **直接 CLI/Python 调用**（不存在 `task_id`）：`_execute_job_now()` 获取普通 at-most-once fire claim，并内联运行共享的 `run_one_job()`。因此没有 gateway ticker 的 CLI-only 安装也能真正执行 `hermes cron run`。
+
+Agent 调用方必须稍后用 `action="list"` 检查结果；queue accepted 不等于 completed。
+
 ## 技能支持的任务
 
 cron 任务可通过 `skills` 字段附加一个或多个技能。执行时：
@@ -141,12 +150,26 @@ import requests, json
 # 将摘要打印到 stdout——agent 进行分析并报告
 ```
 
-脚本超时默认为 120 秒。`_get_script_timeout()` 通过三层链路解析限制：
+脚本超时默认为 3600 秒。`_get_script_timeout()` 通过以下链路解析限制：
 
 1. **模块级覆盖** — `_SCRIPT_TIMEOUT`（用于测试/monkeypatching）。仅在与默认值不同时使用。
 2. **环境变量** — `HERMES_CRON_SCRIPT_TIMEOUT`
 3. **配置** — `config.yaml` 中的 `cron.script_timeout_seconds`（通过 `load_config()` 读取）
-4. **默认值** — 120 秒
+4. **默认值** — 3600 秒（1 小时）
+
+该超时只限制 pre-run script。LLM/skill 任务使用独立的 inactivity budget：`HERMES_CRON_TIMEOUT`，默认 600 秒无活动，`0` 表示无限制。
+
+### SessionDB 初始化超时
+
+LLM 路径在创建 `AIAgent` 前初始化 `SessionDB`。SQLite open/migration 是同步操作；若此时卡住，agent inactivity guard 尚未创建，任务 ID 可能永久留在 `_running_job_ids`。
+
+解析顺序：
+
+1. `HERMES_CRON_SESSION_DB_TIMEOUT`
+2. `config.yaml` 中的 `cron.session_db_timeout_seconds`
+3. 10 秒
+
+正值会在单 worker executor 中运行 `SessionDB()` 并限制 `Future.result()`；`0` 恢复无界旧行为，仅建议调试使用。超时时，本次 cron 以 `session_db=None` 继续，外层 `finally` 仍会释放 running-job guard。
 
 ### Provider 恢复
 

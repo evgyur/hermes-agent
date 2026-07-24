@@ -180,6 +180,15 @@ Each cron job runs in a completely fresh agent session:
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
 
+### Manual-run execution modes
+
+`cronjob(action="run")` has two execution modes selected by call context:
+
+- **Agent/tool invocation** (`task_id` is present): `trigger_job_if_active()` atomically verifies that the job is active and sets `next_run_at` to now. The tool returns `execution_state: "queued"`; the persistent scheduler executes it asynchronously on the next tick. It never re-enables a paused job.
+- **Direct CLI/Python invocation** (`task_id` is absent): `_execute_job_now()` takes the normal at-most-once fire claim and runs the shared `run_one_job()` body inline. This keeps `hermes cron run` useful on CLI-only installations with no active gateway ticker.
+
+The split prevents a long cron agent from blocking its parent gateway turn while preserving truthful immediate execution for direct operator calls. Callers in agent context must inspect `action="list"` later; queue acceptance is not completion.
+
 ## Skill-Backed Jobs
 
 A cron job can attach one or more skills via the `skills` field. At execution time:
@@ -214,6 +223,18 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 4. **Default** — 3600 seconds (1 hour)
 
 This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+
+### SessionDB initialization timeout
+
+The LLM path initializes `SessionDB` before creating `AIAgent`. Because SQLite open/migration is synchronous, a wedged connection at that point would otherwise happen before the agent inactivity guard exists and could leave the job ID stuck in `_running_job_ids` forever.
+
+Hermes resolves the initialization timeout in this order:
+
+1. `HERMES_CRON_SESSION_DB_TIMEOUT`
+2. `cron.session_db_timeout_seconds` in `config.yaml`
+3. 10 seconds
+
+Positive values run `SessionDB()` in a single-worker executor and bound `Future.result()`. `0` restores the unbounded legacy behavior and should be reserved for debugging. On timeout, the worker is abandoned without waiting, the cron run proceeds with `session_db=None`, and the outer dispatch `finally` path still releases the running-job guard.
 
 ### Provider Recovery
 
