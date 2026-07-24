@@ -1427,6 +1427,9 @@ _TEXT_INJECT_EXTENSIONS = {
     ".rst", ".tex", ".srt", ".vtt", ".diff", ".patch",
 }
 
+# Public compatibility name used by Telegram's document intake path.
+TEXT_DOCUMENT_EXTENSIONS = _TEXT_INJECT_EXTENSIONS
+
 
 # ---------------------------------------------------------------------------
 # Image document types
