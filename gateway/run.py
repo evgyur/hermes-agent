@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -3226,6 +3227,87 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _goal_turn_outcome(
+    result: Any,
+    *,
+    response_already_delivered: bool,
+) -> Optional[Dict[str, Any]]:
+    """Normalize one completed model turn for later /goal reconciliation."""
+    if not isinstance(result, dict):
+        return None
+    if "turn_exit_reason" not in result and "final_response" not in result:
+        return None
+
+    reason = str(result.get("turn_exit_reason") or "")
+    is_technical_cap = reason.startswith("max_iterations_reached(")
+    if not is_technical_cap and (
+        result.get("interrupted")
+        or result.get("failed")
+        or result.get("partial")
+        or result.get("error")
+        or result.get("completed") is False
+    ):
+        return None
+    response = str(result.get("final_response") or "")
+    messages = result.get("messages")
+    message_count = len(messages) if isinstance(messages, list) else None
+    offset = result.get("history_offset")
+    identity = str(result.get("outcome_id") or "")
+    if not identity:
+        payload = json.dumps(
+            {
+                "history_offset": offset if isinstance(offset, int) else None,
+                "message_count": message_count,
+                "turn_exit_reason": reason,
+                "final_response": response,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    silence_markers = {"NO_REPLY", "[SILENT]"}
+    return {
+        "outcome_id": identity,
+        "turn_exit_reason": reason,
+        "final_response": response,
+        "response_already_delivered": bool(
+            result.get("response_already_delivered", response_already_delivered)
+        ),
+        "delivery_suppressed": bool(result.get("delivery_suppressed"))
+        or bool(result.get("suppress_delivery"))
+        or response.strip() in silence_markers,
+    }
+
+
+def _goal_turn_outcomes(agent_result: Any) -> List[Dict[str, Any]]:
+    """Return every drained model-turn outcome in chronological order."""
+    if not isinstance(agent_result, dict):
+        return []
+
+    outcomes: List[Dict[str, Any]] = []
+    existing = agent_result.get("goal_turn_outcomes")
+    if isinstance(existing, list):
+        for item in existing:
+            normalized = _goal_turn_outcome(item, response_already_delivered=True)
+            if normalized is not None:
+                outcomes.append(normalized)
+
+    current = _goal_turn_outcome(agent_result, response_already_delivered=False)
+    if current is not None:
+        outcomes.append(current)
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for outcome in outcomes:
+        identity = outcome["outcome_id"]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(outcome)
+    return deduped
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -3246,15 +3328,41 @@ def _preserve_queued_followup_history_offset(
     if not isinstance(current_result, dict):
         return followup_result
 
+    merged = followup_result
     current_offset = current_result.get("history_offset")
     followup_offset = followup_result.get("history_offset")
-    if not isinstance(current_offset, int):
-        return followup_result
-    if isinstance(followup_offset, int) and followup_offset <= current_offset:
-        return followup_result
+    if isinstance(current_offset, int) and not (
+        isinstance(followup_offset, int) and followup_offset <= current_offset
+    ):
+        merged = dict(merged)
+        merged["history_offset"] = current_offset
 
-    merged = dict(followup_result)
-    merged["history_offset"] = current_offset
+    outcomes: List[Dict[str, Any]] = []
+    existing_current = current_result.get("goal_turn_outcomes")
+    if isinstance(existing_current, list):
+        outcomes.extend(item for item in existing_current if isinstance(item, dict))
+    current_outcome = _goal_turn_outcome(
+        current_result,
+        response_already_delivered=True,
+    )
+    if current_outcome is not None:
+        outcomes.append(current_outcome)
+    existing_followup = followup_result.get("goal_turn_outcomes")
+    if isinstance(existing_followup, list):
+        outcomes.extend(item for item in existing_followup if isinstance(item, dict))
+
+    if outcomes:
+        deduped: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in outcomes:
+            normalized = _goal_turn_outcome(item, response_already_delivered=True)
+            if normalized is None or normalized["outcome_id"] in seen:
+                continue
+            seen.add(normalized["outcome_id"])
+            deduped.append(normalized)
+        if merged is followup_result:
+            merged = dict(merged)
+        merged["goal_turn_outcomes"] = deduped
     return merged
 
 
@@ -5217,6 +5325,201 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+
+    def _gateway_ledger_origin_type(self, event: MessageEvent) -> str:
+        if self._is_goal_continuation_event(event):
+            return "internal_goal"
+        if getattr(event, "internal", False):
+            return (
+                "startup_recovery"
+                if not (getattr(event, "text", "") or "").strip()
+                else "internal_goal"
+            )
+        return "real_user"
+
+    def _gateway_ledger_snippet(self, event: MessageEvent) -> Optional[str]:
+        origin_type = self._gateway_ledger_origin_type(event)
+        if origin_type == "internal_goal":
+            return "[internal goal continuation]"
+        if origin_type == "startup_recovery":
+            return "[startup recovery continuation]"
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            return None
+        try:
+            from agent.redact import redact_sensitive_text
+
+            text = redact_sensitive_text(text)
+        except Exception:
+            pass
+        return re.sub(r"\s+", " ", text).strip()[:160] or None
+
+    def _record_gateway_ledger_received(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[int]:
+        """Record receipt best-effort; ledger failures never break intake."""
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        source = getattr(event, "source", None)
+        if db is None or source is None:
+            return None
+        try:
+            ledger_id = db.record_gateway_message_received(
+                platform=getattr(
+                    getattr(source, "platform", None),
+                    "value",
+                    getattr(source, "platform", None),
+                ),
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                user_id=getattr(source, "user_id", None),
+                session_key=session_key,
+                session_id=session_id,
+                origin_type=self._gateway_ledger_origin_type(event),
+                reason=reason,
+                metadata={
+                    "message_type": getattr(
+                        getattr(event, "message_type", None),
+                        "value",
+                        str(getattr(event, "message_type", "")),
+                    ),
+                    "platform_update_id": getattr(event, "platform_update_id", None),
+                    "internal": bool(getattr(event, "internal", False)),
+                },
+                snippet=self._gateway_ledger_snippet(event),
+            )
+            setattr(event, "_hermes_gateway_ledger_id", ledger_id)
+            return ledger_id
+        except Exception as exc:
+            logger.debug("gateway message ledger receive failed: %s", exc, exc_info=True)
+            return None
+
+    def _update_gateway_ledger(
+        self,
+        event: MessageEvent,
+        status: str,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Any = None,
+    ) -> bool:
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        source = getattr(event, "source", None)
+        if db is None or source is None:
+            return False
+        ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        try:
+            ok = db.update_gateway_message_ledger(
+                ledger_id=ledger_id,
+                platform=getattr(
+                    getattr(source, "platform", None),
+                    "value",
+                    getattr(source, "platform", None),
+                ),
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                status=status,
+                session_key=session_key,
+                session_id=session_id,
+                reason=reason,
+                metadata=metadata,
+            )
+            if not ok and ledger_id is None:
+                ledger_id = self._record_gateway_ledger_received(
+                    event,
+                    session_key=session_key,
+                    session_id=session_id,
+                    reason="late-ledger-create",
+                )
+                if ledger_id is not None:
+                    ok = db.update_gateway_message_ledger(
+                        ledger_id=ledger_id,
+                        status=status,
+                        session_key=session_key,
+                        session_id=session_id,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+            return bool(ok)
+        except Exception as exc:
+            logger.debug("gateway message ledger update failed: %s", exc, exc_info=True)
+            return False
+
+    def _mark_gateway_ledger_after_agent_result(
+        self,
+        event: MessageEvent,
+        agent_result: Any,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        if isinstance(agent_result, dict):
+            result_session_id = session_id or agent_result.get("session_id")
+            if _should_clear_resume_pending_after_turn(agent_result):
+                self._update_gateway_ledger(
+                    event,
+                    "completed",
+                    session_key=session_key,
+                    session_id=result_session_id,
+                    reason="turn-completed",
+                    metadata={"completed": True},
+                )
+            elif agent_result.get("interrupted") or agent_result.get("partial"):
+                self._update_gateway_ledger(
+                    event,
+                    "drained",
+                    session_key=session_key,
+                    session_id=result_session_id,
+                    reason="turn-interrupted",
+                    metadata={
+                        "interrupted": bool(agent_result.get("interrupted")),
+                        "partial": bool(agent_result.get("partial")),
+                    },
+                )
+            elif agent_result.get("failed") or agent_result.get("error"):
+                self._update_gateway_ledger(
+                    event,
+                    "failed",
+                    session_key=session_key,
+                    session_id=result_session_id,
+                    reason=str(agent_result.get("error") or "turn-failed")[:500],
+                    metadata={"failed": bool(agent_result.get("failed"))},
+                )
+        elif isinstance(agent_result, str) and agent_result.strip():
+            self._update_gateway_ledger(
+                event,
+                "completed",
+                session_key=session_key,
+                session_id=session_id,
+                reason="turn-completed",
+                metadata={"completed": True},
+            )
+
+    def _mark_gateway_ledger_session_drained(
+        self, session_key: str, *, reason: str
+    ) -> None:
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        if db is None or not session_key:
+            return
+        try:
+            db.mark_gateway_session_messages_drained(session_key, reason=reason)
+        except Exception as exc:
+            logger.debug(
+                "gateway message ledger drain mark failed for %s: %s",
+                session_key,
+                exc,
+                exc_info=True,
+            )
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
@@ -11014,6 +11317,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        await asyncio.to_thread(
+            self._record_gateway_ledger_received,
+            event,
+            reason="handle-message-entry",
+        )
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -11175,6 +11483,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        await asyncio.to_thread(
+            self._update_gateway_ledger,
+            event,
+            "received",
+            session_key=_quick_key,
+            reason="session-key-resolved",
+        )
+        if self._is_goal_continuation_event(event):
+            try:
+                goal_entry = await self.async_session_store.get_or_create_session(source)
+                goal_session_id = getattr(goal_entry, "session_id", "") or ""
+            except Exception:
+                goal_session_id = ""
+            if not self._goal_still_active_for_session(goal_session_id):
+                logger.info(
+                    "Dropping stale internal /goal continuation for %s — goal is no longer active",
+                    _quick_key or "?",
+                )
+                await asyncio.to_thread(
+                    self._update_gateway_ledger,
+                    event,
+                    "dropped",
+                    session_key=_quick_key,
+                    session_id=goal_session_id,
+                    reason="stale-internal-goal-continuation",
+                )
+                try:
+                    adapter = self._adapter_for_source(source)
+                    if adapter and _quick_key:
+                        self._clear_goal_pending_continuations(_quick_key, adapter)
+                except Exception as exc:
+                    logger.debug("stale goal continuation cleanup failed: %s", exc)
+                return None
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -12510,6 +12851,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents_ts[_quick_key] = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        await asyncio.to_thread(
+            self._update_gateway_ledger,
+            event,
+            "in_progress",
+            session_key=_quick_key,
+            reason="active-session-claimed",
+            metadata={"run_generation": _run_generation},
+        )
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -12525,10 +12874,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                if not _final_text:
+                    _final_text = str(
+                        getattr(event, "_hermes_final_response", "") or ""
+                    )
+                if isinstance(_agent_result, dict):
+                    _goal_outcomes = _goal_turn_outcomes(_agent_result)
+                else:
+                    _goal_outcomes = _goal_turn_outcomes(
+                        {"final_response": _final_text}
+                    )
+                if not _goal_outcomes and _final_text:
+                    _goal_outcomes = _goal_turn_outcomes(
+                        {"final_response": _final_text}
+                    )
+                if _final_text.strip() or _goal_outcomes:
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -12546,7 +12906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_entry=session_entry,
                                 source=source,
                             )
-                        else:
+                        elif _final_text.strip():
                             _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
                                 session_entry=session_entry,
                                 source=source,
@@ -12557,10 +12917,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_entry=session_entry,
                                 source=source,
                                 final_response=_final_text,
+                                turn_outcomes=_goal_outcomes,
                             )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+            await asyncio.to_thread(
+                self._mark_gateway_ledger_after_agent_result,
+                event,
+                _agent_result,
+                session_key=_quick_key,
+            )
             return _agent_result
+        except Exception as _agent_exc:
+            await asyncio.to_thread(
+                self._update_gateway_ledger,
+                event,
+                "failed",
+                session_key=_quick_key,
+                reason=f"agent-exception:{type(_agent_exc).__name__}",
+                metadata={"error": str(_agent_exc)[:300]},
+            )
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -15789,6 +16166,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        turn_outcomes: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -15822,11 +16200,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
-        )
+        outcomes = [item for item in (turn_outcomes or []) if isinstance(item, dict)]
+        if not outcomes:
+            outcomes = [{
+                "turn_exit_reason": "",
+                "final_response": final_response or "",
+                "response_already_delivered": False,
+                "delivery_suppressed": False,
+            }]
+
+        decision: Optional[Dict[str, Any]] = None
+        ignore_wait_barrier = False
+        for index, outcome in enumerate(outcomes):
+            if not mgr.is_active():
+                break
+            reason = str(outcome.get("turn_exit_reason") or "")
+            technical_boundary = (
+                reason if reason.startswith("max_iterations_reached(") else None
+            )
+            current_decision = mgr.evaluate_after_turn(
+                str(outcome.get("final_response") or ""),
+                user_initiated=True,
+                background_processes=_bg_procs,
+                technical_boundary=technical_boundary,
+                defer_budget_pause=index < len(outcomes) - 1,
+                ignore_wait_barrier=ignore_wait_barrier,
+            )
+            decision = current_decision
+            if current_decision.get("verdict") == "wait":
+                ignore_wait_barrier = True
+            elif current_decision.get("verdict") == "waiting":
+                break
+            else:
+                ignore_wait_barrier = False
+
+        if decision is None:
+            return
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -15836,7 +16245,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            latest_outcome = outcomes[-1]
+            if bool(latest_outcome.get("response_already_delivered")) or bool(
+                latest_outcome.get("delivery_suppressed")
+            ):
+                await self._send_goal_status_notice(source, msg)
+            else:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
             return
