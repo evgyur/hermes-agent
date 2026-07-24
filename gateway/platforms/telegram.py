@@ -55,6 +55,7 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
+        ChatMemberHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -73,6 +74,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    ChatMemberHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -118,6 +120,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.telegram_team_membership import TelegramTeamMembershipPolicy
 from utils import atomic_replace
 from agent.redact import redact_sensitive_text as _redact_sensitive_text
 
@@ -159,7 +162,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, ChatMemberHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -178,6 +181,7 @@ def check_telegram_requirements() -> bool:
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
+            ChatMemberHandler as _CMH,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
@@ -194,6 +198,7 @@ def check_telegram_requirements() -> bool:
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
+    ChatMemberHandler = _CMH
     TelegramMessageHandler = _MH
     ContextTypes = _CT
     filters = _filters
@@ -641,6 +646,270 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+
+        # Optional profile-scoped authorization: current human membership in one
+        # configured Telegram authority supergroup replaces static allowlists and
+        # pairing for inbound Telegram turns.  No deployment identifiers live in
+        # source; profiles opt in through ``extra.team_authority_chat_id``.
+        authority_chat_id = str(
+            self.config.extra.get("team_authority_chat_id") or ""
+        ).strip()
+        self._team_membership_policy: Optional[TelegramTeamMembershipPolicy] = None
+        if authority_chat_id:
+            self._team_membership_policy = TelegramTeamMembershipPolicy(
+                authority_chat_id=authority_chat_id,
+                get_chat_member=self._get_team_chat_member,
+                positive_ttl_seconds=max(
+                    1,
+                    self._coerce_int_extra("team_membership_positive_ttl_seconds", 30),
+                ),
+                negative_ttl_seconds=max(
+                    1,
+                    self._coerce_int_extra("team_membership_negative_ttl_seconds", 5),
+                ),
+                max_cache_entries=max(
+                    1,
+                    self._coerce_int_extra("team_membership_max_cache_entries", 2048),
+                ),
+            )
+        # Track the actual background task owner, not the last actor to touch a
+        # session key. Forum topics may deliberately share one session, so a
+        # last-writer map cannot make revocation actor-local.
+        self._team_actor_active_tasks: Dict[str, Dict[str, asyncio.Task]] = {}
+        self._team_session_task_owner: Dict[str, tuple[str, asyncio.Task]] = {}
+
+    @staticmethod
+    def _normalized_team_chat_type(raw_chat_type: Any) -> str:
+        value = str(getattr(raw_chat_type, "value", raw_chat_type) or "").lower()
+        if value == "private":
+            return "dm"
+        if value == "supergroup":
+            return "group"
+        return value or "unknown"
+
+    async def _get_team_chat_member(self, chat_id: str, user_id: str) -> Any:
+        if self._bot is None:
+            raise RuntimeError("Telegram bot is not initialized")
+        return await self._bot.get_chat_member(chat_id=chat_id, user_id=int(user_id))
+
+    async def _team_membership_decision_for_message(self, msg: Any):
+        policy = getattr(self, "_team_membership_policy", None)
+        if policy is None:
+            return None
+        user = getattr(msg, "from_user", None)
+        chat = getattr(msg, "chat", None)
+        return await policy.authorize(
+            user_id=getattr(user, "id", None),
+            source_chat_id=getattr(chat, "id", None),
+            source_chat_type=self._normalized_team_chat_type(getattr(chat, "type", None)),
+            sender_is_bot=bool(getattr(user, "is_bot", False)),
+        )
+
+    async def _team_membership_allows_message(self, msg: Any) -> bool:
+        decision = await self._team_membership_decision_for_message(msg)
+        return decision is None or decision.allowed
+
+    async def _team_membership_decision_for_source(self, source: Any):
+        policy = getattr(self, "_team_membership_policy", None)
+        if policy is None:
+            return None
+        return await policy.authorize(
+            user_id=getattr(source, "user_id", None),
+            source_chat_id=getattr(source, "chat_id", None),
+            source_chat_type=getattr(source, "chat_type", None),
+            sender_is_bot=bool(getattr(source, "is_bot", False)),
+        )
+
+    async def _authorize_team_source(self, source: Any) -> bool:
+        """Run and stamp the production team-membership gate without creating state."""
+        decision = await self._team_membership_decision_for_source(source)
+        if decision is None:
+            return True
+        source.telegram_team_membership_required = True
+        source.telegram_team_membership_authorized = decision.allowed
+        source.telegram_team_membership_reason = decision.reason
+        return bool(decision.allowed)
+
+    def _track_team_task_owner(
+        self, actor_id: str, session_key: str, task: asyncio.Task
+    ) -> None:
+        previous = self._team_session_task_owner.get(session_key)
+        if previous is not None and previous != (actor_id, task):
+            previous_actor, previous_task = previous
+            previous_tasks = self._team_actor_active_tasks.get(previous_actor)
+            if previous_tasks is not None and previous_tasks.get(session_key) is previous_task:
+                previous_tasks.pop(session_key, None)
+                if not previous_tasks:
+                    self._team_actor_active_tasks.pop(previous_actor, None)
+        self._team_session_task_owner[session_key] = (actor_id, task)
+        self._team_actor_active_tasks.setdefault(actor_id, {})[session_key] = task
+
+    def _untrack_team_task_owner(
+        self, actor_id: str, session_key: str, task: asyncio.Task
+    ) -> None:
+        if self._team_session_task_owner.get(session_key) == (actor_id, task):
+            self._team_session_task_owner.pop(session_key, None)
+        actor_tasks = self._team_actor_active_tasks.get(actor_id)
+        if actor_tasks is not None and actor_tasks.get(session_key) is task:
+            actor_tasks.pop(session_key, None)
+            if not actor_tasks:
+                self._team_actor_active_tasks.pop(actor_id, None)
+
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Bind the actual processing task to its Telegram actor."""
+
+        task = asyncio.current_task()
+        actor_id = str(getattr(event.source, "user_id", "") or "")
+        tracked = bool(
+            task is not None
+            and actor_id
+            and getattr(self, "_team_membership_policy", None) is not None
+        )
+        if tracked:
+            self._track_team_task_owner(actor_id, session_key, task)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            if tracked:
+                self._untrack_team_task_owner(actor_id, session_key, task)
+
+    async def handle_message(self, event: MessageEvent) -> Any:
+        """Enforce team membership before BasePlatformAdapter creates state."""
+
+        team_policy_active = getattr(self, "_team_membership_policy", None) is not None
+        if team_policy_active:
+            if not await self._authorize_team_source(event.source):
+                return None
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+            actor_id = str(event.source.user_id)
+            task_before = self._session_tasks.get(session_key)
+            result = await super().handle_message(event)
+            task_after = self._session_tasks.get(session_key)
+            if task_after is not None and task_after is not task_before:
+                self._track_team_task_owner(actor_id, session_key, task_after)
+            return result
+        return await super().handle_message(event)
+
+    async def _team_membership_allows_callback(self, query: Any) -> bool:
+        policy = getattr(self, "_team_membership_policy", None)
+        if policy is None:
+            return True
+        user = getattr(query, "from_user", None)
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        decision = await policy.authorize(
+            user_id=getattr(user, "id", None),
+            source_chat_id=getattr(chat, "id", None),
+            source_chat_type=self._normalized_team_chat_type(getattr(chat, "type", None)),
+            sender_is_bot=bool(getattr(user, "is_bot", False)),
+        )
+        return decision.allowed
+
+    async def _cancel_team_actor_sessions(self, user_id: str) -> None:
+        """Cancel active/pending turns only; durable jobs and artifacts remain."""
+
+        actor_id = str(user_id)
+        active_tasks = getattr(self, "_team_actor_active_tasks", {}).pop(
+            actor_id, {}
+        )
+        for session_key, owned_task in list(active_tasks.items()):
+            if self._session_tasks.get(session_key) is not owned_task:
+                continue
+            pending = self._pending_messages.get(session_key)
+            pending_actor = str(
+                getattr(getattr(pending, "source", None), "user_id", "")
+            )
+            # Preserve another actor's queued follow-up in a shared forum
+            # session. Keep the Level-1 guard installed while the cancelled
+            # task's finally block hands ownership to the drain task; releasing
+            # it here would let a third actor run concurrently with the drain.
+            preserve_pending = pending is not None and pending_actor != actor_id
+            if preserve_pending:
+                await self.cancel_session_processing(
+                    session_key,
+                    release_guard=False,
+                    discard_pending=False,
+                )
+            else:
+                await self.cancel_session_processing(
+                    session_key,
+                    discard_pending=True,
+                )
+            owner = getattr(self, "_team_session_task_owner", {}).get(session_key)
+            if owner == (actor_id, owned_task):
+                self._team_session_task_owner.pop(session_key, None)
+
+        # Base-platform pending/debounce queues may share a session key while
+        # still retaining actor identity on the queued MessageEvent.
+        base_pending = getattr(self, "_pending_messages", {})
+        base_debounce = getattr(self, "_text_debounce", {})
+        for session_key, pending in list(base_pending.items()):
+            pending_actor = str(
+                getattr(getattr(pending, "source", None), "user_id", "")
+            )
+            if pending_actor != actor_id:
+                continue
+            base_pending.pop(session_key, None)
+            self._discard_text_debounce(session_key)
+        for session_key, debounce in list(base_debounce.items()):
+            debounce_actor = str(
+                getattr(
+                    getattr(getattr(debounce, "event", None), "source", None),
+                    "user_id",
+                    "",
+                )
+            )
+            if debounce_actor == actor_id:
+                self._discard_text_debounce(session_key)
+
+        # Adapter-local debounce/media queues precede BasePlatformAdapter state.
+        # Purge only entries whose source still belongs to the removed actor.
+        queue_pairs = (
+            (self._pending_text_batches, self._pending_text_batch_tasks),
+            (self._pending_photo_batches, self._pending_photo_batch_tasks),
+            (self._media_group_events, self._media_group_tasks),
+        )
+        for events, tasks in queue_pairs:
+            for key, queued in list(events.items()):
+                if str(getattr(getattr(queued, "source", None), "user_id", "")) != actor_id:
+                    continue
+                events.pop(key, None)
+                task = tasks.pop(key, None)
+                if task is not None and not task.done():
+                    task.cancel()
+
+    async def _handle_team_chat_member_update(
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+    ) -> None:
+        policy = getattr(self, "_team_membership_policy", None)
+        change = getattr(update, "chat_member", None)
+        chat = getattr(change, "chat", None)
+        if (
+            policy is None
+            or change is None
+            or str(getattr(chat, "id", "")) != policy.authority_chat_id
+        ):
+            return
+        new_member = getattr(change, "new_chat_member", None)
+        user = getattr(new_member, "user", None)
+        user_id = getattr(user, "id", None)
+        if user_id is None or bool(getattr(user, "is_bot", False)):
+            return
+        policy.invalidate(user_id)
+        if not policy.member_is_allowed(new_member):
+            await self._cancel_team_actor_sessions(str(user_id))
 
     def _cache_observed_chat_type(self, chat_id: Any, chat_type: Any) -> None:
         """Cache a normalized inbound chat type for fail-closed CTA routing."""
@@ -1516,6 +1785,11 @@ class TelegramAdapter(BasePlatformAdapter):
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
+
+        team_policy = getattr(self, "_team_membership_policy", None)
+        if team_policy is not None:
+            decision = team_policy.cached_decision(normalized_user_id)
+            return bool(decision is not None and decision.allowed)
 
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
@@ -3351,6 +3625,13 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            if self._team_membership_policy is not None:
+                self._app.add_handler(
+                    ChatMemberHandler(
+                        self._handle_team_chat_member_update,
+                        ChatMemberHandler.CHAT_MEMBER,
+                    )
+                )
 
             # Start polling — retry initialize() for transient TLS resets
             try:
@@ -5572,6 +5853,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle inline keyboard button clicks."""
         query = update.callback_query
         if not query or not query.data:
+            return
+        if not await self._team_membership_allows_callback(query):
             return
         data = query.data
         query_message = getattr(query, "message", None)
@@ -8372,6 +8655,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if not await self._team_membership_allows_message(msg):
+            return
         if self._is_native_voice_transcript_followup(msg):
             chat_id = getattr(getattr(msg, "chat", None), "id", "unknown")
             message_id = getattr(msg, "message_id", "unknown")
@@ -8462,6 +8747,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if not await self._team_membership_allows_message(msg):
+            return
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
@@ -8479,6 +8766,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming location/venue pin messages."""
         msg = self._effective_update_message(update)
         if not msg:
+            return
+        if not await self._team_membership_allows_message(msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
@@ -8664,6 +8953,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if not await self._team_membership_allows_message(update.message):
             return
         if await self._handle_business_voice_transcription_hook(update.message):
             return

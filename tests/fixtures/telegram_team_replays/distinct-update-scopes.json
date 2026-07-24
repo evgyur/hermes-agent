@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "case_id": "distinct-update-scopes",
+  "synthetic": true,
+  "source": "generated",
+  "target": "telegram",
+  "input": {
+    "update_key": 41,
+    "routes": [
+      {
+        "profile_key": "profile-alpha",
+        "chat_key": "chat-alpha",
+        "thread_key": "thread-alpha"
+      },
+      {
+        "profile_key": "profile-beta",
+        "chat_key": "chat-alpha",
+        "thread_key": "thread-alpha"
+      },
+      {
+        "profile_key": "profile-alpha",
+        "chat_key": "chat-beta",
+        "thread_key": "thread-alpha"
+      },
+      {
+        "profile_key": "profile-alpha",
+        "chat_key": "chat-alpha",
+        "thread_key": "thread-beta"
+      }
+    ]
+  },
+  "expected": {
+    "agent_executions": 4,
+    "final_deliveries": 4
+  }
+}

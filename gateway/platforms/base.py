@@ -19,6 +19,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -2521,6 +2522,14 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Telegram long-polling can replay an already fetched update after a
+        # reconnect or an unacknowledged shutdown. Keep a bounded, in-memory
+        # ingress identity window so the replay cannot execute or deliver twice.
+        # Scope includes profile/chat/thread because update ids belong to a bot
+        # transport, while one process may host multiple logical routes.
+        self._recent_update_keys: OrderedDict[tuple[str, str, str, str], float] = OrderedDict()
+        self._update_dedupe_ttl_seconds = 300.0
+        self._update_dedupe_max_entries = 4096
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -4866,6 +4875,51 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def _telegram_update_dedupe_key(
+        self,
+        event: MessageEvent,
+    ) -> Optional[tuple[str, str, str, str]]:
+        """Return the scoped Telegram ingress identity, when one exists."""
+        if _platform_name(self.platform) != "telegram":
+            return None
+        update_id = getattr(event, "platform_update_id", None)
+        source = getattr(event, "source", None)
+        if update_id is None or source is None:
+            return None
+        profile = getattr(source, "profile", None)
+        if profile is None:
+            profile = self.config.extra.get("profile") or self.config.extra.get("profile_name")
+        return (
+            str(profile or ""),
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "thread_id", "") or ""),
+            str(update_id),
+        )
+
+    def _is_duplicate_telegram_update(self, event: MessageEvent) -> bool:
+        """Atomically remember a bounded update identity and detect replays."""
+        key = self._telegram_update_dedupe_key(event)
+        if key is None or self._update_dedupe_ttl_seconds <= 0:
+            return False
+
+        now = time.monotonic()
+        cutoff = now - self._update_dedupe_ttl_seconds
+        while self._recent_update_keys:
+            _, oldest_at = next(iter(self._recent_update_keys.items()))
+            if oldest_at >= cutoff:
+                break
+            self._recent_update_keys.popitem(last=False)
+
+        if key in self._recent_update_keys:
+            self._recent_update_keys[key] = now
+            self._recent_update_keys.move_to_end(key)
+            return True
+
+        self._recent_update_keys[key] = now
+        while len(self._recent_update_keys) > self._update_dedupe_max_entries:
+            self._recent_update_keys.popitem(last=False)
+        return False
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -4884,6 +4938,17 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        if self._is_duplicate_telegram_update(event):
+            logger.info(
+                "[%s] Dropping replayed Telegram update %s for profile/chat/thread %s/%s/%s",
+                self.name,
+                event.platform_update_id,
+                getattr(event.source, "profile", None) or "",
+                event.source.chat_id,
+                getattr(event.source, "thread_id", None) or "",
+            )
+            return
 
         session_key = build_session_key(
             event.source,

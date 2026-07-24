@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "case_id": "non-reproducing-baseline",
+  "synthetic": true,
+  "source": "generated",
+  "target": "telegram",
+  "observations": [
+    {
+      "symptom": "stream final fallback duplicates clean final",
+      "reproduced": false,
+      "evidence": "existing final delivery regression matrix green"
+    },
+    {
+      "symptom": "compression progress reaches chat",
+      "reproduced": false,
+      "evidence": "existing noise filter already suppresses canonical compression text"
+    },
+    {
+      "symptom": "denied busy-session steering reaches runner",
+      "reproduced": false,
+      "evidence": "membership authorization regression matrix green"
+    }
+  ],
+  "expected": {
+    "speculative_repairs": []
+  }
+}

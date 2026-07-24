@@ -206,6 +206,14 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal, wire-INVISIBLE Telegram team authorization stamp.  The adapter
+    # sets these fields after resolving current authority-supergroup membership
+    # and before BasePlatformAdapter can derive a session key.  They are omitted
+    # from to_dict/from_dict so transport or persisted state cannot forge trust.
+    telegram_team_membership_required: bool = False
+    telegram_team_membership_authorized: bool = False
+    telegram_team_membership_reason: Optional[str] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other

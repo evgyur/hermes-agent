@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "case_id": "duplicate-update",
+  "synthetic": true,
+  "source": "generated",
+  "target": "telegram",
+  "input": {
+    "route": {
+      "profile_key": "profile-alpha",
+      "chat_key": "chat-alpha",
+      "thread_key": "thread-alpha"
+    },
+    "update_key": 41,
+    "copies": 2
+  },
+  "expected": {
+    "agent_executions": 1,
+    "final_deliveries": 1
+  }
+}

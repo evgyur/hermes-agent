@@ -41,6 +41,12 @@ def _items(word: str):
 
 @pytest.fixture(autouse=True)
 def _reset_fuzzy_cache(monkeypatch):
+    # Completion cwd precedence intentionally honors configured profile cwd in
+    # production. These tests exercise temporary per-test trees, so isolate
+    # them from the machine's real profile config and terminal environment.
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda _profile_home: None)
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: None)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
     # Each test walks a fresh tmp dir; clear the cached listing so prior
     # roots can't leak through the TTL window.
     server._fuzzy_cache.clear()

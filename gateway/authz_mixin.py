@@ -437,6 +437,24 @@ class GatewayAuthorizationMixin:
 
         adapter_profile = self._adapter_profile_for_source(source)
 
+        # A configured Telegram authority-supergroup policy is the complete
+        # authorization source for that adapter/profile.  Its local stamp must
+        # precede every legacy chat/user allowlist, pairing grant, bot mode, and
+        # allow-all switch; an absent or negative stamp therefore fails closed.
+        if source.platform == Platform.TELEGRAM:
+            adapter = self._adapter_for_source(source)
+            if getattr(adapter, "_team_membership_policy", None) is not None:
+                return (
+                    getattr(source, "telegram_team_membership_required", False)
+                    is True
+                    and getattr(
+                        source, "telegram_team_membership_authorized", False
+                    )
+                    is True
+                    and bool(source.user_id)
+                    and getattr(source, "is_bot", False) is not True
+                )
+
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
         # gateway's WS with a per-instance secret and resolves owner-only author

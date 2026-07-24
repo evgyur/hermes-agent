@@ -115,6 +115,14 @@ class StartupGoalRecoveryDecision:
             "ledger_statuses": list(self.ledger_statuses),
         }
 
+_TELEGRAM_INTERNAL_ONLY_STATUS_TYPES = frozenset(
+    {"tool", "tool_progress", "self_review", "interrupt", "compaction"}
+)
+_TELEGRAM_INTERNAL_LIFECYCLE_RE = re.compile(
+    r"(self[- ]?(?:improvement\s+)?review|operation\s+interrupted|"
+    r"iteration\s+budget\s+exhausted|compacting\s+context)",
+    re.IGNORECASE,
+)
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -602,6 +610,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    platform_key = str(getattr(platform, "value", platform) or "").lower()
+    event_key = str(event_type or "").strip().lower()
+    if platform_key == "telegram" and (
+        event_key in _TELEGRAM_INTERNAL_ONLY_STATUS_TYPES
+        or _TELEGRAM_INTERNAL_LIFECYCLE_RE.search(text)
+    ):
+        return None
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):

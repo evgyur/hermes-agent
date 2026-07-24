@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "case_id": "quiet-internal-lifecycle",
+  "synthetic": true,
+  "source": "generated",
+  "target": "telegram",
+  "input": {
+    "event_kinds": [
+      "tool_progress",
+      "self_review",
+      "interrupt",
+      "lifecycle",
+      "compaction"
+    ],
+    "payloads": [
+      "synthetic tool progress",
+      "synthetic review complete",
+      "synthetic interruption",
+      "synthetic budget exhaustion",
+      "synthetic compaction"
+    ]
+  },
+  "expected": {
+    "telegram_messages": [],
+    "durable_user_turns": []
+  }
+}
