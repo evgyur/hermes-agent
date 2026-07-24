@@ -312,6 +312,36 @@ class Platform(Enum):
 # Used to distinguish real platforms from arbitrary strings.
 _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.values())
 
+# Platforms that bind a host TCP port. Secondary multiplex profiles cannot
+# safely own these listeners because the default profile already serves the
+# shared endpoint.
+PORT_BINDING_PLATFORM_VALUES = frozenset({
+    "webhook",
+    "api_server",
+    "msgraph_webhook",
+    "feishu",
+    "wecom_callback",
+    "bluebubbles",
+    "sms",
+    "whatsapp_cloud",
+    "line",
+})
+
+PORT_BINDING_CONDITIONAL_MODES: dict[str, str] = {
+    "feishu": "webhook",
+}
+
+
+def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bool:
+    """Return whether a platform actually binds a listener for this config."""
+    if platform_value not in PORT_BINDING_PLATFORM_VALUES:
+        return False
+    expected_mode = PORT_BINDING_CONDITIONAL_MODES.get(platform_value)
+    if expected_mode is not None:
+        actual = str((extra or {}).get("connection_mode", "websocket")).strip().lower()
+        return actual == expected_mode
+    return True
+
 
 @dataclass
 class HomeChannel:
