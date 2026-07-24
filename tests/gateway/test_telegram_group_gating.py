@@ -10,8 +10,11 @@ from gateway.session import SessionSource
 
 def _make_adapter(
     require_mention=None,
+    require_mention_chats=None,
     free_response_chats=None,
     free_response_topics=None,
+    private_chats=None,
+    public_chats=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -24,15 +27,25 @@ def _make_adapter(
     observe_unmentioned_group_messages=None,
     bot_username="hermes_bot",
 ):
-    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.platforms.telegram import TelegramAdapter
 
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
+    if require_mention_chats is not None:
+        extra["require_mention_chats"] = require_mention_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
         extra["free_response_topics"] = free_response_topics
+    if private_chats is not None:
+        extra["private_chats"] = private_chats
+    else:
+        extra["private_chats"] = []
+    if public_chats is not None:
+        extra["public_chats"] = public_chats
+    else:
+        extra["public_chats"] = []
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -118,19 +131,41 @@ def _group_message(
     )
 
 
-def _dm_message(text="hello", *, from_user_id=111):
+def _dm_message(
+    text="hello",
+    *,
+    from_user_id=111,
+    reply_to_bot=False,
+    reply_to_user_id=None,
+    reply_to_text="previous bot reply",
+    reply_to_message_id=10,
+    entities=None,
+    caption=None,
+    caption_entities=None,
+):
+    reply_to_message = None
+    if reply_to_bot:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=reply_to_message_id, text=reply_to_text, caption=None)
+    elif reply_to_user_id is not None:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=reply_to_user_id), message_id=reply_to_message_id, text=reply_to_text, caption=None)
     return SimpleNamespace(
         message_id=43,
         text=text,
-        caption=None,
-        entities=[],
-        caption_entities=[],
+        caption=caption,
+        entities=entities or [],
+        caption_entities=caption_entities or [],
         message_thread_id=None,
         chat=SimpleNamespace(id=from_user_id, type="private", full_name="Alice Example", title=None, is_forum=False),
         from_user=SimpleNamespace(id=from_user_id, full_name="Alice Example", first_name="Alice"),
-        reply_to_message=None,
+        reply_to_message=reply_to_message,
         date=None,
     )
+
+
+def _business_dm_message(text="hello", *, from_user_id=111, business_connection_id="biz-123", **kwargs):
+    message = _dm_message(text, from_user_id=from_user_id, **kwargs)
+    message.business_connection_id = business_connection_id
+    return message
 
 
 def _mention_entity(text, mention="@hermes_bot"):
@@ -346,9 +381,7 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
 
     assert attributed.text == "/new@hermes_bot"
     assert attributed.get_command() == "new"
-    # Commands preserve sender identity for slash-access control (#67816).
-    assert attributed.source.user_id == "111"
-    assert attributed.source.user_name == "Alice"
+    assert attributed.source.user_id is None
     assert "observed Telegram group context" in attributed.channel_prompt
 
 
@@ -475,70 +508,415 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
-def test_explicit_multi_bot_mentions_route_only_to_named_bots():
-    text = "@research_bot @ops_bot hi"
-    entities = _mention_entities(text, ["@research_bot", "@ops_bot"])
+def test_live_plugin_adapter_honors_per_chat_mention_reply_gate():
+    """The plugin adapter loaded by production must honor require_mention_chats."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter as PluginTelegramAdapter
 
-    default_bot = _make_adapter(require_mention=True, bot_username="default_bot")
-    research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
-    ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
+    adapter = object.__new__(PluginTelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={
+            "require_mention": False,
+            "require_mention_chats": ["-100123"],
+            "free_response_chats": [],
+            "allowed_chats": [],
+            "allowed_topics": [],
+            "ignored_threads": [],
+            "group_allowed_chats": [],
+            "private_chats": [],
+            "public_chats": [],
+        },
+    )
+    adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+    adapter._dm_topic_chat_ids = set()
+    adapter._mention_patterns = adapter._compile_mention_patterns()
 
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True, entities=entities)) is False
-    assert research_bot._should_process_message(_group_message(text, entities=entities)) is True
-    assert ops_bot._should_process_message(_group_message(text, entities=entities)) is True
-
-
-def test_entityless_multi_bot_mentions_still_route_exclusively():
-    text = "@research_bot @ops_bot hi"
-
-    default_bot = _make_adapter(require_mention=True, bot_username="default_bot")
-    research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
-    ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
-
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
-    assert research_bot._should_process_message(_group_message(text)) is True
-    assert ops_bot._should_process_message(_group_message(text)) is True
-
-
-def test_intern_bots_ignore_messages_addressed_to_other_intern_bot():
-    text = "@Interntestnumber1bot you're not supposed to do the blog"
-
-    test2_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber2bot")
-    test1_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber1bot")
-
-    assert test2_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
-    assert test1_bot._should_process_message(_group_message(text)) is True
-
-
-def test_bot_command_addressed_to_other_bot_is_exclusive_even_when_mentions_not_required():
-    text = "/stop@Interntestnumber1bot"
-    entity = _bot_command_entity(text, text)
-
-    test2_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber2bot")
-    test1_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber1bot")
-
-    assert test2_bot._should_process_message(_group_message(text, entities=[entity]), is_command=True) is False
-    assert test1_bot._should_process_message(_group_message(text, entities=[entity]), is_command=True) is True
+    assert adapter._should_process_message(
+        _group_message("ordinary public chatter", chat_id=-100123)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("replying to Hermes", chat_id=-100123, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-100123,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("ordinary private-group chatter", chat_id=-100456)
+    ) is True
 
 
-def test_raw_bot_mention_fallback_does_not_match_email_or_substring():
-    adapter = _make_adapter(require_mention=True, bot_username="hermes_bot")
+def test_private_dms_remain_unrestricted_without_explicit_chat_policy():
+    adapter = _make_adapter(require_mention=False)
 
-    assert adapter._should_process_message(_group_message("email ops@hermes_bot.example")) is False
-    assert adapter._should_process_message(_group_message("prefix@hermes_bot hi")) is False
-    assert adapter._should_process_message(_group_message("hi @hermes_bot")) is True
+    assert adapter._should_process_message(_dm_message("hello there")) is True
+    assert adapter._should_process_message(
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+    assert adapter._should_process_message(_dm_message("replying", reply_to_bot=True)) is True
+    assert adapter._should_process_message(_dm_message("Sigurd, status")) is True
 
 
-def test_exclusive_bot_mentions_can_be_disabled_for_legacy_groups():
+def test_business_messages_are_wake_word_or_mention_only_by_default():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is False
+    assert adapter._message_matches_business_trigger(_dm_message("Sigurd, check this")) is True
+    assert adapter._message_matches_business_trigger(
+        _dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_business_dm_dispatch_requires_trigger():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+
+    assert adapter._should_process_message(_business_dm_message("plain customer reply")) is False
+    assert adapter._should_process_message(_business_dm_message("Sigurd, посчитай")) is True
+    assert adapter._should_process_message(
+        _business_dm_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_business_dm_ignored_user_id_suppresses_reflected_human_account_echo():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_user_ids": ["617744661"],
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, echo from delegated human account", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, real customer", from_user_id=111)
+    ) is True
+
+
+def test_business_dm_private_chat_owner_plain_echoes_are_fail_closed_but_wake_words_dispatch():
     adapter = _make_adapter(
-        require_mention=True,
-        exclusive_bot_mentions=False,
-        bot_username="default_bot",
+        require_mention=False,
+        private_chats=["617744661", "111"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd", "Сигурд"]}
+
+    assert adapter._should_process_message(
+        _business_dm_message("plain mirrored owner echo", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, mirrored owner command", from_user_id=617744661)
+    ) is True
+    assert adapter._should_process_message(
+        _business_dm_message("Сигурд, проверь", from_user_id=617744661)
+    ) is True
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, real customer", from_user_id=111)
+    ) is True
+
+
+def test_business_dm_private_chat_owner_reply_to_business_assistant_echo_dispatches(monkeypatch):
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+    outbound = "Да, смогу. Но возврат — финансовое действие, поэтому сначала сверю оплату и покажу тебе точную строку."
+    monkeypatch.setattr(
+        adapter,
+        "_recent_outbound_echo_entries",
+        lambda chat_id, now=None: [(9999999999.0, adapter._self_echo_normalize(outbound), "fingerprint")],
     )
 
     assert adapter._should_process_message(
-        _group_message("@research_bot hi", reply_to_bot=True)
+        _business_dm_message(
+            "сам всё выясни",
+            from_user_id=617744661,
+            reply_to_user_id=617744661,
+            reply_to_text=outbound,
+        )
     ) is True
+
+
+def test_business_reply_to_durable_sent_id_is_owned_after_echo_ttl(monkeypatch):
+    adapter = _make_adapter(require_mention=False)
+    message = _business_dm_message(
+        "customer@example.com",
+        from_user_id=70001,
+        reply_to_user_id=70002,
+        reply_to_text="Готово. Пришли Google-почту — открою адресно.",
+        reply_to_message_id=90001,
+    )
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(
+        rich_sent_store,
+        "lookup",
+        lambda chat_id, message_id: "Готово. Пришли Google-почту — открою адресно."
+        if (str(chat_id), str(message_id)) == ("70001", "90001")
+        else None,
+    )
+    monkeypatch.setattr(adapter, "_recent_outbound_echo_entries", lambda *_args, **_kwargs: [])
+
+    assert adapter._is_reply_to_own_outbound_text(message) is True
+
+
+def test_business_owner_reply_recovers_cached_connection_for_response(monkeypatch):
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["70002"],
+        allow_from=["70002"],
+    )
+    message = _dm_message(
+        "customer@example.com дай доступ",
+        from_user_id=70002,
+        reply_to_user_id=70002,
+        reply_to_text="Готово. Пришли Google-почту — открою адресно.",
+        reply_to_message_id=90001,
+    )
+    message.chat.id = 70001
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(
+        rich_sent_store,
+        "lookup",
+        lambda chat_id, message_id: "Готово. Пришли Google-почту — открою адресно."
+        if (str(chat_id), str(message_id)) == ("70001", "90001")
+        else None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_known_business_connection_id",
+        lambda chat_id: "biz-123" if str(chat_id) == "70001" else None,
+        raising=False,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is True
+
+
+def test_business_dm_external_reply_to_assistant_bypasses_owner_only_private_policy(monkeypatch):
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["70002"],
+        allow_from=["70002"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+    monkeypatch.setattr(adapter, "_is_reply_to_own_outbound_text", lambda _message: True)
+
+    assert adapter._should_process_message(
+        _business_dm_message(
+            "customer@example.com",
+            from_user_id=70001,
+            reply_to_user_id=70002,
+            reply_to_text="Готово. Пришли Google-почту — открою адресно.",
+            reply_to_message_id=90001,
+        )
+    ) is True
+
+
+def test_business_dm_external_wake_word_does_not_bypass_owner_only_private_policy():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["70002"],
+        allow_from=["70002"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, unrelated customer", from_user_id=70001)
+    ) is False
+
+
+def test_business_dm_private_chat_owner_plain_echo_guard_survives_legacy_knob_but_wake_word_dispatches():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_owner_echoes": False,
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("plain reflected owner echo", from_user_id=617744661)
+    ) is False
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, reflected owner command", from_user_id=617744661)
+    ) is True
+
+
+def test_business_dm_explicit_ignore_user_id_still_suppresses_trigger():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["617744661"],
+        allow_from=["617744661"],
+    )
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "ignore_user_ids": ["617744661"],
+    }
+
+    assert adapter._should_process_message(
+        _business_dm_message("Sigurd, explicit ignored user", from_user_id=617744661)
+    ) is False
+
+
+def test_business_voice_auto_transcribe_bypasses_wake_word_gate(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter.config.extra["business"] = {
+            "enabled": True,
+            "trigger_words": ["Sigurd"],
+            "auto_transcribe_voice": True,
+        }
+        adapter.send = AsyncMock()
+        adapter._message_handler = AsyncMock()
+
+        class FakeVoice:
+            file_size = 128
+
+            async def get_file(self):
+                return SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg")))
+
+        message = _business_dm_message("", from_user_id=222, business_connection_id="biz-voice")
+        message.voice = FakeVoice()
+        message.audio = None
+        update = SimpleNamespace(update_id=5001, message=message, effective_message=None)
+
+        monkeypatch.setattr("gateway.platforms.telegram.cache_audio_from_bytes", lambda *_args, **_kw: "/tmp/voice.ogg")
+        monkeypatch.setattr(
+            "tools.transcription_tools.transcribe_audio",
+            lambda path: {"success": True, "transcript": "Привет, это тест", "provider": "groq"},
+        )
+
+        await adapter._handle_media_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args is not None
+        args, kwargs = adapter.send.await_args
+        assert args[0] == "222"
+        assert "Привет, это тест" in args[1]
+        assert kwargs["reply_to"] == "43"
+        assert kwargs["metadata"] == {"business_connection_id": "biz-voice"}
+
+    asyncio.run(_run())
+
+
+def test_business_voice_auto_transcribe_is_config_gated():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+    message = _business_dm_message("", from_user_id=222, business_connection_id="biz-voice")
+    message.voice = SimpleNamespace(file_size=128)
+    message.audio = None
+
+    assert adapter._should_auto_transcribe_business_voice(message) is False
+
+
+def test_business_message_source_keeps_business_connection_id():
+    adapter = _make_adapter(require_mention=False)
+    message = _business_dm_message("Sigurd, ping", from_user_id=95948382)
+
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=123)
+
+    assert event.source.chat_id == "95948382"
+    assert event.source.user_id == "95948382"
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is True
+
+
+def test_business_bot_dialog_mirror_is_dropped_even_with_trigger():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"], "allow_reply_trigger": True}
+    message = _business_dm_message("Sigurd, ping", from_user_id=617744661, reply_to_bot=True)
+    # Telegram Business can mirror Chip's direct DM with this bot as a Business
+    # update whose chat id is the bot id. Processing it duplicates the normal DM
+    # and can render the reply as the connected human/business account.
+    message.chat.id = 999
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_bot_dialog_mirror_without_business_id_is_dropped():
+    adapter = _make_adapter(require_mention=False)
+    message = _business_dm_message(
+        "🎙 Расшифровка голосового: тест",
+        from_user_id=617744661,
+    )
+    message.business_connection_id = None
+    # Telegram can omit business_connection_id on the reflected text update.
+    # A legitimate private user chat can never have chat.id equal to this bot's id.
+    message.chat.id = 999
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_business_third_party_wake_still_dispatches():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "trigger_words": ["Sigurd"]}
+    message = _business_dm_message("Sigurd, ping", from_user_id=95948382)
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_business_bot_dialog_mirror_voice_is_not_auto_transcribed():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {"enabled": True, "auto_transcribe_voice": True}
+    message = _business_dm_message("", from_user_id=617744661, business_connection_id="biz-voice")
+    message.chat.id = 999
+    message.voice = SimpleNamespace(file_size=128)
+    message.audio = None
+
+    assert adapter._should_auto_transcribe_business_voice(message) is False
+
+
+def test_business_reply_trigger_requires_explicit_opt_in():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "allow_reply_trigger": True,
+    }
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain reply", reply_to_bot=True)) is True
+
+
+def test_business_free_response_chat_bypasses_trigger_requirement():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "trigger_words": ["Sigurd"],
+        "free_response_chats": ["6442556885"],
+    }
+
+    assert adapter._message_matches_business_trigger(_dm_message("plain message", from_user_id=6442556885)) is True
+    assert adapter._message_matches_business_trigger(_dm_message("plain message", from_user_id=617744661)) is False
 
 
 def test_free_response_chats_bypass_mention_requirement():
@@ -548,40 +926,65 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
-def test_free_response_topics_bypass_mention_requirement_only_for_topic():
-    adapter = _make_adapter(require_mention=True, free_response_topics=["-200:31"])
-
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=31)) is True
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=32)) is False
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201, thread_id=31)) is False
-
-
-def test_free_response_topics_treat_missing_thread_as_general_topic():
-    adapter = _make_adapter(require_mention=True, free_response_topics=["-200:1"])
-
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=None)) is True
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=31)) is False
-
-
-def test_free_response_topic_messages_are_dispatched_not_observed():
-    """A free-response topic message must go to the dispatcher, not the observe path."""
+def test_free_response_topics_bypass_mention_requirement_only_for_that_topic():
     adapter = _make_adapter(
-        require_mention=True,
-        allowed_chats=["-200"],
-        group_allowed_chats=["-200"],
-        observe_unmentioned_group_messages=True,
-        free_response_topics=["-200:31"],
+        require_mention=False,
+        require_mention_chats=["-200"],
+        private_chats=["617744661"],
+        public_chats=["-200"],
+        free_response_topics=["-200:777"],
     )
 
-    in_topic = _group_message("hello everyone", chat_id=-200, thread_id=31)
-    assert adapter._should_process_message(in_topic) is True
-    assert adapter._should_observe_unmentioned_group_message(in_topic) is False
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=777)) is True
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=778)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            thread_id=778,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("plain", chat_id=-201, thread_id=777)) is False
 
-    # Same chat, different topic: not dispatched, but still observable.
-    other_topic = _group_message("side chatter", chat_id=-200, thread_id=32)
-    assert adapter._should_process_message(other_topic) is False
-    assert adapter._should_observe_unmentioned_group_message(other_topic) is True
 
+def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():
+    adapter = _make_adapter(require_mention=False, require_mention_chats=["-200"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("replying", chat_id=-200, reply_to_bot=True)) is True
+    assert adapter._should_process_message(_group_message("/status", chat_id=-200), is_command=True) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
+
+
+
+def test_explicit_chat_policy_private_public_and_unknown_chats():
+    adapter = _make_adapter(
+        require_mention=False,
+        private_chats=["12345", "-300"],
+        public_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=12345)) is True
+    assert adapter._should_process_message(_dm_message("hello", from_user_id=99999)) is False
+    assert adapter._should_process_message(_group_message("plain private", chat_id=-300)) is True
+    assert adapter._should_process_message(_group_message("plain public", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("reply public", chat_id=-200, reply_to_bot=True)) is True
+    assert adapter._should_process_message(_group_message("unknown", chat_id=-400)) is False
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
     adapter = _make_adapter(
@@ -661,62 +1064,6 @@ def test_allowed_topics_treat_missing_thread_as_general_topic():
     assert adapter._should_process_message(_group_message("hello", thread_id=8)) is False
 
 
-def _forum_message(*, chat_id, thread_id, is_topic_message, is_forum, chat_type="supergroup"):
-    """Build a message with independently-controlled topic/forum flags.
-
-    The shared ``_group_message`` fixture couples ``is_topic_message`` and
-    ``is_forum`` to ``thread_id is not None``, which cannot express a plain
-    reply-UI anchor (``message_thread_id`` set, ``is_topic_message=False``,
-    ``is_forum=False``). This helper decouples them for gating regressions.
-    """
-    return SimpleNamespace(
-        message_id=42,
-        text="hello",
-        caption=None,
-        entities=[],
-        caption_entities=[],
-        message_thread_id=thread_id,
-        is_topic_message=is_topic_message,
-        chat=SimpleNamespace(id=chat_id, type=chat_type, title="T", is_forum=is_forum),
-        from_user=SimpleNamespace(id=111, full_name="Alice", first_name="Alice"),
-        reply_to_message=None,
-        date=None,
-    )
-
-
-def test_gating_ignores_non_forum_reply_anchor_thread_id():
-    """A plain group reply's ``message_thread_id`` is a UI anchor, not a topic.
-
-    Before the shared ``_effective_message_thread_id`` normalizer, gating read
-    the raw ``message_thread_id`` — so a non-forum group reply whose anchor id
-    happened to match an ``ignored_threads`` entry was wrongly dropped, and its
-    anchor id was treated as a routable topic under ``allowed_topics``. The
-    normalizer drops reply anchors (non-forum, ``is_topic_message=False``), so
-    such a reply gates as the General topic instead.
-    """
-    # ignored_threads: reply anchor 55 must NOT be treated as thread 55.
-    adapter = _make_adapter(require_mention=False, free_response_chats=["-200"], ignored_threads=[55])
-    reply_anchor = _forum_message(
-        chat_id=-200, thread_id=55, is_topic_message=False, is_forum=False, chat_type="group"
-    )
-    assert adapter._should_process_message(reply_anchor) is True
-
-    # allowed_topics: reply anchor 55 normalizes to General ("1"), so a group
-    # that only allows topic "1" still processes the reply.
-    adapter2 = _make_adapter(require_mention=False, allowed_chats=["-200"], allowed_topics=["1"])
-    assert adapter2._should_process_message(reply_anchor) is True
-
-
-def test_gating_forum_general_topic_normalizes_to_one():
-    """Forum General-topic messages (thread_id=None) gate as topic "1"."""
-    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"], allowed_topics=["1"])
-    general = _forum_message(chat_id=-100, thread_id=None, is_topic_message=False, is_forum=True)
-    assert adapter._should_process_message(general) is True
-
-    adapter2 = _make_adapter(require_mention=False, allowed_chats=["-100"], allowed_topics=["8"])
-    assert adapter2._should_process_message(general) is False
-
-
 def test_regex_mention_patterns_allow_custom_wake_words():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"^\s*chompy\b"])
 
@@ -732,66 +1079,6 @@ def test_invalid_regex_patterns_are_ignored():
     assert adapter._should_process_message(_group_message("hello everyone")) is False
 
 
-def test_bot_self_messages_are_ignored_in_dm_and_group():
-    """Bot-authored messages must not re-enter as fresh user turns (issue #11905).
-
-    Telegram echoes the bot's own outbound messages back through getUpdates.
-    Without a self-author guard, those echoes — including
-    ``[SYSTEM: Background process ...]`` watcher notifications — get ingested
-    as new inbound turns, producing the "haunted topic" loop. The guard keys
-    on ``from_user.id == self._bot.id`` (bot id is 999 in ``_make_adapter``).
-    """
-    adapter = _make_adapter(require_mention=False)
-
-    # Control: a real user in the same group IS processed.
-    assert adapter._should_process_message(_group_message("hi", chat_id=-100)) is True
-
-    # The exact reported symptom: a bot-authored DM-topic watcher echo.
-    self_dm = _group_message(
-        "[SYSTEM: Background process matched watch pattern ...]",
-        chat_id=555,
-        from_user_id=999,
-    )
-    self_dm.chat.type = "private"
-    assert adapter._should_process_message(self_dm) is False
-
-    # Same guard applies in groups/supergroups.
-    self_group = _group_message("status tick", chat_id=-100, from_user_id=999)
-    assert adapter._should_process_message(self_group) is False
-
-
-def test_other_bots_are_still_processed():
-    """A different bot's message must not be over-filtered.
-
-    Distinguishes the self-id guard from a blanket ``from_user.is_bot`` check,
-    which would incorrectly drop unrelated bots (weather, music, etc.) sharing
-    the same chat.
-    """
-    adapter = _make_adapter(require_mention=False)
-    other_bot = _group_message("weather update", chat_id=-100, from_user_id=555)
-    other_bot.from_user = SimpleNamespace(id=555, is_bot=True)
-    assert adapter._should_process_message(other_bot) is True
-
-
-def test_self_message_guard_skips_observe_path():
-    """Bot-authored messages are not stored via the observe-unmentioned path.
-
-    When ``_should_process_message`` rejects a message, dispatch falls through
-    to ``_should_observe_unmentioned_group_message``; the self-guard must also
-    sit there so a self-echo is neither dispatched nor stored.
-    """
-    adapter = _make_adapter(require_mention=True, observe_unmentioned_group_messages=True)
-    self_group = _group_message("status tick", chat_id=-100, from_user_id=999)
-    assert adapter._should_observe_unmentioned_group_message(self_group) is False
-
-
-def test_missing_from_user_does_not_crash():
-    adapter = _make_adapter(require_mention=False)
-    anon = _group_message("channel post", chat_id=-100)
-    anon.from_user = None
-    assert adapter._should_process_message(anon) is True
-
-
 def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -803,6 +1090,12 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  observe_unmentioned_group_messages: true\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
+        "  require_mention_chats:\n"
+        "    - \"-456\"\n"
+        "  private_chats:\n"
+        "    - \"12345\"\n"
+        "  public_chats:\n"
+        "    - \"-789\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
         "  allowed_chats:\n"
@@ -815,48 +1108,45 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     )
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    # Clear the TELEGRAM_* vars this test exercises so a developer's ambient
-    # shell/.env values don't pre-empt the YAML→env bridge (env-over-YAML
-    # precedence, adapter.py::_apply_yaml_config). The authoritative assertions
-    # below read the returned config object, which is immune to env pollution
-    # from third-party import-time load_dotenv calls; see the note at the asserts.
-    for _var in (
-        "TELEGRAM_REQUIRE_MENTION",
-        "TELEGRAM_MENTION_PATTERNS",
-        "TELEGRAM_EXCLUSIVE_BOT_MENTIONS",
-        "TELEGRAM_GUEST_MODE",
-        "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES",
-        "TELEGRAM_FREE_RESPONSE_CHATS",
-        "TELEGRAM_ALLOWED_CHATS",
-        "TELEGRAM_GROUP_ALLOWED_CHATS",
-        "TELEGRAM_ALLOWED_TOPICS",
-    ):
-        monkeypatch.delenv(_var, raising=False)
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("TELEGRAM_MENTION_PATTERNS", raising=False)
+    monkeypatch.delenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", raising=False)
+    monkeypatch.delenv("TELEGRAM_GUEST_MODE", raising=False)
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_PRIVATE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_PUBLIC_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_TOPICS", raising=False)
 
     config = load_gateway_config()
 
-    # Assert against the returned config object — the authoritative result of the
-    # bridge. We deliberately do NOT assert on os.environ here: a third-party
-    # import (microsoft_teams/apps/app.py) runs load_dotenv(find_dotenv(usecwd=True))
-    # at import time, which walks up from cwd and can repopulate TELEGRAM_* vars
-    # from a developer's real ~/.hermes/.env, defeating the env-over-YAML bridge
-    # for any key present there. The PlatformConfig.extra values below are parsed
-    # straight from the test's config.yaml and are immune to that ambient leak.
     assert config is not None
+    assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION"] == "true"
+    assert __import__("os").environ["TELEGRAM_GUEST_MODE"] == "true"
+    assert __import__("os").environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "true"
+    assert __import__("os").environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] == "true"
+    assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
+    assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION_CHATS"] == "-456"
+    assert __import__("os").environ["TELEGRAM_PRIVATE_CHATS"] == "12345"
+    assert __import__("os").environ["TELEGRAM_PUBLIC_CHATS"] == "-789"
+    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_ALLOWED_CHATS"] == "-100"
+    assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
+    assert __import__("os").environ["TELEGRAM_ALLOWED_TOPICS"] == "8"
     tg_cfg = config.platforms.get(Platform.TELEGRAM)
     assert tg_cfg is not None
-    assert tg_cfg.extra.get("require_mention") is True
     assert tg_cfg.extra.get("guest_mode") is True
-    assert tg_cfg.extra.get("exclusive_bot_mentions") is True
-    assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
-    assert tg_cfg.extra.get("mention_patterns") == [r"^\s*chompy\b"]
+    assert tg_cfg.extra.get("require_mention_chats") == ["-456"]
+    assert tg_cfg.extra.get("private_chats") == ["12345"]
+    assert tg_cfg.extra.get("public_chats") == ["-789"]
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
-    # free_response_chats is bridged to the env var only (not PlatformConfig.extra).
-    # TELEGRAM_FREE_RESPONSE_CHATS is not a key that appears in developer .env
-    # files, so asserting it via os.environ stays deterministic.
-    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert tg_cfg.extra.get("exclusive_bot_mentions") is True
+    assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
@@ -884,13 +1174,7 @@ def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
     assert config is not None
     assert __import__("os").environ["TELEGRAM_ALLOWED_USERS"] == "111,222"
     assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_USERS"] == "333"
-    # group_allowed_chats via the config object, not os.environ: the
-    # microsoft_teams import-time load_dotenv(find_dotenv(usecwd=True)) can
-    # repopulate TELEGRAM_GROUP_ALLOWED_CHATS from a developer's real
-    # ~/.hermes/.env, which would defeat the env-over-YAML bridge here.
-    tg_cfg = config.platforms.get(Platform.TELEGRAM)
-    assert tg_cfg is not None
-    assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
+    assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
 
 
 def test_config_env_overrides_telegram_user_allowlists(monkeypatch, tmp_path):
@@ -976,33 +1260,6 @@ def test_top_level_require_mention_does_not_override_telegram_section(monkeypatc
     assert config is not None
     # The telegram-specific "false" must win over the top-level "true".
     assert __import__("os").environ.get("TELEGRAM_REQUIRE_MENTION") == "false"
-
-
-def test_config_bridges_telegram_free_response_topics(monkeypatch, tmp_path):
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text(
-        "telegram:\n"
-        "  free_response_topics:\n"
-        '    - "-1001234567:3"\n'
-        '    - "-1001234567:9"\n',
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_TOPICS", raising=False)
-
-    config = load_gateway_config()
-
-    assert config is not None
-    tg_cfg = config.platforms.get(Platform.TELEGRAM)
-    assert tg_cfg is not None
-    # free_response_topics is carried in PlatformConfig.extra (like guest_mode)
-    # AND bridged to the env var the adapter reads at runtime. The env var is
-    # not a key that appears in developer .env files, so asserting it via
-    # os.environ stays deterministic.
-    assert tg_cfg.extra.get("free_response_topics") == ["-1001234567:3", "-1001234567:9"]
-    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_TOPICS"] == "-1001234567:3,-1001234567:9"
 
 
 def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):
@@ -1381,7 +1638,7 @@ def test_unmentioned_large_document_observed_without_download(monkeypatch):
     asyncio.run(_run())
 
 
-def test_unmentioned_unsupported_document_observed_and_cached(monkeypatch):
+def test_unmentioned_unsupported_document_observed_without_caching(monkeypatch):
     async def _run():
         adapter = _make_adapter(
             require_mention=True, allowed_chats=["-100"],
@@ -1389,14 +1646,14 @@ def test_unmentioned_unsupported_document_observed_and_cached(monkeypatch):
         )
         store = _FakeSessionStore()
         adapter._session_store = store
-        cache_doc = Mock(return_value="/tmp/program.exe")
+        cache_doc = Mock(return_value="/tmp/malware.exe")
         monkeypatch.setattr("gateway.platforms.base.cache_document_from_bytes", cache_doc)
         file_obj = SimpleNamespace(
-            file_path="documents/program.exe",
+            file_path="documents/malware.exe",
             download_as_bytearray=AsyncMock(return_value=bytearray(b"MZ")),
         )
         document = SimpleNamespace(
-            file_name="program.exe", mime_type="application/x-msdownload",
+            file_name="malware.exe", mime_type="application/x-msdownload",
             file_size=2, get_file=AsyncMock(return_value=file_obj),
         )
         update = SimpleNamespace(
@@ -1405,10 +1662,8 @@ def test_unmentioned_unsupported_document_observed_and_cached(monkeypatch):
 
         await adapter._handle_media_message(update, SimpleNamespace())
 
-        # Any file type is now cached — authorization is the gate, not the
-        # extension. The observed message records a path-pointing note.
-        cache_doc.assert_called_once()
+        cache_doc.assert_not_called()
         _, message, _ = store.messages[0]
-        assert "program.exe" in message["content"]
+        assert "unsupported" in message["content"].lower()
 
     asyncio.run(_run())
