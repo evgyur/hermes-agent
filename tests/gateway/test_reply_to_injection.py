@@ -162,7 +162,9 @@ async def test_own_reply_context_is_appended_after_preprocessing():
 def test_gateway_appends_reply_context_after_inbound_preprocessing():
     """The model prompt must be built after reply preprocessing mutates the event."""
     source = inspect.getsource(GatewayRunner._handle_message_with_agent)
-    prepare_pos = source.index("message_text = await self._prepare_inbound_message_text(")
+    prepare_pos = source.index(
+        "message_text = await self._prepare_profile_scoped_inbound_message_text("
+    )
     append_pos = source.index(
         "context_prompt = _append_recent_context_prompt(context_prompt, event)"
     )

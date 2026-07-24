@@ -711,6 +711,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # as plain text, which is worse than degraded table/task-list rendering
         # for command snippets and mobile handoffs.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        rich_chat_ids = self.config.extra.get("rich_message_chats") or []
+        if isinstance(rich_chat_ids, str):
+            try:
+                decoded = json.loads(rich_chat_ids)
+                rich_chat_ids = decoded if isinstance(decoded, list) else [rich_chat_ids]
+            except Exception:
+                rich_chat_ids = [
+                    part.strip() for part in rich_chat_ids.split(",") if part.strip()
+                ]
+        self._rich_message_chat_ids = {
+            str(chat_id).strip() for chat_id in rich_chat_ids if str(chat_id).strip()
+        }
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
@@ -1661,7 +1673,10 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def prefers_fresh_final_streaming(
-        self, content: str, metadata: Optional[Dict[str, Any]] = None
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Whether to replace a streamed preview with a fresh rich final.
 
@@ -1673,6 +1688,13 @@ class TelegramAdapter(BasePlatformAdapter):
         ``editMessageText`` ``rich_message`` parameter (see
         :meth:`_try_edit_rich`), so no fresh re-send / delete is needed.
         """
+        private_chats = getattr(self, "_rich_message_chat_ids", set())
+        if private_chats:
+            return bool(
+                chat_id is not None
+                and str(chat_id) in private_chats
+                and self._rich_eligible(content)
+            )
         return False
 
     def streaming_overflow_limit(self) -> Optional[int]:
@@ -1706,10 +1728,35 @@ class TelegramAdapter(BasePlatformAdapter):
         multi-line content (slash-command lists, etc.) renders correctly
         in the rich-message path.  See ``_rich_normalize_linebreaks``.
         """
-        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
+        rich_markdown = self._rich_markdown_from_content(content)
+        payload: Dict[str, Any] = {
+            "markdown": (
+                rich_markdown
+                if "➊" in str(content or "")
+                else _rich_normalize_linebreaks(rich_markdown)
+            )
+        }
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
+
+    @staticmethod
+    def _rich_markdown_from_content(content: str) -> str:
+        """Convert Chipline numbered-section markers into rich headings."""
+        return re.sub(r"(?m)^➊\s+(.+)$", r"## \1", str(content or ""))
+
+    async def _edit_rich_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        result = await self._try_edit_rich(
+            chat_id, message_id, content, metadata=metadata
+        )
+        return result or SendResult(success=False, error="rich edit unavailable")
 
     def _is_rich_capability_error(self, exc: Exception) -> bool:
         """True ⇒ the rich endpoint itself is unavailable (old PTB/server).
@@ -4633,6 +4680,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         business_kwargs = self._business_connection_kwargs(metadata)
+
+        if (
+            finalize
+            and str(chat_id) in getattr(self, "_rich_message_chat_ids", set())
+            and "➊" in content
+        ):
+            return await self._edit_rich_message(
+                chat_id, message_id, content, metadata=metadata
+            )
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet

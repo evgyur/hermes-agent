@@ -2670,6 +2670,15 @@ def _format_status_count(value: Any) -> str:
     return f"{sign}{int(number):,}"
 
 
+def _append_recent_context_prompt(context_prompt: str, event: Any) -> str:
+    """Append ephemeral same-chat context without persisting it as history."""
+    recent_context = str(getattr(event, "recent_context", "") or "").strip()
+    if not recent_context:
+        return context_prompt
+    base = str(context_prompt or "").rstrip()
+    return f"{base}\n\n{recent_context}" if base else recent_context
+
+
 def _format_status_duration(seconds: Any) -> str:
     try:
         total = max(0, int(float(seconds or 0)))
@@ -8292,122 +8301,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
-
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
-
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or when the platform reconnects — the reconnect watcher
-        calls this again scoped to that ``platform``.
-
-        ``platform`` (a ``Platform``) restricts the pass to sessions that
-        originated on that platform.  The reconnect path passes it so a
-        platform coming back online retries only its own sessions and never
-        re-touches another platform's in-flight recoveries.  Sessions whose
-        agent is already running are skipped regardless, so a session
-        scheduled at startup is never resumed a second time.
-        """
-        window = _auto_continue_freshness_window()
+    def _mark_active_goal_resume_pending(self, entry: Any) -> None:
+        if getattr(entry, "resume_pending", False):
+            return
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            if self.session_store.mark_resume_pending(
+                entry.session_key, _STARTUP_GOAL_RECOVERY_REASON
+            ) is True:
+                return
+        except Exception as exc:
+            logger.debug("startup goal recovery: mark_resume_pending failed: %s", exc)
+        entry.resume_pending = True
+        entry.resume_reason = _STARTUP_GOAL_RECOVERY_REASON
+        entry.last_resume_marked_at = datetime.now()
+
+    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+        """Auto-continue fresh private active goals and safe pending sessions."""
+        generic_enabled = os.environ.get(
+            "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        try:
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
                 candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
+                    entry for entry in self.session_store._entries.values()
+                    if not getattr(entry, "suspended", False)
+                    and getattr(entry, "origin", None) is not None
+                    and (
+                        platform is None
+                        or getattr(entry.origin, "platform", None) == platform
+                    )
                 ]
         except Exception as exc:
-            logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
+            logger.warning("Failed to enumerate startup recovery sessions: %s", exc)
             return 0
 
-        # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
-        # boot when there are restart-interrupted sessions to resume — a clean
-        # boot must not accrue toward the breaker. If too many such boots have
-        # happened in the configured window, skip auto-resume for THIS boot:
-        # the gateway still comes up and serves real inbound messages, it just
-        # stops replaying the session that keeps killing it. The session stays
-        # resume_pending, so a real user message can still continue it (a human
-        # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
-        # this catches every other SIGTERM source (e.g. a raw `terminal(
-        # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
-            try:
-                from gateway import restart_loop_guard as _rlg
-
-                _max_restarts, _window = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window):
-                    return 0
-            except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
-                logger.debug("Restart-loop guard check skipped: %s", exc)
-
-        now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
+            decision = self._classify_startup_goal_recovery(
+                entry,
+                platform=platform,
+                generic_auto_resume_enabled=generic_enabled,
+            )
+            if decision.status == "skip":
                 continue
-
-            # Already being resumed (e.g. scheduled at startup and still
-            # in-flight) — don't synthesize a second continuation turn.
-            if entry.session_key in self._running_agents:
-                continue
-
             source = entry.origin
-            adapter = self._adapter_for_source(source)
-            if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
-                    entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
+            if decision.status == "alert_only":
+                self._schedule_startup_goal_recovery_alert(decision, source)
                 continue
-
-            # Validate the session owner against the current allowlist
-            # before auto-resuming. A session created before
-            # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
-            # before the owner was removed from it, must not silently
-            # receive a full agent response on gateway restart just
-            # because it has a resume-pending marker (issue #23778).
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                continue
             try:
                 if not self._is_user_authorized(source):
                     logger.warning(
-                        "Skipping auto-resume for %s: session owner is no "
-                        "longer authorized under the current allowlist",
+                        "Skipping startup recovery for unauthorized session %s",
                         entry.session_key,
                     )
                     continue
             except Exception as exc:
                 logger.warning(
-                    "Skipping auto-resume for %s: authorization check failed: %s",
-                    entry.session_key, exc,
+                    "Skipping startup recovery for %s: authorization check failed: %s",
+                    entry.session_key,
+                    exc,
                 )
                 continue
 
-            # Claim the session slot *before* spawning the task so that an
-            # inbound message arriving between task creation and the task's
-            # first await (where _process_message_background sets the real
-            # sentinel) sees the slot as occupied and queues behind it
-            # instead of spinning up a duplicate AIAgent (#45456).
             self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
-
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            if decision.goal_status == "active":
+                self._mark_active_goal_resume_pending(entry)
             event = MessageEvent(
-                text="",
+                text=decision.prompt or "",
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -8425,10 +8391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tasks.append(task)
             scheduled += 1
         if scheduled:
-            logger.info(
-                "Scheduled auto-resume for %d restart-interrupted session(s)",
-                scheduled,
-            )
+            logger.info("Scheduled startup recovery for %d session(s)", scheduled)
         return scheduled
 
     def _startup_should_abort(self) -> bool:
@@ -13292,9 +13255,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # guess (or answer for both subjects). Token overhead is minimal.
             reply_snippet = event.reply_to_text[:500]
             if getattr(event, "reply_to_is_own_message", False):
-                message_text = (
-                    f'[Replying to your previous message: "{reply_snippet}"]\n\n'
-                    f"{message_text}"
+                reply_note = (
+                    "[CURRENT TELEGRAM REPLY — use this context to interpret "
+                    "the current user message. The user replied to previous "
+                    f"bot/assistant message ID {event.reply_to_message_id}; "
+                    "the quoted text is NOT user-authored: "
+                    f'"{reply_snippet}"]'
+                )
+                existing_context = str(
+                    getattr(event, "recent_context", "") or ""
+                ).strip()
+                event.recent_context = (
+                    f"{existing_context}\n\n{reply_note}"
+                    if existing_context
+                    else reply_note
                 )
             else:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
@@ -14472,6 +14446,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
+
+        context_prompt = _append_recent_context_prompt(context_prompt, event)
 
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
