@@ -19966,6 +19966,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        if source.platform == Platform.TELEGRAM:
+            try:
+                telegram_cfg = user_config.get("telegram") or {}
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                private_raw = telegram_cfg.get("private_chats") or []
+                public_raw = telegram_cfg.get("public_chats") or []
+                if isinstance(private_raw, str):
+                    private_ids = {
+                        part.strip() for part in private_raw.split(",") if part.strip()
+                    }
+                else:
+                    private_ids = {
+                        str(part).strip() for part in private_raw if str(part).strip()
+                    }
+                if isinstance(public_raw, str):
+                    public_ids = {
+                        part.strip() for part in public_raw.split(",") if part.strip()
+                    }
+                else:
+                    public_ids = {
+                        str(part).strip() for part in public_raw if str(part).strip()
+                    }
+                if private_ids or public_ids:
+                    # Intent policy wins over Telegram's raw chat type: private
+                    # work groups can have negative IDs but still need progress.
+                    tool_progress_enabled = tool_progress_enabled and chat_id in private_ids
+            except Exception:
+                pass
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
