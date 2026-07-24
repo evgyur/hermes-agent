@@ -124,6 +124,17 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Internal agent-loop terminal states are diagnostics, not assistant prose.
+# Keep them available on local/programmatic surfaces while preventing raw
+# control-plane failures from becoming chat messages.
+_GATEWAY_INTERNAL_FAILURE_SENTINEL_RE = re.compile(
+    r"^\s*(?:"
+    r"Codex\s+response\s+remained\s+incomplete\s+after\s+\d+\s+continuation\s+attempts"
+    r"|Incomplete\s+REASONING_SCRATCHPAD\s+after\s+\d+\s+retries"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
 # diagnostics, API JSON, webhook payloads) and therefore must keep RAW
 # status/error text. EVERY other platform is a human-facing chat surface
@@ -517,6 +528,9 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
+    if _GATEWAY_INTERNAL_FAILURE_SENTINEL_RE.match(str(text)):
+        return ""
+
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
@@ -536,6 +550,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if _GATEWAY_INTERNAL_FAILURE_SENTINEL_RE.match(text):
+        return None
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
