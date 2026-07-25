@@ -175,7 +175,13 @@ def _read_bounded_body(
                 raise _TotalDeadlineExceeded
             _set_raw_read_timeout(response, remaining)
             try:
-                chunk = response.raw.read(_READ_CHUNK_BYTES, decode_content=True)
+                read1 = getattr(response.raw, "read1", None)
+                if callable(read1):
+                    chunk = read1(_READ_CHUNK_BYTES, decode_content=True)
+                else:
+                    chunk = response.raw.read(
+                        _READ_CHUNK_BYTES, decode_content=True
+                    )
             except Exception as exc:
                 if deadline_fired.is_set() or time.monotonic() >= deadline:
                     raise _TotalDeadlineExceeded from exc
@@ -201,11 +207,18 @@ def _parse_json(body: bytes) -> Any:
 
 def _gateway_error_type(status_code: int, body: bytes) -> str:
     code = ""
+    detail_text = ""
     try:
         payload = _parse_json(body)
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error, dict) and isinstance(error.get("code"), str):
-            code = error["code"]
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+            if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+                code = detail["code"]
+            elif isinstance(detail, str):
+                detail_text = detail.lower()
+            error = payload.get("error")
+            if not code and isinstance(error, dict) and isinstance(error.get("code"), str):
+                code = error["code"]
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
 
@@ -222,7 +235,11 @@ def _gateway_error_type(status_code: int, body: bytes) -> str:
             return code
         return "conflict"
     if status_code == 429:
-        return "capacity_rejected" if code == "capacity_rejected" else "rate_limited"
+        if code == "capacity_rejected" or "capacity exceeded" in detail_text:
+            return "capacity_rejected"
+        return "rate_limited"
+    if 300 <= status_code < 400:
+        return "protocol_error"
     if status_code == 502:
         return "upstream_error"
     if status_code == 503:
@@ -524,6 +541,7 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
                     read=remaining,
                 ),
                 stream=True,
+                allow_redirects=False,
             )
             max_body = (
                 _MAX_SUCCESS_BODY_BYTES
@@ -587,6 +605,7 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
                 "upstream_error": "Image generation upstream failed",
                 "upstream_unavailable": "Image generation upstream is unavailable",
                 "timeout": "Image generation upstream timed out",
+                "protocol_error": "Human20 Keys returned an unexpected redirect",
                 "api_error": "Human20 Keys image generation request failed",
             }
             return error_response(

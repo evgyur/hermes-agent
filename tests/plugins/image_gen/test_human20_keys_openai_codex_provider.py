@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import importlib
 import json
@@ -32,6 +34,23 @@ def _png_b64(size=(1024, 1024)) -> str:
 
 
 _PNG = _png_b64()
+
+
+@contextmanager
+def _serve(handler_type):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_type)
+    server.daemon_threads = True
+    thread = threading.Thread(
+        target=lambda: server.serve_forever(poll_interval=0.01), daemon=True
+    )
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -128,6 +147,7 @@ def test_generate_posts_exact_gateway_request_and_persists_png(
         "n": 1,
     }
     assert post.call_args.kwargs["stream"] is True
+    assert post.call_args.kwargs["allow_redirects"] is False
     timeout = post.call_args.kwargs["timeout"]
     assert 0 < timeout.total <= 330
     assert 0 < timeout.connect_timeout <= 30
@@ -237,18 +257,56 @@ def test_timeout_is_standard_error(provider, monkeypatch):
 def test_gateway_status_and_code_mapping_is_sanitized(
     provider, monkeypatch, status_code, code, error_type
 ):
-    response = _response(
-        status_code=status_code,
-        payload={"error": {"code": code, "message": "contains customer-secret"}},
-        text="contains customer-secret",
-    )
-    monkeypatch.setattr(provider_module.requests, "post", MagicMock(return_value=response))
+    if status_code == 409:
+        detail = {"code": code, "request_id": "req-original"}
+    elif status_code == 429 and code == "capacity_rejected":
+        detail = "image generation capacity exceeded"
+    else:
+        detail = "contains customer-secret"
+    body = json.dumps({"detail": detail}).encode()
 
-    result = provider.generate("a lighthouse")
+    class ErrorHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with _serve(ErrorHandler) as root:
+        monkeypatch.setenv("H20_KEYS_BASE_URL", f"{root}/v1")
+        result = provider.generate("a lighthouse")
 
     assert result["success"] is False
     assert result["error_type"] == error_type
     assert "customer-secret" not in result["error"]
+
+
+def test_fastapi_capacity_detail_maps_to_capacity_rejected(provider, monkeypatch):
+    body = json.dumps({"detail": "image generation capacity exceeded"}).encode()
+
+    class CapacityHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with _serve(CapacityHandler) as root:
+        monkeypatch.setenv("H20_KEYS_BASE_URL", f"{root}/v1")
+        result = provider.generate("a lighthouse")
+    assert result["error_type"] == "capacity_rejected"
 
 
 def test_empty_or_invalid_image_response_fails_safely(provider, monkeypatch):
@@ -416,6 +474,124 @@ def test_bounded_reader_interrupts_blocked_read_at_total_deadline():
 
     assert time.monotonic() - started < 0.5
     assert response.close.called
+
+
+def test_real_http_steady_drip_obeys_total_deadline(provider, monkeypatch):
+    disconnected = threading.Event()
+
+    class DripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for byte in b'{"data":[{"b64_json":"' + (b"A" * 1000):
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected.set()
+
+    monkeypatch.setattr(provider_module, "_TIMEOUT_SECONDS", 0.25)
+    before_non_daemon = {
+        thread.ident for thread in threading.enumerate() if not thread.daemon
+    }
+    with _serve(DripHandler) as root:
+        monkeypatch.setenv("H20_KEYS_BASE_URL", f"{root}/v1")
+        started = time.monotonic()
+        result = provider.generate("a lighthouse")
+        elapsed = time.monotonic() - started
+
+    assert result["error_type"] == "timeout"
+    assert elapsed < 1.0
+    assert disconnected.wait(timeout=1.0)
+    after_non_daemon = {
+        thread.ident for thread in threading.enumerate() if not thread.daemon
+    }
+    assert after_non_daemon == before_non_daemon
+
+
+def test_real_http_large_bounded_body_streams_successfully(provider, monkeypatch):
+    body = json.dumps(
+        {
+            "created": 1,
+            "data": [{"b64_json": _PNG}],
+            "padding": "x" * (1024 * 1024),
+        }
+    ).encode()
+
+    class LargeHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with _serve(LargeHandler) as root:
+        monkeypatch.setenv("H20_KEYS_BASE_URL", f"{root}/v1")
+        result = provider.generate("a lighthouse", aspect_ratio="square")
+
+    assert result["success"] is True
+
+
+@pytest.mark.parametrize("redirect_status", [302, 307, 308])
+def test_redirect_is_not_followed_or_replayed(
+    provider, monkeypatch, redirect_status
+):
+    target_contacted = threading.Event()
+    replayed_bodies = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def _contacted(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            replayed_bodies.append(self.rfile.read(length))
+            target_contacted.set()
+            self.send_response(502)
+            self.end_headers()
+
+        do_GET = _contacted
+        do_POST = _contacted
+
+    with _serve(TargetHandler) as target_root:
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                self.send_response(redirect_status)
+                self.send_header(
+                    "Location", f"{target_root}/v1/images/generations"
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        with _serve(RedirectHandler) as redirect_root:
+            monkeypatch.setenv("H20_KEYS_BASE_URL", f"{redirect_root}/v1")
+            result = provider.generate("never replay this prompt")
+
+    assert result["error_type"] == "protocol_error"
+    assert not target_contacted.is_set()
+    assert replayed_bodies == []
 
 
 def test_bounded_reader_rejects_oversize_before_buffering():
