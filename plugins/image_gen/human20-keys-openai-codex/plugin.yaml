@@ -1,0 +1,8 @@
+name: human20-keys-openai-codex
+version: 1.0.0
+description: "Text-only gpt-image-2 generation through Human20 Keys. Saves generated PNGs to $HERMES_HOME/cache/images/."
+author: Human20
+kind: backend
+requires_env:
+  - H20_KEYS_BASE_URL
+  - H20_KEYS_API_KEY
