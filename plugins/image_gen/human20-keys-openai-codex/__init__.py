@@ -131,6 +131,17 @@ class _ResponseTooLarge(ValueError):
     pass
 
 
+def _close_response_quietly(response: requests.Response) -> None:
+    """Close a response without exposing teardown exception contents."""
+    try:
+        response.close()
+    except Exception:
+        # Cleanup failures can contain transport/request details. The response
+        # has already been classified, and the deadline socket timeout remains
+        # the final backstop, so never replace or leak the original result.
+        pass
+
+
 def _set_raw_read_timeout(response: requests.Response, seconds: float) -> None:
     """Best-effort reduction of the live socket timeout to the remaining budget."""
     try:
@@ -156,10 +167,7 @@ def _read_bounded_body(
 
     def abort_at_deadline() -> None:
         deadline_fired.set()
-        try:
-            response.close()
-        except Exception:
-            pass
+        _close_response_quietly(response)
 
     watchdog: Optional[threading.Timer] = None
     if math.isfinite(initial_remaining):
@@ -588,7 +596,7 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
             )
         finally:
             if response is not None:
-                response.close()
+                _close_response_quietly(response)
 
         if response.status_code != 200:
             error_type = _gateway_error_type(response.status_code, raw_body)

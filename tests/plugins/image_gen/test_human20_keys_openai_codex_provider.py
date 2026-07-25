@@ -624,6 +624,82 @@ def test_stream_read_timeout_is_mapped_to_timeout(provider, monkeypatch):
     assert response.close.called
 
 
+def test_close_error_does_not_override_success(provider, monkeypatch):
+    response = _response(payload={"data": [{"b64_json": _PNG}]})
+    response.close.side_effect = RuntimeError("secret-bearing close failure")
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("a lighthouse", aspect_ratio="square")
+
+    assert result["success"] is True
+
+
+def test_close_error_does_not_override_mapped_http_error(provider, monkeypatch):
+    response = _response(
+        status_code=402,
+        payload={"detail": "insufficient credits"},
+    )
+    response.close.side_effect = RuntimeError("secret-bearing close failure")
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("a lighthouse")
+
+    assert result["error_type"] == "insufficient_credits"
+
+
+def test_close_error_does_not_override_read_timeout(provider, monkeypatch):
+    response = _response(payload={"data": []})
+    response.raw.read = MagicMock(
+        side_effect=ReadTimeoutError(None, None, "read timed out")
+    )
+    response.close.side_effect = RuntimeError("secret-bearing close failure")
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("a lighthouse")
+
+    assert result["error_type"] == "timeout"
+
+
+def test_concurrent_watchdog_double_close_preserves_timeout_without_secret_log(
+    provider, monkeypatch, caplog
+):
+    closed = threading.Event()
+    close_calls = 0
+
+    class BlockingRaw:
+        def read1(self, _size, decode_content=True):
+            closed.wait(timeout=1.0)
+            return b""
+
+    response = _response(payload={"data": []})
+    response.raw = BlockingRaw()
+
+    def close():
+        nonlocal close_calls
+        close_calls += 1
+        closed.set()
+        if close_calls > 1:
+            raise RuntimeError("secret-bearing close failure")
+
+    response.close.side_effect = close
+    monkeypatch.setattr(provider_module, "_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("a lighthouse")
+
+    assert result["error_type"] == "timeout"
+    assert close_calls >= 2
+    assert "secret-bearing close failure" not in caplog.text
+
+
 def test_atomic_persistence_cleans_temp_file_on_replace_failure(
     monkeypatch, tmp_path
 ):
