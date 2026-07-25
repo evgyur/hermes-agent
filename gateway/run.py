@@ -80,6 +80,11 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# ContextCompressor gives compression auxiliaries a 300s minimum deadline for
+# large summaries. Gateway hygiene wraps that same worker in asyncio.wait_for;
+# its default must cover the worker's budget or a healthy 30s+ summary is
+# reported as failed while the shielded thread keeps running in the background.
+_HYG_COMPRESSION_TIMEOUT_SECS_DEFAULT = 300.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -13917,7 +13922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
-            _hyg_timeout_seconds = 30.0
+            _hyg_timeout_seconds = _HYG_COMPRESSION_TIMEOUT_SECS_DEFAULT
             _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
             _hyg_provider = None

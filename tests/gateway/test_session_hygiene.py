@@ -84,6 +84,18 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
 
+
+def test_hygiene_default_timeout_covers_auxiliary_compression_budget():
+    """Gateway must not abandon a healthy summary worker before its own deadline."""
+    gateway_run = importlib.import_module("gateway.run")
+    from agent.auxiliary_client import _COMPRESSION_TIMEOUT_FLOOR_SECONDS
+
+    assert (
+        gateway_run._HYG_COMPRESSION_TIMEOUT_SECS_DEFAULT
+        >= _COMPRESSION_TIMEOUT_FLOOR_SECONDS
+    )
+
+
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.
 
