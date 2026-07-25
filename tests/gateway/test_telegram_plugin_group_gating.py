@@ -8,7 +8,7 @@ TARGET_CHAT = -1003770669948
 BOT_ID = 8928336881
 
 
-def _message(text="hello", *, chat_id=TARGET_CHAT, reply_to_bot=False):
+def _message(text="hello", *, chat_id=TARGET_CHAT, thread_id=5391, reply_to_bot=False):
     reply = None
     if reply_to_bot:
         reply = SimpleNamespace(from_user=SimpleNamespace(id=BOT_ID, is_bot=True))
@@ -20,12 +20,18 @@ def _message(text="hello", *, chat_id=TARGET_CHAT, reply_to_bot=False):
         caption=None,
         entities=[],
         caption_entities=[],
-        message_thread_id=5391,
+        message_thread_id=thread_id,
         reply_to_message=reply,
     )
 
 
-def _adapter():
+def _adapter(
+    *,
+    require_mention_chats=None,
+    require_mention_topics=None,
+    reply_trigger_disabled_chats=None,
+    free_response_chats=None,
+):
     module = load_plugin_adapter("telegram")
     adapter = object.__new__(module.TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -34,9 +40,14 @@ def _adapter():
         token="***",
         extra={
             "require_mention": False,
-            "require_mention_chats": [str(TARGET_CHAT)],
-            "reply_trigger_disabled_chats": [str(TARGET_CHAT)],
-            "free_response_chats": [],
+            "require_mention_chats": [str(TARGET_CHAT)] if require_mention_chats is None else require_mention_chats,
+            "require_mention_topics": [] if require_mention_topics is None else require_mention_topics,
+            "reply_trigger_disabled_chats": (
+                [str(TARGET_CHAT)]
+                if reply_trigger_disabled_chats is None
+                else reply_trigger_disabled_chats
+            ),
+            "free_response_chats": [] if free_response_chats is None else free_response_chats,
             "allowed_chats": [],
             "allowed_topics": [],
             "ignored_threads": [],
@@ -64,3 +75,17 @@ def test_live_plugin_policy_is_scoped_to_configured_chat():
     adapter = _adapter()
 
     assert adapter._should_process_message(_message("обычное сообщение", chat_id=-100999)) is True
+
+
+def test_live_plugin_topic_gate_overrides_free_response_chat():
+    adapter = _adapter(
+        require_mention_chats=[],
+        require_mention_topics=[f"{TARGET_CHAT}:14804"],
+        reply_trigger_disabled_chats=[],
+        free_response_chats=[str(TARGET_CHAT)],
+    )
+
+    assert adapter._should_process_message(_message("обычное сообщение", thread_id=14804)) is False
+    assert adapter._should_process_message(_message("ответ", thread_id=14804, reply_to_bot=True)) is True
+    assert adapter._should_process_message(_message("@Human20Bot вопрос", thread_id=14804)) is True
+    assert adapter._should_process_message(_message("обычное сообщение", thread_id=5413)) is True

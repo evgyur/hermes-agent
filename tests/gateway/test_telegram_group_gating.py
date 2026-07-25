@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     require_mention_chats=None,
+    require_mention_topics=None,
     reply_trigger_disabled_chats=None,
     free_response_chats=None,
     free_response_topics=None,
@@ -35,6 +36,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if require_mention_chats is not None:
         extra["require_mention_chats"] = require_mention_chats
+    if require_mention_topics is not None:
+        extra["require_mention_topics"] = require_mention_topics
     if reply_trigger_disabled_chats is not None:
         extra["reply_trigger_disabled_chats"] = reply_trigger_disabled_chats
     if free_response_chats is not None:
@@ -949,6 +952,50 @@ def test_free_response_topics_bypass_mention_requirement_only_for_that_topic():
         )
     ) is True
     assert adapter._should_process_message(_group_message("plain", chat_id=-201, thread_id=777)) is False
+
+
+def test_require_mention_topics_override_free_response_chat_only_for_that_topic():
+    adapter = _make_adapter(
+        require_mention=False,
+        free_response_chats=["-200"],
+        require_mention_topics=["-200:777"],
+    )
+
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=777)) is False
+    assert adapter._should_process_message(
+        _group_message("reply", chat_id=-200, thread_id=777, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            thread_id=777,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200, thread_id=778)) is True
+
+
+def test_config_bridges_require_mention_topics(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  require_mention_topics:\n"
+        "    - -1003770669948:14804\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION_TOPICS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION_TOPICS"] == "-1003770669948:14804"
+    assert config.platforms[Platform.TELEGRAM].extra["require_mention_topics"] == [
+        "-1003770669948:14804"
+    ]
 
 
 def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():

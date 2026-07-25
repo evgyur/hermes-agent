@@ -1666,6 +1666,7 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(telegram_cfg, dict):
                 for config_key, env_name in (
                     ("require_mention_chats", "TELEGRAM_REQUIRE_MENTION_CHATS"),
+                    ("require_mention_topics", "TELEGRAM_REQUIRE_MENTION_TOPICS"),
                     ("reply_trigger_disabled_chats", "TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS"),
                     ("private_chats", "TELEGRAM_PRIVATE_CHATS"),
                     ("public_chats", "TELEGRAM_PUBLIC_CHATS"),
