@@ -1711,6 +1711,43 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_terminal_progress_can_use_compact_one_line(monkeypatch, tmp_path):
+    """Per-platform config restores the historical compact terminal preview."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TerminalCommandAgent,
+        session_id="sess-terminal-compact-line",
+        config_data={
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "tool_progress": "all",
+                        "tool_preview_length": 120,
+                        "tool_progress_code_blocks": False,
+                    }
+                }
+            }
+        },
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="",
+        adapter_cls=CodeBlockProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    assert "```" not in all_content
+    assert "set -euo pipefail" in all_content
+    assert "node --version" in all_content
+    assert all(
+        "\n" not in call["content"] for call in [*adapter.sent, *adapter.edits]
+    )
+
+
+@pytest.mark.asyncio
 async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
     """Verbose mode on a markdown-capable gateway renders the FULL multi-line
     command in a bare fenced block (no truncation, no 'bash' tag).  This is the

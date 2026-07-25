@@ -21693,6 +21693,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _progress_adapter = None
             if (
                 getattr(_progress_adapter, "supports_code_blocks", False)
+                and bool(
+                    resolve_display_setting(
+                        user_config,
+                        platform_key,
+                        "tool_progress_code_blocks",
+                        True,
+                    )
+                )
                 and tool_name == "terminal"
                 and isinstance(args, dict)
                 and isinstance(args.get("command"), str)
@@ -21758,6 +21766,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     tool_verb_connector,
                     verb_drops_preview,
                 )
+                # Compact mode is intentionally one physical line. Terminal
+                # previews may contain a multi-line shell script, so collapse
+                # whitespace before applying the configured cap.
+                if tool_name == "terminal":
+                    preview = " ".join(str(preview).split())
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:

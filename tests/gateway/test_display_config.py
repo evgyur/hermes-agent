@@ -72,6 +72,21 @@ class TestResolveDisplaySetting:
 
         assert resolve_display_setting(config, "telegram", "busy_steer_ack_enabled", True) is False
 
+    def test_tool_progress_code_blocks_can_be_disabled_per_platform(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {"tool_progress_code_blocks": False},
+                }
+            }
+        }
+
+        assert resolve_display_setting(
+            config, "telegram", "tool_progress_code_blocks"
+        ) is False
+
     def test_fallback_parameter_used_last(self):
         """Explicit fallback is used when nothing else matches."""
         from gateway.display_config import resolve_display_setting
