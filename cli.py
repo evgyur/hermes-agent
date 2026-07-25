@@ -9500,9 +9500,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
+                    import shlex
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        env = os.environ.copy()
+                        env["HERMES_COMMAND_NAME"] = base_cmd.lstrip("/")
+                        env["HERMES_COMMAND_ARGS"] = user_args
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
@@ -9510,7 +9520,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # quick commands run in the CLI process which
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            sanitized_env = _sanitize_subprocess_env(env)
                             from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,

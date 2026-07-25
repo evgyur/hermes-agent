@@ -12638,12 +12638,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        env = os.environ.copy()
+                        env["HERMES_COMMAND_NAME"] = command
+                        env["HERMES_COMMAND_ARGS"] = user_args
+
+                        # Preserve the inbound return route for detached quick-command
+                        # workers/notifiers.  Without this, jobs can complete with no
+                        # way to deliver their result to the originating chat/topic.
+                        source_platform = getattr(source, "platform", "")
+                        origin_platform = getattr(source_platform, "value", source_platform)
+                        env["HERMES_ORIGIN_PLATFORM"] = str(origin_platform or "")
+                        env["HERMES_ORIGIN_CHAT_ID"] = str(
+                            getattr(source, "chat_id", "") or ""
+                        )
+                        origin_thread_id = getattr(source, "thread_id", None)
+                        if origin_thread_id is not None:
+                            env["HERMES_ORIGIN_THREAD_ID"] = str(origin_thread_id)
+                        else:
+                            env.pop("HERMES_ORIGIN_THREAD_ID", None)
+
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            sanitized_env = _sanitize_subprocess_env(env)
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
