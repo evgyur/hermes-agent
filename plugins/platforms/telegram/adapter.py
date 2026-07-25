@@ -1321,7 +1321,12 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return any(os.getenv(key, "").strip() for key in keys)
 
-    def _is_user_authorized_from_message(self, message: Message) -> bool:
+    def _is_user_authorized_from_message(
+        self,
+        message: Message,
+        *,
+        team_membership_prechecked: bool = False,
+    ) -> bool:
         """Check if the sender of a Telegram message is authorized.
 
         Intake prefilter that runs BEFORE text batching, event construction,
@@ -1339,6 +1344,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # they carry no authorizable identity, so let the normal
         # _should_process_message gating handle them.
         if not user_id:
+            return True
+
+        # Every production message handler runs the async team-membership gate
+        # immediately before this legacy prefilter. When that complete
+        # authority is active and has already allowed the message, do not ask
+        # the runner to authorize a fresh, unstamped SessionSource a second
+        # time: the runner correctly fails closed on the missing stamp.
+        if (
+            team_membership_prechecked
+            and getattr(self, "_team_membership_policy", None) is not None
+        ):
             return True
 
         # Adapter-level allow_from / group_allow_from: when set, they are the
@@ -8828,7 +8844,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # text batching, observe-buffer persistence, event building, or response
         # generation. This prevents removed/blocked users from injecting prompts
         # into the agent path or the observed transcript context (#40863).
-        if not self._is_user_authorized_from_message(msg):
+        if not self._is_user_authorized_from_message(
+            msg, team_membership_prechecked=True
+        ):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
                 getattr(getattr(msg, "from_user", None), "id", None),
@@ -8856,7 +8874,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg, is_command=True):
             return
-        if not self._is_user_authorized_from_message(msg):
+        if not self._is_user_authorized_from_message(
+            msg, team_membership_prechecked=True
+        ):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
                 getattr(getattr(msg, "from_user", None), "id", None),
@@ -8878,7 +8898,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not await self._team_membership_allows_message(msg):
             return
-        if not self._is_user_authorized_from_message(msg):
+        if not self._is_user_authorized_from_message(
+            msg, team_membership_prechecked=True
+        ):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
                 getattr(getattr(msg, "from_user", None), "id", None),
@@ -9084,7 +9106,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not await self._team_membership_allows_message(update.message):
             return
-        if not self._is_user_authorized_from_message(update.message):
+        if not self._is_user_authorized_from_message(
+            update.message, team_membership_prechecked=True
+        ):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
                 getattr(getattr(update.message, "from_user", None), "id", None),

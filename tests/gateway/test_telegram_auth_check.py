@@ -228,6 +228,44 @@ def test_is_user_authorized_from_message_group_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+@pytest.mark.asyncio
+async def test_team_membership_allow_is_not_rejected_by_legacy_dm_allowlist(monkeypatch):
+    """A team-authorized group sender must not be re-checked as a legacy DM user."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    adapter = _make_adapter()
+    adapter._team_membership_policy = object()
+    adapter._team_membership_allows_message = AsyncMock(return_value=True)
+
+    class Runner:
+        def _is_user_authorized(self, source):
+            # The production runner requires a membership stamp that the
+            # message-level prefilter does not carry.
+            return bool(source.telegram_team_membership_authorized)
+
+        async def handle(self, event):
+            return None
+
+    adapter._message_handler = Runner().handle
+    build_called = False
+    original_build = adapter._build_message_event
+
+    def track_build(*args, **kwargs):
+        nonlocal build_called
+        build_called = True
+        return original_build(*args, **kwargs)
+
+    adapter._build_message_event = track_build
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(from_user_id=244, chat_id=-100, chat_type="supergroup"),
+        effective_message=None,
+    )
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+    assert build_called is True
+
+
 def test_group_message_uses_group_allow_from_without_granting_dm_access():
     """Group-only senders must pass intake without inheriting DM access."""
     adapter = _make_adapter(
