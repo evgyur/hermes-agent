@@ -7656,6 +7656,26 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_topics(self) -> set[str]:
+        """Return topic-level mention/reply gates as ``<chat_id>:<thread_id>``."""
+        raw = self.config.extra.get("require_mention_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_TOPICS", "")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_is_require_mention_topic(self, message: Message) -> bool:
+        topics = self._telegram_require_mention_topics()
+        if not topics:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not chat_id:
+            return False
+        thread_id = self._effective_message_thread_id(message)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return f"{chat_id}:{topic_id}" in topics
+
     def _telegram_chat_requires_mention(self, chat_id: str) -> bool:
         if str(chat_id) in self._telegram_require_mention_chats():
             return True
@@ -8082,12 +8102,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
-            return False
-        if self._telegram_is_free_response_topic(message):
-            return False
-        if not self._telegram_chat_requires_mention(chat_id_str):
-            return False
+        topic_requires_mention = self._telegram_is_require_mention_topic(message)
+        if not topic_requires_mention:
+            if chat_id_str in self._telegram_free_response_chats():
+                return False
+            if self._telegram_is_free_response_topic(message):
+                return False
+            if not self._telegram_chat_requires_mention(chat_id_str):
+                return False
         if self._is_reply_to_bot(message):
             return False
         if self._message_mentions_bot(message):
@@ -8480,12 +8502,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_free_response_chats():
-            return True
-        if self._telegram_is_free_response_topic(message):
-            return True
-        if not self._telegram_chat_requires_mention(chat_id_str):
-            return True
+        topic_requires_mention = self._telegram_is_require_mention_topic(message)
+        if not topic_requires_mention:
+            if chat_id_str in self._telegram_free_response_chats():
+                return True
+            if self._telegram_is_free_response_topic(message):
+                return True
+            if not self._telegram_chat_requires_mention(chat_id_str):
+                return True
         if self._is_reply_to_bot(message):
             return True
         # When guest_mode is True, _is_guest_mention already called
@@ -9759,6 +9783,11 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(frt, list):
             frt = ",".join(str(v) for v in frt)
         os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(frt)
+    rmt = telegram_cfg.get("require_mention_topics")
+    if rmt is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION_TOPICS"):
+        if isinstance(rmt, list):
+            rmt = ",".join(str(v) for v in rmt)
+        os.environ["TELEGRAM_REQUIRE_MENTION_TOPICS"] = str(rmt)
     ac = telegram_cfg.get("allowed_chats")
     if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
         if isinstance(ac, list):
@@ -9811,7 +9840,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(group_allowed_chats, list):
             group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
         os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
+    for _key in (
+        "guest_mode",
+        "disable_link_previews",
+        "observe_unmentioned_group_messages",
+        "free_response_topics",
+        "require_mention_topics",
+    ):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
     # Pass through telegram-specific extra keys (e.g. base_url proxy override),
