@@ -116,6 +116,35 @@ def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageE
 
 
 @pytest.mark.asyncio
+async def test_non_dm_message_does_not_wait_for_topic_recovery_executor(monkeypatch):
+    """Group quick commands must not queue behind the shared thread pool.
+
+    Topic recovery only applies to Telegram DM topic mode.  Offloading the
+    no-op check for every group message makes ingress wait behind unrelated
+    sync tools when the default executor is saturated.
+    """
+    adapter = _make_adapter()
+    adapter.set_topic_recovery_fn(MagicMock(return_value=None))
+    executor_called = False
+    never_release = asyncio.Event()
+
+    async def _blocked_to_thread(*args, **kwargs):
+        nonlocal executor_called
+        executor_called = True
+        await never_release.wait()
+
+    monkeypatch.setattr(asyncio, "to_thread", _blocked_to_thread)
+
+    await asyncio.wait_for(
+        adapter.handle_message(_make_event("/hype", chat_type="group")),
+        timeout=0.1,
+    )
+    await asyncio.sleep(0)
+
+    assert executor_called is False
+
+
+@pytest.mark.asyncio
 async def test_rapid_text_followups_accumulate_instead_of_replacing():
     """Rapid TEXT follow-ups must all survive in the pending event."""
     adapter = _make_adapter()

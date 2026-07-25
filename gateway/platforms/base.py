@@ -4879,11 +4879,24 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
-        # Rewrite ``event.source.thread_id`` via the installed recovery hook
-        # (Telegram DM topic mode) so the session key, guard checks, and
-        # downstream delivery all agree on the same lane.
-        # Offloaded: the sync hook must not block the loop.
-        await asyncio.to_thread(self._apply_topic_recovery, event)
+        # Telegram topic recovery only applies to private DM topic lanes.  Do
+        # not submit the no-op check for group/forum/channel traffic to the
+        # shared default executor: when sync tools saturate that pool, even an
+        # exec quick command such as /hype can otherwise sit at ingress for
+        # tens of seconds before its background task is spawned.
+        source = getattr(event, "source", None)
+        source_platform = getattr(
+            getattr(source, "platform", None),
+            "value",
+            getattr(source, "platform", None),
+        )
+        needs_topic_recovery = (
+            getattr(self, "_topic_recovery_fn", None) is not None
+            and source_platform == "telegram"
+            and getattr(source, "chat_type", None) == "dm"
+        )
+        if needs_topic_recovery:
+            await asyncio.to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
