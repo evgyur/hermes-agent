@@ -7716,6 +7716,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_ignore_other_bot_replies_chats(self) -> set[str]:
+        """Chats where replies to another bot are routed away from this bot."""
+        raw = self.config.extra.get("ignore_other_bot_replies_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_IGNORE_OTHER_BOT_REPLIES_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -8037,6 +8046,23 @@ class TelegramAdapter(BasePlatformAdapter):
         mentioned_bot_usernames = self._extract_bot_mention_usernames(message)
         return bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
 
+    def _other_bot_reply_excludes_self(self, message: Any, chat_id: str) -> bool:
+        """True when a scoped group reply addresses another bot, not this one.
+
+        An explicit mention of this bot wins, allowing users to invite it into a
+        thread that started as a reply to another bot. Otherwise the message is
+        rejected before observation or LLM dispatch.
+        """
+        if str(chat_id) not in self._telegram_ignore_other_bot_replies_chats():
+            return False
+        if not self._bot or self._message_mentions_bot(message):
+            return False
+        reply = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply, "from_user", None) if reply else None
+        if not reply_user or not getattr(reply_user, "is_bot", False):
+            return False
+        return getattr(reply_user, "id", None) != getattr(self._bot, "id", None)
+
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
             return False
@@ -8087,6 +8113,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if self._other_bot_reply_excludes_self(message, chat_id_str):
+            return False
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -8486,6 +8514,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
+        if self._other_bot_reply_excludes_self(message, chat_id_str):
+            return False
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 

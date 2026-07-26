@@ -8,10 +8,12 @@ TARGET_CHAT = -200
 BOT_ID = 999
 
 
-def _message(text="hello", *, thread_id=777, reply_to_bot=False):
+def _message(text="hello", *, thread_id=777, reply_to_bot=False, reply_to_other_bot=False):
     reply = None
     if reply_to_bot:
         reply = SimpleNamespace(from_user=SimpleNamespace(id=BOT_ID, is_bot=True))
+    elif reply_to_other_bot:
+        reply = SimpleNamespace(from_user=SimpleNamespace(id=555, is_bot=True))
     return SimpleNamespace(
         chat=SimpleNamespace(id=TARGET_CHAT, type="supergroup", is_forum=True),
         from_user=SimpleNamespace(id=111, is_bot=False, username="alice"),
@@ -42,6 +44,7 @@ def _adapter():
             "ignored_threads": [],
             "guest_mode": False,
             "exclusive_bot_mentions": True,
+            "ignore_other_bot_replies_chats": [str(TARGET_CHAT)],
             "mention_patterns": [r"@testbot\b"],
         },
     )
@@ -57,3 +60,17 @@ def test_plugin_topic_gate_overrides_free_response_chat():
     assert adapter._should_process_message(_message("reply", thread_id=777, reply_to_bot=True)) is True
     assert adapter._should_process_message(_message("@testbot question", thread_id=777)) is True
     assert adapter._should_process_message(_message("plain", thread_id=778)) is True
+
+
+def test_plugin_free_response_chat_ignores_other_bot_replies():
+    adapter = _adapter()
+
+    assert adapter._should_process_message(
+        _message("reply to other", thread_id=778, reply_to_other_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _message("reply to self", thread_id=778, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _message("@testbot join", thread_id=778, reply_to_other_bot=True)
+    ) is True
