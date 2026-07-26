@@ -12254,6 +12254,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not self._ensure_runtime_credentials():
             return None
 
+        skill_reasoning_override = None
+        if isinstance(message, str):
+            try:
+                from agent.skill_commands import writing_skill_reasoning_config
+
+                skill_reasoning_override = writing_skill_reasoning_config(message)
+                if skill_reasoning_override is not None:
+                    self.reasoning_config = skill_reasoning_override
+            except Exception as exc:
+                logging.debug("Writing-skill reasoning override check failed: %s", exc)
+
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
@@ -12270,6 +12281,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         agent = self.agent
         if agent is None:
             return None
+        if skill_reasoning_override is not None:
+            agent.reasoning_config = dict(skill_reasoning_override)
 
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters

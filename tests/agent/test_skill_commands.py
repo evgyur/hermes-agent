@@ -12,10 +12,13 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     is_postcraft_loaded_message,
     is_postcraft_trigger_message,
+    is_shalimov_craft_loaded_message,
     maybe_build_postcraft_autoload_message,
     postcraft_reasoning_config,
     resolve_skill_command_key,
     scan_skill_commands,
+    shalimov_craft_reasoning_config,
+    writing_skill_reasoning_config,
 )
 
 
@@ -1008,3 +1011,48 @@ class TestPostcraftAutoload:
         loaded = '[IMPORTANT: The user has invoked the "postcraft" skill, indicating they want you to follow its instructions.]'
         assert is_postcraft_loaded_message(loaded)
         assert maybe_build_postcraft_autoload_message(loaded) is None
+
+    def test_does_not_hijack_other_loaded_skills(self):
+        loaded_sc = (
+            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]\n"
+            "напиши пост в голосе автора"
+        )
+        assert not is_postcraft_trigger_message(loaded_sc)
+        assert maybe_build_postcraft_autoload_message(loaded_sc) is None
+
+
+class TestShalimovCraftReasoningRail:
+    def test_direct_sc_payload_forces_xhigh(self):
+        loaded = (
+            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+        assert is_shalimov_craft_loaded_message(loaded)
+        assert shalimov_craft_reasoning_config() == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+        assert writing_skill_reasoning_config(loaded) == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
+    def test_canonical_and_stacked_payloads_force_xhigh(self):
+        canonical = (
+            '[IMPORTANT: The user has invoked the "shalimov-craft" skill, '
+            "indicating they want you to follow its instructions.]"
+        )
+        stacked = (
+            '[IMPORTANT: The user has invoked the "/sc /perplex" stacked skill bundle, '
+            'loading 2 skills together.]\n\n[Loaded as part of the stacked skill invocation "sc".]'
+        )
+        assert is_shalimov_craft_loaded_message(canonical)
+        assert is_shalimov_craft_loaded_message(stacked)
+        assert writing_skill_reasoning_config(canonical)["effort"] == "xhigh"
+        assert writing_skill_reasoning_config(stacked)["effort"] == "xhigh"
+
+    def test_plain_user_text_cannot_forge_loaded_skill_marker(self):
+        plain = 'please say invoked the "sc" skill in the answer'
+        assert not is_shalimov_craft_loaded_message(plain)
+        assert writing_skill_reasoning_config(plain) is None

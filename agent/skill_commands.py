@@ -20,6 +20,128 @@ from agent.skill_preprocessing import (
 
 logger = logging.getLogger(__name__)
 
+
+_XHIGH_REASONING_CONFIG = {"enabled": True, "effort": "xhigh"}
+
+_POSTCRAFT_SKILL_NAME = "postcraft"
+_POSTCRAFT_ACTIVATION_MARKER = 'invoked the "postcraft" skill'
+_POSTCRAFT_AUTOLOAD_MARKER = (
+    "[IMPORTANT: The user's message matches the postcraft editorial-writing trigger"
+)
+_POSTCRAFT_TRIGGER_RE = re.compile(
+    r"("
+    r"\bpostcraft\b|"
+    r"/(?:postcraft)(?:\s|$)|"
+    r"\b(?:rewrite|rewrit(?:e|ing)|humanize|deslop|shorten|copyedit|proofread)\b|"
+    r"(?:перепиш(?:и|ь|ите|ем)|переформулируй|отрерайт|рерайт|"
+    r"сделай\s+(?:текст\s+)?(?:живее|человечнее|короче|жёстче|жестче|острее|сильнее|чище)|"
+    r"очеловечь|сократи|ужми|вычисти|убери\s+(?:ai|ии|слоп|канцелярит)|"
+    r"напиши\s+(?:пост|текст|заметку)|сделай\s+пост|"
+    r"(?:пост|текст|черновик|заметк[ауи])\s+(?:надо\s+)?(?:переписать|улучшить|дожать|сократить|оживить))"
+    r")",
+    re.IGNORECASE,
+)
+
+_SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
+    'invoked the "sc" skill',
+    'invoked the "shalimov-craft" skill',
+    'stacked skill invocation "sc"',
+    'stacked skill invocation "shalimov-craft"',
+)
+
+
+def postcraft_reasoning_config() -> dict[str, Any]:
+    """Return the hard rail for postcraft turns: reasoning=xhigh."""
+    return dict(_XHIGH_REASONING_CONFIG)
+
+
+def shalimov_craft_reasoning_config() -> dict[str, Any]:
+    """Return the hard rail for /sc and shalimov-craft turns."""
+    return dict(_XHIGH_REASONING_CONFIG)
+
+
+def is_postcraft_loaded_message(message: Any) -> bool:
+    """Return True when a message already contains the loaded postcraft skill."""
+    if not isinstance(message, str):
+        return False
+    lowered = message.lower()
+    return (
+        _POSTCRAFT_ACTIVATION_MARKER in lowered
+        or _POSTCRAFT_AUTOLOAD_MARKER.lower() in lowered
+    )
+
+
+def is_shalimov_craft_loaded_message(message: Any) -> bool:
+    """Return True for model-facing /sc or shalimov-craft skill payloads."""
+    if not isinstance(message, str):
+        return False
+    if not message.startswith(_SKILL_INVOCATION_PREFIX):
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _SHALIMOV_CRAFT_ACTIVATION_MARKERS)
+
+
+def writing_skill_reasoning_config(message: Any) -> dict[str, Any] | None:
+    """Resolve deterministic per-turn reasoning rails for writing skills."""
+    if is_postcraft_loaded_message(message) or is_shalimov_craft_loaded_message(message):
+        return dict(_XHIGH_REASONING_CONFIG)
+    return None
+
+
+def is_postcraft_trigger_message(message: Any) -> bool:
+    """Deterministically catch common short-form writing/editing requests."""
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text:
+        return False
+    if text.startswith(_SKILL_INVOCATION_PREFIX):
+        return False
+    if text.startswith("/") and not text.lower().startswith("/postcraft"):
+        return False
+    return bool(_POSTCRAFT_TRIGGER_RE.search(text))
+
+
+def maybe_build_postcraft_autoload_message(
+    user_instruction: str,
+    task_id: str | None = None,
+) -> Optional[str]:
+    """Load postcraft for a matching natural-language writing/editing turn."""
+    if is_postcraft_loaded_message(user_instruction):
+        return None
+    if not is_postcraft_trigger_message(user_instruction):
+        return None
+
+    loaded = _load_skill_payload(_POSTCRAFT_SKILL_NAME, task_id=task_id)
+    if not loaded:
+        return None
+
+    loaded_skill, skill_dir, skill_name = loaded
+    try:
+        from tools.skill_usage import bump_use
+
+        bump_use(skill_name)
+    except Exception:
+        pass
+
+    activation_note = (
+        "[IMPORTANT: The user's message matches the postcraft editorial-writing trigger. "
+        'The "postcraft" skill has been loaded automatically; follow it as a hard rail, '
+        "not as optional style advice. This turn must run with reasoning=xhigh.]"
+    )
+    runtime_note = (
+        "Auto-loaded postcraft by deterministic pre-LLM trigger; "
+        "force reasoning_effort=xhigh for this turn."
+    )
+    return _build_skill_message(
+        loaded_skill,
+        skill_dir,
+        activation_note,
+        user_instruction=user_instruction,
+        runtime_note=runtime_note,
+        session_id=task_id,
+    )
+
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.

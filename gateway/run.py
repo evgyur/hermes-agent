@@ -13491,6 +13491,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("@ context reference expansion failed: %s", exc)
                 logger.debug("@ context reference expansion failure detail", exc_info=True)
 
+        try:
+            from agent.skill_commands import maybe_build_postcraft_autoload_message
+
+            postcraft_message = maybe_build_postcraft_autoload_message(
+                message_text,
+                task_id=session_key,
+            )
+            if postcraft_message:
+                logger.info(
+                    "Auto-loaded postcraft skill for editorial turn; forcing reasoning=xhigh"
+                )
+                message_text = postcraft_message
+        except Exception as exc:
+            logger.debug("Postcraft autoload check failed: %s", exc)
+
         return message_text
 
     async def _prepare_profile_scoped_inbound_message_text(
@@ -22458,6 +22473,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 model=model,
             )
+            try:
+                from agent.skill_commands import (
+                    is_shalimov_craft_loaded_message,
+                    writing_skill_reasoning_config,
+                )
+
+                skill_reasoning_config = writing_skill_reasoning_config(message)
+                if skill_reasoning_config is not None:
+                    reasoning_config = skill_reasoning_config
+                    if is_shalimov_craft_loaded_message(message) and session_key:
+                        self._set_session_reasoning_override(
+                            session_key,
+                            skill_reasoning_config,
+                        )
+                    logger.info(
+                        "Applied writing-skill reasoning hard rail: effort=xhigh session=%s",
+                        session_key or "",
+                    )
+            except Exception as exc:
+                logger.debug("Writing-skill reasoning override check failed: %s", exc)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(
                 source=source, session_key=session_key

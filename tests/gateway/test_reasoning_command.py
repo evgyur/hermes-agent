@@ -276,6 +276,67 @@ class TestReasoningCommand:
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
 
+    def test_run_agent_forces_xhigh_for_loaded_sc_skill(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: low\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+            },
+        )
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        loaded_sc = (
+            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message=loaded_sc,
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:local:dm",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        assert _CapturingAgent.last_init["reasoning_config"] == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+        assert runner._session_reasoning_overrides["agent:main:local:dm"] == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
     def test_run_agent_prefers_session_reasoning_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
