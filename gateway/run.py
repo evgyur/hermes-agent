@@ -8404,6 +8404,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         entry.resume_reason = _STARTUP_GOAL_RECOVERY_REASON
         entry.last_resume_marked_at = datetime.now()
 
+    def _schedule_startup_goal_recovery_alert(
+        self,
+        decision: StartupGoalRecoveryDecision,
+        source: Any,
+    ) -> None:
+        alerted = getattr(self, "_startup_goal_recovery_alerted", None)
+        if alerted is None:
+            alerted = set()
+            self._startup_goal_recovery_alerted = alerted
+        key = (decision.session_key, decision.reason)
+        if key in alerted:
+            return
+        alerted.add(key)
+        if not self._startup_recovery_source_is_trusted_private(source):
+            logger.warning(
+                "Active /goal recovery withheld for %s: %s",
+                decision.session_key,
+                decision.reason,
+            )
+            return
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return
+
+        async def _send() -> None:
+            try:
+                metadata = self._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            message = (
+                "⚠️ Active /goal was found after gateway startup, but auto-resume "
+                f"was withheld: {decision.reason}.\n"
+                "Send a new message or `/goal status` to inspect it."
+            )
+            try:
+                await adapter.send(source.chat_id, message, metadata=metadata)
+            except Exception as exc:
+                logger.warning(
+                    "startup goal recovery alert send failed for %s: %s",
+                    decision.session_key,
+                    exc,
+                )
+
+        try:
+            task = asyncio.create_task(_send())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            logger.warning(
+                "Active /goal recovery withheld for %s: %s",
+                decision.session_key,
+                decision.reason,
+            )
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh private active goals and safe pending sessions."""
         generic_enabled = os.environ.get(

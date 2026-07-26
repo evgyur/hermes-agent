@@ -350,6 +350,30 @@ def test_active_goal_startup_checks_chip_history_before_auto_resume(hermes_home,
     assert "missed_by_gateway" in decision.reason
 
 
+@pytest.mark.asyncio
+async def test_alert_only_startup_recovery_notifies_private_chat_without_crashing(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="already-running-goal-sid", resume_pending=False)
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._running_agents[entry.session_key] = object()
+    GoalManager(session_id=entry.session_id).set("keep the active goal safe")
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    assert len(adapter.sent) == 1
+    assert "auto-resume was withheld" in adapter.sent[0]
+    assert "agent-already-running" in adapter.sent[0]
+
+    # Re-running the startup scan must not send duplicate alerts.
+    scheduled_again = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled_again == 0
+    assert len(adapter.sent) == 1
+
+
 def test_public_telegram_group_generic_resume_still_waits_without_global_flag(hermes_home):
     runner, _adapter = make_restart_runner()
     source = make_restart_source(chat_id="-100public", chat_type="group", thread_id="1858")
