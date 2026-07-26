@@ -19,6 +19,7 @@ def _make_adapter(
     public_chats=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
+    ignore_other_bot_replies_chats=None,
     ignored_threads=None,
     allowed_topics=None,
     allow_from=None,
@@ -56,6 +57,8 @@ def _make_adapter(
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
         extra["exclusive_bot_mentions"] = exclusive_bot_mentions
+    if ignore_other_bot_replies_chats is not None:
+        extra["ignore_other_bot_replies_chats"] = ignore_other_bot_replies_chats
     if ignored_threads is not None:
         extra["ignored_threads"] = ignored_threads
     if allowed_topics is not None:
@@ -115,13 +118,16 @@ def _group_message(
     from_user_name="Alice Example",
     thread_id=None,
     reply_to_bot=False,
+    reply_to_other_bot=False,
     entities=None,
     caption=None,
     caption_entities=None,
 ):
     reply_to_message = None
     if reply_to_bot:
-        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=10, text="previous bot reply", caption=None)
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999, is_bot=True), message_id=10, text="previous bot reply", caption=None)
+    elif reply_to_other_bot:
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=555, is_bot=True), message_id=11, text="other bot reply", caption=None)
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -512,6 +518,33 @@ def test_group_messages_can_require_direct_trigger_via_config():
     # And commands still pass unconditionally when require_mention is disabled
     adapter_no_mention = _make_adapter(require_mention=False)
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
+
+
+def test_free_response_chat_ignores_replies_to_other_bots_when_scoped():
+    adapter = _make_adapter(
+        require_mention=False,
+        free_response_chats=["-200"],
+        ignore_other_bot_replies_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_group_message("plain", chat_id=-200)) is True
+    assert adapter._should_process_message(
+        _group_message("reply to self", chat_id=-200, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("reply to other", chat_id=-200, reply_to_other_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "@hermes_bot join this reply",
+            chat_id=-200,
+            reply_to_other_bot=True,
+            entities=[_mention_entity("@hermes_bot join this reply")],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("reply elsewhere", chat_id=-201, reply_to_other_bot=True)
+    ) is True
 
 
 def test_live_plugin_adapter_honors_per_chat_mention_reply_gate():
@@ -996,6 +1029,26 @@ def test_config_bridges_require_mention_topics(monkeypatch, tmp_path):
     assert config.platforms[Platform.TELEGRAM].extra["require_mention_topics"] == [
         "-1003770669948:14804"
     ]
+
+
+def test_config_bridges_ignore_other_bot_replies_chats(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  ignore_other_bot_replies_chats:\n"
+        "    - '-200'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_IGNORE_OTHER_BOT_REPLIES_CHATS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    assert __import__("os").environ["TELEGRAM_IGNORE_OTHER_BOT_REPLIES_CHATS"] == "-200"
+    assert config.platforms[Platform.TELEGRAM].extra["ignore_other_bot_replies_chats"] == ["-200"]
 
 
 def test_require_mention_chats_force_direct_trigger_only_for_listed_chat():

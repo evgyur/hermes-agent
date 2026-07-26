@@ -8,10 +8,19 @@ TARGET_CHAT = -1003770669948
 BOT_ID = 8928336881
 
 
-def _message(text="hello", *, chat_id=TARGET_CHAT, thread_id=5391, reply_to_bot=False):
+def _message(
+    text="hello",
+    *,
+    chat_id=TARGET_CHAT,
+    thread_id=5391,
+    reply_to_bot=False,
+    reply_to_other_bot=False,
+):
     reply = None
     if reply_to_bot:
         reply = SimpleNamespace(from_user=SimpleNamespace(id=BOT_ID, is_bot=True))
+    elif reply_to_other_bot:
+        reply = SimpleNamespace(from_user=SimpleNamespace(id=8533179145, is_bot=True))
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id, type="supergroup", is_forum=True),
         from_user=SimpleNamespace(id=111, is_bot=False, username="srg"),
@@ -53,6 +62,7 @@ def _adapter(
             "ignored_threads": [],
             "guest_mode": False,
             "exclusive_bot_mentions": True,
+            "ignore_other_bot_replies_chats": [str(TARGET_CHAT)],
             "mention_patterns": [r"@Human20Bot\b"],
         },
     )
@@ -75,6 +85,21 @@ def test_live_plugin_policy_is_scoped_to_configured_chat():
     adapter = _adapter()
 
     assert adapter._should_process_message(_message("обычное сообщение", chat_id=-100999)) is True
+
+
+def test_live_plugin_ignores_reply_to_sigurd_in_target_chat():
+    adapter = _adapter(
+        require_mention_chats=[],
+        reply_trigger_disabled_chats=[],
+        free_response_chats=[str(TARGET_CHAT)],
+    )
+
+    assert adapter._should_process_message(
+        _message("продолжай", thread_id=14804, reply_to_other_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _message("@Human20Bot подключись", thread_id=14804, reply_to_other_bot=True)
+    ) is True
 
 
 def test_live_plugin_topic_gate_overrides_free_response_chat():

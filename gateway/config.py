@@ -1518,6 +1518,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
                     bridged["exclusive_bot_mentions"] = platform_cfg["exclusive_bot_mentions"]
+                if plat == Platform.TELEGRAM and "ignore_other_bot_replies_chats" in platform_cfg:
+                    bridged["ignore_other_bot_replies_chats"] = platform_cfg["ignore_other_bot_replies_chats"]
                 if plat == Platform.TELEGRAM and "observe_unmentioned_group_messages" in platform_cfg:
                     bridged["observe_unmentioned_group_messages"] = platform_cfg["observe_unmentioned_group_messages"]
                 if "dm_policy" in platform_cfg:
@@ -1668,6 +1670,7 @@ def load_gateway_config() -> GatewayConfig:
                     ("require_mention_chats", "TELEGRAM_REQUIRE_MENTION_CHATS"),
                     ("require_mention_topics", "TELEGRAM_REQUIRE_MENTION_TOPICS"),
                     ("reply_trigger_disabled_chats", "TELEGRAM_REPLY_TRIGGER_DISABLED_CHATS"),
+                    ("ignore_other_bot_replies_chats", "TELEGRAM_IGNORE_OTHER_BOT_REPLIES_CHATS"),
                     ("private_chats", "TELEGRAM_PRIVATE_CHATS"),
                     ("public_chats", "TELEGRAM_PUBLIC_CHATS"),
                 ):
