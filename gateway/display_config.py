@@ -123,16 +123,16 @@ _TIER_MINIMAL = {
 
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 1 — full edit support, personal/team use
-    # Telegram is usually a durable mobile inbox. Bot-authored progress and
-    # interim assistant/commentary fragments stay in chat history and can look
-    # like the bot leaked internal state or spoke in the wrong identity lane
-    # when mirrored through userbot/Business tooling. Default Telegram to
-    # final-answer-first. Users can opt into progress explicitly per platform.
+    # Telegram is usually a mobile inbox: keep tool_progress quiet and skip
+    # the verbose busy-ack iteration counter, but DO surface real mid-turn
+    # assistant commentary (interim_assistant_messages) and DO send periodic
+    # heartbeats (long_running_notifications) so the user has signal between
+    # turn start and final answer. Otherwise it looks like "typing..." for
+    # 30 minutes with nothing happening. Opt out per profile when final-only
+    # delivery is preferred.
     "telegram":    {
         **_TIER_HIGH,
         "tool_progress": "off",
-        "interim_assistant_messages": False,
-        "long_running_notifications": False,
         "busy_ack_detail": False,
     },
     # Discord has a native "subtext" primitive (-# small grey text) that reads
