@@ -3180,6 +3180,21 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_server_error(exc: Exception) -> bool:
+    """Detect provider-side HTTP 5xx failures after transient retries.
+
+    A reachable endpoint can still be unable to serve the selected auxiliary
+    model. Once Hermes exhausts its bounded same-provider retries, a 5xx is a
+    capacity failure for this request and must advance the configured fallback
+    chain. Some local gateways wrap the route-unavailable error without keeping
+    ``status_code``, so preserve that exact sentinel as a defensive fallback.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 500 <= status <= 599:
+        return True
+    return "forced_litellm_route_unavailable" in str(exc).lower()
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -4213,6 +4228,7 @@ def _candidate_context_window(
     model: str,
     base_url: str = "",
     api_key: str = "",
+    config_context_length: Optional[int] = None,
 ) -> Optional[int]:
     """Resolve the effective context window for a fallback candidate.
 
@@ -4233,6 +4249,7 @@ def _candidate_context_window(
             model,
             base_url=base_url,
             api_key=api_key,
+            config_context_length=config_context_length,
             provider=provider,
         )
     except Exception as exc:
@@ -4298,6 +4315,7 @@ def _try_configured_fallback_chain(
                     resolved_model,
                     base_url=str(entry.get("base_url") or ""),
                     api_key=_fallback_entry_api_key(entry) or "",
+                    config_context_length=_fallback_entry_context_length(entry),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -4352,6 +4370,18 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     if key_env:
         return os.getenv(key_env, "").strip() or None
     return None
+
+
+def _fallback_entry_context_length(entry: Dict[str, Any]) -> Optional[int]:
+    """Return a positive context-window override from a fallback entry."""
+    raw = entry.get("context_length")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
@@ -4431,6 +4461,7 @@ def _try_main_fallback_chain(
                     resolved_model or fb_model,
                     base_url=str(entry.get("base_url") or ""),
                     api_key=_fallback_entry_api_key(entry) or "",
+                    config_context_length=_fallback_entry_context_length(entry),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -7604,6 +7635,7 @@ def call_llm(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -7627,6 +7659,7 @@ def call_llm(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -7645,6 +7678,8 @@ def call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_server_error(first_err):
+                reason = "server error"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -8134,6 +8169,7 @@ async def async_call_llm(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -8149,6 +8185,7 @@ async def async_call_llm(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -8163,6 +8200,8 @@ async def async_call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_server_error(first_err):
+                reason = "server error"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):

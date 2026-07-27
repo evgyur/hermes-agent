@@ -2539,8 +2539,8 @@ class TestCallLlmPaymentFallback:
         exc.status_code = 429
         return exc
 
-    def test_non_payment_error_not_caught(self, monkeypatch):
-        """Non-payment/non-connection errors (500) should NOT trigger fallback."""
+    def test_non_compression_server_error_not_caught(self, monkeypatch):
+        """Generic 5xx fallback stays scoped to critical compression calls."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -2554,7 +2554,7 @@ class TestCallLlmPaymentFallback:
                     return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
-                    task="compression",
+                    task="title_generation",
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
@@ -3275,6 +3275,57 @@ class TestTransientTransportRetry:
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
         assert result == {"ok": True}
         assert client.chat.completions.create.call_count == 2
+
+    def test_exhausted_5xx_uses_configured_compression_fallback(self):
+        """A pinned compression model that keeps returning 5xx must move to
+        its configured fallback after the bounded same-provider retries.
+
+        This is the live mmfast failure shape: the Human20 route returned
+        ``503 forced_litellm_route_unavailable`` and compression stopped even
+        though a healthy GLM fallback was configured.
+        """
+        class _Err503(Exception):
+            status_code = 503
+
+        primary = MagicMock()
+        primary.base_url = "http://127.0.0.1:18750/v1"
+        primary.chat.completions.create.side_effect = _Err503(
+            "forced_litellm_route_unavailable"
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "http://127.0.0.1:18750/v1"
+        fallback.chat.completions.create.return_value = {"model": "glm"}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback,
+                    "glm",
+                    "fallback_chain[0](human20-keys-glm)",
+                ),
+            ) as configured_chain,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback"
+            ) as main_fallback,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result == {"model": "glm"}
+        assert primary.chat.completions.create.call_count == 2
+        fallback.chat.completions.create.assert_called_once()
+        configured_chain.assert_called_once_with(
+            "compression", "openrouter", reason="server error"
+        )
+        main_fallback.assert_not_called()
 
     def test_does_not_retry_non_transient_400(self):
         class _Err400(Exception):
@@ -6258,6 +6309,38 @@ class TestCompressionFallbackContextFilter:
             "screening by context window.")
         assert model == "huge-1m"
         assert "big-provider" in label
+
+    def test_configured_chain_honors_explicit_context_length(self, monkeypatch):
+        """Private model aliases may not expose context metadata via /models.
+        A fallback entry can pin the verified window so the runtime does not
+        misclassify a 1M GLM alias as the generic 202K GLM family.
+        """
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        client = MagicMock(name="glm_client")
+        entry = self._make_chain_entry("human20-keys-glm", "glm")
+        entry["context_length"] = 1_048_576
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]} if task == "compression" else {},
+        )
+
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(client, "glm"),
+        ), patch(
+            "agent.auxiliary_client.get_model_context_length",
+            return_value=202_752,
+        ) as context_probe:
+            resolved_client, model, label = _try_configured_fallback_chain(
+                task="compression", failed_provider="human20-keys"
+            )
+
+        assert resolved_client is client
+        assert model == "glm"
+        assert "human20-keys-glm" in label
+        assert context_probe.call_args.kwargs["config_context_length"] == 1_048_576
 
     def test_configured_chain_continues_after_skipping_too_small(self, monkeypatch):
         """When all small candidates are skipped and only the last is large enough,
