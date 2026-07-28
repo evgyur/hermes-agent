@@ -12250,8 +12250,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
-        # Refresh provider credentials if needed (handles key rotation transparently)
-        if not self._ensure_runtime_credentials():
+        skill_runtime_requested = False
+        if isinstance(message, str):
+            try:
+                from agent.skill_commands import writing_skill_runtime_config
+
+                skill_runtime_requested = (
+                    writing_skill_runtime_config(message) is not None
+                )
+            except Exception as exc:
+                logging.debug("Writing-skill runtime check failed: %s", exc)
+
+        # Refresh the current session provider only when the turn does not carry
+        # its own fail-closed skill route. /sco resolves OpenRouter independently.
+        if not skill_runtime_requested and not self._ensure_runtime_credentials():
             return None
 
         skill_reasoning_override = None
@@ -12265,7 +12277,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as exc:
                 logging.debug("Writing-skill reasoning override check failed: %s", exc)
 
-        turn_route = self._resolve_turn_agent_config(message)
+        try:
+            turn_route = self._resolve_turn_agent_config(message)
+        except Exception as exc:
+            logging.error("Writing-skill runtime resolution failed: %s", exc)
+            _cprint(f"  ✗ Required skill model route failed: {exc}")
+            return None
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -12276,6 +12293,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
+            disable_fallbacks=turn_route.get("disable_fallbacks", False),
         ):
             return None
         agent = self.agent
@@ -12298,11 +12316,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 from hermes_cli.config import load_config
 
+                _active_agent = self.agent
                 _img_mode = decide_image_input_mode(
-                    (self.provider or "").strip(),
-                    (self.model or "").strip(),
+                    (getattr(_active_agent, "provider", None) or self.provider or "").strip(),
+                    (getattr(_active_agent, "model", None) or self.model or "").strip(),
                     load_config(),
-                    requested_provider=(self.requested_provider or "").strip(),
+                    requested_provider=(
+                        getattr(_active_agent, "requested_provider", None)
+                        or self.requested_provider
+                        or ""
+                    ).strip(),
                 )
             except Exception as _img_exc:
                 logging.debug("image_routing decision failed, defaulting to text: %s", _img_exc)

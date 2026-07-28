@@ -54,6 +54,13 @@ _DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
     'stacked skill invocation "shalimov-craft"',
 )
 
+_SCO_ACTIVATION_MARKERS = (
+    'invoked the "sco" skill',
+    'stacked skill invocation "sco"',
+)
+_SCO_PROVIDER = "openrouter"
+_SCO_MODEL = "anthropic/claude-opus-5"
+
 
 def postcraft_reasoning_config() -> dict[str, Any]:
     """Return the hard rail for postcraft turns: reasoning=xhigh."""
@@ -94,6 +101,68 @@ def is_direct_shalimov_craft_loaded_message(message: Any) -> bool:
     return any(
         marker in lowered for marker in _DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS
     )
+
+
+def is_sco_loaded_message(message: Any) -> bool:
+    """Return True only for model-facing /sco skill payloads."""
+    if not isinstance(message, str):
+        return False
+    if not message.startswith(_SKILL_INVOCATION_PREFIX):
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _SCO_ACTIVATION_MARKERS)
+
+
+def writing_skill_runtime_config(message: Any) -> dict[str, Any] | None:
+    """Return deterministic model/provider rails for writing-skill turns."""
+    if is_sco_loaded_message(message):
+        return {
+            "provider": _SCO_PROVIDER,
+            "model": _SCO_MODEL,
+            "allow_fallbacks": False,
+        }
+    return None
+
+
+def resolve_writing_skill_runtime(
+    message: Any,
+    *,
+    max_tokens: int | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a writing skill's exact runtime without mutating session state.
+
+    Provider resolution is deliberately fail-closed: callers must surface the
+    exception instead of silently keeping the current provider/model.
+    """
+    config = writing_skill_runtime_config(message)
+    if config is None:
+        return None
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime = resolve_runtime_provider(
+        requested=config["provider"],
+        target_model=config["model"],
+    )
+    resolved_runtime = {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider") or config["provider"],
+        "requested_provider": runtime.get("requested_provider")
+        or config["provider"],
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+    }
+    if max_tokens is not None:
+        resolved_runtime["max_tokens"] = max_tokens
+
+    return {
+        "model": config["model"],
+        "runtime": resolved_runtime,
+        "allow_fallbacks": bool(config.get("allow_fallbacks", True)),
+    }
 
 
 def writing_skill_reasoning_config(message: Any) -> dict[str, Any] | None:

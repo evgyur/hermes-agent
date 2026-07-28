@@ -213,7 +213,27 @@ class CLIAgentSetupMixin:
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
+            "disable_fallbacks": False,
         }
+
+        from agent.skill_commands import resolve_writing_skill_runtime
+
+        skill_runtime_route = resolve_writing_skill_runtime(user_message)
+        if skill_runtime_route is not None:
+            route["model"] = skill_runtime_route["model"]
+            route["runtime"] = skill_runtime_route["runtime"]
+            route["signature"] = (
+                route["model"],
+                route["runtime"].get("provider"),
+                route["runtime"].get("requested_provider"),
+                route["runtime"].get("base_url"),
+                route["runtime"].get("api_mode"),
+                route["runtime"].get("command"),
+                tuple(route["runtime"].get("args") or []),
+            )
+            route["disable_fallbacks"] = not skill_runtime_route.get(
+                "allow_fallbacks", True
+            )
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
@@ -227,7 +247,14 @@ class CLIAgentSetupMixin:
         route["request_overrides"] = overrides
         return route
 
-    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
+    def _init_agent(
+        self,
+        *,
+        model_override: str = None,
+        runtime_override: dict = None,
+        request_overrides: dict | None = None,
+        disable_fallbacks: bool = False,
+    ) -> bool:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
@@ -243,7 +270,9 @@ class CLIAgentSetupMixin:
         self._install_tool_callbacks()
         self._ensure_tirith_security()
 
-        if not self._ensure_runtime_credentials():
+        if not (
+            runtime_override and runtime_override.get("api_key")
+        ) and not self._ensure_runtime_credentials():
             return False
 
         from hermes_cli.mcp_startup import wait_for_mcp_discovery
@@ -392,7 +421,7 @@ class CLIAgentSetupMixin:
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
+                fallback_model=None if disable_fallbacks else self._fallback_model,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,

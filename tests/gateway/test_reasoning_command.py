@@ -336,6 +336,91 @@ class TestReasoningCommand:
         }
         assert "agent:main:local:dm" not in runner._session_reasoning_overrides
 
+    def test_run_agent_forces_sco_to_openrouter_opus_without_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: low\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "requested_provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "current-session-key",
+            },
+        )
+
+        import agent.skill_commands as skill_commands
+
+        monkeypatch.setattr(
+            skill_commands,
+            "resolve_writing_skill_runtime",
+            lambda message, max_tokens=None: {
+                "model": "anthropic/claude-opus-5",
+                "runtime": {
+                    "provider": "openrouter",
+                    "requested_provider": "openrouter",
+                    "api_mode": "chat_completions",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "openrouter-test-key",
+                },
+                "allow_fallbacks": False,
+            },
+        )
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+        runner._fallback_model = [
+            {"provider": "openai-codex", "model": "gpt-5.6"}
+        ]
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        loaded_sco = (
+            '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message=loaded_sco,
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:local:dm",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        assert _CapturingAgent.last_init["model"] == "anthropic/claude-opus-5"
+        assert _CapturingAgent.last_init["provider"] == "openrouter"
+        assert _CapturingAgent.last_init["requested_provider"] == "openrouter"
+        assert _CapturingAgent.last_init["fallback_model"] is None
+        assert _CapturingAgent.last_init["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+
     def test_run_agent_prefers_session_reasoning_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()

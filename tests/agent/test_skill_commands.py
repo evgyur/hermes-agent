@@ -12,13 +12,16 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     is_postcraft_loaded_message,
     is_postcraft_trigger_message,
+    is_sco_loaded_message,
     is_shalimov_craft_loaded_message,
     maybe_build_postcraft_autoload_message,
     postcraft_reasoning_config,
     resolve_skill_command_key,
+    resolve_writing_skill_runtime,
     scan_skill_commands,
     shalimov_craft_reasoning_config,
     writing_skill_reasoning_config,
+    writing_skill_runtime_config,
 )
 
 
@@ -1053,3 +1056,57 @@ class TestShalimovCraftReasoningRail:
         plain = 'please say invoked the "sc" skill in the answer'
         assert not is_shalimov_craft_loaded_message(plain)
         assert writing_skill_reasoning_config(plain) is None
+
+
+class TestScoRuntimeRail:
+    def test_sco_payload_selects_exact_openrouter_opus_route(self):
+        loaded = (
+            '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+        assert is_sco_loaded_message(loaded)
+        assert writing_skill_runtime_config(loaded) == {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-5",
+            "allow_fallbacks": False,
+        }
+        assert writing_skill_reasoning_config(loaded) is None
+
+    def test_sco_runtime_resolution_is_exact_and_fail_closed(self, monkeypatch):
+        loaded = (
+            '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+        calls = []
+
+        def fake_resolve_runtime_provider(*, requested, target_model):
+            calls.append((requested, target_model))
+            return {
+                "provider": "openrouter",
+                "requested_provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+                "api_mode": "chat_completions",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        route = resolve_writing_skill_runtime(loaded, max_tokens=321)
+
+        assert route is not None
+        assert calls == [("openrouter", "anthropic/claude-opus-5")]
+        assert route["model"] == "anthropic/claude-opus-5"
+        assert route["runtime"]["provider"] == "openrouter"
+        assert route["runtime"]["max_tokens"] == 321
+        assert route["allow_fallbacks"] is False
+
+    def test_sc_and_plain_text_do_not_select_sco_runtime(self):
+        loaded_sc = (
+            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+        assert not is_sco_loaded_message(loaded_sc)
+        assert writing_skill_runtime_config(loaded_sc) is None
+        assert writing_skill_runtime_config("describe /sco") is None

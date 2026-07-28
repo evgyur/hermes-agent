@@ -16965,6 +16965,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 user_config=user_config,
             )
+            from agent.skill_commands import resolve_writing_skill_runtime
+
+            skill_runtime_route = resolve_writing_skill_runtime(
+                prompt,
+                max_tokens=runtime_kwargs.get("max_tokens"),
+            )
+            if skill_runtime_route is not None:
+                model = skill_runtime_route["model"]
+                runtime_kwargs = skill_runtime_route["runtime"]
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -16988,6 +16997,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            background_fallback_model = (
+                self._refresh_fallback_model()
+                if skill_runtime_route is None
+                or skill_runtime_route.get("allow_fallbacks", True)
+                else None
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -17035,8 +17050,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=background_fallback_model,
                 )
                 try:
                     return agent.run_conversation(
@@ -22503,12 +22517,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             max_iterations = _current_max_iterations()
 
+            skill_runtime_route = None
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
                 )
+                from agent.skill_commands import resolve_writing_skill_runtime
+
+                skill_runtime_route = resolve_writing_skill_runtime(
+                    message,
+                    max_tokens=runtime_kwargs.get("max_tokens"),
+                )
+                if skill_runtime_route is not None:
+                    model = skill_runtime_route["model"]
+                    runtime_kwargs = skill_runtime_route["runtime"]
+                    if not runtime_kwargs.get("api_key"):
+                        raise RuntimeError(
+                            "OpenRouter credentials are unavailable for /sco"
+                        )
+                    logger.info(
+                        "Applied writing-skill model hard rail: model=%s provider=%s fallbacks=%s session=%s",
+                        model,
+                        runtime_kwargs.get("provider"),
+                        "enabled" if skill_runtime_route["allow_fallbacks"] else "disabled",
+                        session_key or "",
+                    )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
@@ -22666,6 +22701,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_fallback_model = (
+                self._refresh_fallback_model()
+                if skill_runtime_route is None
+                or skill_runtime_route.get("allow_fallbacks", True)
+                else None
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -22855,7 +22896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # serialization (_running_agents) keeps this safe post-lock.
             if reused_cached_agent and agent is not None:
                 self._apply_fallback_chain_to_agent(
-                    agent, self._refresh_fallback_model(),
+                    agent, turn_fallback_model,
                 )
 
             # Lock released — now schedule cleanup of any cross-process-evicted
@@ -22911,8 +22952,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    # /sco is fail-closed on the exact OpenRouter Opus 5 route.
+                    fallback_model=turn_fallback_model,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

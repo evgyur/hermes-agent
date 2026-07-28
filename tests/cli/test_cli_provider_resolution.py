@@ -214,6 +214,49 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     assert result["runtime"]["provider"] == "openrouter"
 
 
+def test_cli_turn_routing_forces_sco_to_openrouter_opus_without_mutating_session(
+    monkeypatch,
+):
+    cli = _import_cli()
+
+    calls = []
+
+    def _runtime_resolve(*, requested, target_model):
+        calls.append((requested, target_model))
+        return {
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "openrouter-test-key",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _runtime_resolve,
+    )
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.provider = "openai-codex"
+    shell.requested_provider = "openai-codex"
+    shell.api_mode = "codex_responses"
+    shell.base_url = "https://chatgpt.com/backend-api/codex"
+    shell.api_key = "current-session-key"
+    loaded_sco = (
+        '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]"
+    )
+
+    result = shell._resolve_turn_agent_config(loaded_sco)
+
+    assert calls == [("openrouter", "anthropic/claude-opus-5")]
+    assert result["model"] == "anthropic/claude-opus-5"
+    assert result["runtime"]["provider"] == "openrouter"
+    assert result["runtime"]["requested_provider"] == "openrouter"
+    assert result["disable_fallbacks"] is True
+    assert shell.model == "gpt-5"
+    assert shell.provider == "openai-codex"
+
+
 def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):
     cli = _import_cli()
 
