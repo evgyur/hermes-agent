@@ -2739,13 +2739,94 @@ class TestStaleFallbackCandidateSkip:
 
         assert result.choices[0].message.content == "openrouter-serves"
         assert mock_fb.call_count == 2
-        assert mock_fb.call_args_list[1].kwargs.get("reason") == "stale fallback credential"
+        assert mock_fb.call_args_list[1].kwargs.get("reason") == "failed fallback candidate"
         mock_mark.assert_called_once_with("anthropic")
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
+    def test_compression_fallback_503_skips_to_independent_candidate(self):
+        """A configured compression fallback can fail too.
+
+        Live case (Chip, Jul 28 2026): mmfast exhausted with
+        ``forced_litellm_route_unavailable``, Hermes correctly advanced to the
+        configured GLM fallback, but that route returned the same 503 and
+        escaped from the fallback helper.  The independent next candidate must
+        still get a chance to serve the summary.
+        """
+        class _Err503(Exception):
+            status_code = 503
+
+        primary_client = MagicMock()
+        primary_client.base_url = "http://127.0.0.1:18750/v1"
+        primary_client.chat.completions.create.side_effect = _Err503(
+            "forced_litellm_route_unavailable"
+        )
+
+        broken_glm = MagicMock()
+        broken_glm.base_url = "http://127.0.0.1:18750/v1"
+        broken_glm.chat.completions.create.side_effect = _Err503(
+            "forced_litellm_route_unavailable"
+        )
+
+        independent_fb = MagicMock()
+        independent_fb.base_url = "https://chatgpt.com/backend-api/codex"
+        independent_fb.chat.completions.create.return_value = _DummyResponse(
+            "independent-fallback"
+        )
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("human20-keys", "mmfast", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "mmfast")), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(broken_glm, "glm", "fallback_chain[0](human20-keys-glm)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(independent_fb, "gpt-5.5", "main-agent(openai-codex)")) as next_fb:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "independent-fallback"
+        broken_glm.chat.completions.create.assert_called_once()
+        next_fb.assert_called_once_with(
+            "human20-keys", "compression", reason="failed fallback candidate"
+        )
+        independent_fb.chat.completions.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_compression_fallback_503_is_skippable(self):
+        """The async fallback helper mirrors the sync 5xx recovery rule."""
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        class _Err503(Exception):
+            status_code = 503
+
+        broken_fb = MagicMock()
+        broken_fb.base_url = "http://127.0.0.1:18750/v1"
+        broken_fb.chat.completions.create = AsyncMock(
+            side_effect=_Err503("forced_litellm_route_unavailable")
+        )
+
+        result = await _call_fallback_candidate_async(
+            broken_fb,
+            "glm",
+            "fallback_chain[0](human20-keys-glm)",
+            task="compression",
+            messages=[{"role": "user", "content": "summarize"}],
+            temperature=0,
+            max_tokens=None,
+            tools=None,
+            effective_timeout=60,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+        assert result is None
+
     def test_non_auth_fallback_error_still_raises(self, monkeypatch):
-        """A non-auth error from the fallback candidate propagates unchanged."""
+        """A non-capacity fallback error still propagates unchanged."""
         primary_client = MagicMock()
         primary_client.base_url = "https://chatgpt.com/backend-api/codex"
         primary_client.chat.completions.create.side_effect = self._timeout_err()
