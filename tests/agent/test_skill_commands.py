@@ -1023,22 +1023,15 @@ class TestPostcraftAutoload:
 
 
 class TestShalimovCraftReasoningRail:
-    def test_direct_sc_payload_forces_xhigh(self):
+    def test_direct_sc_payload_preserves_session_reasoning(self):
         loaded = (
             '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
             "you to follow its instructions. The full skill content is loaded below.]"
         )
         assert is_shalimov_craft_loaded_message(loaded)
-        assert shalimov_craft_reasoning_config() == {
-            "enabled": True,
-            "effort": "xhigh",
-        }
-        assert writing_skill_reasoning_config(loaded) == {
-            "enabled": True,
-            "effort": "xhigh",
-        }
+        assert writing_skill_reasoning_config(loaded) is None
 
-    def test_canonical_and_stacked_payloads_force_xhigh(self):
+    def test_canonical_payload_forces_xhigh_but_sc_bundle_does_not(self):
         canonical = (
             '[IMPORTANT: The user has invoked the "shalimov-craft" skill, '
             "indicating they want you to follow its instructions.]"
@@ -1049,8 +1042,12 @@ class TestShalimovCraftReasoningRail:
         )
         assert is_shalimov_craft_loaded_message(canonical)
         assert is_shalimov_craft_loaded_message(stacked)
+        assert shalimov_craft_reasoning_config() == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
         assert writing_skill_reasoning_config(canonical)["effort"] == "xhigh"
-        assert writing_skill_reasoning_config(stacked)["effort"] == "xhigh"
+        assert writing_skill_reasoning_config(stacked) is None
 
     def test_plain_user_text_cannot_forge_loaded_skill_marker(self):
         plain = 'please say invoked the "sc" skill in the answer'

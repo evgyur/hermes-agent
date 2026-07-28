@@ -49,6 +49,11 @@ _SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
     'stacked skill invocation "shalimov-craft"',
 )
 
+_DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
+    'invoked the "shalimov-craft" skill',
+    'stacked skill invocation "shalimov-craft"',
+)
+
 
 def postcraft_reasoning_config() -> dict[str, Any]:
     """Return the hard rail for postcraft turns: reasoning=xhigh."""
@@ -56,7 +61,7 @@ def postcraft_reasoning_config() -> dict[str, Any]:
 
 
 def shalimov_craft_reasoning_config() -> dict[str, Any]:
-    """Return the hard rail for /sc and shalimov-craft turns."""
+    """Return the hard rail for direct shalimov-craft turns."""
     return dict(_XHIGH_REASONING_CONFIG)
 
 
@@ -81,9 +86,21 @@ def is_shalimov_craft_loaded_message(message: Any) -> bool:
     return any(marker in lowered for marker in _SHALIMOV_CRAFT_ACTIVATION_MARKERS)
 
 
+def is_direct_shalimov_craft_loaded_message(message: Any) -> bool:
+    """Return True only for direct shalimov-craft payloads, excluding /sc."""
+    if not is_shalimov_craft_loaded_message(message):
+        return False
+    lowered = message.lower()
+    return any(
+        marker in lowered for marker in _DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS
+    )
+
+
 def writing_skill_reasoning_config(message: Any) -> dict[str, Any] | None:
     """Resolve deterministic per-turn reasoning rails for writing skills."""
-    if is_postcraft_loaded_message(message) or is_shalimov_craft_loaded_message(message):
+    if is_postcraft_loaded_message(message) or is_direct_shalimov_craft_loaded_message(
+        message
+    ):
         return dict(_XHIGH_REASONING_CONFIG)
     return None
 

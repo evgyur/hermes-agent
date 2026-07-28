@@ -276,7 +276,9 @@ class TestReasoningCommand:
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
 
-    def test_run_agent_forces_xhigh_for_loaded_sc_skill(self, tmp_path, monkeypatch):
+    def test_run_agent_preserves_session_reasoning_for_loaded_sc_skill(
+        self, tmp_path, monkeypatch
+    ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
@@ -330,12 +332,9 @@ class TestReasoningCommand:
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {
             "enabled": True,
-            "effort": "xhigh",
+            "effort": "low",
         }
-        assert runner._session_reasoning_overrides["agent:main:local:dm"] == {
-            "enabled": True,
-            "effort": "xhigh",
-        }
+        assert "agent:main:local:dm" not in runner._session_reasoning_overrides
 
     def test_run_agent_prefers_session_reasoning_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
