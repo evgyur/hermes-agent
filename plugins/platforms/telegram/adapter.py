@@ -687,6 +687,74 @@ class TelegramAdapter(BasePlatformAdapter):
             value = min(value, max_value)
         return value
 
+    def _load_auto_skill_routes(self) -> List[Dict[str, Any]]:
+        """Normalize declarative chat URL/media routes from Telegram config."""
+        routes: List[Dict[str, Any]] = []
+        raw_routes = self.config.extra.get("auto_skill_routes", [])
+        if not isinstance(raw_routes, list):
+            return routes
+        for raw in raw_routes:
+            if not isinstance(raw, dict):
+                continue
+            skill = str(raw.get("skill") or "").strip().lstrip("/")
+            chats = raw.get("chats") or []
+            match = raw.get("match") or {}
+            if not skill or not isinstance(match, dict):
+                continue
+            if isinstance(chats, (str, int)):
+                chats = [chats]
+            chat_ids = {str(item).strip() for item in chats if str(item).strip()}
+            media = match.get("media") or []
+            if isinstance(media, str):
+                media = [media]
+            route = {
+                "skill": skill,
+                "chats": chat_ids,
+                "match_urls": bool(match.get("urls", False)),
+                "match_media": {
+                    str(item).strip().lower() for item in media if str(item).strip()
+                },
+            }
+            if chat_ids and (route["match_urls"] or route["match_media"]):
+                routes.append(route)
+        return routes
+
+    @staticmethod
+    def _looks_like_finished_tg_preview(text: str) -> bool:
+        """Avoid routing an externally delivered finished preview back into `/tg`."""
+        stripped = str(text or "").strip()
+        if not stripped or "⠀" not in stripped:
+            return False
+        first_line = stripped.splitlines()[0].strip()
+        has_source = bool(re.search(r"(?im)^\s*(источник|source)\s*:", stripped))
+        has_body = len([line for line in stripped.splitlines() if line.strip()]) >= 4
+        return bool(3 <= len(first_line) <= 120 and has_source and has_body)
+
+    def _auto_skill_prefix_for_text(self, chat_id: Any, text: str) -> Optional[str]:
+        content = str(text or "").strip()
+        if (
+            not content
+            or content.startswith("/")
+            or self._looks_like_finished_tg_preview(content)
+        ):
+            return None
+        has_url = bool(re.search(r"https?://\S+", content, re.IGNORECASE))
+        for route in getattr(self, "_auto_skill_routes", []) or []:
+            if str(chat_id) in route["chats"] and route["match_urls"] and has_url:
+                return f"/{route['skill']} "
+        return None
+
+    def _auto_skill_prefix_for_media(
+        self,
+        chat_id: Any,
+        message_type: MessageType,
+    ) -> Optional[str]:
+        media_name = str(getattr(message_type, "value", message_type)).strip().lower()
+        for route in getattr(self, "_auto_skill_routes", []) or []:
+            if str(chat_id) in route["chats"] and media_name in route["match_media"]:
+                return f"/{route['skill']} "
+        return None
+
     @property
     def message_len_fn(self):
         """Telegram measures message length in UTF-16 code units."""
@@ -839,6 +907,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
+        # Apply declarative chat routing in the live plugin adapter before the
+        # event reaches the model. Without this, configured bare URLs fall
+        # through to generic URL/X behavior instead of the requested skill.
+        self._auto_skill_routes: List[Dict[str, Any]] = self._load_auto_skill_routes()
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
@@ -9569,8 +9641,15 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        event_text = message.text or ""
+        route_prefix = self._auto_skill_prefix_for_text(chat.id, event_text)
+        if route_prefix is None:
+            route_prefix = self._auto_skill_prefix_for_media(chat.id, msg_type)
+        if route_prefix:
+            event_text = f"{route_prefix}{event_text}".rstrip()
+
         return MessageEvent(
-            text=message.text or "",
+            text=event_text,
             message_type=msg_type,
             source=source,
             raw_message=message,

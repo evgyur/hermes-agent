@@ -9481,8 +9481,15 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        event_text = self._message_text_with_hidden_links(message)
+        route_prefix = self._auto_skill_prefix_for_text(chat.id, event_text)
+        if route_prefix is None:
+            route_prefix = self._auto_skill_prefix_for_media(chat.id, msg_type)
+        if route_prefix:
+            event_text = f"{route_prefix}{event_text}".rstrip()
+
         return MessageEvent(
-            text=self._message_text_with_hidden_links(message),
+            text=event_text,
             message_type=msg_type,
             source=source,
             raw_message=message,

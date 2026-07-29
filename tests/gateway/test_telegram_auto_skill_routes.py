@@ -15,6 +15,7 @@ from gateway.platforms.telegram import (
     _looks_like_inline_tg_preview,
     _tg_preview_echo_fingerprint,
 )
+from plugins.platforms.telegram.adapter import TelegramAdapter as PluginTelegramAdapter
 
 
 def _make_adapter(extra):
@@ -112,6 +113,84 @@ def test_unmatched_chat_does_not_trigger():
 
     assert adapter._auto_skill_prefix_for_text("999", "https://example.com") is None
     assert adapter._auto_skill_prefix_for_media("999", MessageType.PHOTO) is None
+
+
+def test_live_plugin_prefixes_configured_url_route_before_agent_dispatch():
+    """The production plugin must turn a bare URL into the configured skill command."""
+    adapter = PluginTelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "auto_skill_routes": [
+                    {"skill": "tg", "chats": ["-1003712304136"], "match": {"urls": True}}
+                ]
+            },
+        )
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(
+            id=-1003712304136,
+            type="supergroup",
+            title="Sigurd // TG",
+            full_name=None,
+            is_forum=False,
+        ),
+        from_user=SimpleNamespace(id=617744661, full_name="Chip", is_bot=False),
+        text="https://x.com/i/status/2082389844391506305",
+        caption=None,
+        message_thread_id=None,
+        is_topic_message=False,
+        message_id=7305,
+        reply_to_message=None,
+        date=None,
+        business_connection_id=None,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.text == "/tg https://x.com/i/status/2082389844391506305"
+    assert event.auto_skill is None
+
+
+def test_core_adapter_prefixes_configured_url_route_before_agent_dispatch():
+    """The maintained core adapter must honor the same route contract."""
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "auto_skill_routes": [
+                    {"skill": "tg", "chats": ["-1003712304136"], "match": {"urls": True}}
+                ]
+            },
+        )
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(
+            id=-1003712304136,
+            type="supergroup",
+            title="Sigurd // TG",
+            full_name=None,
+            is_forum=False,
+        ),
+        from_user=SimpleNamespace(id=617744661, full_name="Chip", username="ChipCR"),
+        text="https://x.com/i/status/2082389844391506305",
+        caption=None,
+        entities=None,
+        caption_entities=None,
+        message_thread_id=None,
+        is_topic_message=False,
+        message_id=7305,
+        reply_to_message=None,
+        date=None,
+        business_connection_id=None,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.text == "/tg https://x.com/i/status/2082389844391506305"
+    assert event.auto_skill is None
 
 
 
