@@ -40,6 +40,7 @@ def test_auto_skill_routes_load_valid_routes():
         {
             "skill": "tg",
             "chats": {"-1001234567890", "123456789"},
+            "match_text": False,
             "match_urls": True,
             "match_media": {"photo", "video"},
         }
@@ -64,6 +65,34 @@ def test_text_without_url_does_not_trigger():
     })
 
     assert adapter._auto_skill_prefix_for_text("123", "обычный вопрос") is None
+
+
+def test_text_match_routes_plain_text_for_matching_chat():
+    adapter = _make_adapter({
+        "auto_skill_routes": [
+            {"skill": "tg", "chats": ["123"], "match": {"text": True}}
+        ]
+    })
+
+    assert adapter._auto_skill_prefix_for_text("123", "сделай заголовок короче") == "/tg "
+
+
+def test_text_match_does_not_route_finished_preview_or_slash_command():
+    adapter = _make_adapter({
+        "auto_skill_routes": [
+            {"skill": "tg", "chats": ["123"], "match": {"text": True}}
+        ]
+    })
+    preview = (
+        "USDH уступает место USDC\n"
+        "⠀\n"
+        "Готовый TG-пост с несколькими смысловыми блоками.\n"
+        "⠀\n"
+        "Источник: Hyperliquid"
+    )
+
+    assert adapter._auto_skill_prefix_for_text("123", preview) is None
+    assert adapter._auto_skill_prefix_for_text("123", "/status") is None
 
 
 def test_finished_tg_preview_text_does_not_auto_route_even_with_urls():
@@ -191,6 +220,45 @@ def test_core_adapter_prefixes_configured_url_route_before_agent_dispatch():
 
     assert event.text == "/tg https://x.com/i/status/2082389844391506305"
     assert event.auto_skill is None
+
+
+@pytest.mark.parametrize("adapter_cls", [TelegramAdapter, PluginTelegramAdapter])
+def test_live_adapters_prefix_plain_text_route_before_agent_dispatch(adapter_cls):
+    adapter = adapter_cls(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "auto_skill_routes": [
+                    {"skill": "tg", "chats": ["-1003712304136"], "match": {"text": True}}
+                ]
+            },
+        )
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(
+            id=-1003712304136,
+            type="supergroup",
+            title="Sigurd // TG",
+            full_name=None,
+            is_forum=False,
+        ),
+        from_user=SimpleNamespace(id=617744661, full_name="Chip", username="ChipCR", is_bot=False),
+        text="сделай заголовок короче",
+        caption=None,
+        entities=None,
+        caption_entities=None,
+        message_thread_id=None,
+        is_topic_message=False,
+        message_id=7366,
+        reply_to_message=None,
+        date=None,
+        business_connection_id=None,
+    )
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.text == "/tg сделай заголовок короче"
 
 
 

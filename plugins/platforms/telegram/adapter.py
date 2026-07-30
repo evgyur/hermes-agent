@@ -710,12 +710,13 @@ class TelegramAdapter(BasePlatformAdapter):
             route = {
                 "skill": skill,
                 "chats": chat_ids,
+                "match_text": bool(match.get("text", False)),
                 "match_urls": bool(match.get("urls", False)),
                 "match_media": {
                     str(item).strip().lower() for item in media if str(item).strip()
                 },
             }
-            if chat_ids and (route["match_urls"] or route["match_media"]):
+            if chat_ids and (route["match_text"] or route["match_urls"] or route["match_media"]):
                 routes.append(route)
         return routes
 
@@ -740,7 +741,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         has_url = bool(re.search(r"https?://\S+", content, re.IGNORECASE))
         for route in getattr(self, "_auto_skill_routes", []) or []:
-            if str(chat_id) in route["chats"] and route["match_urls"] and has_url:
+            if str(chat_id) not in route["chats"]:
+                continue
+            if route["match_text"] or (route["match_urls"] and has_url):
                 return f"/{route['skill']} "
         return None
 
