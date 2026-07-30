@@ -3476,13 +3476,12 @@ class TestTransientTransportRetry:
         assert result == {"ok": True}
         assert client.chat.completions.create.call_count == 2
 
-    def test_exhausted_5xx_uses_configured_compression_fallback(self):
-        """A pinned compression model that keeps returning 5xx must move to
-        its configured fallback after the bounded same-provider retries.
+    def test_forced_route_unavailable_skips_retry_to_compression_fallback(self):
+        """The H20 route-unavailable sentinel is a deterministic route miss.
 
-        This is the live mmfast failure shape: the Human20 route returned
-        ``503 forced_litellm_route_unavailable`` and compression stopped even
-        though a healthy GLM fallback was configured.
+        Retrying the same route can consume the full 300-second compression
+        budget before a healthy independent fallback gets a chance. Generic
+        5xx responses still retain the bounded same-provider retry above.
         """
         class _Err503(Exception):
             status_code = 503
@@ -3520,11 +3519,57 @@ class TestTransientTransportRetry:
             )
 
         assert result == {"model": "glm"}
-        assert primary.chat.completions.create.call_count == 2
+        primary.chat.completions.create.assert_called_once()
         fallback.chat.completions.create.assert_called_once()
         configured_chain.assert_called_once_with(
             "compression", "openrouter", reason="server error"
         )
+        main_fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_forced_route_unavailable_skips_retry_to_compression_fallback(self):
+        class _Err503(Exception):
+            status_code = 503
+
+        primary = MagicMock()
+        primary.base_url = "http://127.0.0.1:18750/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_Err503("forced_litellm_route_unavailable")
+        )
+
+        fallback_sync = MagicMock()
+        fallback_sync.base_url = "http://127.0.0.1:18750/v1"
+        fallback_async = MagicMock()
+        fallback_async.base_url = fallback_sync.base_url
+        fallback_async.chat.completions.create = AsyncMock(
+            return_value={"model": "glm"}
+        )
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback_sync,
+                    "glm",
+                    "fallback_chain[0](human20-keys-glm)",
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback_async, "glm"),
+            ),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback,
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result == {"model": "glm"}
+        primary.chat.completions.create.assert_awaited_once()
+        fallback_async.chat.completions.create.assert_awaited_once()
         main_fallback.assert_not_called()
 
     def test_does_not_retry_non_transient_400(self):

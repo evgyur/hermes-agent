@@ -3195,6 +3195,11 @@ def _is_server_error(exc: Exception) -> bool:
     return "forced_litellm_route_unavailable" in str(exc).lower()
 
 
+def _is_forced_litellm_route_unavailable(exc: Exception) -> bool:
+    """Return True for the H20 gateway's deterministic route-miss sentinel."""
+    return "forced_litellm_route_unavailable" in str(exc).lower()
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -7382,10 +7387,17 @@ def call_llm(
             # back — doubling the user-visible stall (issue #54465). Skip the
             # same-provider retry for compression on a full-budget timeout and
             # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            # streaming-close or a generic 5xx) still retry, since those are
+            # cheap.  The H20 forced-route sentinel is different: that route is
+            # deterministically unavailable and can hold the request for most
+            # of the timeout budget before returning 503, so retrying it blocks
+            # the healthy fallback behind the gateway hygiene deadline.
+            if task == "compression" and (
+                _is_timeout_error(transient_err)
+                or _is_forced_litellm_route_unavailable(transient_err)
+            ):
                 logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
+                    "Auxiliary compression: exhausted route on the critical path; "
                     "skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
@@ -8008,11 +8020,15 @@ async def async_call_llm(
             if not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            # so skip a same-provider retry after a full-budget timeout or the
+            # deterministic H20 route-unavailable sentinel. Both can consume
+            # the hygiene deadline before an independent fallback is tried.
+            if task == "compression" and (
+                _is_timeout_error(transient_err)
+                or _is_forced_litellm_route_unavailable(transient_err)
+            ):
                 logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
+                    "Auxiliary compression (async): exhausted route on the critical "
                     "path; skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
