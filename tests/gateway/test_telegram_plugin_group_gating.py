@@ -52,9 +52,7 @@ def _adapter(
             "require_mention_chats": [str(TARGET_CHAT)] if require_mention_chats is None else require_mention_chats,
             "require_mention_topics": [] if require_mention_topics is None else require_mention_topics,
             "reply_trigger_disabled_chats": (
-                [str(TARGET_CHAT)]
-                if reply_trigger_disabled_chats is None
-                else reply_trigger_disabled_chats
+                [] if reply_trigger_disabled_chats is None else reply_trigger_disabled_chats
             ),
             "free_response_chats": [] if free_response_chats is None else free_response_chats,
             "allowed_chats": [],
@@ -71,11 +69,11 @@ def _adapter(
     return adapter
 
 
-def test_live_plugin_target_chat_is_direct_mention_only():
+def test_live_plugin_target_chat_is_mention_or_reply_only():
     adapter = _adapter()
 
     assert adapter._should_process_message(_message("обычное сообщение")) is False
-    assert adapter._should_process_message(_message("вопрос", reply_to_bot=True)) is False
+    assert adapter._should_process_message(_message("вопрос", reply_to_bot=True)) is True
     assert adapter._should_process_message(_message("@VladisFom вопрос")) is False
     assert adapter._should_process_message(_message("@chipshermesbot вопрос")) is False
     assert adapter._should_process_message(_message("@Human20Bot вопрос")) is True
