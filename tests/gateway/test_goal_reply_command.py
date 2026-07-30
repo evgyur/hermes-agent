@@ -132,6 +132,179 @@ async def test_goal_status_reply_does_not_replace_goal(hermes_home, runner):
 
 
 @pytest.mark.asyncio
+async def test_goal_resume_queues_immediate_canonical_continuation(hermes_home, runner):
+    """Regression: /goal resume must do work without another user message."""
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(runner.session.session_id)
+    mgr.set("finish the paused work")
+    mgr.pause(reason="turn budget exhausted")
+    event = MessageEvent(
+        text="/goal resume",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-resume-1",
+    )
+
+    response = await runner.runner._handle_goal_command(event)
+
+    state = GoalManager(runner.session.session_id).state
+    assert state is not None
+    assert state.status == "active"
+    assert state.turns_used == 0
+    assert "continuation queued immediately" in response.lower()
+    queued = runner.adapter._pending_messages[runner.session.session_key]
+    assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
+    assert state.goal in queued.text
+    assert queued.internal is True
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_replaces_stale_continuations_without_duplication(hermes_home, runner):
+    """Repeated resume is idempotent for queued synthetic continuation turns."""
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GoalManager
+
+    mgr = GoalManager(runner.session.session_id)
+    mgr.set("finish exactly once")
+    mgr.pause(reason="user-paused")
+    stale = MessageEvent(
+        text=CONTINUATION_PROMPT_TEMPLATE.format(goal="stale goal text"),
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        internal=True,
+    )
+    runner.adapter._pending_messages[runner.session.session_key] = stale
+    event = MessageEvent(
+        text="/goal resume",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-resume-2",
+    )
+
+    await runner.runner._handle_goal_command(event)
+    await runner.runner._handle_goal_command(event)
+
+    pending = runner.adapter._pending_messages[runner.session.session_key]
+    overflow = runner.runner._queued_events.get(runner.session.session_key, [])
+    all_events = [pending, *overflow]
+    continuations = [e for e in all_events if runner.runner._is_goal_continuation_event(e)]
+    assert len(continuations) == 1
+    assert "finish exactly once" in continuations[0].text
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_preserves_real_fifo_events(hermes_home, runner):
+    """Replacing stale goal turns must never drop or reorder user messages."""
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GoalManager
+
+    mgr = GoalManager(runner.session.session_id)
+    mgr.set("resume after user queue")
+    mgr.pause(reason="user-paused")
+    first_user = MessageEvent(
+        text="first real user message",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+    )
+    stale = MessageEvent(
+        text=CONTINUATION_PROMPT_TEMPLATE.format(goal="stale"),
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        internal=True,
+    )
+    second_user = MessageEvent(
+        text="second real user message",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+    )
+    key = runner.session.session_key
+    runner.adapter._pending_messages[key] = first_user
+    runner.runner._queued_events[key] = [stale, second_user]
+
+    response = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal resume",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="cmd-resume-fifo",
+        )
+    )
+
+    assert "continuation queued immediately" in response.lower()
+    pending = runner.adapter._pending_messages[key]
+    overflow = runner.runner._queued_events[key]
+    assert pending is first_user
+    assert overflow[0] is second_user
+    assert len(overflow) == 2
+    assert runner.runner._is_goal_continuation_event(overflow[1])
+    assert "resume after user queue" in overflow[1].text
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_promotes_real_user_behind_stale_head(hermes_home, runner):
+    """A real user event behind a stale goal head must run before resumed goal work."""
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GoalManager
+
+    mgr = GoalManager(runner.session.session_id)
+    mgr.set("resume only after queued user")
+    mgr.pause(reason="user-paused")
+    key = runner.session.session_key
+    stale = MessageEvent(
+        text=CONTINUATION_PROMPT_TEMPLATE.format(goal="stale head"),
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        internal=True,
+    )
+    real_user = MessageEvent(
+        text="accepted real user turn",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+    )
+    runner.adapter._pending_messages[key] = stale
+    runner.runner._queued_events[key] = [real_user]
+
+    await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal resume",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="cmd-resume-promote-user",
+        )
+    )
+
+    assert runner.adapter._pending_messages[key] is real_user
+    overflow = runner.runner._queued_events[key]
+    assert len(overflow) == 1
+    assert runner.runner._is_goal_continuation_event(overflow[0])
+    assert "resume only after queued user" in overflow[0].text
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_fails_closed_when_continuation_cannot_queue(hermes_home, runner):
+    """Never claim success while leaving an active goal with no queued work."""
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(runner.session.session_id)
+    mgr.set("must not strand active")
+    mgr.pause(reason="user-paused")
+    runner.runner.adapters.pop(runner.source.platform)
+
+    response = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal resume",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="cmd-resume-no-adapter",
+        )
+    )
+
+    state = GoalManager(runner.session.session_id).state
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "resume continuation enqueue failed"
+    assert "could not resume" in response.lower()
+
+
+@pytest.mark.asyncio
 async def test_bare_goal_reply_strips_supergoal_body_prefix_and_sets_high(hermes_home, runner):
     event = MessageEvent(
         text="/goal",

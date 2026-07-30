@@ -139,8 +139,60 @@ def test_goal_resume_reactivates(server, session):
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
+    assert r["result"]["type"] == "send"
+    assert "resumed" in r["result"]["notice"].lower()
+    assert "continuation queued immediately" in r["result"]["notice"].lower()
+    assert r["result"]["message"].startswith(
+        "[Continuing toward your standing goal]\nGoal: write a story"
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.status == "active"
+
+
+def test_goal_resume_while_turn_running_queues_without_redirect(server, session):
+    """A synthetic resume turn must not rewrite/redirect the live user turn."""
+    sid, session_key, s = session
+    _call(server, "command.dispatch", name="goal", arg="finish after live turn", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    agent = MagicMock()
+    agent._supports_active_turn_redirect = True
+    agent.redirect.return_value = True
+    s["agent"] = agent
+    s["running"] = True
+    s["inflight_turn"] = {"user": "original live prompt", "assistant": "", "streaming": True}
+
+    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
+
     assert r["result"]["type"] == "exec"
-    assert "resumed" in r["result"]["output"].lower()
+    assert "queued" in r["result"]["output"].lower()
+    assert s["inflight_turn"]["user"] == "original live prompt"
+    agent.redirect.assert_not_called()
+    assert s["queued_prompt"]["text"].startswith(
+        "[Continuing toward your standing goal]\nGoal: finish after live turn"
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.status == "active"
+
+
+def test_goal_resume_preserves_existing_tui_user_queue(server, session):
+    """A real queued user turn wins; resume must not merge synthetic text into it."""
+    sid, session_key, s = session
+    _call(server, "command.dispatch", name="goal", arg="continue after user", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    existing = {"text": "real queued user turn", "transport": object()}
+    s["running"] = True
+    s["queued_prompt"] = existing
+
+    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
+
+    assert r["result"]["type"] == "exec"
+    assert "existing queued turn will run first" in r["result"]["output"].lower()
+    assert s["queued_prompt"] is existing
+    assert s["queued_prompt"]["text"] == "real queued user turn"
 
     from hermes_cli.goals import GoalManager
 

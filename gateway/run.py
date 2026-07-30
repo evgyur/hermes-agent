@@ -5644,11 +5644,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         removed += 1
                     else:
                         kept.append(queued_event)
+                # If removing synthetic entries leaves the adapter head empty,
+                # promote the oldest real overflow event.  Otherwise the next
+                # synthetic enqueue can jump ahead of user input, and pause/
+                # clear can strand that user event with no pending head to drain.
+                if (
+                    kept
+                    and isinstance(pending_slot, dict)
+                    and session_key not in pending_slot
+                ):
+                    pending_slot[session_key] = kept.pop(0)
                 if kept:
                     queued_events[session_key] = kept
                 else:
                     queued_events.pop(session_key, None)
         return removed
+
+    def _enqueue_goal_continuation_once(
+        self,
+        *,
+        session_key: str,
+        adapter: Any,
+        source: Any,
+        prompt: str,
+        message_id: Any = None,
+        channel_prompt: Any = None,
+    ) -> bool:
+        """Replace stale synthetic goal turns with one canonical continuation.
+
+        Resume commands and the post-turn judge can race at the same turn
+        boundary.  Both paths use this helper so the queue contains exactly one
+        synthetic continuation while preserving every real user/FIFO event.
+        """
+        if (
+            not session_key
+            or adapter is None
+            or source is None
+            or not str(prompt or "").strip()
+        ):
+            return False
+        self._clear_goal_pending_continuations(session_key, adapter)
+        continuation = MessageEvent(
+            text=str(prompt),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=message_id,
+            channel_prompt=channel_prompt,
+            internal=True,
+        )
+        self._enqueue_fifo(session_key, continuation, adapter)
+        pending_messages = getattr(adapter, "_pending_messages", None)
+        pending = (
+            pending_messages.get(session_key)
+            if isinstance(pending_messages, dict)
+            else None
+        )
+        queued_events = getattr(self, "_queued_events", None)
+        overflow = (
+            queued_events.get(session_key, [])
+            if isinstance(queued_events, dict)
+            else []
+        )
+        return pending is continuation or any(
+            item is continuation for item in overflow
+        )
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
@@ -16114,6 +16173,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            prompt = mgr.next_continuation_prompt()
+            if not prompt:
+                return mgr.status_line()
+            adapter = self.adapters.get(event.source.platform) if event.source else None
+            _quick_key = getattr(session_entry, "session_key", None) or (
+                self._session_key_for_source(event.source) if event.source else None
+            )
+            queued = self._enqueue_goal_continuation_once(
+                session_key=_quick_key,
+                adapter=adapter,
+                source=event.source,
+                prompt=prompt,
+                message_id=event.message_id,
+                channel_prompt=event.channel_prompt,
+            )
+            if not queued:
+                mgr.pause(reason="resume continuation enqueue failed")
+                logger.error("goal resume: failed to enqueue continuation for session %s", _quick_key)
+                return "⚠ Goal could not resume: continuation enqueue failed; goal remains paused."
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -16445,15 +16523,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                cont_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+            self._enqueue_goal_continuation_once(
+                session_key=_quick_key,
+                adapter=adapter,
+                source=source,
+                prompt=prompt,
+            )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 

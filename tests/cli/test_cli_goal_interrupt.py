@@ -112,6 +112,19 @@ class TestInterruptAutoPause:
         mgr.resume()
         assert mgr.state.status == "active"
 
+    def test_goal_resume_command_queues_immediate_continuation(self, hermes_home):
+        """CLI /goal resume must not require typing a second user message."""
+        sid = f"sid-command-resume-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid, "finish the interrupted task")
+        mgr.pause(reason="interrupt")
+
+        cli._handle_goal_command("/goal resume")
+
+        assert mgr.state.status == "active"
+        queued = cli._pending_input.get_nowait()
+        assert queued.startswith("[Continuing toward your standing goal]\nGoal: ")
+        assert "finish the interrupted task" in queued
+
 
 class TestEmptyResponseSkip:
     def test_empty_response_does_not_invoke_judge(self, hermes_home):

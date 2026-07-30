@@ -2141,11 +2141,18 @@ class CLICommandsMixin:
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
+                prompt = mgr.next_continuation_prompt()
+                if not prompt:
+                    _cprint(f"  {mgr.status_line()}")
+                    return
+                try:
+                    self._pending_input.put(prompt)
+                except Exception as exc:
+                    mgr.pause(reason="resume continuation enqueue failed")
+                    _cprint(f"  ⚠ Goal could not resume: continuation enqueue failed ({exc}).")
+                    return
                 _cprint(f"  ▶ Goal resumed: {state.goal}")
-                _cprint(
-                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
-                    f"is a no-op; type 'continue' to kick it off).{_RST}"
-                )
+                _cprint(f"  {_DIM}Continuation queued immediately; no extra message needed.{_RST}")
             return
 
         if lower in {"clear", "stop", "done"}:

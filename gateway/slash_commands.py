@@ -2324,6 +2324,25 @@ class GatewaySlashCommandsMixin:
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            prompt = mgr.next_continuation_prompt()
+            if not prompt:
+                return mgr.status_line()
+            adapter = self.adapters.get(event.source.platform) if event.source else None
+            _quick_key = getattr(session_entry, "session_key", None) or (
+                self._session_key_for_source(event.source) if event.source else None
+            )
+            queued = self._enqueue_goal_continuation_once(
+                session_key=_quick_key,
+                adapter=adapter,
+                source=event.source,
+                prompt=prompt,
+                message_id=event.message_id,
+                channel_prompt=event.channel_prompt,
+            )
+            if not queued:
+                mgr.pause(reason="resume continuation enqueue failed")
+                logger.error("goal resume: failed to enqueue continuation for session %s", _quick_key)
+                return "⚠ Goal could not resume: continuation enqueue failed; goal remains paused."
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
