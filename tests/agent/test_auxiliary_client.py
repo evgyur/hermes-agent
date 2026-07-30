@@ -2795,6 +2795,125 @@ class TestStaleFallbackCandidateSkip:
         )
         independent_fb.chat.completions.create.assert_called_once()
 
+    def test_compression_main_fallback_transport_failure_reaches_discovery(self):
+        """Configured fallback and main model can both fail transiently.
+
+        The explicit-provider path must still reach generic discovery instead
+        of declaring every fallback exhausted after the main candidate alone.
+        """
+        class _Err503(Exception):
+            status_code = 503
+
+        primary_client = MagicMock()
+        primary_client.base_url = "http://127.0.0.1:18750/v1"
+        primary_client.chat.completions.create.side_effect = _Err503(
+            "forced_litellm_route_unavailable"
+        )
+
+        broken_glm = MagicMock()
+        broken_glm.base_url = "http://127.0.0.1:18750/v1"
+        broken_glm.chat.completions.create.side_effect = _Err503(
+            "forced_litellm_route_unavailable"
+        )
+
+        broken_main = MagicMock()
+        broken_main.base_url = "https://chatgpt.com/backend-api/codex"
+        broken_main.chat.completions.create.side_effect = RuntimeError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+        discovery_fb = MagicMock()
+        discovery_fb.base_url = "https://openrouter.ai/api/v1"
+        discovery_fb.chat.completions.create.return_value = _DummyResponse(
+            "discovery-fallback"
+        )
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("human20-keys", "mmfast", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "mmfast")), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(broken_glm, "glm", "fallback_chain[0](human20-keys-glm)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(broken_main, "gpt-5.6-sol", "main-agent(openai-codex)")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(discovery_fb, "fallback-model", "openrouter")) as discovery:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "discovery-fallback"
+        discovery.assert_called_once_with(
+            "openai-codex", "compression",
+            reason="failed main-agent fallback candidate",
+        )
+        discovery_fb.chat.completions.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_compression_main_fallback_failure_reaches_discovery(self):
+        """The async explicit-provider path reaches the same third layer."""
+        class _Err503(Exception):
+            status_code = 503
+
+        primary = MagicMock()
+        primary.base_url = "http://127.0.0.1:18750/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_Err503("forced_litellm_route_unavailable")
+        )
+
+        glm_sync, main_sync, discovery_sync = MagicMock(), MagicMock(), MagicMock()
+        glm_sync.base_url = "http://127.0.0.1:18750/v1"
+        main_sync.base_url = "https://chatgpt.com/backend-api/codex"
+        discovery_sync.base_url = "https://openrouter.ai/api/v1"
+
+        glm_async, main_async, discovery_async = MagicMock(), MagicMock(), MagicMock()
+        glm_async.base_url = glm_sync.base_url
+        main_async.base_url = main_sync.base_url
+        discovery_async.base_url = discovery_sync.base_url
+        glm_async.chat.completions.create = AsyncMock(
+            side_effect=_Err503("forced_litellm_route_unavailable")
+        )
+        main_async.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("incomplete chunked read")
+        )
+        discovery_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async-discovery-fallback")
+        )
+
+        async_clients = {
+            id(glm_sync): (glm_async, "glm"),
+            id(main_sync): (main_async, "gpt-5.6-sol"),
+            id(discovery_sync): (discovery_async, "fallback-model"),
+        }
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("human20-keys", "mmfast", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "mmfast")), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(glm_sync, "glm", "fallback_chain[0](human20-keys-glm)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(main_sync, "gpt-5.6-sol", "main-agent(openai-codex)")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(discovery_sync, "fallback-model", "openrouter")) as discovery, \
+             patch("agent.auxiliary_client._to_async_client",
+                   side_effect=lambda client, model, **_: async_clients[id(client)]):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "async-discovery-fallback"
+        discovery.assert_called_once_with(
+            "openai-codex", "compression",
+            reason="failed main-agent fallback candidate",
+        )
+        discovery_async.chat.completions.create.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_async_compression_fallback_503_is_skippable(self):
         """The async fallback helper mirrors the sync 5xx recovery rule."""

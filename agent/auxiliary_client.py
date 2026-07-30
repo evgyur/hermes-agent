@@ -7787,6 +7787,30 @@ def call_llm(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+                    # The explicit-provider path has now exhausted both its
+                    # configured fallback and the independent main-agent
+                    # safety net. A transient main transport failure must
+                    # still reach generic discovery. Resolve the concrete
+                    # failed backend from the candidate URL so discovery does
+                    # not immediately select the same provider again.
+                    if not is_auto:
+                        failed_layer_provider = _auth_refresh_provider_for_route(
+                            "auto", str(getattr(fb_client, "base_url", "") or ""))
+                        fb_client, fb_model, fb_label = _try_payment_fallback(
+                            failed_layer_provider or resolved_provider,
+                            task,
+                            reason="failed main-agent fallback candidate",
+                        )
+                        if fb_client is not None:
+                            fb_resp = _call_fallback_candidate_sync(
+                                fb_client, fb_model, fb_label,
+                                task=task, messages=messages,
+                                temperature=temperature, max_tokens=max_tokens,
+                                tools=tools, effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                            if fb_resp is not None:
+                                return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -8329,6 +8353,28 @@ async def async_call_llm(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+                    if not is_auto:
+                        failed_layer_provider = _auth_refresh_provider_for_route(
+                            "auto", str(getattr(fb_client, "base_url", "") or ""))
+                        fb_client, fb_model, fb_label = _try_payment_fallback(
+                            failed_layer_provider or resolved_provider,
+                            task,
+                            reason="failed main-agent fallback candidate",
+                        )
+                        if fb_client is not None:
+                            async_fb, async_fb_model = _to_async_client(
+                                fb_client, fb_model or "",
+                                is_vision=(task == "vision"),
+                            )
+                            fb_resp = await _call_fallback_candidate_async(
+                                async_fb, async_fb_model or fb_model, fb_label,
+                                task=task, messages=messages,
+                                temperature=temperature, max_tokens=max_tokens,
+                                tools=tools, effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                            if fb_resp is not None:
+                                return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
