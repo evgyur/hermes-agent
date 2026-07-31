@@ -1595,6 +1595,7 @@ class GoalManager:
         technical_boundary: Optional[str] = None,
         defer_budget_pause: bool = False,
         ignore_wait_barrier: bool = False,
+        durable_resume_scheduled: bool = False,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1622,6 +1623,12 @@ class GoalManager:
         completed after an earlier outcome in the same drain chain set WAIT.
         It clears that newly-created barrier so the later evidence is still
         counted and judged; a barrier that predates the chain remains binding.
+
+        ``durable_resume_scheduled`` is a fail-closed parking gate. Callers may
+        set it only after verifying an enabled, goal-specific cron that will
+        restart this exact goal. A process callback or future deadline alone
+        is not durable enough: an otherwise-valid WAIT verdict is downgraded
+        to CONTINUE so the standing goal cannot silently fall asleep.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1756,12 +1763,21 @@ class GoalManager:
         else:
             state.consecutive_transport_failures = 0
 
-        # WAIT verdict: the judge decided the agent is blocked on async work
-        # and re-poking now would be busy-work. Set the barrier and park —
-        # the turn we just counted stands (the judge call happened), but no
-        # continuation fires. The loop resumes automatically when the pid
-        # exits or the deadline passes (next evaluate_after_turn falls through
-        # the is_waiting() short-circuit once the barrier clears).
+        # WAIT verdict: parking is allowed only when the caller has already
+        # verified a durable, goal-specific resume cron. Process callbacks,
+        # watcher notifications and deadlines can be lost or routed to the
+        # wrong session, so they are not sufficient wake mechanisms by
+        # themselves. Fail closed to CONTINUE when the durable wake is absent.
+        if verdict == "wait" and wait_directive and not durable_resume_scheduled:
+            reason = (
+                f"{reason}; WAIT rejected because no verified durable resume cron "
+                "was scheduled for this exact goal"
+            )
+            verdict = "continue"
+            wait_directive = None
+            state.last_verdict = verdict
+            state.last_reason = reason
+
         if verdict == "wait" and wait_directive:
             if wait_directive.get("session_id"):
                 self.wait_on_session(str(wait_directive["session_id"]), reason=reason)

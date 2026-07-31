@@ -1975,6 +1975,7 @@ class TestJudgeDrivenWait:
                         "pid": proc.pid, "command": "wait_for_pr_green.sh",
                         "status": "running", "uptime_seconds": 12,
                     }],
+                    durable_resume_scheduled=True,
                 )
             assert decision["verdict"] == "wait"
             assert decision["should_continue"] is False
@@ -2003,12 +2004,51 @@ class TestJudgeDrivenWait:
             goals, "judge_goal",
             return_value=("wait", "rate limited", False, {"seconds": 120}, False),
         ):
-            decision = mgr.evaluate_after_turn("Hit a 429, backing off.")
+            decision = mgr.evaluate_after_turn(
+                "Hit a 429, backing off.",
+                durable_resume_scheduled=True,
+            )
         assert decision["verdict"] == "wait"
         assert decision["should_continue"] is False
         assert mgr.state.waiting_until > 0
         assert mgr.state.waiting_on_pid is None
         assert mgr.is_waiting() is True
+
+    def test_judge_wait_without_durable_resume_cron_keeps_goal_running(self, hermes_home):
+        """A process callback alone must never park a standing goal."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-no-cron", default_max_turns=10)
+        mgr.set("finish the release")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=(
+                "wait",
+                "reviewer still running",
+                False,
+                {"session_id": "proc_unbacked"},
+                False,
+            ),
+        ):
+            decision = mgr.evaluate_after_turn(
+                "Waiting for the reviewer callback.",
+                background_processes=[{
+                    "session_id": "proc_unbacked",
+                    "pid": 4242,
+                    "command": "review.sh",
+                    "status": "running",
+                }],
+            )
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert decision["continuation_prompt"]
+        assert mgr.state.waiting_on_session is None
+        assert mgr.state.waiting_on_pid is None
+        assert mgr.state.waiting_until == 0.0
+        assert "durable resume cron" in decision["reason"]
 
     def test_time_barrier_clears_after_deadline(self, hermes_home):
         from hermes_cli.goals import GoalManager
@@ -2108,6 +2148,7 @@ class TestSessionTriggerBarrier:
                     "status": "running", "watch_patterns": ["BUILD SUCCESSFUL"],
                     "watch_hit": False,
                 }],
+                durable_resume_scheduled=True,
             )
         assert decision["verdict"] == "wait"
         assert mgr.state.waiting_on_session == "proc_t4"
