@@ -15741,10 +15741,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     parsed = set()
                     break
                 parsed.add(item)
+            if len(parsed) != len(configured):
+                parsed = set()
             allowed = parsed
         source_platform = getattr(source, "platform", "")
         platform = getattr(source_platform, "value", source_platform)
-        origin = f"{str(platform or '').strip()}:{str(getattr(source, 'chat_id', '') or '').strip()}"
+        platform_value = str(platform or "")
+        chat_id_value = str(getattr(source, "chat_id", "") or "")
+        if (
+            not platform_value
+            or not chat_id_value
+            or platform_value != platform_value.strip()
+            or chat_id_value != chat_id_value.strip()
+        ):
+            origin = ""
+        else:
+            origin = f"{platform_value}:{chat_id_value}"
         if origin in allowed:
             return None
 

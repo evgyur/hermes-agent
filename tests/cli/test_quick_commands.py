@@ -270,6 +270,7 @@ class TestGatewayQuickCommands:
             ["telegram:"],
             [":123"],
             [" telegram:123"],
+            ["telegram:123", "telegram:123"],
         )
         for allowed_origins in invalid_values:
             runner.config = {
@@ -306,9 +307,15 @@ class TestGatewayQuickCommands:
         prefix_event.source.chat_id = "1234"
         platform_event = self._make_event("private")
         platform_event.source.platform.value = "discord"
+        chat_whitespace_event = self._make_event("private")
+        chat_whitespace_event.source.chat_id = " 123"
+        platform_whitespace_event = self._make_event("private")
+        platform_whitespace_event.source.platform.value = "telegram "
 
         assert await runner._handle_message(prefix_event) == "This command is not available in this chat."
         assert await runner._handle_message(platform_event) == "This command is not available in this chat."
+        assert await runner._handle_message(chat_whitespace_event) == "This command is not available in this chat."
+        assert await runner._handle_message(platform_whitespace_event) == "This command is not available in this chat."
 
     @pytest.mark.asyncio
     async def test_alias_allowed_origins_denial_does_not_rewrite_event(self):
