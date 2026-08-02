@@ -12360,6 +12360,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 quick_commands = getattr(self.config, "quick_commands", {}) or {}
             if isinstance(quick_commands, dict) and command in quick_commands:
                 qcmd = quick_commands[command]
+                _origin_denied = self._check_quick_command_origin(source, qcmd, command)
+                if _origin_denied is not None:
+                    return _origin_denied
                 if qcmd.get("type") == "alias":
                     target = (qcmd.get("target") or "").strip()
                     if target:
@@ -12753,6 +12756,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
                 qcmd = quick_commands[command]
+                _origin_denied = self._check_quick_command_origin(source, qcmd, command)
+                if _origin_denied is not None:
+                    return _origin_denied
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
@@ -15709,6 +15715,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "or to set user_allowed_commands."
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+    def _check_quick_command_origin(
+        self, source: SessionSource, qcmd: Any, command: str
+    ) -> Optional[str]:
+        """Fail closed when a quick command is scoped to exact origins.
+
+        ``allowed_origins`` is an optional list of ``<platform>:<chat_id>``
+        strings.  Invalid configured shapes deny execution instead of silently
+        widening access.  Commands without the key retain legacy behaviour.
+        """
+        if not isinstance(qcmd, dict) or "allowed_origins" not in qcmd:
+            return None
+
+        configured = qcmd.get("allowed_origins")
+        allowed: set[str] = set()
+        if isinstance(configured, list) and configured:
+            parsed: set[str] = set()
+            for item in configured:
+                if not isinstance(item, str) or item != item.strip():
+                    parsed = set()
+                    break
+                item_platform, separator, item_chat_id = item.partition(":")
+                if not separator or not item_platform or not item_chat_id:
+                    parsed = set()
+                    break
+                parsed.add(item)
+            allowed = parsed
+        source_platform = getattr(source, "platform", "")
+        platform = getattr(source_platform, "value", source_platform)
+        origin = f"{str(platform or '').strip()}:{str(getattr(source, 'chat_id', '') or '').strip()}"
+        if origin in allowed:
+            return None
+
+        logger.warning(
+            "Quick command /%s denied for origin %s by allowed_origins",
+            command,
+            origin or "?:?",
+        )
+        return "This command is not available in this chat."
 
 
 

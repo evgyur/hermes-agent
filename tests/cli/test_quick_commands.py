@@ -210,6 +210,132 @@ class TestGatewayQuickCommands:
         assert result == "telegram|123|456"
 
     @pytest.mark.asyncio
+    async def test_exec_command_allowed_origins_allows_exact_origin(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "private": {
+                    "type": "exec",
+                    "command": "echo private-ok",
+                    "allowed_origins": ["telegram:123"],
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        result = await runner._handle_message(self._make_event("private"))
+
+        assert result == "private-ok"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_allowed_origins_denies_other_chat_before_execution(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "private": {
+                    "type": "exec",
+                    "command": "echo must-not-run",
+                    "allowed_origins": ["telegram:999"],
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        result = await runner._handle_message(self._make_event("private"))
+
+        assert result == "This command is not available in this chat."
+        assert "must-not-run" not in result
+
+    @pytest.mark.asyncio
+    async def test_exec_command_allowed_origins_invalid_shape_fails_closed(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        invalid_values = (
+            {"telegram:123": True},
+            [],
+            ["telegram:123", 7],
+            ["telegram:"],
+            [":123"],
+            [" telegram:123"],
+        )
+        for allowed_origins in invalid_values:
+            runner.config = {
+                "quick_commands": {
+                    "private": {
+                        "type": "exec",
+                        "command": "echo must-not-run",
+                        "allowed_origins": allowed_origins,
+                    }
+                }
+            }
+            result = await runner._handle_message(self._make_event("private"))
+            assert result == "This command is not available in this chat."
+
+    @pytest.mark.asyncio
+    async def test_exec_command_allowed_origins_rejects_prefix_and_platform_mismatch(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "private": {
+                    "type": "exec",
+                    "command": "echo must-not-run",
+                    "allowed_origins": ["telegram:123"],
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        prefix_event = self._make_event("private")
+        prefix_event.source.chat_id = "1234"
+        platform_event = self._make_event("private")
+        platform_event.source.platform.value = "discord"
+
+        assert await runner._handle_message(prefix_event) == "This command is not available in this chat."
+        assert await runner._handle_message(platform_event) == "This command is not available in this chat."
+
+    @pytest.mark.asyncio
+    async def test_alias_allowed_origins_denial_does_not_rewrite_event(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "private": {
+                    "type": "alias",
+                    "target": "/usage",
+                    "allowed_origins": ["telegram:999"],
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+        event = self._make_event("private", "sensitive")
+        original_text = event.text
+
+        result = await runner._handle_message(event)
+
+        assert result == "This command is not available in this chat."
+        assert event.text == original_text
+
+    @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
         from gateway.run import GatewayRunner
         runner = GatewayRunner.__new__(GatewayRunner)
