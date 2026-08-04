@@ -2033,7 +2033,12 @@ class TelegramAdapter(BasePlatformAdapter):
         return owner_ids
 
     def _is_business_owner_wake_trigger(self, message: Any) -> bool:
-        """Match an explicit owner concierge command in a third-party DM."""
+        """Match an intentional owner concierge turn in a third-party DM.
+
+        Besides an explicit wake word, a reply to a durably indexed Hermes
+        outbound is an intentional invocation. Plain owner messages still stay
+        fail-closed and are treated as human-account echoes.
+        """
         business_cfg = self._telegram_business_config()
         if not self._truthy_config_value(business_cfg.get("enabled", False)):
             return False
@@ -2056,10 +2061,32 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             words = []
         text = text.lstrip()
-        return any(
+        has_explicit_wake = any(
             re.match(rf"(?i)@?{re.escape(word)}(?=$|[\s,:;.!?\-—])", text)
             for word in words
         )
+        if has_explicit_wake:
+            return True
+        return self._is_reply_to_own_outbound_text(message)
+
+    def _is_reply_to_own_outbound_text(self, message: Any) -> bool:
+        """Return True only for a reply to a durably tracked Hermes send."""
+        business_cfg = self._telegram_business_config()
+        if not self._truthy_config_value(
+            business_cfg.get("allow_reply_trigger", False)
+        ):
+            return False
+        reply = getattr(message, "reply_to_message", None)
+        reply_id = getattr(reply, "message_id", None) if reply is not None else None
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if reply_id is None or chat_id is None:
+            return False
+        try:
+            from gateway import rich_sent_store
+
+            return rich_sent_store.lookup(chat_id, reply_id) is not None
+        except Exception:
+            return False
 
     @staticmethod
     def _telegram_supplied_business_connection_id(message: Any) -> Optional[str]:
@@ -4666,7 +4693,19 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                sent_message_id = getattr(msg, "message_id", None)
+                if sent_message_id is not None:
+                    message_ids.append(str(sent_message_id))
+                    try:
+                        from gateway import rich_sent_store
+
+                        rich_sent_store.record(
+                            chat_id,
+                            str(sent_message_id),
+                            _strip_mdv2(chunk),
+                        )
+                    except Exception:
+                        pass
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,

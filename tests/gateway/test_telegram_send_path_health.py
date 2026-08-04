@@ -70,6 +70,24 @@ async def test_send_succeeds_when_path_healthy():
 
 
 @pytest.mark.asyncio
+async def test_legacy_send_records_message_for_durable_business_reply_trigger(monkeypatch):
+    """Every successful text send, not only rich sends, must be reply-addressable."""
+    adapter = _make_adapter()
+    recorded = []
+    monkeypatch.setattr(
+        "gateway.rich_sent_store.record",
+        lambda chat_id, message_id, text: recorded.append(
+            (str(chat_id), str(message_id), text)
+        ),
+    )
+
+    result = await adapter.send("700000002", "Готово. Проверил чат.")
+
+    assert result.success is True
+    assert recorded == [("700000002", "42", "Готово. Проверил чат.")]
+
+
+@pytest.mark.asyncio
 async def test_send_short_circuits_when_path_degraded():
     """Degraded adapter returns failure WITHOUT calling send_message,
     so cron's live-adapter branch falls through to standalone HTTP."""
@@ -347,6 +365,95 @@ def test_business_owner_wake_recovers_the_verified_connection_for_peer_chat(monk
     event = adapter._build_message_event(wake, MessageType.TEXT)
     assert event.source.business_connection_id == "biz-123"
     assert event.source.external_safe_mode is False
+
+
+def test_business_owner_reply_to_durable_concierge_message_dispatches_and_recovers_route(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    adapter.config.extra["allow_from"] = ["700000001"]
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "send_as_account": True,
+        "allow_reply_trigger": True,
+        "trigger_words": ["Sigurd", "Сигурд"],
+    }
+    monkeypatch.setattr(
+        "gateway.rich_sent_store.lookup",
+        lambda chat_id, message_id: (
+            "Готово. Проверил чат."
+            if (str(chat_id), str(message_id)) == ("700000002", "90001")
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_known_business_connection_id",
+        lambda chat_id: "biz-123" if str(chat_id) == "700000002" else None,
+        raising=False,
+    )
+    message = SimpleNamespace(
+        business_connection_id=None,
+        chat=SimpleNamespace(
+            id=700000002,
+            type="private",
+            title=None,
+            full_name="Peer",
+        ),
+        from_user=SimpleNamespace(
+            id=700000001,
+            is_bot=False,
+            full_name="Owner",
+        ),
+        text="Напиши пост аккуратно",
+        caption=None,
+        message_id=90002,
+        message_thread_id=None,
+        reply_to_message=SimpleNamespace(
+            message_id=90001,
+            business_connection_id=None,
+            text="Готово. Проверил чат.",
+            caption=None,
+            from_user=SimpleNamespace(id=700000001, is_bot=False),
+        ),
+        date=None,
+    )
+
+    assert adapter._should_process_message(message) is True
+    assert adapter._resolve_business_connection_id(message, chat_type="dm") == "biz-123"
+
+    from gateway.platforms.base import MessageType
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+    assert event.source.business_connection_id == "biz-123"
+    assert event.source.external_safe_mode is False
+
+
+def test_business_owner_reply_trigger_requires_durable_sent_message_hit(monkeypatch):
+    adapter = _make_adapter()
+    adapter.config.extra["allow_from"] = ["700000001"]
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "allow_reply_trigger": True,
+        "trigger_words": ["Sigurd", "Сигурд"],
+    }
+    monkeypatch.setattr("gateway.rich_sent_store.lookup", lambda *_args: None)
+    message = SimpleNamespace(
+        business_connection_id=None,
+        chat=SimpleNamespace(id=700000002, type="private"),
+        from_user=SimpleNamespace(id=700000001, is_bot=False),
+        text="обычный ответ человеку",
+        caption=None,
+        reply_to_message=SimpleNamespace(
+            message_id=90001,
+            business_connection_id=None,
+            text="сообщение собеседника",
+            caption=None,
+            from_user=SimpleNamespace(id=700000002, is_bot=False),
+        ),
+    )
+
+    assert adapter._should_process_message(message) is False
 
 
 def test_single_verified_business_connection_recovers_a_new_peer_chat(tmp_path, monkeypatch):
