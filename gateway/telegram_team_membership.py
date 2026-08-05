@@ -39,6 +39,7 @@ class TelegramTeamMembershipPolicy:
         *,
         authority_chat_id: str,
         get_chat_member: Callable[[str, str], Awaitable[Any]],
+        allowed_group_chat_ids: Any = None,
         positive_ttl_seconds: float = 30.0,
         negative_ttl_seconds: float = 5.0,
         max_cache_entries: int = 2048,
@@ -52,6 +53,14 @@ class TelegramTeamMembershipPolicy:
         if max_cache_entries < 1:
             raise ValueError("max_cache_entries must be positive")
         self.authority_chat_id = authority
+        raw_allowed_groups = allowed_group_chat_ids or ()
+        if isinstance(raw_allowed_groups, str):
+            raw_allowed_groups = raw_allowed_groups.split(",")
+        self.allowed_group_chat_ids = frozenset(
+            str(chat_id).strip()
+            for chat_id in raw_allowed_groups
+            if str(chat_id).strip()
+        )
         self._get_chat_member = get_chat_member
         self._positive_ttl_seconds = float(positive_ttl_seconds)
         self._negative_ttl_seconds = float(negative_ttl_seconds)
@@ -116,19 +125,21 @@ class TelegramTeamMembershipPolicy:
 
         key = str(user_id)
         source_type = str(source_chat_type or "").lower()
-        if (
-            source_chat_id is not None
-            and str(source_chat_id) == self.authority_chat_id
-            and source_type in _GROUP_CHAT_TYPES
-        ):
-            # Telegram delivering a user-authored event from the authority group
-            # is a fresh positive membership observation.  Cache it only for the
-            # same bounded positive TTL used by getChatMember responses.
-            decision = TeamMembershipDecision(True, "authority_group_turn")
-            self._store(key, decision)
-            return decision
-
-        if source_type not in _PRIVATE_CHAT_TYPES:
+        source_chat = str(source_chat_id) if source_chat_id is not None else ""
+        if source_type in _GROUP_CHAT_TYPES:
+            if source_chat == self.authority_chat_id:
+                # Telegram delivering a user-authored event from the authority
+                # group is a fresh positive membership observation. Cache it
+                # only for the same bounded positive TTL used by getChatMember.
+                decision = TeamMembershipDecision(True, "authority_group_turn")
+                self._store(key, decision)
+                return decision
+            if source_chat not in self.allowed_group_chat_ids:
+                return TeamMembershipDecision(False, "chat_scope_not_authorized")
+            # An explicitly configured shared group is a valid source scope, but
+            # the actor must still be a current member of the authority group.
+            # Continue through the same cached/fresh getChatMember path as DMs.
+        elif source_type not in _PRIVATE_CHAT_TYPES:
             return TeamMembershipDecision(False, "chat_scope_not_authorized")
 
         cached = self.cached_decision(key)

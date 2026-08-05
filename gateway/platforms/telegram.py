@@ -659,6 +659,9 @@ class TelegramAdapter(BasePlatformAdapter):
             self._team_membership_policy = TelegramTeamMembershipPolicy(
                 authority_chat_id=authority_chat_id,
                 get_chat_member=self._get_team_chat_member,
+                allowed_group_chat_ids=self.config.extra.get(
+                    "team_allowed_group_chat_ids"
+                ),
                 positive_ttl_seconds=max(
                     1,
                     self._coerce_int_extra("team_membership_positive_ttl_seconds", 30),
@@ -707,7 +710,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _team_membership_allows_message(self, msg: Any) -> bool:
         decision = await self._team_membership_decision_for_message(msg)
-        return decision is None or decision.allowed
+        if decision is not None and not decision.allowed:
+            logger.warning(
+                "[Telegram] Blocked team-scope message user=%s chat=%s reason=%s",
+                getattr(getattr(msg, "from_user", None), "id", None),
+                getattr(getattr(msg, "chat", None), "id", None),
+                decision.reason,
+            )
+            return False
+        return True
 
     async def _team_membership_decision_for_source(self, source: Any):
         policy = getattr(self, "_team_membership_policy", None)

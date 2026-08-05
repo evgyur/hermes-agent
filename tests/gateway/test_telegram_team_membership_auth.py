@@ -20,7 +20,13 @@ class Clock:
         self.value += seconds
 
 
-def make_policy(*, status="member", positive_ttl=30.0, negative_ttl=5.0):
+def make_policy(
+    *,
+    status="member",
+    positive_ttl=30.0,
+    negative_ttl=5.0,
+    allowed_group_chat_ids=None,
+):
     clock = Clock()
     get_chat_member = AsyncMock(
         return_value=SimpleNamespace(status=status, user=SimpleNamespace(is_bot=False))
@@ -30,6 +36,7 @@ def make_policy(*, status="member", positive_ttl=30.0, negative_ttl=5.0):
         get_chat_member=get_chat_member,
         positive_ttl_seconds=positive_ttl,
         negative_ttl_seconds=negative_ttl,
+        allowed_group_chat_ids=allowed_group_chat_ids,
         clock=clock,
     )
     return policy, get_chat_member, clock
@@ -142,6 +149,69 @@ async def test_authority_group_event_proves_presence_for_that_turn():
     assert decision.allowed is True
     assert decision.reason == "authority_group_turn"
     get_chat_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_configured_shared_group_requires_current_authority_membership():
+    policy, get_chat_member, _ = make_policy(
+        allowed_group_chat_ids=["shared-chat"]
+    )
+
+    decision = await policy.authorize(
+        user_id="actor-1",
+        source_chat_id="shared-chat",
+        source_chat_type="supergroup",
+        sender_is_bot=False,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "current_member"
+    get_chat_member.assert_awaited_once_with("authority-chat", "actor-1")
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_shared_group_remains_fail_closed():
+    policy, get_chat_member, _ = make_policy(
+        allowed_group_chat_ids=["shared-chat"]
+    )
+
+    decision = await policy.authorize(
+        user_id="actor-1",
+        source_chat_id="other-chat",
+        source_chat_type="supergroup",
+        sender_is_bot=False,
+    )
+
+    assert (decision.allowed, decision.reason) == (
+        False,
+        "chat_scope_not_authorized",
+    )
+    get_chat_member.assert_not_awaited()
+
+
+def test_core_and_plugin_adapters_wire_allowed_shared_group_scope():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.telegram import TelegramAdapter as CoreTelegramAdapter
+    from plugins.platforms.telegram.adapter import (
+        TelegramAdapter as PluginTelegramAdapter,
+    )
+
+    for adapter_type in (CoreTelegramAdapter, PluginTelegramAdapter):
+        adapter = adapter_type(
+            PlatformConfig(
+                enabled=True,
+                token="test",
+                typing_indicator=False,
+                extra={
+                    "team_authority_chat_id": "authority-chat",
+                    "team_allowed_group_chat_ids": ["shared-chat"],
+                },
+            )
+        )
+        assert adapter._team_membership_policy is not None
+        assert adapter._team_membership_policy.allowed_group_chat_ids == frozenset(
+            {"shared-chat"}
+        )
 
 
 @pytest.mark.asyncio
