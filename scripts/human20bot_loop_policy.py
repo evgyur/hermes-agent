@@ -85,12 +85,16 @@ def validate(config: dict[str, Any]) -> list[str]:
         required_direct_users = {"617744661", "268754981"}
         for key, values in (
             ("telegram.require_mention_chats", require_mention),
-            ("telegram.reply_trigger_disabled_chats", reply_disabled),
             ("telegram.ignore_other_bot_replies_chats", ignore_other_replies),
             ("telegram.extra.team_allowed_group_chat_ids", allowed_shared_groups),
         ):
             if DIRECT_MENTION_SHARED_CHAT not in values:
                 failures.append(f"{key} must include {DIRECT_MENTION_SHARED_CHAT}")
+        if DIRECT_MENTION_SHARED_CHAT in reply_disabled:
+            failures.append(
+                "telegram.reply_trigger_disabled_chats must exclude "
+                f"{DIRECT_MENTION_SHARED_CHAT}"
+            )
         if DIRECT_MENTION_SHARED_CHAT in free_response:
             failures.append(
                 f"telegram.free_response_chats must exclude {DIRECT_MENTION_SHARED_CHAT}"
@@ -230,7 +234,7 @@ def main() -> int:
         "human20bot-loop-policy=ok max_turns<=200 exact_failure<=2 "
         "same_tool<=4 no_progress<=2 telegram_progress=off "
         f"authority_chat={AUTHORITY_ROUTING_CHAT} reply_triggers=enabled "
-        f"direct_mention_shared_chat={DIRECT_MENTION_SHARED_CHAT}"
+        f"mention_or_reply_shared_chat={DIRECT_MENTION_SHARED_CHAT}"
     )
     return 0
 
