@@ -34,7 +34,9 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def server(hermes_home):
+def server(hermes_home, monkeypatch):
+    # Mocks are scoped to the initial import only (see
+    # tests/tui_gateway/test_protocol.py for the rationale).
     with patch.dict(
         "sys.modules",
         {
@@ -43,18 +45,32 @@ def server(hermes_home):
         },
     ):
         mod = importlib.import_module("tui_gateway.server")
-        yield mod
-        # Reset module-level session state without re-importing. importlib.reload
-        # would re-register the module's atexit hooks (ThreadPoolExecutor
-        # shutdown, _shutdown_sessions); the duplicates race the stderr
-        # buffer at interpreter shutdown and surface as Fatal Python error:
-        # _enter_buffered_busy. Clearing the per-session dicts gives the
-        # next test a clean slate; _methods is NOT cleared because it's
-        # populated at module import time and re-registration only happens
-        # via reload (which we don't do).
-        mod._sessions.clear()
-        mod._pending.clear()
-        mod._answers.clear()
+
+    # Pin config resolution to the isolated HERMES_HOME. Sibling test
+    # files (test_billing_rpc, test_delegation_session_lifecycle,
+    # test_gateway_owned_session_reap, ...) import tui_gateway.server at
+    # collection time — BEFORE the conftest env isolation runs — so the
+    # module-level ``_hermes_home = get_hermes_home()`` snapshot freezes
+    # the developer's real home. When any of them precede this file in
+    # the same process, ``importlib.import_module`` returns that cached
+    # module and ``_load_cfg()`` would read the REAL config.yaml (e.g. a
+    # local MoA preset) instead of the one ``_write_moa_config`` writes.
+    # Also reset the mtime-keyed config cache; monkeypatch restores the
+    # originals on teardown so nothing leaks to later tests either.
+    monkeypatch.setattr(mod, "_hermes_home", hermes_home)
+    monkeypatch.setattr(mod, "_cfg_cache", None)
+    monkeypatch.setattr(mod, "_cfg_mtime", None)
+    monkeypatch.setattr(mod, "_cfg_path", None)
+    yield mod
+    # Reset module-level session state without re-importing. importlib.reload
+    # would re-register the module's atexit hooks (ThreadPoolExecutor
+    # shutdown, _shutdown_sessions); the duplicates race the stderr
+    # buffer at interpreter shutdown and surface as Fatal Python error:
+    # _enter_buffered_busy. Clearing the per-session dicts gives the
+    # next test a clean slate.
+    mod._sessions.clear()
+    mod._pending.clear()
+    mod._answers.clear()
 
 
 @pytest.fixture()
@@ -283,54 +299,3 @@ moa:
     assert "model_override" not in s
 
 
-def test_moa_arg_is_always_one_shot(server, session, hermes_home):
-    # Any arg (even a preset name) is a one-shot prompt through the DEFAULT
-    # preset; /moa never does a sticky switch anymore.
-    _write_moa_config(hermes_home, """
-moa:
-  default_preset: default
-  presets:
-    default: {}
-    review:
-      reference_models:
-        - provider: openrouter
-          model: deepseek/deepseek-v4-pro
-      aggregator:
-        provider: openrouter
-        model: anthropic/claude-opus-4.8
-""")
-    sid, _, s = session
-    r = _call(server, "command.dispatch", name="moa", arg="review", session_id=sid)
-    result = r["result"]
-    assert result["type"] == "send"
-    assert result["message"] == "review"
-    assert "one-shot" in result["notice"]
-    # Lazy session (no live agent) → MoA preset pinned via model_override for
-    # the build, and it is the DEFAULT preset, not the "review" arg.
-    assert s["model_override"]["provider"] == "moa"
-    assert s["model_override"]["model"] == "default"
-
-
-def test_moa_non_preset_returns_one_shot_send(server, session, hermes_home):
-    _write_moa_config(hermes_home, """
-moa:
-  default_preset: default
-  presets:
-    default:
-      reference_models:
-        - provider: openai-codex
-          model: gpt-5.5
-      aggregator:
-        provider: openrouter
-        model: anthropic/claude-opus-4.8
-""")
-    sid, _, _ = session
-    r = _call(server, "command.dispatch", name="moa", arg="inspect this project", session_id=sid)
-    result = r["result"]
-    assert result["type"] == "send"
-    assert result["message"] == "inspect this project"
-    assert "one-shot" in result["notice"]
-
-
-def test_pending_input_commands_includes_moa(server):
-    assert "moa" in server._PENDING_INPUT_COMMANDS

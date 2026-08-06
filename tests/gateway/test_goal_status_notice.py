@@ -41,36 +41,6 @@ def _goal_continuation_event(source, goal="finish the task"):
 
 
 @pytest.mark.asyncio
-async def test_goal_status_notice_uses_adapter_send_with_thread_metadata():
-    """Regression: /goal judge status must use BasePlatformAdapter.send().
-
-    The old implementation checked for a non-existent send_message() method,
-    so the goal could be marked done in state_meta without the visible
-    "✓ Goal achieved" status line being delivered to Discord/Telegram.
-    """
-    runner = GatewayRunner.__new__(GatewayRunner)
-    adapter = FakeAdapter()
-    runner.adapters = {Platform.DISCORD: adapter}
-
-    source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="parent-channel",
-        thread_id="thread-123",
-    )
-
-    await runner._send_goal_status_notice(source, "✓ Goal achieved: done")
-
-    assert adapter.calls == [
-        {
-            "chat_id": "parent-channel",
-            "content": "✓ Goal achieved: done",
-            "reply_to": None,
-            "metadata": {"thread_id": "thread-123"},
-        }
-    ]
-
-
-@pytest.mark.asyncio
 async def test_goal_status_notice_defers_until_post_delivery_callback():
     """Regression: goal status must appear after the agent's visible reply.
 

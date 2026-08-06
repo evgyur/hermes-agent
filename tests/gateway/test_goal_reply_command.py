@@ -218,7 +218,10 @@ async def test_goal_resume_preserves_real_fifo_events(hermes_home, runner):
     )
     key = runner.session.session_key
     runner.adapter._pending_messages[key] = first_user
-    runner.runner._queued_events[key] = [stale, second_user]
+    runner.runner._session_state(key).conversation.queued_events = [
+        stale,
+        second_user,
+    ]
 
     response = await runner.runner._handle_goal_command(
         MessageEvent(
@@ -231,7 +234,7 @@ async def test_goal_resume_preserves_real_fifo_events(hermes_home, runner):
 
     assert "continuation queued immediately" in response.lower()
     pending = runner.adapter._pending_messages[key]
-    overflow = runner.runner._queued_events[key]
+    overflow = runner.runner._session_state(key).conversation.queued_events
     assert pending is first_user
     assert overflow[0] is second_user
     assert len(overflow) == 2
@@ -260,7 +263,7 @@ async def test_goal_resume_promotes_real_user_behind_stale_head(hermes_home, run
         source=runner.source,
     )
     runner.adapter._pending_messages[key] = stale
-    runner.runner._queued_events[key] = [real_user]
+    runner.runner._session_state(key).conversation.queued_events = [real_user]
 
     await runner.runner._handle_goal_command(
         MessageEvent(
@@ -272,7 +275,7 @@ async def test_goal_resume_promotes_real_user_behind_stale_head(hermes_home, run
     )
 
     assert runner.adapter._pending_messages[key] is real_user
-    overflow = runner.runner._queued_events[key]
+    overflow = runner.runner._session_state(key).conversation.queued_events
     assert len(overflow) == 1
     assert runner.runner._is_goal_continuation_event(overflow[0])
     assert "resume only after queued user" in overflow[0].text

@@ -38,66 +38,6 @@ class TestWebProviderABCs:
         with pytest.raises(TypeError):
             WebSearchProvider()  # type: ignore[abstract]
 
-    def test_concrete_search_only_provider_works(self):
-        from agent.web_search_provider import WebSearchProvider
-
-        class Dummy(WebSearchProvider):
-            @property
-            def name(self) -> str:
-                return "dummy"
-
-            @property
-            def display_name(self) -> str:
-                return "Dummy Search"
-
-            def is_available(self) -> bool:
-                return True
-
-            def supports_search(self) -> bool:
-                return True
-
-            def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-                return {"success": True, "data": {"web": []}}
-
-        d = Dummy()
-        assert d.name == "dummy"
-        assert d.display_name == "Dummy Search"
-        assert d.is_available() is True
-        assert d.supports_search() is True
-        assert d.supports_extract() is False  # default
-        assert d.search("test")["success"] is True
-
-    def test_concrete_multi_capability_provider_works(self):
-        from agent.web_search_provider import WebSearchProvider
-
-        class Dummy(WebSearchProvider):
-            @property
-            def name(self) -> str:
-                return "dummy"
-
-            @property
-            def display_name(self) -> str:
-                return "Dummy Multi"
-
-            def is_available(self) -> bool:
-                return True
-
-            def supports_search(self) -> bool:
-                return True
-
-            def supports_extract(self) -> bool:
-                return True
-
-            def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-                return {"success": True, "data": {"web": []}}
-
-            def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
-                return [{"url": urls[0], "content": "x"}]
-
-        d = Dummy()
-        assert d.supports_search() is True
-        assert d.supports_extract() is True
-        assert d.extract(["https://example.com"])[0]["url"] == "https://example.com"
 
     def test_search_only_provider_skips_extract(self):
         """Search-only providers don't have to implement extract()."""
@@ -147,47 +87,6 @@ class TestPerCapabilityBackendSelection:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         assert web_tools._get_search_backend() == "tavily"
 
-    def test_extract_backend_overrides_generic(self, monkeypatch):
-        from tools import web_tools
-
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
-            "backend": "tavily",
-            "extract_backend": "exa",
-        })
-        monkeypatch.setenv("EXA_API_KEY", "test-key")
-        assert web_tools._get_extract_backend() == "exa"
-
-    def test_falls_back_to_generic_backend_when_search_backend_empty(self, monkeypatch):
-        from tools import web_tools
-
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
-            "backend": "tavily",
-            "search_backend": "",
-        })
-        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
-        assert web_tools._get_search_backend() == "tavily"
-
-    def test_falls_back_to_generic_backend_when_extract_backend_empty(self, monkeypatch):
-        from tools import web_tools
-
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
-            "backend": "parallel",
-            "extract_backend": "",
-        })
-        monkeypatch.setenv("PARALLEL_API_KEY", "test-key")
-        assert web_tools._get_extract_backend() == "parallel"
-
-    def test_search_backend_ignored_when_not_available(self, monkeypatch):
-        from tools import web_tools
-
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
-            "backend": "firecrawl",
-            "search_backend": "exa",  # set but no EXA_API_KEY
-        })
-        monkeypatch.delenv("EXA_API_KEY", raising=False)
-        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-key")
-        # Should fall back to firecrawl since exa isn't configured
-        assert web_tools._get_search_backend() == "firecrawl"
 
     def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools

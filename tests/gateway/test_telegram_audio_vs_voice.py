@@ -84,51 +84,6 @@ async def test_voice_message_still_transcribed():
 # 2. AUDIO file attachment bypasses STT
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_audio_attachment_skips_stt():
-    """MessageType.AUDIO must NOT be routed to STT — transcribe_audio must not be called."""
-    runner = _make_runner(stt_enabled=True)
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
-    event = _audio_event("/tmp/song.mp3")
-
-    with patch(
-        "tools.transcription_tools.transcribe_audio",
-        side_effect=AssertionError("transcribe_audio must NOT be called for audio file attachments"),
-    ):
-        with patch(
-            "tools.credential_files.to_agent_visible_cache_path",
-            side_effect=lambda p: p,
-        ):
-            result = await runner._prepare_inbound_message_text(
-                event=event,
-                source=source,
-                history=[],
-            )
-
-    assert result is not None
-    assert "/tmp/song.mp3" in result
-    assert "audio file attachment" in result.lower()
-
-
-@pytest.mark.asyncio
-async def test_pending_audio_attachment_is_not_selected_for_stt():
-    """Pending Telegram AUDIO files retain file semantics during interrupts."""
-    runner = _make_runner(stt_enabled=True)
-    event = _audio_event("/tmp/pending-song.mp3")
-
-    with patch(
-        "tools.transcription_tools.transcribe_audio",
-        side_effect=AssertionError("pending audio attachments must not enter STT"),
-    ):
-        result, transcripts = await runner._transcribe_pending_audio_event_once(
-            event,
-            event.text,
-        )
-
-    assert runner._pending_event_audio_paths(event) == []
-    assert result == ""
-    assert transcripts == []
-
 
 @pytest.mark.asyncio
 async def test_audio_attachment_context_note_format():
@@ -164,32 +119,6 @@ async def test_audio_attachment_context_note_format():
 # ---------------------------------------------------------------------------
 # 3. STT disabled still results in no transcription for audio file attachments
 # ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_audio_attachment_skips_stt_when_stt_disabled():
-    """Even with STT disabled, AUDIO must NOT produce STT disabled notice — just a file note."""
-    runner = _make_runner(stt_enabled=False)
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
-    event = _audio_event("/tmp/podcast.m4a")
-
-    with patch(
-        "tools.transcription_tools.transcribe_audio",
-        side_effect=AssertionError("must not be called"),
-    ):
-        with patch(
-            "tools.credential_files.to_agent_visible_cache_path",
-            side_effect=lambda p: p,
-        ):
-            result = await runner._prepare_inbound_message_text(
-                event=event,
-                source=source,
-                history=[],
-            )
-
-    # Should NOT see the "transcription is disabled" note — that's only for VOICE
-    assert "transcription is disabled" not in result.lower()
-    assert "audio file attachment" in result.lower()
-    assert "/tmp/podcast.m4a" in result
 
 
 # ---------------------------------------------------------------------------

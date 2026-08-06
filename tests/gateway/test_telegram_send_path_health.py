@@ -299,6 +299,31 @@ def test_first_seen_plain_owner_business_echo_is_rejected_and_route_is_retained(
     )
 
 
+def test_business_owner_ids_can_be_narrower_than_telegram_allowlist():
+    adapter = _make_adapter()
+    adapter.config.extra["allow_from"] = ["700000001", "700000009"]
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "owner_user_ids": ["700000001"],
+        "trigger_words": ["Sigurd", "Сигурд"],
+    }
+
+    def message(sender_id: int):
+        return SimpleNamespace(
+            business_connection_id="biz-new",
+            reply_to_message=None,
+            chat=SimpleNamespace(id=700000002, type="private"),
+            from_user=SimpleNamespace(id=sender_id, is_bot=False),
+            text="Sigurd, продолжи",
+            caption=None,
+        )
+
+    assert adapter._business_owner_ids() == {"700000001"}
+    assert adapter._is_business_owner_wake_trigger(message(700000001)) is True
+    assert adapter._is_business_owner_wake_trigger(message(700000009)) is False
+    assert adapter._should_process_message(message(700000009)) is False
+
+
 def test_business_wake_word_must_be_an_explicit_command_prefix():
     adapter = _make_adapter()
     adapter.config.extra["allow_from"] = ["700000001"]
@@ -552,11 +577,8 @@ async def test_send_retries_without_business_connection_id_on_business_peer_inva
 
 
 @pytest.mark.asyncio
-async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
-    """_handle_polling_network_error sets the flag while reconnecting; if the
-    reconnect attempt itself raises (polling not yet healthy), the flag stays
-    True until a later successful heartbeat probe in
-    _verify_polling_after_reconnect clears it."""
+async def test_reconnect_storm_keeps_degraded_after_failed_restart(monkeypatch):
+    """A failed polling restart must keep outbound delivery fail-closed."""
     adapter = _make_adapter()
     adapter._app = MagicMock()
     adapter._app.updater = MagicMock()
@@ -568,6 +590,7 @@ async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     adapter._app.bot = MagicMock()
     adapter._app.bot.get_me = AsyncMock(return_value=MagicMock())
     adapter._polling_error_callback_ref = AsyncMock()
+    monkeypatch.setattr(adapter, "_drain_polling_connections", AsyncMock())
     monkeypatch.setattr(
         "plugins.platforms.telegram.adapter.Update", MagicMock(ALL_TYPES=[])
     )
@@ -581,20 +604,9 @@ async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     # start_polling failed → path still degraded.
     assert adapter._send_path_degraded is True
 
-    # Now the deferred probe runs against a recovered (running) updater and
-    # a responsive bot — it clears the flag.
-    adapter._app.updater.running = True
-    with patch("plugins.platforms.telegram.adapter.asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
-    assert adapter._send_path_degraded is False
-
-
 @pytest.mark.asyncio
-async def test_successful_reconnect_clears_flag_without_probe(monkeypatch):
-    """Regression for #35205: a successful start_polling() clears
-    _send_path_degraded immediately, so outbound sends are not blocked for
-    the full HEARTBEAT_PROBE_DELAY window (and never get stuck True if the
-    deferred probe is never scheduled / never runs)."""
+async def test_successful_reconnect_waits_for_polling_progress(monkeypatch):
+    """start_polling() alone must not clear degradation before getUpdates moves."""
     adapter = _make_adapter()
     adapter._app = MagicMock()
     adapter._app.updater = MagicMock()
@@ -604,6 +616,7 @@ async def test_successful_reconnect_clears_flag_without_probe(monkeypatch):
     adapter._app.bot = MagicMock()
     adapter._app.bot.get_me = AsyncMock(return_value=MagicMock())
     adapter._polling_error_callback_ref = AsyncMock()
+    monkeypatch.setattr(adapter, "_drain_polling_connections", AsyncMock())
     monkeypatch.setattr(
         "plugins.platforms.telegram.adapter.Update", MagicMock(ALL_TYPES=[])
     )
@@ -616,8 +629,5 @@ async def test_successful_reconnect_clears_flag_without_probe(monkeypatch):
     with patch("plugins.platforms.telegram.adapter.asyncio.sleep", new_callable=AsyncMock):
         await adapter._handle_polling_network_error(OSError("Bad Gateway"))
 
-    assert adapter._send_path_degraded is False
-    assert adapter._polling_network_error_count == 0
-    # And send() works again right away.
-    result = await adapter.send("123", "hello")
-    assert result.success is True
+    assert adapter._send_path_degraded is True
+    assert adapter._polling_network_error_count == 1
