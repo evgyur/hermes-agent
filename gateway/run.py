@@ -26518,6 +26518,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             ) if _progress_thread_id else None
 
+        # Publish the status/interim routing bridge onto the extracted turn
+        # context before TurnRunner.run_sync installs its callbacks. Missing
+        # these assignments silently stripped Telegram forum metadata from
+        # commentary and status sends, leaking them into the General topic.
+        turn_ctx._status_adapter = _status_adapter
+        turn_ctx._status_chat_id = _status_chat_id
+        turn_ctx._status_thread_metadata = _status_thread_metadata
+        turn_ctx._status_callback_sync = turn_runner._status_callback_sync
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return

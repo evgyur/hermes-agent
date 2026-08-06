@@ -1155,6 +1155,37 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 
 @pytest.mark.asyncio
+async def test_run_agent_keeps_telegram_interim_commentary_in_forum_topic(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DelayedInterimAgent,
+        session_id="sess-forum-interim",
+        chat_id="-1003971448755",
+        chat_type="forum",
+        thread_id="21452",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+                "streaming": False,
+            }
+        },
+    )
+
+    interim = [
+        call for call in adapter.sent
+        if call["content"] in {"first interim", "second interim"}
+    ]
+    assert result["final_response"] == "done"
+    assert interim
+    assert all(
+        (call["metadata"] or {}).get("thread_id") == "21452"
+        for call in interim
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
     import yaml
 
