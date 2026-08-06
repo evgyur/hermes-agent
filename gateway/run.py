@@ -26002,6 +26002,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        turn_ctx = TurnContext(
+            source=source,
+            _run_still_current=_run_still_current,
+            _live_status_adapter=_live_status_adapter,
+            _live_status_mode=_live_status_mode,
+            _thinking_enabled=_thinking_enabled,
+            progress_mode=progress_mode,
+            progress_grouping=progress_grouping,
+            tool_progress_enabled=tool_progress_enabled,
+            progress_queue=progress_queue,
+            log_queue=log_queue,
+            last_progress_msg=last_progress_msg,
+            last_tool=last_tool,
+            last_was_terminal_block=last_was_terminal_block,
+            repeat_count=repeat_count,
+            long_tool_hint_fired=long_tool_hint_fired,
+            _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
+            _cleanup_progress=_cleanup_progress,
+            _cleanup_msg_ids=_cleanup_msg_ids,
+            message=message,
+            AIAgent=AIAgent,
+            resolve_display_setting=resolve_display_setting,
+            user_config=user_config,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            log_mode_enabled=log_mode_enabled,
+            interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+            needs_progress_queue=needs_progress_queue,
+            _voice_ack_fired=_voice_ack_fired,
+            _voice_ack_guild=_voice_ack_guild,
+            _voice_ack_loop=_voice_ack_loop,
+            history=history,
+            context_prompt=context_prompt,
+            channel_prompt=channel_prompt,
+            session_id=session_id,
+            session_key=session_key,
+            run_generation=run_generation,
+            _interrupt_depth=_interrupt_depth,
+            event_message_id=event_message_id,
+            moa_config=moa_config,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+        )
+        turn_runner = TurnRunner(self, turn_ctx)
+        turn_ctx.progress_callback = turn_runner.progress_callback
+        turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             # Live status line (Slack's assistant status): stash the current
