@@ -185,6 +185,33 @@ async def test_handle_message_wires_iteration_boundary_to_goal_resume(ledger_db)
     assert wired[1]["delivery_suppressed"] is True
 
 
+def test_intentional_silence_marks_gateway_ledger_completed(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    event = _event(text="explicit mention", message_id="msg-silent")
+    session_key = "agent:main:telegram:group:chat-1"
+
+    runner._record_gateway_ledger_received(
+        event, session_key=session_key, session_id="sid-silent"
+    )
+    runner._update_gateway_ledger(
+        event, "in_progress", session_key=session_key, session_id="sid-silent"
+    )
+    event.metadata["intentional_silence"] = True
+    runner._mark_gateway_ledger_after_agent_result(
+        event,
+        "",
+        session_key=session_key,
+        session_id="sid-silent",
+    )
+
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram", chat_id="chat-1", message_id="msg-silent"
+    )
+    assert row["status"] == "completed"
+    assert row["reason"] == "intentional-silence"
+    assert row["completed_at"] is not None
+
+
 def test_interrupted_turn_marks_drained_not_completed(ledger_db):
     runner = _runner_with_ledger(ledger_db)
     event = _event(text="long task", message_id="msg-drain")

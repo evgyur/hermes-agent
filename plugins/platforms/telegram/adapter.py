@@ -8393,6 +8393,29 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+    def _preserve_explicit_bot_mention_context(
+        self, event: MessageEvent, message: Message
+    ) -> MessageEvent:
+        """Keep the routing meaning of a self-mention after trigger cleanup."""
+        if not self._is_group_chat(message) or not self._message_mentions_bot(message):
+            return event
+
+        metadata = dict(event.metadata or {})
+        metadata["telegram_explicit_bot_mention"] = True
+        event.metadata = metadata
+
+        routing_context = (
+            "Telegram routing context: the current message explicitly mentioned this bot. "
+            "It is addressed to you even though the @username trigger was removed from "
+            "the visible message text."
+        )
+        event.channel_prompt = (
+            f"{event.channel_prompt}\n\n{routing_context}"
+            if event.channel_prompt
+            else routing_context
+        )
+        return event
+
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
         if self._is_own_message(message):
@@ -9895,7 +9918,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        return MessageEvent(
+        event = MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
@@ -9908,6 +9931,7 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+        return self._preserve_explicit_bot_mention_context(event, message)
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 

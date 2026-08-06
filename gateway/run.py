@@ -5685,14 +5685,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reason=str(agent_result.get("error") or "turn-failed")[:500],
                     metadata={"failed": bool(agent_result.get("failed"))},
                 )
-        elif isinstance(agent_result, str) and agent_result.strip():
+        elif isinstance(agent_result, str) and (
+            agent_result.strip() or bool(event.metadata.get("intentional_silence"))
+        ):
+            intentional_silence = bool(event.metadata.get("intentional_silence"))
             self._update_gateway_ledger(
                 event,
                 "completed",
                 session_key=session_key,
                 session_id=session_id,
-                reason="turn-completed",
-                metadata={"completed": True},
+                reason=("intentional-silence" if intentional_silence else "turn-completed"),
+                metadata={
+                    "completed": True,
+                    "intentional_silence": intentional_silence,
+                },
             )
 
     def _mark_gateway_ledger_session_drained(
@@ -15395,6 +15401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Suppressing intentional silence marker for session %s",
                     session_entry.session_id,
                 )
+                event.metadata["intentional_silence"] = True
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response

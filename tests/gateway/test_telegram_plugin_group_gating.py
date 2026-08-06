@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 
@@ -22,8 +23,22 @@ def _message(
     elif reply_to_other_bot:
         reply = SimpleNamespace(from_user=SimpleNamespace(id=8533179145, is_bot=True))
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id, type="supergroup", is_forum=True),
-        from_user=SimpleNamespace(id=111, is_bot=False, username="srg"),
+        message_id=18795,
+        date=None,
+        chat=SimpleNamespace(
+            id=chat_id,
+            type="supergroup",
+            is_forum=True,
+            title="ИИ РАБОЧИЙ",
+            full_name=None,
+        ),
+        from_user=SimpleNamespace(
+            id=111,
+            is_bot=False,
+            username="srg",
+            full_name="Evgeny Chip",
+            first_name="Evgeny",
+        ),
         sender_chat=None,
         text=text,
         caption=None,
@@ -77,6 +92,18 @@ def test_live_plugin_target_chat_is_mention_or_reply_only():
     assert adapter._should_process_message(_message("@VladisFom вопрос")) is False
     assert adapter._should_process_message(_message("@chipshermesbot вопрос")) is False
     assert adapter._should_process_message(_message("@Human20Bot вопрос")) is True
+
+
+def test_explicit_self_mention_survives_trigger_cleanup_as_routing_context():
+    adapter = _adapter()
+    message = _message('@Human20Bot "рг ты здесь?')
+    event = adapter._build_message_event(message, MessageType.TEXT)
+    event.text = adapter._clean_bot_trigger_text(event.text)
+
+    assert event.text == '"рг ты здесь?'
+    assert event.metadata["telegram_explicit_bot_mention"] is True
+    assert "explicitly mentioned this bot" in event.channel_prompt
+    assert "addressed to you" in event.channel_prompt
 
 
 def test_live_plugin_policy_is_scoped_to_configured_chat():
