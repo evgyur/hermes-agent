@@ -263,6 +263,13 @@ def test_unknown_dm_with_no_allowlist_passes_to_pairing(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
 
+    class Runner:
+        def _is_user_authorized(self, source):
+            return False
+
+        async def handle(self, event):
+            return None
+
     runner = Runner()
     adapter = _make_adapter()
     adapter._message_handler = runner.handle

@@ -1222,6 +1222,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
+        authorized: Optional[bool] = None
+
         # A chat-scoped sender policy is more specific than the global group
         # allowlist. This is what lets one shared team forum accept every human
         # participant without widening access in unrelated groups.
@@ -1255,7 +1257,7 @@ class TelegramAdapter(BasePlatformAdapter):
             adapter_allow_from = self.config.extra.get("allow_from")
             if adapter_allow_from is not None:
                 allowed = _coerce_allow_set(adapter_allow_from)
-                return user_id in allowed or "*" in allowed
+                authorized = user_id in allowed or "*" in allowed
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
