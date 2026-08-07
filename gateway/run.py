@@ -60,6 +60,7 @@ from agent.conversation_compression import (
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.interrupt_compat import request_hard_interrupt
 from gateway import goal_launch
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
