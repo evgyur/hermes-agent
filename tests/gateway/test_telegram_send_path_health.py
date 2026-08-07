@@ -324,6 +324,30 @@ def test_business_owner_ids_can_be_narrower_than_telegram_allowlist():
     assert adapter._should_process_message(message(700000009)) is False
 
 
+def test_business_blocked_chat_rejects_external_updates_and_owner_wakes():
+    adapter = _make_adapter()
+    adapter.config.extra["allow_from"] = ["700000001"]
+    adapter.config.extra["business"] = {
+        "enabled": True,
+        "owner_user_ids": ["700000001"],
+        "blocked_chats": ["700000002"],
+        "trigger_words": ["Sigurd", "Сигурд"],
+    }
+
+    def message(sender_id: int, text: str):
+        return SimpleNamespace(
+            business_connection_id="biz-new",
+            reply_to_message=None,
+            chat=SimpleNamespace(id=700000002, type="private"),
+            from_user=SimpleNamespace(id=sender_id, is_bot=False),
+            text=text,
+            caption=None,
+        )
+
+    assert adapter._should_process_message(message(700000002, "location update")) is False
+    assert adapter._should_process_message(message(700000001, "Sigurd, продолжи")) is False
+
+
 def test_business_wake_word_must_be_an_explicit_command_prefix():
     adapter = _make_adapter()
     adapter.config.extra["allow_from"] = ["700000001"]

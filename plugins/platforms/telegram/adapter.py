@@ -2138,6 +2138,12 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return owner_ids
 
+    def _business_blocked_chat_ids(self) -> set[str]:
+        """Return private chats where Telegram Business must stay silent."""
+        raw = self._telegram_business_config().get("blocked_chats", [])
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        return {str(value).strip() for value in values if str(value).strip()}
+
     def _is_business_owner_wake_trigger(self, message: Any) -> bool:
         """Match an intentional owner concierge turn in a third-party DM.
 
@@ -9187,6 +9193,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
         if not self._is_group_chat(message):
+            chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+            if chat_id and chat_id in self._business_blocked_chat_ids():
+                logger.info(
+                    "[%s] Telegram private chat blocked by business policy: chat=%s",
+                    self.name,
+                    chat_id,
+                )
+                return False
             # Owner-authored Telegram Business updates arrive as ordinary DMs.
             # In a third-party peer chat, process only an explicit concierge wake
             # command; plain outgoing owner text is an echo, not an agent turn.
