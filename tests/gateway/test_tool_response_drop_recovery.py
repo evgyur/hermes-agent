@@ -166,11 +166,46 @@ class TestRecoveryDoesNotLeakMediaFragments:
             if "vacation" in s["content"] or "photo" in s["content"] or "MEDIA" in s["content"]
         ]
         assert leaked == [], f"media-path fragment leaked to user: {leaked}"
-        # The genuinely-undeliverable response is logged loudly, not silent.
+        # The required attachment failure is explicit and observable.
         assert any(
-            "response_delivery_dropped" in r.getMessage()
+            "response_required_media_missing" in r.getMessage()
             for r in caplog.records if r.levelno == logging.ERROR
         ), [r.getMessage() for r in caplog.records]
+
+
+class TestRequiredMediaFailureIsFailClosed:
+    @pytest.mark.asyncio
+    async def test_missing_declared_image_replaces_false_success(self, monkeypatch, caplog):
+        adapter = _DummyAdapter(Platform.TELEGRAM)
+        adapter._keep_typing = _hold_typing
+
+        async def handler(_event):
+            return (
+                "Готово: формат 4:5 для Instagram.\n\n"
+                "MEDIA:/home/kosulia/.hermes/outputs/missing-retouch.png"
+            )
+
+        adapter.set_message_handler(handler)
+        monkeypatch.setattr(
+            type(adapter),
+            "filter_media_delivery_paths",
+            staticmethod(lambda _media: []),
+        )
+
+        event = _make_event(Platform.TELEGRAM)
+        with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
+            await adapter._process_message_background(
+                event, build_session_key(event.source)
+            )
+
+        assert [message["content"] for message in adapter.sent] == [
+            "⚠️ Не удалось прикрепить изображение: файл не был создан."
+        ]
+        assert all("Готово" not in message["content"] for message in adapter.sent)
+        assert any(
+            "response_required_media_missing" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestUnrecoverableDropIsLoud:

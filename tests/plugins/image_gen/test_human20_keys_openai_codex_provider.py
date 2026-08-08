@@ -18,19 +18,27 @@ from uuid import UUID
 
 import pytest
 import requests
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from urllib3.exceptions import ReadTimeoutError
 
 
-provider_module = importlib.import_module(
-    "plugins.image_gen.human20-keys-openai-codex"
-)
+provider_module = importlib.import_module("plugins.image_gen.human20-keys-openai-codex")
 
 
 def _png_b64(size=(1024, 1024)) -> str:
     stream = io.BytesIO()
     Image.new("RGB", size, (10, 20, 30)).save(stream, format="PNG")
     return base64.b64encode(stream.getvalue()).decode()
+
+
+def _image_bytes(image_format: str, size=(4, 3)) -> bytes:
+    stream = io.BytesIO()
+    Image.new("RGB", size, (40, 50, 60)).save(stream, format=image_format)
+    return stream.getvalue()
+
+
+def _data_url(mime: str, raw: bytes) -> str:
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 _PNG = _png_b64()
@@ -76,16 +84,14 @@ def _response(*, status_code=200, payload=None, text=""):
     response.raw = Raw(json.dumps(payload).encode() if payload is not None else b"")
     response.raise_for_status.side_effect = None
     if status_code >= 400:
-        response.raise_for_status.side_effect = requests.HTTPError(
-            response=response
-        )
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
     return response
 
 
-def test_provider_metadata_is_text_only(provider):
+def test_provider_metadata_advertises_primary_image_edits(provider):
     assert provider.name == "human20-keys-openai-codex"
     assert provider.capabilities() == {
-        "modalities": ["text"],
+        "modalities": ["text", "image"],
         "max_reference_images": 0,
     }
     assert provider.default_model() == "gpt-image-2-medium"
@@ -131,9 +137,7 @@ def test_generate_posts_exact_gateway_request_and_persists_png(
     assert result["size"] == size
     assert Path(result["image"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     post.assert_called_once()
-    assert post.call_args.args == (
-        "http://127.0.0.1:18750/v1/images/generations",
-    )
+    assert post.call_args.args == ("http://127.0.0.1:18750/v1/images/generations",)
     assert post.call_args.kwargs["headers"] == {
         "Authorization": "Bearer customer-secret",
         "Content-Type": "application/json",
@@ -156,25 +160,246 @@ def test_generate_posts_exact_gateway_request_and_persists_png(
     assert str(UUID(idempotency_key)) == idempotency_key
 
 
+def test_edit_posts_exact_gateway_request_with_canonical_local_jpeg(
+    provider, monkeypatch, tmp_path
+):
+    source_bytes = _image_bytes("JPEG")
+    source = tmp_path / "source-with-wrong-extension.png"
+    source.write_bytes(source_bytes)
+    response = _response(payload={"data": [{"b64_json": _PNG}]})
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate(
+        "  preserve the subject  ",
+        aspect_ratio="square",
+        model="gpt-image-2-high",
+        image_url=str(source),
+    )
+
+    assert result["success"] is True
+    assert result["modality"] == "image"
+    assert post.call_args.args == ("http://127.0.0.1:18750/v1/images/edits",)
+    assert post.call_args.kwargs["json"] == {
+        "model": "gpt-image-2",
+        "prompt": "preserve the subject",
+        "image": provider_module._canonicalize_primary_image(str(source)),
+        "size": "1024x1024",
+        "quality": "high",
+        "n": 1,
+    }
+    assert post.call_args.kwargs["stream"] is True
+    assert post.call_args.kwargs["allow_redirects"] is False
+    assert response.close.called
+    assert str(UUID(post.call_args.kwargs["headers"]["Idempotency-Key"]))
+
+
+def test_edit_accepts_and_canonicalizes_base64_data_url(provider, monkeypatch):
+    source_bytes = _image_bytes("PNG")
+    source = _data_url("image/png", source_bytes)
+    response = _response(payload={"data": [{"b64_json": _PNG}]})
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate("edit this", aspect_ratio="square", image_url=source)
+
+    assert result["success"] is True
+    assert result["modality"] == "image"
+    assert post.call_args.args[0].endswith("/images/edits")
+    assert post.call_args.kwargs["json"]["image"] == source
+
+
+def test_explicit_instagram_output_size_is_applied_after_gpt_edit(
+    provider, monkeypatch, tmp_path
+):
+    source = tmp_path / "source.jpg"
+    source.write_bytes(_image_bytes("JPEG"))
+    response = _response(payload={"data": [{"b64_json": _png_b64((1024, 1536))}]})
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate(
+        "Retouch only. Instagram format 4:5 — 1080 × 1350 px.",
+        aspect_ratio="portrait",
+        image_url=str(source),
+    )
+
+    assert result["success"] is True
+    assert result["size"] == "1080x1350"
+    with Image.open(result["image"]) as output:
+        assert output.format == "PNG"
+        assert output.size == (1080, 1350)
+
+
+def test_unlabelled_dimensions_in_scene_do_not_trigger_postprocessing(
+    provider, monkeypatch
+):
+    response = _response(payload={"data": [{"b64_json": _PNG}]})
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("A 1080x1350 sign in a room", aspect_ratio="square")
+
+    assert result["success"] is True
+    assert result["size"] == "1024x1024"
+    with Image.open(result["image"]) as output:
+        assert output.size == (1024, 1024)
+
+
 @pytest.mark.parametrize(
-    "reference_kwargs",
-    [
-        {"image_url": "https://example.test/source.png"},
-        {"reference_image_urls": ["https://example.test/reference.png"]},
-        {"reference_images": ["/tmp/reference.png"]},
-    ],
+    "source", ["http://example.test/a.png", "https://example.test/a.png"]
 )
-def test_reference_inputs_are_rejected_locally_before_http(
-    provider, monkeypatch, reference_kwargs
+def test_remote_primary_image_urls_are_rejected_before_http(
+    provider, monkeypatch, source
 ):
     post = MagicMock()
     monkeypatch.setattr(provider_module.requests, "post", post)
 
-    result = provider.generate("edit this", **reference_kwargs)
+    result = provider.generate("edit this", image_url=source)
 
     assert result["success"] is False
     assert result["error_type"] == "capability_unsupported"
+    assert "local file path or base64 data:image URL" in result["error"]
     post.assert_not_called()
+
+
+def test_gif_primary_is_rejected_and_png_trailer_is_removed(provider, monkeypatch):
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+    result = provider.generate(
+        "edit this", image_url=_data_url("image/gif", _image_bytes("GIF"))
+    )
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+    raw = _image_bytes("PNG")
+    canonical = provider_module._canonicalize_primary_image(
+        _data_url("image/png", raw + b"private-trailer")
+    )
+    decoded = base64.b64decode(canonical.split(",", 1)[1], validate=True)
+    assert canonical.startswith("data:image/png;base64,")
+    assert b"private-trailer" not in decoded
+
+
+def test_primary_image_preserves_palette_alpha_and_strips_metadata():
+    source = Image.new("P", (2, 1))
+    source.putpalette([0, 0, 0, 255, 0, 0] + [0, 0, 0] * 254)
+    source.putdata([0, 1])
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("private-note", "must-not-survive")
+    buffer = io.BytesIO()
+    source.save(
+        buffer,
+        format="PNG",
+        transparency=bytes([0, 128]),
+        pnginfo=metadata,
+        icc_profile=b"private-icc-sentinel",
+    )
+
+    canonical = provider_module._canonicalize_primary_image(
+        _data_url("image/png", buffer.getvalue())
+    )
+    raw = base64.b64decode(canonical.split(",", 1)[1])
+    with Image.open(io.BytesIO(raw)) as canonical_image:
+        canonical_image.load()
+        assert canonical_image.mode == "RGBA"
+        alpha = canonical_image.getchannel("A")
+        assert [alpha.getpixel((x, 0)) for x in range(2)] == [0, 128]
+        assert "icc_profile" not in canonical_image.info
+        assert "private-note" not in canonical_image.info
+
+
+def test_local_primary_read_is_fail_closed_and_rejects_symlink_components(
+    provider, monkeypatch, tmp_path
+):
+    import agent.file_safety as file_safety
+
+    source = tmp_path / "source.png"
+    source.write_bytes(_image_bytes("PNG"))
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+    monkeypatch.setattr(
+        file_safety,
+        "get_read_block_error",
+        MagicMock(side_effect=RuntimeError("classifier failure")),
+    )
+    failed = provider.generate("edit", image_url=str(source))
+    assert failed["success"] is False
+    assert failed["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+    monkeypatch.undo()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("H20_KEYS_BASE_URL", "http://127.0.0.1:18750/v1/")
+    monkeypatch.setenv("H20_KEYS_API_KEY", "customer-secret")
+    provider = provider_module.Human20KeysOpenAICodexImageGenProvider()
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+    alias = tmp_path / "alias.png"
+    alias.symlink_to(source)
+    denied = provider.generate("edit", image_url=str(alias))
+    assert denied["success"] is False
+    assert denied["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    nested = real_directory / "source.png"
+    nested.write_bytes(_image_bytes("PNG"))
+    parent_alias = tmp_path / "linked-directory"
+    parent_alias.symlink_to(real_directory, target_is_directory=True)
+    denied_parent = provider.generate(
+        "edit", image_url=str(parent_alias / "source.png")
+    )
+    assert denied_parent["success"] is False
+    assert denied_parent["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "reference_kwargs",
+    [
+        {"reference_image_urls": ["https://example.test/reference.png"]},
+        {"reference_image_urls": "https://example.test/reference.png"},
+        {"reference_images": ["/tmp/reference.png"]},
+        {"reference_images": [""]},
+    ],
+)
+def test_nonempty_reference_inputs_are_rejected_before_http(
+    provider, monkeypatch, tmp_path, reference_kwargs
+):
+    source = tmp_path / "source.png"
+    source.write_bytes(_image_bytes("PNG"))
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate("edit this", image_url=str(source), **reference_kwargs)
+
+    assert result["success"] is False
+    assert result["error_type"] == "capability_unsupported"
+    assert "exactly one primary image" in result["error"]
+    post.assert_not_called()
+
+
+def test_empty_reference_fields_do_not_change_text_generation(provider, monkeypatch):
+    response = _response(payload={"data": [{"b64_json": _PNG}]})
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate(
+        "a lighthouse",
+        aspect_ratio="square",
+        reference_image_urls=[],
+        reference_images=[],
+    )
+
+    assert result["success"] is True
+    assert result["modality"] == "text"
+    assert post.call_args.args[0].endswith("/images/generations")
+    assert "image" not in post.call_args.kwargs["json"]
 
 
 def test_requires_only_human20_keys_environment(monkeypatch):
@@ -223,6 +448,29 @@ def test_gateway_error_is_standard_and_does_not_fallback(provider, monkeypatch):
     assert result["error_type"] == "upstream_error"
     assert result["provider"] == "human20-keys-openai-codex"
     assert post.call_count == 1
+
+
+def test_edit_server_error_does_not_leak_secret_or_source(
+    provider, monkeypatch, tmp_path, caplog
+):
+    source = tmp_path / "private-source.png"
+    source.write_bytes(_image_bytes("PNG"))
+    secret = "server-secret-that-must-not-leak"
+    response = _response(
+        status_code=502,
+        payload={"detail": secret, "source": str(source)},
+    )
+    monkeypatch.setattr(
+        provider_module.requests, "post", MagicMock(return_value=response)
+    )
+
+    result = provider.generate("edit", image_url=str(source))
+
+    assert result["error_type"] == "upstream_error"
+    assert secret not in json.dumps(result)
+    assert str(source) not in json.dumps(result)
+    assert secret not in caplog.text
+    assert str(source) not in caplog.text
 
 
 def test_timeout_is_standard_error(provider, monkeypatch):
@@ -400,20 +648,71 @@ def test_prompt_must_be_valid_utf8(provider, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "image_url",
     [
-        {"image_url": ""},
-        {"image_url": 1},
-        {"reference_image_urls": []},
-        {"reference_image_urls": ""},
-        {"reference_images": []},
+        "",
+        "   ",
+        1,
+        "data:image/png;base64,%%%",
+        "data:image/png,AAAA",
+        "data:text/plain;base64,AAAA",
+        "data:image/tiff;base64,AAAA",
+        "/definitely/missing/source.png",
     ],
 )
-def test_any_explicit_reference_field_is_rejected(provider, monkeypatch, kwargs):
+def test_malformed_primary_image_is_rejected_before_http(
+    provider, monkeypatch, image_url
+):
     post = MagicMock()
     monkeypatch.setattr(provider_module.requests, "post", post)
-    result = provider.generate("edit", **kwargs)
-    assert result["error_type"] == "capability_unsupported"
+    result = provider.generate("edit", image_url=image_url)
+    assert result["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+
+def test_data_url_declared_mime_must_match_magic(provider, monkeypatch):
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+    mismatched = _data_url("image/png", _image_bytes("JPEG"))
+
+    result = provider.generate("edit", image_url=mismatched)
+
+    assert result["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["local", "data"])
+def test_primary_image_size_is_bounded_before_http(
+    provider, monkeypatch, tmp_path, mode
+):
+    raw = _image_bytes("PNG")
+    monkeypatch.setattr(provider_module, "_MAX_INPUT_IMAGE_BYTES", len(raw) - 1)
+    source = tmp_path / "source.png"
+    source.write_bytes(raw)
+    image_url = str(source) if mode == "local" else _data_url("image/png", raw)
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate("edit", image_url=image_url)
+
+    assert result["error_type"] == "invalid_argument"
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["local", "data"])
+def test_magic_bytes_must_also_decode_with_pillow(
+    provider, monkeypatch, tmp_path, mode
+):
+    raw = b"\xff\xd8\xffcorrupt-jpeg"
+    source = tmp_path / "source.jpg"
+    source.write_bytes(raw)
+    image_url = str(source) if mode == "local" else _data_url("image/jpeg", raw)
+    post = MagicMock()
+    monkeypatch.setattr(provider_module.requests, "post", post)
+
+    result = provider.generate("edit", image_url=image_url)
+
+    assert result["error_type"] == "invalid_argument"
     post.assert_not_called()
 
 
@@ -520,13 +819,11 @@ def test_real_http_steady_drip_obeys_total_deadline(provider, monkeypatch):
 
 
 def test_real_http_large_bounded_body_streams_successfully(provider, monkeypatch):
-    body = json.dumps(
-        {
-            "created": 1,
-            "data": [{"b64_json": _PNG}],
-            "padding": "x" * (1024 * 1024),
-        }
-    ).encode()
+    body = json.dumps({
+        "created": 1,
+        "data": [{"b64_json": _PNG}],
+        "padding": "x" * (1024 * 1024),
+    }).encode()
 
     class LargeHandler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -549,9 +846,7 @@ def test_real_http_large_bounded_body_streams_successfully(provider, monkeypatch
 
 
 @pytest.mark.parametrize("redirect_status", [302, 307, 308])
-def test_redirect_is_not_followed_or_replayed(
-    provider, monkeypatch, redirect_status
-):
+def test_redirect_is_not_followed_or_replayed(provider, monkeypatch, redirect_status):
     target_contacted = threading.Event()
     replayed_bodies = []
 
@@ -579,9 +874,7 @@ def test_redirect_is_not_followed_or_replayed(
                 length = int(self.headers.get("Content-Length", "0"))
                 self.rfile.read(length)
                 self.send_response(redirect_status)
-                self.send_header(
-                    "Location", f"{target_root}/v1/images/generations"
-                )
+                self.send_header("Location", f"{target_root}/v1/images/generations")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -700,9 +993,7 @@ def test_concurrent_watchdog_double_close_preserves_timeout_without_secret_log(
     assert "secret-bearing close failure" not in caplog.text
 
 
-def test_atomic_persistence_cleans_temp_file_on_replace_failure(
-    monkeypatch, tmp_path
-):
+def test_atomic_persistence_cleans_temp_file_on_replace_failure(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(
         provider_module.os,

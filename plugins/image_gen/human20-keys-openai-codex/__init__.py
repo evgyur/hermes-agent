@@ -1,4 +1,4 @@
-"""Text-only image generation through the Human20 Keys tenant boundary."""
+"""Image generation and secure primary-image edits through Human20 Keys."""
 
 from __future__ import annotations
 
@@ -10,18 +10,21 @@ import json
 import logging
 import math
 import os
+import re
+import stat
 import struct
 import tempfile
 import threading
 import time
 import uuid
+import warnings
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ReadTimeoutError
 from urllib3.util import Timeout
@@ -40,10 +43,34 @@ _API_MODEL = "gpt-image-2"
 _DEFAULT_MODEL = "gpt-image-2-medium"
 _TIMEOUT_SECONDS = 330
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024
+_MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+_MAX_INPUT_IMAGE_PIXELS = 12_000_000
+_MAX_INPUT_IMAGE_DIMENSION = 8192
 _MAX_SUCCESS_BODY_BYTES = ((_MAX_IMAGE_BYTES + 2) // 3 * 4) + 1024 * 1024
 _MAX_ERROR_BODY_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_ALLOWED_INPUT_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_PIL_FORMAT_MIMES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+}
+_SENSITIVE_PATH_PARTS = frozenset({
+    ".env",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    "auth.json",
+    "credentials",
+    "secrets",
+})
+_EXPLICIT_OUTPUT_SIZE_RE = re.compile(
+    r"(?:output(?:\s+size)?|size|dimensions?|format|resolution|instagram|"
+    r"размер|формат|разрешение)[^\n]{0,48}?"
+    r"(?<!\d)(\d{2,4})\s*[x×]\s*(\d{2,4})(?!\d)",
+    re.IGNORECASE,
+)
 
 _MODELS: Dict[str, Dict[str, str]] = {
     "gpt-image-2-low": {
@@ -104,7 +131,7 @@ def _resolve_model(requested: Any = _UNSET) -> Tuple[str, Dict[str, str]]:
     return _DEFAULT_MODEL, _MODELS[_DEFAULT_MODEL]
 
 
-def _generation_url(base_url: str) -> Optional[str]:
+def _image_api_url(base_url: str, endpoint: str) -> Optional[str]:
     value = base_url.strip().rstrip("/")
     try:
         parsed = urlsplit(value)
@@ -120,7 +147,233 @@ def _generation_url(base_url: str) -> Optional[str]:
         or parsed.path.rstrip("/") != "/v1"
     ):
         return None
-    return f"{value}/images/generations"
+    return f"{value}/images/{endpoint}"
+
+
+def _generation_url(base_url: str) -> Optional[str]:
+    return _image_api_url(base_url, "generations")
+
+
+def _edit_url(base_url: str) -> Optional[str]:
+    return _image_api_url(base_url, "edits")
+
+
+def _sniff_input_mime(raw: bytes) -> Optional[str]:
+    if raw.startswith(_PNG_SIGNATURE):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _validate_input_image(
+    raw: bytes, *, declared_mime: Optional[str]
+) -> Tuple[str, bytes]:
+    if not raw:
+        raise ValueError("Primary image is empty")
+    if len(raw) > _MAX_INPUT_IMAGE_BYTES:
+        raise ValueError("Primary image exceeds size limit")
+
+    magic_mime = _sniff_input_mime(raw)
+    if magic_mime not in _ALLOWED_INPUT_MIMES:
+        raise ValueError("Primary image has an unsupported format")
+    if declared_mime is not None and declared_mime != magic_mime:
+        raise ValueError("Primary image MIME does not match its bytes")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                pillow_mime = _PIL_FORMAT_MIMES.get(image.format or "")
+                if pillow_mime != magic_mime:
+                    raise ValueError(
+                        "Primary image decoder format does not match its bytes"
+                    )
+                if getattr(image, "n_frames", 1) != 1:
+                    raise ValueError("Animated primary images are not supported")
+                if (
+                    image.width > _MAX_INPUT_IMAGE_DIMENSION
+                    or image.height > _MAX_INPUT_IMAGE_DIMENSION
+                    or image.width * image.height > _MAX_INPUT_IMAGE_PIXELS
+                ):
+                    raise ValueError("Primary image pixel count exceeds safe limit")
+                image.load()
+                image = ImageOps.exif_transpose(image)
+                has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
+                canonical_image = image.convert("RGBA" if has_alpha else "RGB")
+                canonical_image.info.clear()
+                output = io.BytesIO()
+                canonical_image.save(output, format="PNG", optimize=False)
+                canonical_raw = output.getvalue()
+    except ValueError:
+        raise
+    except (
+        OSError,
+        SyntaxError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
+        raise ValueError("Primary image could not be decoded") from exc
+    if len(canonical_raw) > _MAX_INPUT_IMAGE_BYTES:
+        raise ValueError("Canonical primary image exceeds size limit")
+    return "image/png", canonical_raw
+
+
+def _decode_input_data_url(source: str) -> Tuple[str, bytes]:
+    max_encoded = ((_MAX_INPUT_IMAGE_BYTES + 2) // 3) * 4
+    if len(source) > max_encoded + 64:
+        raise ValueError("Primary image data URL exceeds size limit")
+    header, separator, encoded = source.partition(",")
+    if not separator:
+        raise ValueError("Malformed primary image data URL")
+    parts = header[5:].split(";") if header.lower().startswith("data:") else []
+    if len(parts) != 2 or parts[1].lower() != "base64":
+        raise ValueError("Primary image data URL must be base64 encoded")
+    declared_mime = parts[0].lower()
+    if declared_mime not in _ALLOWED_INPUT_MIMES:
+        raise ValueError("Primary image data URL has an unsupported MIME")
+    try:
+        encoded_bytes = encoded.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Primary image data URL is not ASCII base64") from exc
+    if not encoded_bytes or len(encoded_bytes) > max_encoded:
+        raise ValueError("Primary image data URL exceeds size limit")
+    try:
+        raw = base64.b64decode(encoded_bytes, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Primary image data URL has invalid base64") from exc
+    return declared_mime, raw
+
+
+def _read_local_input_image(source: str) -> bytes:
+    source_path = Path(source).expanduser()
+    if any(part.lower() in _SENSITIVE_PATH_PARTS for part in source_path.parts):
+        raise ValueError("Primary image path is sensitive")
+    file_descriptor = -1
+    directory_descriptor = -1
+    try:
+        from agent.file_safety import get_read_block_error
+
+        path = Path(os.path.abspath(source_path))
+        if any(part.lower() in _SENSITIVE_PATH_PARTS for part in path.parts):
+            raise ValueError("Primary image path is sensitive")
+        try:
+            blocked = get_read_block_error(str(path))
+        except Exception as exc:
+            raise ValueError("Primary image path could not be validated") from exc
+        if blocked:
+            raise ValueError("Primary image path is sensitive")
+
+        directory_descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        components = path.parts[1:]
+        if not components:
+            raise ValueError("Primary image path is not a regular file")
+        for component in components[:-1]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        file_descriptor = os.open(
+            components[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_descriptor,
+        )
+        file_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("Primary image path is not a regular file")
+        if file_stat.st_size > _MAX_INPUT_IMAGE_BYTES:
+            raise ValueError("Primary image file exceeds size limit")
+        with os.fdopen(file_descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(_MAX_INPUT_IMAGE_BYTES + 1)
+    except ValueError:
+        raise
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise ValueError("Primary image file could not be read") from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+    if len(raw) > _MAX_INPUT_IMAGE_BYTES:
+        raise ValueError("Primary image file exceeds size limit")
+    return raw
+
+
+def _canonicalize_primary_image(source: Any) -> str:
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("Primary image must be a non-empty string")
+    value = source.strip()
+    if value.lower().startswith("data:"):
+        declared_mime, raw = _decode_input_data_url(value)
+    else:
+        declared_mime = None
+        raw = _read_local_input_image(value)
+    mime, canonical_raw = _validate_input_image(raw, declared_mime=declared_mime)
+    encoded = base64.b64encode(canonical_raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _explicit_output_size(prompt: str) -> Optional[Tuple[int, int]]:
+    """Return a bounded output size only when the prompt labels it as such."""
+    matches = list(_EXPLICIT_OUTPUT_SIZE_RE.finditer(prompt))
+    if not matches:
+        return None
+    width, height = (int(value) for value in matches[-1].groups())
+    if not (256 <= width <= 4096 and 256 <= height <= 4096):
+        return None
+    if width * height > 16_777_216:
+        return None
+    return width, height
+
+
+def _fit_png_to_explicit_size(path: Path, prompt: str) -> Optional[Tuple[int, int]]:
+    """Deterministically format GPT Image output; never generate a fallback."""
+    target = _explicit_output_size(prompt)
+    if target is None:
+        return None
+    with Image.open(path) as source:
+        source.load()
+        if source.format != "PNG":
+            raise ValueError("Generated edit is not a PNG")
+        fitted = ImageOps.fit(
+            source.convert("RGB"), target, method=Image.Resampling.LANCZOS
+        )
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.fit-", suffix=".png", dir=path.parent
+    )
+    temp_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            fitted.save(output, format="PNG", optimize=True)
+            output.flush()
+            os.fsync(output.fileno())
+        if temp_path.stat().st_size > _MAX_IMAGE_BYTES:
+            raise ValueError("Explicitly sized PNG exceeds size limit")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+        directory_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    with Image.open(path) as verified:
+        verified.load()
+        if verified.format != "PNG" or verified.size != target:
+            raise ValueError("Explicit output sizing failed verification")
+    return target
 
 
 class _TotalDeadlineExceeded(TimeoutError):
@@ -187,9 +440,7 @@ def _read_bounded_body(
                 if callable(read1):
                     chunk = read1(_READ_CHUNK_BYTES, decode_content=True)
                 else:
-                    chunk = response.raw.read(
-                        _READ_CHUNK_BYTES, decode_content=True
-                    )
+                    chunk = response.raw.read(_READ_CHUNK_BYTES, decode_content=True)
             except Exception as exc:
                 if deadline_fired.is_set() or time.monotonic() >= deadline:
                     raise _TotalDeadlineExceeded from exc
@@ -225,7 +476,11 @@ def _gateway_error_type(status_code: int, body: bytes) -> str:
             elif isinstance(detail, str):
                 detail_text = detail.lower()
             error = payload.get("error")
-            if not code and isinstance(error, dict) and isinstance(error.get("code"), str):
+            if (
+                not code
+                and isinstance(error, dict)
+                and isinstance(error.get("code"), str)
+            ):
                 code = error["code"]
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
@@ -289,7 +544,9 @@ def _decode_and_validate_png(encoded: str, expected_size: Tuple[int, int]) -> by
             raise ValueError("Truncated PNG chunk data")
         kind = image_bytes[offset + 4 : offset + 8]
         data = image_bytes[offset + 8 : offset + 8 + length]
-        expected_crc = struct.unpack(">I", image_bytes[offset + 8 + length : chunk_end])[0]
+        expected_crc = struct.unpack(
+            ">I", image_bytes[offset + 8 + length : chunk_end]
+        )[0]
         actual_crc = zlib.crc32(kind + data) & 0xFFFFFFFF
         if actual_crc != expected_crc:
             raise ValueError("PNG CRC mismatch")
@@ -377,7 +634,7 @@ def _atomic_persist_png(image_bytes: bytes, *, prefix: str) -> Path:
 
 
 class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
-    """Generate gpt-image-2 PNGs using a Human20 customer credential."""
+    """Generate or edit gpt-image-2 PNGs with a Human20 credential."""
 
     @property
     def name(self) -> str:
@@ -408,13 +665,13 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
         return _DEFAULT_MODEL
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"modalities": ["text"], "max_reference_images": 0}
+        return {"modalities": ["text", "image"], "max_reference_images": 0}
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
             "name": self.display_name,
             "badge": "managed",
-            "tag": "Text-only gpt-image-2 through Human20 Keys",
+            "tag": "gpt-image-2 generation and primary-image edits through Human20 Keys",
             "env_vars": [
                 {"key": "H20_KEYS_BASE_URL", "prompt": "Human20 Keys base URL"},
                 {"key": "H20_KEYS_API_KEY", "prompt": "Human20 customer key"},
@@ -435,18 +692,25 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
         )
         prompt_for_error = prompt if isinstance(prompt, str) else ""
 
-        if (
-            image_url is not None
-            or reference_image_urls is not None
-            or (
-                "reference_images" in kwargs
-                and kwargs.get("reference_images") is not None
-            )
-        ):
+        if reference_image_urls or kwargs.get("reference_images"):
             return error_response(
                 error=(
-                    "Human20 Keys Codex image generation is text-only; "
-                    "reference images are unsupported."
+                    "Human20 Keys image edits support exactly one primary image "
+                    "through image_url; additional reference images are unsupported."
+                ),
+                error_type="capability_unsupported",
+                provider=_PROVIDER,
+                prompt=prompt_for_error,
+                aspect_ratio=aspect_for_error,
+            )
+        if isinstance(image_url, str) and image_url.strip().lower().startswith((
+            "http://",
+            "https://",
+        )):
+            return error_response(
+                error=(
+                    "Human20 Keys primary image edits require a local file path "
+                    "or base64 data:image URL; remote HTTP(S) URLs are not allowed."
                 ),
                 error_type="capability_unsupported",
                 provider=_PROVIDER,
@@ -495,6 +759,24 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        is_edit = image_url is not None
+        canonical_image: Optional[str] = None
+        if is_edit:
+            try:
+                canonical_image = _canonicalize_primary_image(image_url)
+            except ValueError:
+                return error_response(
+                    error=(
+                        "Primary image must be a valid PNG, JPEG, GIF, or WebP "
+                        "local file or base64 data:image URL no larger than 25 MiB"
+                    ),
+                    error_type="invalid_argument",
+                    provider=_PROVIDER,
+                    model=tier_id,
+                    prompt=clean_prompt,
+                    aspect_ratio=aspect,
+                )
+
         base_url = os.environ.get("H20_KEYS_BASE_URL", "")
         api_key = os.environ.get("H20_KEYS_API_KEY", "").strip()
         if not base_url.strip() or not api_key:
@@ -507,7 +789,7 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        url = _generation_url(base_url)
+        url = _edit_url(base_url) if is_edit else _generation_url(base_url)
         if url is None:
             return error_response(
                 error="H20_KEYS_BASE_URL must be an HTTP(S) URL ending in /v1",
@@ -532,6 +814,8 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
             "quality": quality,
             "n": 1,
         }
+        if canonical_image is not None:
+            payload["image"] = canonical_image
 
         deadline = time.monotonic() + _TIMEOUT_SECONDS
         response: Optional[requests.Response] = None
@@ -651,13 +935,20 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         expected_size = tuple(int(value) for value in size.split("x", 1))
+        image_path: Optional[Path] = None
         try:
             image_bytes = _decode_and_validate_png(encoded, expected_size)
             image_path = _atomic_persist_png(
                 image_bytes,
                 prefix=f"human20_keys_{tier_id}",
             )
+            explicit_size = _fit_png_to_explicit_size(image_path, clean_prompt)
         except ValueError as exc:
+            if image_path is not None:
+                try:
+                    image_path.unlink()
+                except OSError:
+                    pass
             logger.debug("Human20 Keys returned invalid PNG: %s", exc)
             return error_response(
                 error="Human20 Keys returned an invalid PNG",
@@ -668,6 +959,11 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
         except (OSError, RuntimeError) as exc:
+            if image_path is not None:
+                try:
+                    image_path.unlink()
+                except OSError:
+                    pass
             logger.debug("Could not persist Human20 Keys image: %s", exc)
             return error_response(
                 error="Could not save image to cache",
@@ -684,7 +980,15 @@ class Human20KeysOpenAICodexImageGenProvider(ImageGenProvider):
             prompt=clean_prompt,
             aspect_ratio=aspect,
             provider=_PROVIDER,
-            extra={"size": size, "quality": quality},
+            modality="image" if is_edit else "text",
+            extra={
+                "size": (
+                    f"{explicit_size[0]}x{explicit_size[1]}"
+                    if explicit_size is not None
+                    else size
+                ),
+                "quality": quality,
+            },
         )
 
 

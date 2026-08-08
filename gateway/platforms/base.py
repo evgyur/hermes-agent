@@ -5903,8 +5903,9 @@ class BasePlatformAdapter(ABC):
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                declared_media_files, response = self.extract_media(response)
+                media_files = self.filter_media_delivery_paths(declared_media_files)
+                declared_media_missing = bool(declared_media_files and not media_files)
 
                 # Do NOT deduplicate MEDIA tags against prior turns here.
                 # The auto-append path in GatewayRunner._run_agent_inner already
@@ -5947,6 +5948,21 @@ class BasePlatformAdapter(ABC):
                         local_files = [p for p in local_files if p not in _history_media_paths]
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+
+                # A declared attachment is part of the response contract. If every
+                # declared path is missing or unsafe, never deliver the surrounding
+                # success prose by itself: that would claim a file was sent when no
+                # upload can happen.
+                if declared_media_missing and not (images or local_files):
+                    logger.error(
+                        "[%s] response_required_media_missing: declared attachment "
+                        "was not deliverable for %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                    text_content = (
+                        "⚠️ Не удалось прикрепить изображение: файл не был создан."
+                    )
 
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
