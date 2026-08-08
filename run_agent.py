@@ -243,6 +243,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # Guard-enabled completion candidates stay in the in-memory verification
+    # loop but may not become durable until turn_finalizer validates/replaces
+    # the final candidate and removes this marker.
+    "_claim_integrity_pending",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an

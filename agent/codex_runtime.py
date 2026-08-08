@@ -631,6 +631,29 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
+    from agent.claim_integrity import claim_integrity_enabled
+
+    if claim_integrity_enabled():
+        # The app-server path owns its own event bridge, projection, streaming,
+        # and persistence and deliberately bypasses turn_finalizer. Until it
+        # produces the same typed evidence boundary, do not silently weaken the
+        # user's guard by switching runtimes.
+        return {
+            "final_response": (
+                "⚠️ Claim-integrity guard blocked the codex_app_server runtime: "
+                "this path cannot yet prove final claims before delivery. "
+                "Use the codex_responses/default runtime instead."
+            ),
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "interrupted": False,
+            "error": "claim_integrity_incompatible_runtime",
+            "agent_persisted": True,
+            "claim_integrity_blocked_runtime": True,
+        }
+
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
         _ServerRequestRouting,

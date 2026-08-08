@@ -439,8 +439,25 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
-    # Store stream callback for _interruptible_api_call to pick up.
-    agent._stream_callback = stream_callback
+    # A claim-integrity decision needs the complete final response plus the
+    # current-turn tool trace. Streaming model text before that decision would
+    # leak wording the finalizer may later block, so guarded sessions buffer
+    # assistant text until finalization.
+    try:
+        from agent.claim_integrity import claim_guarded_callbacks
+        (
+            agent._stream_callback,
+            agent.stream_delta_callback,
+            agent.interim_assistant_callback,
+        ) = claim_guarded_callbacks(
+            stream_callback,
+            getattr(agent, "stream_delta_callback", None),
+            getattr(agent, "interim_assistant_callback", None),
+        )
+    except Exception:
+        agent._stream_callback = None
+        agent.stream_delta_callback = None
+        agent.interim_assistant_callback = None
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp

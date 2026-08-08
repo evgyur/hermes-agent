@@ -66,6 +66,45 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _rewrite_current_turn_final_assistant(messages, old_text, new_text, agent) -> None:
+    """Resolve one guarded candidate and drop older unverified candidates."""
+
+    turn_start = -1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if any(message.get(flag) for flag in _VERIFICATION_CONTINUATION_FLAGS):
+            continue
+        turn_start = index
+
+    resolved_index = None
+    for index in range(len(messages) - 1, turn_start, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if message.get("content") == old_text:
+            resolved_index = index
+            break
+
+    rebuilt = list(messages[: turn_start + 1])
+    for index in range(turn_start + 1, len(messages)):
+        message = messages[index]
+        is_pending = isinstance(message, dict) and message.get("_claim_integrity_pending")
+        if is_pending and index != resolved_index:
+            continue
+        if index == resolved_index and isinstance(message, dict):
+            message["content"] = new_text
+            message.pop("_claim_integrity_pending", None)
+            message.pop("_db_persisted", None)
+        rebuilt.append(message)
+
+    if resolved_index is None:
+        rebuilt.append({"role": "assistant", "content": new_text})
+
+    messages[:] = rebuilt
+    agent._db_flush_scan_prefix = None
+
+
 def finalize_turn(
     agent,
     *,
@@ -230,6 +269,48 @@ def finalize_turn(
         )
         if callable(_rollback_fn):
             _rollback_fn(_preflight_snapshot)
+
+    # Apply the proof boundary before trajectory/session persistence. The same
+    # guard runs again after output-transform plugins below, but this first pass
+    # ensures an unsupported model answer never becomes durable history.
+    # Interrupted turns can still carry a model-authored final candidate, so
+    # interruption is not an exemption from verification.
+    _response_transformed = False
+    if final_response:
+        _claim_original = final_response
+        try:
+            from agent.claim_integrity import (
+                claim_integrity_enabled as _claim_integrity_enabled,
+                enforce_claim_integrity as _enforce_claim_integrity,
+            )
+            if _claim_integrity_enabled():
+                final_response, _claim_blocked, _claim_reason = (
+                    _enforce_claim_integrity(final_response, messages)
+                )
+                if _claim_blocked:
+                    logger.warning(
+                        "claim-integrity guard blocked unsupported pre-persist response: %s",
+                        _claim_reason,
+                    )
+                    _response_transformed = True
+                _rewrite_current_turn_final_assistant(
+                    messages, _claim_original, final_response, agent
+                )
+        except Exception as exc:
+            logger.critical(
+                "claim-integrity pre-persist guard failed closed: %s",
+                exc,
+                exc_info=True,
+            )
+            final_response = (
+                "⚠️ **Ответ заблокирован: защита доказательности дала ошибку.**\n\n"
+                "Исходное утверждение не отправлено, потому что его проверка не "
+                "завершилась. Результат нельзя считать подтверждённым."
+            )
+            _rewrite_current_turn_final_assistant(
+                messages, _claim_original, final_response, agent
+            )
+            _response_transformed = True
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -538,8 +619,6 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
-
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
@@ -561,6 +640,40 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Deterministic claim-integrity guard. This runs after output-transform
+    # plugins so no later wording rewrite can smuggle an unsupported completion
+    # or live-state claim into the user-visible response. When enabled it is
+    # fail-closed for the claim, not for the whole turn: the unsafe wording is
+    # replaced by a transparent evidence status.
+    if final_response and not interrupted:
+        try:
+            from agent.claim_integrity import (
+                claim_integrity_enabled as _claim_integrity_enabled,
+                enforce_claim_integrity as _enforce_claim_integrity,
+            )
+
+            if _claim_integrity_enabled():
+                _guarded_response, _claim_blocked, _claim_reason = (
+                    _enforce_claim_integrity(final_response, messages)
+                )
+                if _claim_blocked:
+                    logger.warning(
+                        "claim-integrity guard blocked unsupported final response: %s",
+                        _claim_reason,
+                    )
+                    final_response = _guarded_response
+                    _response_transformed = True
+        except Exception as exc:
+            # The integrity layer itself is part of the proof boundary. If it
+            # breaks, do not leak the unverified wording it was meant to check.
+            logger.critical("claim-integrity guard failed closed: %s", exc, exc_info=True)
+            final_response = (
+                "⚠️ **Ответ заблокирован: защита доказательности дала ошибку.**\n\n"
+                "Исходное утверждение не отправлено, потому что его проверка не "
+                "завершилась. Результат нельзя считать подтверждённым."
+            )
+            _response_transformed = True
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

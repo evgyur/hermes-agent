@@ -92,6 +92,12 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # Deterministic post-turn evidence boundary. When enabled, first-person
+        # completion/promise claims are checked against successful current-turn
+        # mutation, test, and live-probe receipts before delivery. Unsupported
+        # wording is replaced with a transparent blocked status. Off by default;
+        # operators opt in after validating their language/tool mix.
+        "claim_integrity_guard": False,
         # Universal parallel-tool-call guidance — short prompt block applied to
         # all models that tells the model to batch independent tool calls
         # (reads, searches, web fetches, read-only commands) into one turn

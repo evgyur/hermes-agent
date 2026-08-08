@@ -7077,12 +7077,21 @@ def run_conversation(
                     # attempted final answer before the verification loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
                     try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
+                        from agent.claim_integrity import claim_integrity_enabled
+                        _claim_guard_buffers_interim = claim_integrity_enabled()
                     except Exception:
-                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
+                        _claim_guard_buffers_interim = True
+                    if not _claim_guard_buffers_interim:
+                        agent._emit_interim_assistant_message(final_msg)
+                    else:
+                        final_msg["_claim_integrity_pending"] = True
+                    messages.append(final_msg)
+                    if not _claim_guard_buffers_interim:
+                        try:
+                            agent._flush_messages_to_session_db(messages, conversation_history)
+                        except Exception:
+                            logger.debug("verify-on-stop interim flush failed", exc_info=True)
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge,
@@ -7149,12 +7158,21 @@ def run_conversation(
                     # attempted final answer before the pre_verify loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
                     try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
+                        from agent.claim_integrity import claim_integrity_enabled
+                        _claim_guard_buffers_interim = claim_integrity_enabled()
                     except Exception:
-                        logger.debug("pre_verify interim flush failed", exc_info=True)
+                        _claim_guard_buffers_interim = True
+                    if not _claim_guard_buffers_interim:
+                        agent._emit_interim_assistant_message(final_msg)
+                    else:
+                        final_msg["_claim_integrity_pending"] = True
+                    messages.append(final_msg)
+                    if not _claim_guard_buffers_interim:
+                        try:
+                            agent._flush_messages_to_session_db(messages, conversation_history)
+                        except Exception:
+                            logger.debug("pre_verify interim flush failed", exc_info=True)
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge2,

@@ -251,8 +251,17 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    # Direct sends bypass turn_finalizer. Block unsupported assistant claims.
+    try:
+        from agent.claim_integrity import claim_integrity_enabled, enforce_claim_integrity
+        if claim_integrity_enabled() and args.get("message"):
+            _, blocked, reason = enforce_claim_integrity(str(args["message"]), [])
+            if blocked:
+                return json.dumps(_error(f"send blocked by claim-integrity guard: {reason}"))
+    except Exception as exc:
+        return json.dumps(_error(f"send blocked: claim-integrity guard failed: {exc}"))
 
+    return _handle_send(args)
 
 def _handle_list():
     """Return formatted list of available messaging targets."""
