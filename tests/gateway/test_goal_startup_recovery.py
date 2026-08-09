@@ -32,8 +32,11 @@ def hermes_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from gateway import restart_loop_guard
     from hermes_cli import goals
 
+    restart_state = home / "gateway" / "restart_loop.json"
+    monkeypatch.setattr(restart_loop_guard, "_state_path", lambda: restart_state)
     goals._DB_CACHE.clear()
     yield home
     goals._DB_CACHE.clear()
@@ -193,6 +196,22 @@ def test_active_goal_without_resume_pending_uses_goalmanager_classifier(hermes_h
     assert decision.reason == "active-goal-startup-recovery"
     assert decision.prompt.startswith("[Continuing toward your standing goal]\nGoal:")
     assert "recover from a lost queued continuation" in decision.prompt
+
+
+@pytest.mark.asyncio
+async def test_active_goal_without_resume_pending_does_not_count_as_restart_boot(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="goal-only-recovery-sid", resume_pending=False)
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    GoalManager(session_id=entry.session_id).set("continue durable goal after clean boot")
+
+    with patch("gateway.restart_loop_guard.check_and_record") as guard:
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    guard.assert_not_called()
 
 
 def test_completed_supergoal_state_is_not_auto_resumed_at_startup(hermes_home, tmp_path):
