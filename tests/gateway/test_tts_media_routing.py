@@ -17,7 +17,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _queued_first_response_delivery_policy
 from gateway.session import SessionSource, build_session_key
 
 
@@ -450,6 +450,24 @@ async def test_queued_followup_delivery_skips_media_when_turn_failed():
     adapter.send_multiple_images.assert_not_awaited()
     adapter.send_document.assert_not_awaited()
     adapter.send_video.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("final_text_delivered", "failed", "expected"),
+    [
+        (False, False, (False, True)),
+        (True, False, (True, True)),
+        (False, True, (False, False)),
+        (True, True, (False, False)),
+    ],
+)
+def test_queued_delivery_policy_replays_failure_text_and_suppresses_failed_media(
+    final_text_delivered, failed, expected,
+):
+    assert _queued_first_response_delivery_policy(
+        final_text_delivered=final_text_delivered,
+        failed=failed,
+    ) == expected
 
 
 class _QueuedMediaCaptureAdapter(BasePlatformAdapter):

@@ -3104,6 +3104,17 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     return cleaned.strip()
 
 
+def _queued_first_response_delivery_policy(
+    *, final_text_delivered: bool, failed: bool,
+) -> tuple[bool, bool]:
+    """Return ``(text_already_delivered, deliver_media)`` for queued fallback.
+
+    A failed turn must replay its normalized failure text even if streaming
+    emitted partial output. Attachments from failed turns remain suppressed.
+    """
+    return final_text_delivered and not failed, not failed
+
+
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive the /command slug and declared frontmatter name from a SKILL.md.
 
@@ -28721,14 +28732,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
+                            _text_already_delivered, _deliver_media = (
+                                _queued_first_response_delivery_policy(
+                                    final_text_delivered=_already_streamed,
+                                    failed=bool(_delivery_result.get("failed")),
+                                )
+                            )
                             await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
                                 adapter=adapter,
                                 metadata=_status_thread_metadata,
                                 event_message_id=event_message_id,
-                                text_already_delivered=_already_streamed,
-                                deliver_media=not _delivery_result.get("failed"),
+                                text_already_delivered=_text_already_delivered,
+                                deliver_media=_deliver_media,
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
