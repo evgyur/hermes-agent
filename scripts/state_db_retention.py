@@ -321,7 +321,11 @@ def build_manifest(
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-    os.replace(tmp, output)
+    try:
+        os.replace(tmp, output)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     summary["manifest"] = str(output.resolve())
     summary["manifest_sha256"] = _file_sha256(output)
     return summary

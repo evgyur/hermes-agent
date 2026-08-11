@@ -250,3 +250,24 @@ def test_manifest_refuses_existing_output(tmp_path: Path) -> None:
             archive_sha256=None,
         )
     assert output.read_text(encoding="utf-8") == "keep"
+
+
+def test_manifest_publish_failure_removes_candidate(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "manifest.jsonl"
+    _make_db(source)
+
+    def fail_replace(_source, _destination):
+        raise OSError("publish failed")
+
+    monkeypatch.setattr(retention.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="publish failed"):
+        retention.build_manifest(
+            source,
+            output,
+            recent_days=30,
+            archive_sha256=None,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".manifest.jsonl.candidate-*"))
