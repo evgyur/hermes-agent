@@ -26,6 +26,7 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
     escape_like as _escape_like,
+    trigram_fts_config_enabled,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -732,10 +733,13 @@ class SessionSearchMixin:
         # path above). Markers are already durable.
         with self._lock:
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            trigram_ok = self._ensure_fts_schema(
-                self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
-            self._trigram_available = bool(trigram_ok)
+            if trigram_fts_config_enabled():
+                trigram_ok = self._ensure_fts_schema(
+                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                self._trigram_available = bool(trigram_ok)
+            else:
+                self._trigram_available = False
             if not base_ok:
                 raise sqlite3.OperationalError(
                     "failed to create v23 messages_fts during optimize-storage demote"
@@ -787,10 +791,13 @@ class SessionSearchMixin:
                 base_ok = self._ensure_fts_schema(
                     self._conn, "messages_fts", FTS_SQL
                 )
-                trigram_ok = self._ensure_fts_schema(
-                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = bool(trigram_ok)
+                if trigram_fts_config_enabled():
+                    trigram_ok = self._ensure_fts_schema(
+                        self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
+                    self._trigram_available = bool(trigram_ok)
+                else:
+                    self._trigram_available = False
                 if not base_ok:
                     # Fail fast: without the base table the backfill loop
                     # below would retry "no such table" errors forever.

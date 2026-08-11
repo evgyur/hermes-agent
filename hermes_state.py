@@ -56,6 +56,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
+    trigram_fts_config_enabled,
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
@@ -2944,7 +2945,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._fts_enabled = (
                         self._fts_table_probe(cursor, "messages_fts") is True
                     )
-                    if self._fts_enabled:
+                    if self._fts_enabled and trigram_fts_config_enabled():
                         self._trigram_available = (
                             self._fts_table_probe(
                                 cursor,

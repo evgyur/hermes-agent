@@ -2794,6 +2794,13 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
+        # Trigram CJK/substring derivative. It can dominate state.db on long
+        # histories, so operators may disable it after measuring their query
+        # mix. Canonical messages and ordinary unicode61 FTS remain intact;
+        # CJK/substring queries fall back to LIKE. Disabling stops maintenance
+        # but does not drop stored pages — reclaim them in a maintenance window.
+        # Bridged to HERMES_TRIGRAM_FTS (internal carrier).
+        "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
         # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)

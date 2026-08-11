@@ -23,6 +23,14 @@ def _write_home(tmp_path: Path, sessions_cfg: dict, env_text: str = "") -> Path:
     return hermes_home
 
 
+def test_trigram_fts_bridged_from_config(tmp_path, monkeypatch):
+    home = _write_home(tmp_path, {"trigram_fts": False})
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1")
+    gateway_run._reload_runtime_env_preserving_config_authority()
+    assert os.environ["HERMES_TRIGRAM_FTS"] == "False"
+
+
 def test_cjk_fts_bridged_from_config(tmp_path, monkeypatch):
     home = _write_home(tmp_path, {"cjk_fts": False})
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
@@ -36,6 +44,7 @@ def test_search_knobs_have_documented_defaults():
     user-facing env switch): cjk index default ON, slow-search log at 1s."""
     from hermes_cli.config import DEFAULT_CONFIG
 
+    assert DEFAULT_CONFIG["sessions"]["trigram_fts"] is True
     assert DEFAULT_CONFIG["sessions"]["cjk_fts"] is True
     assert DEFAULT_CONFIG["sessions"]["search_slow_ms"] == 1000
 

@@ -6,6 +6,7 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+import os
 from typing import Any
 
 from agent.skill_commands import (
@@ -184,14 +185,26 @@ FTS_STORAGE_VERSION = 1
 MAX_FTS5_QUERY_CHARS = 2_048
 
 
-_FTS_TRIGGERS = (
+_FTS_BASE_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+
+_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
+
+
+def trigram_fts_config_enabled() -> bool:
+    """Return whether the rebuildable trigram derivative should be served."""
+    return os.getenv("HERMES_TRIGRAM_FTS", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
 
 
 SCHEMA_SQL = """

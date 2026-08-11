@@ -768,6 +768,8 @@ def load_cli_config() -> Dict[str, Any]:
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
     if isinstance(sessions_config, dict):
+        if "trigram_fts" in sessions_config:
+            os.environ["HERMES_TRIGRAM_FTS"] = str(sessions_config["trigram_fts"])
         if "cjk_fts" in sessions_config:
             os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
         if "search_slow_ms" in sessions_config:
