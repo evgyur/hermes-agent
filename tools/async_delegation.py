@@ -443,14 +443,16 @@ def _prune_durable_records() -> None:
             )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """CAS one terminal outcome; lose cleanly to a concurrent restart defer."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        changed = conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                heartbeat_at=?, event_json=?, result_json=?, delivery_state='pending',
                status_revision=status_revision+1
-               WHERE delegation_id=?""",
+               WHERE delegation_id=?
+                 AND state IN ('running','stalling','finalizing')""",
             (
                 event.get("status", "completed"),
                 event.get("completed_at", now),
@@ -460,7 +462,8 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
                 json.dumps(result),
                 event["delegation_id"],
             ),
-        )
+        ).rowcount
+    return bool(changed)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -757,7 +760,7 @@ def _interrupt_pending_restarts(
             [_RESTART_POLICY, *params],
         ).fetchall()
         for delegation_id, task_json, origin, origin_ui, parent_sid, dispatched_at in rows:
-            task = json.loads(task_json or "{}")
+            task = _load_durable_json(task_json, {})
             error = f"Retained work stopped before automatic recovery ({reason})"
             duration = round(max(0.0, now - float(dispatched_at or now)), 2)
             if task.get("is_batch"):
@@ -870,7 +873,7 @@ def recover_abandoned_delegations() -> int:
                 )
                 recovered += 1
                 continue
-            task = json.loads(task_json or "{}")
+            task = _load_durable_json(task_json, {})
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -2333,8 +2336,8 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     ):
         return
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    if _push_completion_event(event_record, result, status):
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -2368,7 +2371,7 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
 
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
-) -> None:
+) -> bool:
     """Push a type='async_delegation' event onto the shared completion queue.
 
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
@@ -2382,7 +2385,7 @@ def _push_completion_event(
             "result lost: %s",
             record.get("delegation_id"), exc,
         )
-        return
+        return False
 
     summary = result.get("summary")
     error = result.get("error")
@@ -2424,7 +2427,8 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
+    if not _persist_completion(evt, result):
+        return False
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -2433,6 +2437,7 @@ def _push_completion_event(
             "result lost: %s",
             record.get("delegation_id"), exc,
         )
+    return True
 
 
 def dispatch_async_delegation_batch(
@@ -2598,13 +2603,13 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    if _push_batch_completion_event(event_record, combined, status):
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
-) -> None:
+) -> bool:
     """Push a combined async-delegation batch completion event."""
     try:
         from tools.process_registry import process_registry
@@ -2614,7 +2619,7 @@ def _push_batch_completion_event(
             "failed; result lost: %s",
             event_record.get("delegation_id"), exc,
         )
-        return
+        return False
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
@@ -2655,7 +2660,8 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
+    if not _persist_completion(evt, combined):
+        return False
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -2664,6 +2670,7 @@ def _push_batch_completion_event(
             "result lost: %s",
             event_record.get("delegation_id"), exc,
         )
+    return True
 
 
 def _ensure_stale_monitor() -> None:
