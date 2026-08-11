@@ -1263,23 +1263,28 @@ def handle_function_call(
                 return _return_bridge_result(_probe_err)
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
-            return handle_function_call(
-                function_name=underlying_name,
-                function_args=underlying_args,
-                task_id=task_id,
-                tool_call_id=tool_call_id,
-                session_id=session_id,
-                turn_id=turn_id,
-                api_request_id=api_request_id,
-                user_task=user_task,
-                enabled_tools=enabled_tools,
-                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
-                skip_tool_request_middleware=skip_tool_request_middleware,
-                skip_tool_execution_middleware=skip_tool_execution_middleware,
-                tool_request_middleware_trace=list(_tool_middleware_trace),
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-            )
+            # Bind an exact request-scoped authority only after the scoped
+            # catalog and schema gates above pass. Effectful plugin handlers
+            # can read this host-owned proof even though progressive disclosure
+            # keeps the underlying name out of agent.valid_tool_names.
+            with _ts_mod._bind_scoped_deferred_tool_authority(underlying_name):
+                return handle_function_call(
+                    function_name=underlying_name,
+                    function_args=underlying_args,
+                    task_id=task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
+                    enabled_tools=enabled_tools,
+                    skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                    skip_tool_request_middleware=skip_tool_request_middleware,
+                    skip_tool_execution_middleware=skip_tool_execution_middleware,
+                    tool_request_middleware_trace=list(_tool_middleware_trace),
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:

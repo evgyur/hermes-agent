@@ -459,3 +459,61 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
+
+    def test_scoped_deferred_dispatch_binds_exact_authority(self):
+        import model_tools
+        from tools.registry import registry
+        from tools.tool_search import get_active_scoped_deferred_tool_authority
+
+        name = "continuum_authority_probe"
+
+        def _handler(args, **kwargs):
+            return json.dumps(
+                {"authority": get_active_scoped_deferred_tool_authority()}
+            )
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema=_td(name, "effectful deferred authority probe"),
+            toolset="continuum-authority-probe",
+        )
+
+        assert get_active_scoped_deferred_tool_authority() is None
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": name, "arguments": {}},
+            enabled_toolsets=["continuum-authority-probe"],
+        )
+
+        assert json.loads(result) == {"authority": name}
+        assert get_active_scoped_deferred_tool_authority() is None
+
+    def test_out_of_scope_deferred_call_never_binds_authority(self):
+        import model_tools
+        from tools.registry import registry
+        from tools.tool_search import get_active_scoped_deferred_tool_authority
+
+        name = "continuum_out_of_scope_authority_probe"
+        calls = []
+
+        def _handler(args, **kwargs):
+            calls.append(get_active_scoped_deferred_tool_authority())
+            return json.dumps({"ok": True})
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema=_td(name, "out-of-scope deferred authority probe"),
+            toolset="continuum-out-of-scope-probe",
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": name, "arguments": {}},
+            enabled_toolsets=["continuum-authority-probe"],
+        )
+
+        assert "not available in this session" in result
+        assert calls == []
+        assert get_active_scoped_deferred_tool_authority() is None

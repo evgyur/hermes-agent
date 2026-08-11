@@ -41,6 +41,8 @@ import json
 import logging
 import math
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -57,6 +59,38 @@ TOOL_DESCRIBE_NAME = "tool_describe"
 TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
+
+# Exact, request-scoped proof that ``tool_call`` admitted one underlying tool
+# from the active session's scoped deferred catalog.  Model-visible
+# ``agent.valid_tool_names`` intentionally contains only the bridge names after
+# progressive disclosure, so effectful plugin handlers need this host-owned
+# signal to distinguish an authorized deferred call from a direct registry
+# invocation.  The dispatcher binds it only after the scoped-catalog and schema
+# gates pass, and always resets it when the recursive dispatch returns.
+_ACTIVE_SCOPED_DEFERRED_TOOL: ContextVar[Optional[str]] = ContextVar(
+    "active_scoped_deferred_tool",
+    default=None,
+)
+
+
+@contextmanager
+def _bind_scoped_deferred_tool_authority(tool_name: str):
+    token = _ACTIVE_SCOPED_DEFERRED_TOOL.set(tool_name)
+    try:
+        yield
+    finally:
+        _ACTIVE_SCOPED_DEFERRED_TOOL.reset(token)
+
+
+def get_active_scoped_deferred_tool_authority() -> Optional[str]:
+    """Return the exact deferred tool admitted for the current dispatch.
+
+    This is intentionally a read-only public seam for effectful plugin
+    handlers.  ``None`` means the handler was not reached through the scoped
+    ``tool_call`` bridge.
+    """
+
+    return _ACTIVE_SCOPED_DEFERRED_TOOL.get()
 
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
@@ -1075,4 +1109,5 @@ __all__ = [
     "resolve_underlying_call",
     "scoped_deferrable_names",
     "validate_deferred_call_args",
+    "get_active_scoped_deferred_tool_authority",
 ]
