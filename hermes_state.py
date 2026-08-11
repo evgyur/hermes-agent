@@ -2765,7 +2765,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # then backs off so a long hold isn't hammered with BEGIN IMMEDIATE
     # attempts.
     _WRITE_PATIENCE_S = 20.0
-    _TRANSCRIPT_WRITE_PATIENCE_S = 60.0
+    # Transcript persistence is the one write that must not turn transient
+    # storage contention into a destroyed user turn.  A large production FTS
+    # index can still be held by an older process or an already-running SQLite
+    # maintenance command for several minutes.  Routine/background writers
+    # retain the short budget above; transcript writes wait out that bounded
+    # maintenance window instead of surfacing session_persistence_failed.
+    _TRANSCRIPT_WRITE_PATIENCE_S = 600.0
     # Observation-only activity heartbeat/label writes (#76354 review S1):
     # these run on (or adjacent to) the response-critical path and must never
     # wait out the full routine patience under contention. Sub-second budget;
@@ -2802,6 +2808,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _FTS_MERGE_EVERY_N_WRITES = 1000
     _FTS_MERGE_MAX_PAGES_PER_INDEX = 500
     _FTS_MERGE_COMMANDS_PER_PASS = 4
+    # FTS5 automerge is incremental and keeps segment growth bounded across
+    # connections. Keep its documented default. Crisismerge is different: it
+    # fully merges a level inside the triggering INSERT and may monopolize the
+    # write lock for minutes on a multi-GB index. SQLite treats 0/1 as the
+    # default (16), so use the largest accepted 32-bit threshold to disable
+    # that emergency full merge in practice. Explicit positive-rank merges
+    # below remain page-bounded.
+    _FTS_AUTOMERGE = 4
+    _FTS_CRISISMERGE = 2_147_483_647
+    _LONG_WRITE_WARN_S = 2.0
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -3313,6 +3329,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         try:
             cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._configure_fts_merge_policy(cursor, "messages_fts_cjk")
             if not cjk_present:
                 # Freshly created. An empty DB's index is complete by
                 # construction (triggers will cover every future row); a
@@ -3376,6 +3393,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError:
                 pass
 
+    def _configure_fts_merge_policy(
+        self, cursor: sqlite3.Cursor, table_name: str
+    ) -> None:
+        """Keep routine FTS maintenance incremental and crisis merges inert."""
+        cursor.execute(
+            f"INSERT INTO {table_name}({table_name}, rank) "
+            "VALUES('automerge', ?)",
+            (self._FTS_AUTOMERGE,),
+        )
+        cursor.execute(
+            f"INSERT INTO {table_name}({table_name}, rank) "
+            "VALUES('crisismerge', ?)",
+            (self._FTS_CRISISMERGE,),
+        )
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
@@ -3390,6 +3422,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # triggers are recreated after a previous no-FTS5 runtime disabled
             # them to keep message writes working.
             cursor.executescript(ddl)
+            # Persist the bounded-maintenance policy in the FTS shadow config.
+            # These are metadata-only writes and schema initialization happens
+            # before this SessionDB begins serving traffic.  Existing indexes
+            # are corrected on every writable open; fresh indexes never get a
+            # chance to launch a surprise full crisis-merge on a user append.
+            self._configure_fts_merge_policy(cursor, table_name)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -3453,9 +3491,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
+                    txn_started = time.monotonic()
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
+                        held_s = time.monotonic() - txn_started
+                        if held_s >= self._LONG_WRITE_WARN_S:
+                            logger.warning(
+                                "state.db long write transaction: operation=%s "
+                                "held_lock=%.3fs pid=%d thread=%d",
+                                getattr(fn, "__qualname__", getattr(fn, "__name__", "write")),
+                                held_s,
+                                os.getpid(),
+                                threading.get_ident(),
+                            )
                     except BaseException:
                         try:
                             self._conn.rollback()
@@ -3498,7 +3547,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
                     raise sqlite3.OperationalError(
-                        f"database is locked (another Hermes process held the "
+                        f"database is locked (another Hermes writer held the "
                         f"state.db write lock for over {patience_s:.0f}s — "
                         "likely a long maintenance operation such as VACUUM, "
                         "a large WAL checkpoint, or an older pre-update "
@@ -9813,6 +9862,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         where, where_params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
+
+        # Candidate discovery may touch a cold multi-GB messages index.  Never
+        # run that read after BEGIN IMMEDIATE: even a zero-result daily sweep
+        # would otherwise monopolize the global WAL write lock for minutes.
+        # The write transaction below repeats the predicate, preserving the
+        # existing race-safe semantics when candidates do exist.
+        if not self.list_prune_candidates(
+            older_than_days=None, source=source, **filters
+        ):
+            return 0
 
         def _do(conn):
             cursor = conn.execute(

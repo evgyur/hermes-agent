@@ -2273,6 +2273,11 @@ class SessionSearchMixin:
 
         Protocol (SQLite FTS5 §6.8-6.9):
 
+        - FTS5 ``automerge`` stays at its incremental default. ``crisismerge``
+          is raised to an effectively disabled threshold during schema
+          initialization because, unlike automerge, it fully merges a level
+          inside the triggering transcript INSERT. Runtime full-segment work
+          therefore happens only through these bounded positive-rank commands.
         - ``usermerge`` is lowered to its minimum of 2 (persisted in the
           ``%_config`` shadow table, applied once per instance) so a
           positive merge acts on ANY level holding >= 2 segments. With the

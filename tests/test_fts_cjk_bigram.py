@@ -65,6 +65,12 @@ def test_two_char_korean_hits_cjk_index(db):
     assert rows
 
 
+def test_cjk_index_uses_bounded_merge_policy(db):
+    config = dict(db._conn.execute("SELECT k, v FROM messages_fts_cjk_config"))
+    assert int(config["automerge"]) == 4
+    assert int(config["crisismerge"]) == 2_147_483_647
+
+
 def test_mixed_and_ascii_queries(db):
     assert db.search_messages("graphiti", limit=10)
     assert db.search_messages('"shared default" AND 웅기', limit=10)

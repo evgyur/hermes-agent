@@ -2348,6 +2348,27 @@ class TestOptimizeFts:
         assert any("VALUES('usermerge', 2)" in sql for sql in statements)
         assert not any("'optimize'" in sql for sql in statements)
 
+    def test_fts_schema_disables_unbounded_implicit_merges(self, db):
+        """Ordinary transcript INSERTs must never trigger full FTS merges."""
+        for table in ("messages_fts", "messages_fts_trigram"):
+            config = dict(db._conn.execute(f"SELECT k, v FROM {table}_config"))
+            assert int(config["automerge"]) == 4
+            assert int(config["crisismerge"]) == 2_147_483_647
+
+    def test_empty_prune_candidate_scan_does_not_take_write_lock(self, db):
+        """A cold zero-result maintenance sweep stays read-only."""
+        db.create_session(session_id="live", source="cli")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            assert db.prune_sessions(older_than_days=90) == 0
+        finally:
+            db._conn.set_trace_callback(None)
+        assert not any(sql.upper().startswith("BEGIN IMMEDIATE") for sql in statements)
+
+    def test_transcript_lock_patience_covers_long_bounded_maintenance(self, db):
+        assert db._TRANSCRIPT_WRITE_PATIENCE_S >= 600.0
+
 
 
 
