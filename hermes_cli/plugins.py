@@ -374,6 +374,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._retained_work: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -411,6 +412,16 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
+
+    @property
+    def retained_work(self) -> Any:
+        """Return a plugin-bound native durable background-work facade."""
+        if self._retained_work is None:
+            from agent.plugin_retained_work import PluginRetainedWorkServiceV1
+
+            plugin_id = self.manifest.key or self.manifest.name
+            self._retained_work = PluginRetainedWorkServiceV1(plugin_id)
+        return self._retained_work
 
     # -- profile awareness --------------------------------------------------
 

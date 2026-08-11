@@ -5324,6 +5324,31 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+    async def pin_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        disable_notification: bool = True,
+    ) -> bool:
+        """Pin one status message without emitting a notification."""
+        if self._bot is None:
+            return False
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                disable_notification=disable_notification,
+            )
+            return True
+        except Exception as exc:
+            safe_error = _redact_telegram_error_text(exc)
+            logger.warning(
+                "[Telegram] Unable to pin status message: %s",
+                safe_error,
+            )
+            return False
+
     async def edit_message(
         self,
         chat_id: str,
@@ -5537,7 +5562,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id,
                     safe_error,
                 )
-                return SendResult(success=False, error=safe_error, retryable=True)
+                return SendResult(
+                    success=False,
+                    error=safe_error,
+                    retryable=True,
+                    error_kind=classify_send_error(e),
+                )
             safe_error = _redact_telegram_error_text(e)
             logger.error(
                 "[%s] Failed to edit Telegram message %s: %s",
@@ -5545,7 +5575,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id,
                 safe_error,
             )
-            return SendResult(success=False, error=safe_error)
+            return SendResult(
+                success=False,
+                error=safe_error,
+                error_kind=classify_send_error(e),
+            )
 
     def _truncate_stream_overflow_preview(self, content: str) -> str:
         """Return a one-message preview for oversized streaming edits.

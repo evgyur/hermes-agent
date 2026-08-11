@@ -718,12 +718,50 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     return _skill_commands
 
 
+def _hot_reload_entrypoint_plugins() -> list[str]:
+    """Reload command/tool-only pip-entrypoint plugins in this process."""
+    import importlib
+
+    from hermes_cli import plugins as plugins_mod
+    from tools.registry import registry
+
+    manager = plugins_mod.get_plugin_manager()
+    manager.discover_and_load()
+    reloaded: list[str] = []
+    importlib.invalidate_caches()
+    for key, loaded in list(manager._plugins.items()):
+        if not loaded.enabled or loaded.manifest.source != "entrypoint":
+            continue
+        if loaded.module is None:
+            continue
+        if loaded.hooks_registered or loaded.middleware_registered:
+            raise RuntimeError(
+                f"Plugin {key!r} has hooks/middleware and cannot be hot-reloaded safely"
+            )
+        for tool_name in loaded.tools_registered:
+            registry.deregister(tool_name)
+            manager._plugin_tool_names.discard(tool_name)
+        for command_name in loaded.commands_registered:
+            manager._plugin_commands.pop(command_name, None)
+
+        importlib.reload(loaded.module)
+        manager._plugins.pop(key, None)
+        manager._load_plugin(loaded.manifest)
+        refreshed = manager._plugins.get(key)
+        if refreshed is None or not refreshed.enabled:
+            detail = refreshed.error if refreshed is not None else "plugin disappeared"
+            raise RuntimeError(f"Plugin {key!r} hot reload failed: {detail}")
+        reloaded.append(key)
+    return sorted(reloaded)
+
+
 def reload_skills() -> Dict[str, Any]:
     """Re-scan the skills directory and return a diff of what changed.
 
     Rescans ``~/.hermes/skills/`` and any ``skills.external_dirs`` so the
     slash-command map (``agent.skill_commands._skill_commands``) reflects
-    skills added or removed on disk.
+    skills added or removed on disk. Enabled command/tool-only pip-entrypoint
+    plugins are hot-reloaded so command changes do not require a gateway restart.
 
     This does NOT invalidate the skills system-prompt cache. Skills are
     called by name via ``/skill-name``, ``skills_list``, or ``skill_view``
@@ -762,6 +800,7 @@ def reload_skills() -> Dict[str, Any]:
     # Rescan the skills dir. ``scan_skill_commands`` resets
     # ``_skill_commands = {}`` internally and repopulates it.
     new_commands = scan_skill_commands()
+    reloaded_plugins = _hot_reload_entrypoint_plugins()
 
     after = _snapshot(new_commands)
 
@@ -780,6 +819,7 @@ def reload_skills() -> Dict[str, Any]:
         "unchanged": unchanged,
         "total": len(after),
         "commands": len(new_commands),
+        "plugins_reloaded": reloaded_plugins,
     }
 
 

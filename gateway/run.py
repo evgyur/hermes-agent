@@ -42,7 +42,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -5877,7 +5877,52 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            _restart_wake = getattr(ctx, "_trusted_restart_wake", None)
+            if _restart_wake is not None:
+                # The parent now exists with its normal routed capabilities.
+                # Claim the persisted row here (not when merely restoring the
+                # queue), then resume without asking the model to decide.
+                from gateway.status import get_process_start_time
+                from tools.async_delegation import (
+                    claim_restartable_delegation,
+                    finalize_exhausted_restarts,
+                    release_restart_claim,
+                    restore_undelivered_completions,
+                )
+                from tools.delegate_tool import resume_async_delegation
+                from tools.process_registry import process_registry
+
+                _delegation_id = str(_restart_wake.get("delegation_id") or "")
+                _claim = claim_restartable_delegation(
+                    _delegation_id,
+                    owner_pid=os.getpid(),
+                    owner_started_at=get_process_start_time(os.getpid()) or 0,
+                    expected_session_key=ctx.session_key,
+                )
+                _accepted = bool(
+                    _claim and resume_async_delegation(_claim, agent)
+                )
+                if _claim and not _accepted:
+                    if release_restart_claim(_delegation_id, "dead_owner"):
+                        # Retry the same trusted wake. The claim CAS prevents a
+                        # second worker from being admitted for this task.
+                        process_registry.completion_queue.put(_restart_wake)
+                    elif finalize_exhausted_restarts():
+                        # Exhaustion is a real terminal outcome. Reuse the
+                        # normal durable delivery rail exactly once.
+                        restore_undelivered_completions(
+                            process_registry.completion_queue
+                        )
+                result = {
+                    "final_response": "NO_REPLY",
+                    "messages": agent_history,
+                    "api_calls": 0,
+                    "tools": [],
+                    "completed": True,
+                    "session_id": session_id,
+                }
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -14125,6 +14170,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                try:
+                    from tools.async_delegation import interrupt_all as _interrupt_async
+
+                    # Persist the infrastructure restart intent before each
+                    # detached child can finalize its hard interruption.
+                    # Explicit /stop and ordinary failures never use this path.
+                    _interrupt_async(reason="gateway shutdown")
+                except Exception as _e:
+                    logger.warning(
+                        "Could not prepare restartable async delegations: %s",
+                        _e,
+                    )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -16891,7 +16948,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
-                    return str(result) if result else None
+                    return result if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
@@ -19185,6 +19242,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                _trusted_restart_wake=getattr(
+                    event, "_hermes_trusted_restart_event", None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -24148,6 +24208,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
+            from tools.async_delegation import TrustedRestartEvent
+
+            if isinstance(evt, TrustedRestartEvent):
+                # Preserve the trusted in-process object through a busy-session
+                # FIFO. A ContextVar around handle_message would be reset before
+                # that queued event eventually creates its TurnContext.
+                setattr(synth_event, "_hermes_trusted_restart_event", evt)
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -24252,19 +24319,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery,
+                        completion_delivery_disposition,
+                    )
 
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     if not claim_completion_delivery(
                         durable_delegation_id, durable_claim_id,
                     ):
-                        return None
+                        disposition = completion_delivery_disposition(
+                            durable_delegation_id
+                        )
+                        return False if disposition in {"pending", "claimed"} else None
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
                         durable_delegation_id, exc,
                     )
                     return False
+            try:
+                from tools.async_delegation import (
+                    complete_completion_delivery,
+                    continuum_task_card_delivery_state,
+                    release_completion_delivery_waiting,
+                )
+
+                card_state = await asyncio.to_thread(
+                    continuum_task_card_delivery_state,
+                    durable_delegation_id,
+                )
+                if card_state != "unmanaged":
+                    if card_state != "delivered":
+                        accepted_cards = await self._publish_continuum_task_cards(
+                            terminal_delivery_id=durable_delegation_id
+                        )
+                        if durable_delegation_id in accepted_cards:
+                            card_state = "delivered"
+                        else:
+                            card_state = await asyncio.to_thread(
+                                continuum_task_card_delivery_state,
+                                durable_delegation_id,
+                            )
+                    if card_state == "delivered":
+                        await asyncio.to_thread(
+                            complete_completion_delivery,
+                            durable_delegation_id,
+                            durable_claim_id,
+                        )
+                        return True
+                    await asyncio.to_thread(
+                        release_completion_delivery_waiting,
+                        durable_delegation_id,
+                        durable_claim_id,
+                    )
+                    return False
+            except Exception:
+                logger.exception("Continuum terminal card delivery failed")
+                try:
+                    from tools.async_delegation import release_completion_delivery_waiting
+
+                    await asyncio.to_thread(
+                        release_completion_delivery_waiting,
+                        durable_delegation_id,
+                        durable_claim_id,
+                    )
+                except Exception:
+                    logger.debug("Could not release terminal-card claim", exc_info=True)
+                return False
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 # Pre-flight (#65838-class): adapter acceptance is NOT proof of
@@ -24385,6 +24507,193 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _publish_continuum_task_cards(
+        self, *, terminal_delivery_id: str = ""
+    ) -> set[str]:
+        """Create once, then edit one durable Telegram card per Continuum task."""
+        try:
+            from hermes_continuum.status_rail import render_hash, render_task_status_card
+            from tools.async_delegation import (
+                _continuum_task_card_reconcile_handle,
+                claim_continuum_task_card_create,
+                continuum_task_card_publish_due,
+                list_continuum_task_card_reconciliations,
+                list_continuum_task_card_snapshots,
+                mark_continuum_task_card_missing,
+                record_continuum_task_card_failure,
+                record_continuum_task_card_publish,
+            )
+        except Exception:
+            return set()
+
+        try:
+            snapshots = await asyncio.to_thread(list_continuum_task_card_snapshots)
+            reconciliations = await asyncio.to_thread(
+                list_continuum_task_card_reconciliations
+            )
+        except Exception:
+            logger.debug("Continuum task-card snapshot unavailable", exc_info=True)
+            return set()
+
+        accepted: set[str] = set()
+        logged = getattr(self, "_continuum_task_card_reconciliations_logged", set())
+        if not isinstance(logged, set):
+            logged = set()
+        for reconciliation in reconciliations:
+            handle = str(reconciliation.get("handle") or "")
+            if handle and handle not in logged:
+                logger.error(
+                    "Continuum task-card create needs operator reconciliation; handle=%s",
+                    handle,
+                )
+                logged.add(handle)
+        self._continuum_task_card_reconciliations_logged = logged
+
+        for snapshot in snapshots:
+            delegation_id = str(snapshot.get("delegation_id") or "")
+            origin = str(snapshot.get("origin_session") or "")
+            row = snapshot.get("row") or {}
+            card = snapshot.get("card") or {}
+            if not delegation_id or not origin or not row:
+                continue
+            source = self._build_process_event_source(
+                {"type": "continuum_status", "session_key": origin}
+            )
+            if source is None or source.platform != Platform.TELEGRAM:
+                continue
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                continue
+
+            try:
+                text = render_task_status_card(row)
+                digest = render_hash(text)
+                due = await asyncio.to_thread(
+                    continuum_task_card_publish_due,
+                    delegation_id,
+                    digest,
+                )
+            except Exception:
+                logger.debug("Continuum task-card render failed", exc_info=True)
+                continue
+            if not due:
+                continue
+
+            card = snapshot.get("card") or {}
+            message_id = str(card.get("message_id") or "")
+            metadata = {"thread_id": source.thread_id} if source.thread_id else {}
+            result = None
+            create_token = ""
+
+            if message_id:
+                try:
+                    result = await adapter.edit_message(
+                        source.chat_id,
+                        message_id,
+                        text,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    result = None
+                if result is not None and not result.success:
+                    # A transient edit error must never create a duplicate card.
+                    if getattr(result, "error_kind", None) != "not_found":
+                        await asyncio.to_thread(
+                            record_continuum_task_card_failure,
+                            delegation_id,
+                            origin,
+                            str(result.error or "edit failed"),
+                        )
+                        continue
+                    cleared = await asyncio.to_thread(
+                        mark_continuum_task_card_missing,
+                        delegation_id,
+                        origin,
+                        message_id,
+                    )
+                    if not cleared:
+                        continue
+                    message_id = ""
+
+            if not message_id:
+                # A task that finished before its first dashboard publish gets
+                # only the host-owned terminal outcome.  Creating a terminal
+                # card here would become a second automatic outcome message.
+                if (
+                    delegation_id != terminal_delivery_id
+                    and str(row.get("state") or "")
+                    in {
+                        "completed",
+                        "failed",
+                        "error",
+                        "timeout",
+                        "stalled",
+                        "interrupted",
+                        "cancelled",
+                        "unknown",
+                    }
+                ):
+                    continue
+                create_token = await asyncio.to_thread(
+                    claim_continuum_task_card_create,
+                    delegation_id,
+                    origin,
+                )
+                if not create_token:
+                    continue
+                try:
+                    result = await adapter.send(
+                        source.chat_id,
+                        text,
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        record_continuum_task_card_failure,
+                        delegation_id,
+                        origin,
+                        f"{type(exc).__name__}: {exc}",
+                        create_token=create_token,
+                    )
+                    logger.error(
+                        "Continuum task-card create is uncertain; reconcile handle=%s",
+                        _continuum_task_card_reconcile_handle(
+                            delegation_id, create_token
+                        ),
+                    )
+                    continue
+
+            if result is None or not result.success or not result.message_id:
+                await asyncio.to_thread(
+                    record_continuum_task_card_failure,
+                    delegation_id,
+                    origin,
+                    str(getattr(result, "error", "delivery failed")),
+                    create_token=create_token,
+                )
+                logger.error(
+                    "Continuum task-card create was not accepted; reconcile handle=%s",
+                    _continuum_task_card_reconcile_handle(delegation_id, create_token),
+                )
+                continue
+
+            message_id = str(result.message_id)
+            persisted = await asyncio.to_thread(
+                record_continuum_task_card_publish,
+                delegation_id,
+                origin,
+                message_id=message_id,
+                rendered_hash=digest,
+                source_revision=int(snapshot.get("source_revision") or 0),
+                create_token=create_token,
+            )
+            if not persisted:
+                logger.error("Continuum task-card binding persistence rejected")
+            elif delegation_id == terminal_delivery_id:
+                accepted.add(delegation_id)
+
+        return accepted
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -24401,8 +24710,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        next_card_poll = 0.0
         while self._running:
             try:
+                now = time.monotonic()
+                if now >= next_card_poll:
+                    await self._publish_continuum_task_cards()
+                    next_card_poll = now + 5.0
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
@@ -24413,7 +24727,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    if evt.get("type") in {
+                        "async_delegation", "async_delegation_restart"
+                    }:
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
@@ -24421,6 +24737,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    if evt.get("type") == "async_delegation_restart":
+                        from tools.async_delegation import TrustedRestartEvent
+                        if not isinstance(evt, TrustedRestartEvent):
+                            # User/plugin-forged dict metadata is never trusted.
+                            continue
+                        delivered = await self._inject_watch_notification(
+                            "Internal Continuum recovery wake", evt
+                        )
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
@@ -26455,6 +26782,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -26474,6 +26802,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _trusted_restart_wake=_trusted_restart_wake,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -26486,6 +26815,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _trusted_restart_wake=_trusted_restart_wake,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -26608,6 +26938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26921,6 +27252,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )
+        if _trusted_restart_wake is not None:
+            from tools.async_delegation import TrustedRestartEvent
+
+            if isinstance(_trusted_restart_wake, TrustedRestartEvent):
+                setattr(turn_ctx, "_trusted_restart_wake", _trusted_restart_wake)
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback

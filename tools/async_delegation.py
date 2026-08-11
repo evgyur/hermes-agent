@@ -36,14 +36,17 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -51,6 +54,9 @@ from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+
+CONTINUUM_RUNTIME_REVISION = "0.1.0rc18-restartable-task-cards-v1"
+logger.info("Continuum async runtime loaded revision=%s", CONTINUUM_RUNTIME_REVISION)
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -77,13 +83,35 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
-_MAX_DURABLE_PENDING = 1000
+_STALE_RESERVATION_SECONDS = 300
+# Pending terminal outcomes are delivery obligations, not bounded history. They
+# remain durable until acknowledged delivery or explicit operator archival.
+# Never count-prune them: dropping an undelivered callback is data loss.
 # A pending completion whose delivery keeps failing is retried across claim
 # cycles (and across restarts via restore_undelivered_completions). Cap the
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+_MAX_RESTART_ATTEMPTS = 3
+_RESTART_POLICY = "gateway_owned_v1"
 _DB_LOCK = threading.Lock()
+_CURRENT_DELEGATION_ID: ContextVar[str] = ContextVar(
+    "HERMES_CURRENT_ASYNC_DELEGATION_ID", default=""
+)
+_PRIVATE_PATH_RE = re.compile(r"(?<![\w:])/(?:[^\s`]+)")
+_PRIVATE_METADATA_RE = re.compile(
+    r"(?i)\b(?:origin|session|parent[_ -]?session|transcript|callback)"
+    r"(?:[_ -]?(?:id|path|payload))?(?:\s*[=:]\s*|\s+)[^\s,;]+"
+)
+_SECRET_RE = re.compile(
+    r"(?i)(?:bearer\s+|api[_-]?key\s*[=:]\s*|token\s*[=:]\s*|password\s*[=:]\s*)"
+    r"[^\s,;]+"
+)
+_CHECKPOINT_STATES = {"planned", "running", "blocked", "completed", "summarizing"}
+
+
+class TrustedRestartEvent(dict):
+    """In-process wake type that cannot be produced by user text/metadata."""
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -158,7 +186,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            public_title TEXT NOT NULL DEFAULT '',
+            progress_json TEXT,
+            heartbeat_at REAL,
+            api_calls INTEGER NOT NULL DEFAULT 0,
+            current_tool TEXT NOT NULL DEFAULT '',
+            status_revision INTEGER NOT NULL DEFAULT 1
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -173,9 +207,67 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("public_title", "TEXT NOT NULL DEFAULT ''"),
+        ("progress_json", "TEXT"),
+        ("heartbeat_at", "REAL"),
+        ("api_calls", "INTEGER NOT NULL DEFAULT 0"),
+        ("current_tool", "TEXT NOT NULL DEFAULT ''"),
+        ("status_revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("child_session_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("restart_policy", "TEXT NOT NULL DEFAULT ''"),
+        ("restart_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("restart_reason", "TEXT NOT NULL DEFAULT ''"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS continuum_status_rails (
+            origin_session TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL DEFAULT '',
+            rendered_hash TEXT NOT NULL DEFAULT '',
+            source_revision INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at REAL,
+            last_published_at REAL,
+            create_state TEXT NOT NULL DEFAULT '',
+            create_token TEXT NOT NULL DEFAULT '',
+            create_started_at REAL,
+            updated_at REAL NOT NULL,
+            last_error TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    rail_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(continuum_status_rails)")
+    }
+    for name, sql_type in (
+        ("create_state", "TEXT NOT NULL DEFAULT ''"),
+        ("create_token", "TEXT NOT NULL DEFAULT ''"),
+        ("create_started_at", "REAL"),
+    ):
+        if name not in rail_columns:
+            conn.execute(f"ALTER TABLE continuum_status_rails ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS continuum_task_cards (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            message_id TEXT NOT NULL DEFAULT '',
+            rendered_hash TEXT NOT NULL DEFAULT '',
+            source_revision INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at REAL,
+            last_published_at REAL,
+            create_state TEXT NOT NULL DEFAULT '',
+            create_token TEXT NOT NULL DEFAULT '',
+            create_started_at REAL,
+            updated_at REAL NOT NULL,
+            last_error TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_continuum_task_cards_origin "
+        "ON continuum_task_cards(origin_session)"
+    )
 
 
 @contextmanager
@@ -197,7 +289,30 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _sanitize_public_text(value: Any, *, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True)
+    except Exception:
+        # A failed central redactor must fail closed rather than persist raw text.
+        text = "[скрыто]" if text else ""
+    text = _SECRET_RE.sub("[скрыто]", text)
+    text = _PRIVATE_PATH_RE.sub("[скрытый путь]", text)
+    text = _PRIVATE_METADATA_RE.sub("[скрыто]", text)
+    return text[:limit].rstrip()
+
+
+def _public_title(record: Dict[str, Any]) -> str:
+    goal = record.get("goal")
+    if not isinstance(goal, str):
+        return ""
+    first_line = next((line.strip() for line in goal.splitlines() if line.strip()), "")
+    return _sanitize_public_text(first_line, limit=80)
+
+
+def _persist_dispatch(record: Dict[str, Any]) -> bool:
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -210,20 +325,59 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
+        existing = conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            (record["delegation_id"],),
+        ).fetchone()
+        if record.get("resume_claim"):
+            if not existing or existing[0] != "restarting":
+                return False
+            changed = conn.execute(
+                """UPDATE async_delegations SET state='running', updated_at=?,
+                   heartbeat_at=?, owner_pid=?, owner_started_at=?,
+                   child_session_ids_json=?, restart_reason=''
+                   WHERE delegation_id=? AND state='restarting'""",
+                (now, now, __import__("os").getpid(), owner_started_at,
+                 json.dumps(record.get("child_session_ids") or []),
+                 record["delegation_id"]),
+            )
+            return changed.rowcount == 1
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+                owner_started_at, task_json, origin_session_id,
+                public_title, heartbeat_at, status_revision)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, 1)""",
+            (
+                record["delegation_id"],
+                record.get("session_key", ""),
+                record.get("origin_ui_session_id", ""),
+                record.get("parent_session_id"),
+                record["dispatched_at"],
+                now,
+                __import__("os").getpid(),
+                owner_started_at,
+                json.dumps(task_payload),
+                record.get("origin_session_id", ""),
+                _public_title(record),
+                now,
+            ),
+        )
+        conn.execute(
+            """UPDATE async_delegations SET child_session_ids_json=?,
+               restart_policy=?, restart_count=?, restart_reason=''
+               WHERE delegation_id=?""",
+            (
+                json.dumps(record.get("child_session_ids") or []),
+                record.get("restart_policy", ""),
+                int(record.get("restart_count", 0) or 0),
+                record["delegation_id"],
+            ),
         )
     _prune_durable_records()
+    return True
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
@@ -232,7 +386,7 @@ def _delete_durable_delegation(delegation_id: str) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound acknowledged terminal history without deleting delivery obligations."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
@@ -240,33 +394,21 @@ def _prune_durable_records() -> None:
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
         )
-        terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+        delivered_count = conn.execute(
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')
+                 AND delivery_state='delivered'"""
         ).fetchone()[0]
-        excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
+        excess = max(0, delivered_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
-                   )""",
-                (excess,),
-            )
-        pending_count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
-        ).fetchone()[0]
-        overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
-        if overflow:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       AND delivery_state='delivered'
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
-                (overflow,),
+                (excess,),
             )
 
 
@@ -275,10 +417,18 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               heartbeat_at=?, event_json=?, result_json=?, delivery_state='pending',
+               status_revision=status_revision+1
                WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+            (
+                event.get("status", "completed"),
+                event.get("completed_at", now),
+                now,
+                now,
+                json.dumps(event),
+                json.dumps(result),
+                event["delegation_id"],
+            ),
         )
 
 
@@ -288,6 +438,262 @@ def _note_delivery_attempt(delegation_id: str) -> None:
             "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
             (time.time(), delegation_id),
         )
+
+
+def restart_reason_is_eligible(reason: str) -> bool:
+    """Host-only restart gate. No caller origin or model judgment participates."""
+    return reason in {"gateway_drain", "dead_owner"}
+
+
+def defer_restartable_interruption(delegation_id: str, reason: str) -> bool:
+    if not restart_reason_is_eligible(reason):
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        changed = conn.execute(
+            """UPDATE async_delegations SET state='restart_pending',
+               restart_reason=?, completed_at=NULL, event_json=NULL,
+               result_json=NULL, updated_at=?, heartbeat_at=?
+               WHERE delegation_id=? AND restart_policy=?
+                 AND child_session_ids_json NOT IN ('', '[]')
+                 AND restart_count < ? AND state IN ('running','stalling','finalizing')""",
+            (reason, now, now, delegation_id, _RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+        ).rowcount
+    if changed:
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record["status"] = "restart_pending"
+        return True
+    return False
+
+
+def claim_restartable_delegation(
+    delegation_id: str, *, owner_pid: int, owner_started_at: int,
+    expected_session_key: str,
+) -> Optional[Dict[str, Any]]:
+    """CAS one trusted persisted wake for its exact host-bound origin."""
+    if not expected_session_key:
+        return None
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        changed = conn.execute(
+            """UPDATE async_delegations SET state='restarting', owner_pid=?,
+               owner_started_at=?, restart_count=restart_count+1, updated_at=?
+               WHERE delegation_id=? AND state='restart_pending'
+                 AND restart_policy=? AND restart_count < ?
+                 AND origin_session=?""",
+            (owner_pid, owner_started_at, now, delegation_id,
+             _RESTART_POLICY, _MAX_RESTART_ATTEMPTS, expected_session_key),
+        ).rowcount
+        if not changed:
+            return None
+        row = conn.execute(
+            """SELECT task_json, child_session_ids_json, restart_count,
+                      parent_session_id, origin_session, origin_ui_session_id
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    return {
+        "delegation_id": delegation_id,
+        "task": json.loads(row[0] or "{}"),
+        "child_session_ids": json.loads(row[1] or "[]"),
+        "restart_count": row[2],
+        "parent_session_id": row[3],
+        "session_key": row[4],
+        "origin_ui_session_id": row[5],
+    }
+
+
+def claim_restartable_delegations(*, owner_pid: int, owner_started_at: int) -> List[Dict[str, Any]]:
+    """Compatibility bulk claimer; production wakes claim individually."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session FROM async_delegations
+               WHERE state='restart_pending' AND restart_policy=?
+                 AND restart_count < ? ORDER BY dispatched_at, delegation_id""",
+            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+        ).fetchall()
+    return [claim for delegation_id, session_key in rows if (
+        claim := claim_restartable_delegation(
+            delegation_id,
+            owner_pid=owner_pid,
+            owner_started_at=owner_started_at,
+            expected_session_key=str(session_key or ""),
+        )
+    ) is not None]
+
+
+def finalize_exhausted_restarts() -> int:
+    """Publish one durable terminal error after the bounded retry budget."""
+    now = time.time()
+    finalized = 0
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, task_json, origin_session,
+                      origin_ui_session_id, parent_session_id
+               FROM async_delegations WHERE state='restart_pending'
+                 AND restart_policy=? AND restart_count >= ?""",
+            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+        ).fetchall()
+        for delegation_id, task_json, origin, origin_ui, parent_sid in rows:
+            task = json.loads(task_json or "{}")
+            event = {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "status": "error",
+                "task": task,
+                "result": {
+                    "error": "Continuum recovery failed after 3 restart attempts"
+                },
+                "session_key": origin,
+                "origin_ui_session_id": origin_ui,
+                "parent_session_id": parent_sid,
+            }
+            changed = conn.execute(
+                """UPDATE async_delegations SET state='error', completed_at=?,
+                   updated_at=?, event_json=?, result_json=?
+                   WHERE delegation_id=? AND state='restart_pending'
+                     AND restart_count >= ?""",
+                (now, now, json.dumps(event), json.dumps(event["result"]),
+                 delegation_id, _MAX_RESTART_ATTEMPTS),
+            ).rowcount
+            finalized += int(bool(changed))
+    return finalized
+
+
+def restore_restartable_delegations(target_queue) -> int:
+    """Restore persisted pending rows as trusted internal recovery wakes."""
+    recover_abandoned_delegations()
+    finalize_exhausted_restarts()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
+                      parent_session_id FROM async_delegations
+               WHERE state='restart_pending' AND restart_policy=?
+                 AND restart_count < ? ORDER BY dispatched_at, delegation_id""",
+            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+        ).fetchall()
+    for delegation_id, session_key, origin_ui, parent_sid in rows:
+        target_queue.put(TrustedRestartEvent({
+            "type": "async_delegation_restart",
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui,
+            "parent_session_id": parent_sid,
+            "internal": True,
+        }))
+    return len(rows)
+
+
+def release_restart_claim(delegation_id: str, reason: str) -> bool:
+    if not restart_reason_is_eligible(reason):
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE async_delegations SET state='restart_pending',
+               restart_reason=?, updated_at=? WHERE delegation_id=?
+               AND state='restarting' AND restart_count < ?""",
+            (reason, time.time(), delegation_id, _MAX_RESTART_ATTEMPTS),
+        ).rowcount)
+
+
+def _interrupt_pending_restarts(
+    reason: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    all_rows: bool = False,
+) -> int:
+    """Terminalize durable recovery rows on an explicit lifecycle stop."""
+    selectors: List[str] = []
+    params: List[Any] = []
+    for column, value in (
+        ("origin_session", session_key),
+        ("origin_ui_session_id", origin_ui_session_id),
+        ("parent_session_id", parent_session_id),
+    ):
+        if value:
+            selectors.append(f"{column}=?")
+            params.append(value)
+    if not all_rows and not selectors:
+        return 0
+    selector_sql = "" if all_rows else " AND (" + " OR ".join(selectors) + ")"
+    now = time.time()
+    events: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, task_json, origin_session,
+                      origin_ui_session_id, parent_session_id, dispatched_at
+               FROM async_delegations
+               WHERE restart_policy=?
+                 AND state IN ('restart_pending','restarting')"""
+            + selector_sql,
+            [_RESTART_POLICY, *params],
+        ).fetchall()
+        for delegation_id, task_json, origin, origin_ui, parent_sid, dispatched_at in rows:
+            task = json.loads(task_json or "{}")
+            error = f"Retained work stopped before automatic recovery ({reason})"
+            duration = round(max(0.0, now - float(dispatched_at or now)), 2)
+            if task.get("is_batch"):
+                result: Dict[str, Any] = {
+                    "results": [],
+                    "error": error,
+                    "total_duration_seconds": duration,
+                }
+            else:
+                result = {
+                    "status": "interrupted",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "interrupted",
+                }
+            event = {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "status": "interrupted",
+                "task": task,
+                "result": result,
+                "session_key": origin,
+                "origin_ui_session_id": origin_ui,
+                "parent_session_id": parent_sid,
+                "dispatched_at": dispatched_at,
+                "completed_at": now,
+            }
+            changed = conn.execute(
+                """UPDATE async_delegations SET state='interrupted',
+                   completed_at=?, updated_at=?, heartbeat_at=?, event_json=?,
+                   result_json=?, delivery_state='pending', restart_reason=?
+                   WHERE delegation_id=?
+                     AND state IN ('restart_pending','restarting')""",
+                (
+                    now,
+                    now,
+                    now,
+                    json.dumps(event),
+                    json.dumps(result),
+                    reason,
+                    delegation_id,
+                ),
+            ).rowcount
+            if changed:
+                events.append(event)
+    if not events:
+        return 0
+    with _records_lock:
+        for event in events:
+            _records.pop(event["delegation_id"], None)
+    try:
+        from tools.process_registry import process_registry
+
+        for event in events:
+            process_registry.completion_queue.put(event)
+    except Exception:
+        logger.exception("Could not enqueue explicit restart cancellations")
+    return len(events)
 
 
 def recover_abandoned_delegations() -> int:
@@ -303,7 +709,8 @@ def recover_abandoned_delegations() -> int:
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id
-               FROM async_delegations WHERE state IN ('running','finalizing')"""
+               FROM async_delegations
+               WHERE state IN ('running','stalling','finalizing','restarting')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
@@ -314,6 +721,25 @@ def recover_abandoned_delegations() -> int:
                 if live and started is not None:
                     live = get_process_start_time(int(pid)) == int(started)
             if live:
+                continue
+            restart_row = conn.execute(
+                "SELECT restart_policy, restart_count FROM async_delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+            if (
+                task_json
+                and restart_row is not None
+                and restart_row[0] == _RESTART_POLICY
+                and int(restart_row[1] or 0) < _MAX_RESTART_ATTEMPTS
+            ):
+                conn.execute(
+                    """UPDATE async_delegations SET state='restart_pending',
+                       restart_reason='dead_owner', owner_pid=NULL,
+                       owner_started_at=NULL, updated_at=?, heartbeat_at=?
+                       WHERE delegation_id=?""",
+                    (now, now, delegation_id),
+                )
+                recovered += 1
                 continue
             task = json.loads(task_json or "{}")
             event = {
@@ -333,9 +759,10 @@ def recover_abandoned_delegations() -> int:
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, heartbeat_at=?, event_json=?, result_json=?,
+                   delivery_state='pending', status_revision=status_revision+1
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (now, now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
     return recovered
@@ -373,7 +800,8 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?,
+                      updated_at=?, status_revision=status_revision+1
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
@@ -398,6 +826,25 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (claim_id, now, now, delegation_id, now - 300),
         )
         return cur.rowcount == 1
+
+
+def completion_delivery_disposition(delegation_id: str) -> str:
+    """Classify a durable completion without exposing payload or route."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT delivery_state, delivery_claim, delivery_claimed_at
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return "legacy"
+    state = str(row[0] or "")
+    if state != "pending":
+        return state
+    if row[1] and float(row[2] or 0) >= now - 300:
+        return "claimed"
+    return "pending"
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -447,6 +894,21 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def release_completion_delivery_waiting(delegation_id: str, claim_id: str) -> bool:
+    """Release a claim while waiting for idempotent card reconciliation."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET delivery_claim=NULL, delivery_claimed_at=NULL,
+                   delivery_attempts=MAX(0, delivery_attempts-1), updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Terminally drop a claimed completion that can never be delivered.
 
@@ -476,7 +938,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      delivery_claimed_at=NULL, status_revision=status_revision+1
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
@@ -492,6 +954,901 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def current_delegation_id() -> str:
+    """Return the worker-bound delegation id; empty outside a retained child."""
+    return _CURRENT_DELEGATION_ID.get()
+
+
+def record_current_delegation_checkpoint(
+    *,
+    stage: int,
+    total: int,
+    label: str,
+    state: str,
+    note: str = "",
+    plan: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Persist a redacted semantic checkpoint for the currently running child."""
+    delegation_id = current_delegation_id()
+    if not delegation_id:
+        return {"ok": False, "state": "blocked", "diagnostic": "NO_ACTIVE_DELEGATION"}
+    if not 1 <= int(total) <= 32 or not 1 <= int(stage) <= int(total):
+        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_RANGE"}
+    if state not in _CHECKPOINT_STATES:
+        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_STATE"}
+    if plan is not None and (not isinstance(plan, list) or len(plan) != int(total)):
+        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_PLAN"}
+
+    now = time.time()
+    safe_label = _sanitize_public_text(label, limit=72) or f"этап {stage}"
+    safe_note = _sanitize_public_text(note, limit=120)
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, progress_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None or row[0] not in {"running", "stalling", "finalizing"}:
+            return {"ok": False, "state": "blocked", "diagnostic": "DELEGATION_NOT_RUNNING"}
+        try:
+            progress = json.loads(row[1]) if row[1] else {}
+        except (TypeError, ValueError):
+            progress = {}
+        raw_stages = progress.get("stages")
+        stages: List[Dict[str, Any]] = (
+            [dict(item) for item in raw_stages if isinstance(item, dict)]
+            if isinstance(raw_stages, list)
+            else []
+        )
+        requested_total = int(total)
+        if int(stage) < 1 or int(stage) > requested_total:
+            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_STAGE_RANGE"}
+        if len(stages) > requested_total:
+            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_TOTAL_REGRESSION"}
+        if len(stages) < requested_total:
+            labels = plan if plan is not None else [f"этап {i}" for i in range(1, requested_total + 1)]
+            for index in range(len(stages), requested_total):
+                item = labels[index] if index < len(labels) else f"этап {index + 1}"
+                stages.append(
+                    {
+                        "label": _sanitize_public_text(item, limit=72),
+                        "state": "planned",
+                    }
+                )
+        target = stages[int(stage) - 1]
+        previous = str(target.get("state") or "planned")
+        if any(
+            str(item.get("state") or "planned") != "completed"
+            for item in stages[: int(stage) - 1]
+        ) and state != "planned":
+            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_ORDER"}
+        allowed_transitions = {
+            "planned": {"planned", "running", "blocked", "summarizing", "completed"},
+            "running": {"running", "blocked", "summarizing", "completed"},
+            "blocked": {"blocked", "running", "summarizing", "completed"},
+            "summarizing": {"summarizing", "completed"},
+            "completed": {"completed"},
+        }
+        if state not in allowed_transitions.get(previous, set()):
+            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_REGRESSION"}
+        if previous == "completed" and safe_label != str(target.get("label") or ""):
+            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_IMMUTABLE"}
+        target["label"] = safe_label
+        if state in {"running", "blocked", "summarizing"} and not target.get("started_at"):
+            target["started_at"] = now
+        if state == "completed":
+            target.setdefault("started_at", now)
+            target.setdefault("completed_at", now)
+        target["state"] = state
+        progress = {"stages": stages, "note": safe_note, "updated_at": now}
+        conn.execute(
+            """UPDATE async_delegations SET progress_json=?, heartbeat_at=?, updated_at=?,
+                      status_revision=status_revision+1
+               WHERE delegation_id=?""",
+            (json.dumps(progress), now, now, delegation_id),
+        )
+    return {"ok": True, "stage": int(stage), "total": int(total), "state": state}
+
+
+def _persist_progress_telemetry(delegation_id: str, token: Any, in_tool: bool) -> None:
+    api_calls = 0
+    tools: List[str] = []
+    if isinstance(token, (tuple, list)):
+        nested = bool(token) and all(isinstance(part, (tuple, list)) for part in token)
+        parts = token if nested else (token,)
+        for part in parts:
+            if part and isinstance(part[0], int):
+                api_calls += max(0, part[0])
+            if len(part) > 1 and isinstance(part[1], str) and part[1]:
+                tools.append(part[1])
+    unique_tools = list(dict.fromkeys(tools))
+    current_tool = ""
+    if len(unique_tools) == 1:
+        current_tool = unique_tools[0]
+    elif len(unique_tools) > 1:
+        current_tool = f"{len(unique_tools)} active tools"
+    if not in_tool:
+        current_tool = ""
+    safe_tool = _sanitize_public_text(current_tool, limit=48)
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT api_calls, current_tool FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None or (int(row[0] or 0), str(row[1] or "")) == (api_calls, safe_tool):
+            return
+        conn.execute(
+            """UPDATE async_delegations SET heartbeat_at=?, updated_at=?, api_calls=?,
+                      current_tool=? WHERE delegation_id=?
+               AND state IN ('running','stalling','finalizing')""",
+            (now, now, api_calls, safe_tool, delegation_id),
+        )
+
+
+def list_continuum_rail_snapshots(*, terminal_age_seconds: float = 86400) -> List[Dict[str, Any]]:
+    """Return internal origin-scoped snapshots for the gateway status publisher."""
+    now = time.time()
+    cutoff = now - max(0, float(terminal_age_seconds))
+    reservation_cutoff = now - _STALE_RESERVATION_SECONDS
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, state, dispatched_at, completed_at,
+                      updated_at, heartbeat_at, delivery_state, api_calls, current_tool,
+                      public_title, progress_json, status_revision
+               FROM async_delegations
+               WHERE origin_session!=''
+                 AND (
+                   state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
+                   OR origin_session IN (
+                     SELECT origin_session FROM continuum_status_rails WHERE message_id!=''
+                   )
+                 )
+                 AND (
+                   state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
+                   OR completed_at>=?
+                 )
+                 AND (state!='reserved' OR dispatched_at>=?)
+               ORDER BY origin_session, dispatched_at""",
+            (cutoff, reservation_cutoff),
+        ).fetchall()
+        rail_rows = conn.execute(
+            """SELECT origin_session, message_id, rendered_hash, source_revision,
+                      revision, pinned, last_attempt_at, last_published_at,
+                      create_state, create_started_at
+               FROM continuum_status_rails"""
+        ).fetchall()
+    bindings = {
+        row[0]: {
+            "message_id": row[1],
+            "rendered_hash": row[2],
+            "source_revision": row[3],
+            "revision": row[4],
+            "pinned": bool(row[5]),
+            "last_attempt_at": row[6],
+            "last_published_at": row[7],
+            "create_state": row[8],
+            "create_started_at": row[9],
+        }
+        for row in rail_rows
+    }
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            progress = json.loads(row[11]) if row[11] else None
+        except (TypeError, ValueError):
+            progress = None
+        grouped.setdefault(row[1], []).append(
+            {
+                "delegation_id": row[0],
+                "state": row[2],
+                "dispatched_at": row[3],
+                "completed_at": row[4],
+                "updated_at": row[5],
+                "heartbeat_at": row[6],
+                "delivery_state": row[7],
+                "api_calls": row[8],
+                "current_tool": row[9],
+                "public_title": row[10],
+                "progress": progress,
+                "status_revision": row[12],
+            }
+        )
+    snapshots = [
+        {
+            "origin_session": origin,
+            "rows": grouped[origin],
+            "source_revision": max(
+                int(row.get("status_revision") or 0) for row in grouped[origin]
+            ),
+            "rail": bindings.get(origin, {}),
+        }
+        for origin in sorted(grouped)
+    ]
+    for origin in sorted(set(bindings) - set(grouped)):
+        binding = bindings[origin]
+        if not binding.get("message_id"):
+            continue
+        snapshots.append(
+            {
+                "origin_session": origin,
+                "rows": [],
+                "source_revision": int(binding.get("source_revision") or 0),
+                "rail": binding,
+            }
+        )
+    return snapshots
+
+
+def continuum_rail_publish_due(
+    origin_session: str,
+    rendered_hash: str,
+    *,
+    now: Optional[float] = None,
+    min_interval_seconds: float = 5,
+) -> bool:
+    """Rate-limit edits and suppress byte-identical dashboard renders."""
+    current = time.time() if now is None else float(now)
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT rendered_hash, last_attempt_at FROM continuum_status_rails
+               WHERE origin_session=?""",
+            (origin_session,),
+        ).fetchone()
+        if row and row[0] == rendered_hash:
+            return False
+        if row and row[1] is not None and current - float(row[1]) < min_interval_seconds:
+            return False
+        conn.execute(
+            """INSERT INTO continuum_status_rails(origin_session, last_attempt_at, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(origin_session) DO UPDATE SET
+                 last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
+            (origin_session, current, current),
+        )
+    return True
+
+
+def claim_continuum_rail_create(origin_session: str) -> str:
+    """Reserve one create attempt; an uncertain attempt is never replayed."""
+    token = uuid.uuid4().hex
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT message_id, create_state FROM continuum_status_rails WHERE origin_session=?",
+            (origin_session,),
+        ).fetchone()
+        if row and (str(row[0] or "") or str(row[1] or "")):
+            return ""
+        conn.execute(
+            """INSERT INTO continuum_status_rails(
+                   origin_session, create_state, create_token, create_started_at,
+                   last_attempt_at, updated_at
+               ) VALUES (?, 'in_flight', ?, ?, ?, ?)
+               ON CONFLICT(origin_session) DO UPDATE SET
+                   create_state='in_flight', create_token=excluded.create_token,
+                   create_started_at=excluded.create_started_at,
+                   last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
+            (origin_session, token, now, now, now),
+        )
+    return token
+
+
+def mark_continuum_rail_missing(origin_session: str, message_id: str) -> bool:
+    """Clear a durable binding only after the provider confirms it is gone."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE continuum_status_rails
+               SET message_id='', rendered_hash='', create_state='', create_token='',
+                   create_started_at=NULL, updated_at=?
+               WHERE origin_session=? AND message_id=?""",
+            (now, origin_session, str(message_id)),
+        )
+        return cursor.rowcount == 1
+
+
+def reconcile_continuum_rail_create(
+    origin_session: str,
+    create_token: str,
+    *,
+    confirmed_message_id: str = "",
+    confirmed_absent: bool = False,
+) -> bool:
+    """Resolve an ambiguous create only after an operator checks Telegram.
+
+    Exactly one resolution is allowed: bind the provider-confirmed message or
+    clear the claim after confirming that no message exists. The claim token
+    makes stale/manual guesses fail closed; this function is never called by
+    the automatic publisher.
+    """
+    message_id = str(confirmed_message_id).strip()
+    if bool(message_id) == bool(confirmed_absent):
+        return False
+    if message_id and (not message_id.isdigit() or int(message_id) <= 0):
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        if message_id:
+            cursor = conn.execute(
+                """UPDATE continuum_status_rails
+                   SET message_id=?, rendered_hash='', create_state='', create_token='',
+                       create_started_at=NULL, revision=revision+1, updated_at=?, last_error=''
+                   WHERE origin_session=? AND message_id='' AND create_token=?
+                     AND create_state IN ('in_flight','uncertain')""",
+                (message_id, now, origin_session, create_token),
+            )
+        else:
+            cursor = conn.execute(
+                """UPDATE continuum_status_rails
+                   SET create_state='', create_token='', create_started_at=NULL,
+                       updated_at=?, last_error='operator confirmed create absent'
+                   WHERE origin_session=? AND message_id='' AND create_token=?
+                     AND create_state IN ('in_flight','uncertain')""",
+                (now, origin_session, create_token),
+            )
+        return cursor.rowcount == 1
+
+
+def _continuum_rail_reconcile_handle(origin_session: str, create_token: str) -> str:
+    material = f"{origin_session}\0{create_token}".encode()
+    return hashlib.sha256(material).hexdigest()[:20]
+
+
+def list_continuum_rail_reconciliations() -> List[Dict[str, Any]]:
+    """List ambiguous creates by opaque local handle, never by origin/token."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT origin_session, create_token, create_state, create_started_at
+               FROM continuum_status_rails
+               WHERE message_id='' AND create_token!=''
+                 AND create_state IN ('in_flight','uncertain')"""
+        ).fetchall()
+    return sorted(
+        (
+            {
+                "handle": _continuum_rail_reconcile_handle(row[0], row[1]),
+                "state": row[2],
+                "age_seconds": max(0, int(now - float(row[3] or now))),
+            }
+            for row in rows
+        ),
+        key=lambda item: item["handle"],
+    )
+
+
+def reconcile_continuum_rail_create_by_handle(
+    handle: str,
+    *,
+    confirmed_message_id: str = "",
+    confirmed_absent: bool = False,
+) -> bool:
+    """Operator surface for one opaque reconciliation handle."""
+    candidate = str(handle).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{20}", candidate) is None:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT origin_session, create_token
+               FROM continuum_status_rails
+               WHERE message_id='' AND create_token!=''
+                 AND create_state IN ('in_flight','uncertain')"""
+        ).fetchall()
+    matches = [
+        row
+        for row in rows
+        if _continuum_rail_reconcile_handle(str(row[0]), str(row[1])) == candidate
+    ]
+    if len(matches) != 1:
+        return False
+    return reconcile_continuum_rail_create(
+        str(matches[0][0]),
+        str(matches[0][1]),
+        confirmed_message_id=confirmed_message_id,
+        confirmed_absent=confirmed_absent,
+    )
+
+
+def record_continuum_rail_publish(
+    origin_session: str,
+    *,
+    message_id: str,
+    rendered_hash: str,
+    source_revision: int,
+    pinned: bool,
+    error: str = "",
+    create_token: str = "",
+) -> bool:
+    """Persist an accepted binding; reject a stale or foreign create claim."""
+    now = time.time()
+    safe_error = _sanitize_public_text(error, limit=160)
+    with _DB_LOCK, _transaction() as conn:
+        if create_token:
+            row = conn.execute(
+                "SELECT create_token FROM continuum_status_rails WHERE origin_session=?",
+                (origin_session,),
+            ).fetchone()
+            if row is None or str(row[0] or "") != create_token:
+                return False
+        conn.execute(
+            """INSERT INTO continuum_status_rails(
+                   origin_session, message_id, rendered_hash, source_revision,
+                   revision, pinned, last_attempt_at, last_published_at,
+                   create_state, create_token, create_started_at, updated_at, last_error
+               ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, '', '', NULL, ?, ?)
+               ON CONFLICT(origin_session) DO UPDATE SET
+                   message_id=excluded.message_id,
+                   rendered_hash=excluded.rendered_hash,
+                   source_revision=MAX(source_revision, excluded.source_revision),
+                   revision=revision+1,
+                   pinned=MAX(pinned, excluded.pinned),
+                   last_attempt_at=excluded.last_attempt_at,
+                   last_published_at=excluded.last_published_at,
+                   create_state='', create_token='', create_started_at=NULL,
+                   updated_at=excluded.updated_at,
+                   last_error=excluded.last_error""",
+            (
+                origin_session,
+                str(message_id),
+                rendered_hash,
+                max(0, int(source_revision)),
+                int(bool(pinned)),
+                now,
+                now,
+                now,
+                safe_error,
+            ),
+        )
+    return True
+
+
+def record_continuum_rail_failure(
+    origin_session: str, error: str, *, create_token: str = ""
+) -> None:
+    now = time.time()
+    safe_error = _sanitize_public_text(error, limit=160)
+    with _DB_LOCK, _transaction() as conn:
+        if create_token:
+            conn.execute(
+                """UPDATE continuum_status_rails
+                   SET create_state='uncertain', updated_at=?, last_error=?, last_attempt_at=?
+                   WHERE origin_session=? AND create_token=?""",
+                (now, safe_error, now, origin_session, create_token),
+            )
+            return
+        conn.execute(
+            """INSERT INTO continuum_status_rails(origin_session, updated_at, last_error, last_attempt_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(origin_session) DO UPDATE SET
+                 updated_at=excluded.updated_at, last_error=excluded.last_error,
+                 last_attempt_at=excluded.last_attempt_at""",
+            (origin_session, now, safe_error, now),
+        )
+
+
+def register_continuum_task_card(delegation_id: str, parent_session_id: str) -> bool:
+    """Bind a freshly launched Continuum task to its host-owned trusted origin."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT origin_session FROM async_delegations
+               WHERE delegation_id=? AND parent_session_id=? AND origin_session!=''""",
+            (delegation_id, parent_session_id),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            """INSERT INTO continuum_task_cards(
+                   delegation_id, origin_session, last_attempt_at, updated_at
+               ) VALUES (?, ?, NULL, ?)
+               ON CONFLICT(delegation_id) DO NOTHING""",
+            (delegation_id, str(row[0]), now),
+        )
+    return True
+
+
+def list_continuum_task_card_snapshots(
+    *, terminal_age_seconds: float = 86400
+) -> List[Dict[str, Any]]:
+    """Return one internal, trusted-origin snapshot per durable task card."""
+    now = time.time()
+    cutoff = now - max(0, float(terminal_age_seconds))
+    reservation_cutoff = now - _STALE_RESERVATION_SECONDS
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT d.delegation_id, d.origin_session, d.state, d.dispatched_at,
+                      d.completed_at, d.updated_at, d.heartbeat_at, d.delivery_state,
+                      d.api_calls, d.current_tool, d.public_title, d.progress_json,
+                      d.status_revision,
+                      c.message_id, c.rendered_hash, c.source_revision, c.revision,
+                      c.last_attempt_at, c.last_published_at, c.create_state,
+                      c.create_started_at
+               FROM async_delegations AS d
+               INNER JOIN continuum_task_cards AS c
+                 ON c.delegation_id=d.delegation_id AND c.origin_session=d.origin_session
+               WHERE d.origin_session!=''
+                 AND (d.state!='reserved' OR d.dispatched_at>=?)
+                 AND (
+                   d.state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
+                   OR d.completed_at>=?
+                 )
+               ORDER BY d.dispatched_at, d.delegation_id""",
+            (reservation_cutoff, cutoff),
+        ).fetchall()
+    snapshots: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            progress = json.loads(row[11]) if row[11] else None
+        except (TypeError, ValueError):
+            progress = None
+        snapshots.append(
+            {
+                "delegation_id": row[0],
+                "origin_session": row[1],
+                "row": {
+                    "delegation_id": row[0],
+                    "state": row[2],
+                    "dispatched_at": row[3],
+                    "completed_at": row[4],
+                    "updated_at": row[5],
+                    "heartbeat_at": row[6],
+                    "delivery_state": row[7],
+                    "api_calls": row[8],
+                    "current_tool": row[9],
+                    "public_title": row[10],
+                    "progress": progress,
+                    "status_revision": row[12],
+                },
+                "source_revision": int(row[12] or 0),
+                "card": {
+                    "message_id": row[13] or "",
+                    "rendered_hash": row[14] or "",
+                    "source_revision": int(row[15] or 0),
+                    "revision": int(row[16] or 0),
+                    "last_attempt_at": row[17],
+                    "last_published_at": row[18],
+                    "create_state": row[19] or "",
+                    "create_started_at": row[20],
+                },
+            }
+        )
+    return snapshots
+
+
+def continuum_task_card_delivery_state(delegation_id: str) -> str:
+    """Return unmanaged, pending, or delivered for a managed task card."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT d.state, d.status_revision, c.message_id,
+                      c.rendered_hash, c.source_revision
+               FROM async_delegations AS d
+               JOIN continuum_task_cards AS c
+                 ON c.delegation_id=d.delegation_id
+                AND c.origin_session=d.origin_session
+               WHERE d.delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return "unmanaged"
+    state = str(row[0] or "")
+    terminal = state not in {"reserved", "running", "stalling", "finalizing"}
+    delivered = (
+        terminal
+        and bool(str(row[2] or ""))
+        and bool(str(row[3] or ""))
+        and int(row[4] or 0) >= int(row[1] or 0)
+    )
+    return "delivered" if delivered else "pending"
+
+
+def continuum_task_card_publish_due(
+    delegation_id: str,
+    rendered_hash: str,
+    *,
+    now: Optional[float] = None,
+    min_interval_seconds: float = 5,
+) -> bool:
+    """Suppress unchanged renders and coalesce semantic card updates."""
+    current = time.time() if now is None else float(now)
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT rendered_hash, last_attempt_at FROM continuum_task_cards
+               WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row and row[0] == rendered_hash:
+            return False
+        if row and row[1] is not None and current - float(row[1]) < min_interval_seconds:
+            return False
+        origin = conn.execute(
+            "SELECT origin_session FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if origin is None or not str(origin[0] or ""):
+            return False
+        conn.execute(
+            """INSERT INTO continuum_task_cards(
+                   delegation_id, origin_session, last_attempt_at, updated_at
+               ) VALUES (?, ?, ?, ?)
+               ON CONFLICT(delegation_id) DO UPDATE SET
+                 last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
+            (delegation_id, str(origin[0]), current, current),
+        )
+    return True
+
+
+def claim_continuum_task_card_create(delegation_id: str, origin_session: str) -> str:
+    """Reserve the only automatic create attempt for one trusted task binding."""
+    token = uuid.uuid4().hex
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        owner = conn.execute(
+            """SELECT 1 FROM async_delegations
+               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
+            (delegation_id, origin_session),
+        ).fetchone()
+        if owner is None:
+            return ""
+        row = conn.execute(
+            """SELECT message_id, create_state FROM continuum_task_cards
+               WHERE delegation_id=? AND origin_session=?""",
+            (delegation_id, origin_session),
+        ).fetchone()
+        if row and (str(row[0] or "") or str(row[1] or "")):
+            return ""
+        conn.execute(
+            """INSERT INTO continuum_task_cards(
+                   delegation_id, origin_session, create_state, create_token,
+                   create_started_at, last_attempt_at, updated_at
+               ) VALUES (?, ?, 'in_flight', ?, ?, ?, ?)
+               ON CONFLICT(delegation_id) DO UPDATE SET
+                   create_state='in_flight', create_token=excluded.create_token,
+                   create_started_at=excluded.create_started_at,
+                   last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
+            (delegation_id, origin_session, token, now, now, now),
+        )
+    return token
+
+
+def mark_continuum_task_card_missing(
+    delegation_id: str, origin_session: str, message_id: str
+) -> bool:
+    """Clear a task-card binding only after Telegram proves it is gone."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE continuum_task_cards
+               SET message_id='', rendered_hash='', create_state='', create_token='',
+                   create_started_at=NULL, updated_at=?
+               WHERE delegation_id=? AND origin_session=? AND message_id=?""",
+            (now, delegation_id, origin_session, str(message_id)),
+        )
+        return cursor.rowcount == 1
+
+
+def record_continuum_task_card_publish(
+    delegation_id: str,
+    origin_session: str,
+    *,
+    message_id: str,
+    rendered_hash: str,
+    source_revision: int,
+    error: str = "",
+    create_token: str = "",
+) -> bool:
+    """Persist one accepted create/edit without accepting caller-selected routing."""
+    now = time.time()
+    safe_error = _sanitize_public_text(error, limit=160)
+    with _DB_LOCK, _transaction() as conn:
+        owner = conn.execute(
+            """SELECT 1 FROM async_delegations
+               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
+            (delegation_id, origin_session),
+        ).fetchone()
+        if owner is None:
+            return False
+        if create_token:
+            row = conn.execute(
+                """SELECT create_token FROM continuum_task_cards
+                   WHERE delegation_id=? AND origin_session=?""",
+                (delegation_id, origin_session),
+            ).fetchone()
+            if row is None or str(row[0] or "") != create_token:
+                return False
+        conn.execute(
+            """INSERT INTO continuum_task_cards(
+                   delegation_id, origin_session, message_id, rendered_hash,
+                   source_revision, revision, last_attempt_at, last_published_at,
+                   create_state, create_token, create_started_at, updated_at, last_error
+               ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', '', NULL, ?, ?)
+               ON CONFLICT(delegation_id) DO UPDATE SET
+                   message_id=excluded.message_id,
+                   rendered_hash=excluded.rendered_hash,
+                   source_revision=MAX(source_revision, excluded.source_revision),
+                   revision=revision+1,
+                   last_attempt_at=excluded.last_attempt_at,
+                   last_published_at=excluded.last_published_at,
+                   create_state='', create_token='', create_started_at=NULL,
+                   updated_at=excluded.updated_at, last_error=excluded.last_error""",
+            (
+                delegation_id,
+                origin_session,
+                str(message_id),
+                rendered_hash,
+                max(0, int(source_revision)),
+                now,
+                now,
+                now,
+                safe_error,
+            ),
+        )
+    return True
+
+
+def record_continuum_task_card_failure(
+    delegation_id: str,
+    origin_session: str,
+    error: str,
+    *,
+    create_token: str = "",
+) -> None:
+    """Record delivery failure internally; never turn it into a chat message."""
+    now = time.time()
+    safe_error = _sanitize_public_text(error, limit=160)
+    with _DB_LOCK, _transaction() as conn:
+        if create_token:
+            conn.execute(
+                """UPDATE continuum_task_cards
+                   SET create_state='uncertain', updated_at=?, last_error=?, last_attempt_at=?
+                   WHERE delegation_id=? AND origin_session=? AND create_token=?""",
+                (now, safe_error, now, delegation_id, origin_session, create_token),
+            )
+            return
+        conn.execute(
+            """UPDATE continuum_task_cards
+               SET updated_at=?, last_error=?, last_attempt_at=?
+               WHERE delegation_id=? AND origin_session=?""",
+            (now, safe_error, now, delegation_id, origin_session),
+        )
+
+
+def _continuum_task_card_reconcile_handle(delegation_id: str, create_token: str) -> str:
+    """Return an opaque operator handle without exposing task or routing ids."""
+    if not delegation_id or not create_token:
+        return ""
+    return hashlib.sha256(f"{delegation_id}:{create_token}".encode()).hexdigest()[:24]
+
+
+def list_continuum_task_card_reconciliations() -> List[Dict[str, Any]]:
+    """List ambiguous creates using opaque handles only."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, create_token, create_state, create_started_at
+               FROM continuum_task_cards
+               WHERE message_id='' AND create_state IN ('in_flight','uncertain')
+                     AND create_token!=''
+               ORDER BY create_started_at, delegation_id"""
+        ).fetchall()
+    return [
+        {
+            "handle": _continuum_task_card_reconcile_handle(str(row[0]), str(row[1])),
+            "state": str(row[2]),
+            "age_seconds": max(0, int(now - float(row[3] or now))),
+        }
+        for row in rows
+    ]
+
+
+def reconcile_continuum_task_card_create_by_handle(
+    handle: str,
+    *,
+    accepted_message_id: str = "",
+    retry_create: bool = False,
+) -> bool:
+    """Resolve one ambiguous create after an operator verifies Telegram reality.
+
+    Exactly one resolution is allowed: bind the accepted Telegram message, or
+    clear the reservation so the publisher may retry after absence is proved.
+    No origin, session, delegation, or create token is accepted from the caller.
+    """
+    candidate = str(handle or "").strip().lower()
+    accepted = str(accepted_message_id or "").strip()
+    if (
+        len(candidate) != 24
+        or bool(accepted) == bool(retry_create)
+        or (accepted and not re.fullmatch(r"[1-9][0-9]{0,31}", accepted))
+    ):
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, create_token
+               FROM continuum_task_cards
+               WHERE message_id='' AND create_state IN ('in_flight','uncertain')
+                     AND create_token!=''"""
+        ).fetchall()
+        matches = [
+            row
+            for row in rows
+            if _continuum_task_card_reconcile_handle(str(row[0]), str(row[2]))
+            == candidate
+        ]
+        if len(matches) != 1:
+            return False
+        delegation_id, origin_session, create_token = map(str, matches[0])
+        owner = conn.execute(
+            """SELECT 1 FROM async_delegations
+               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
+            (delegation_id, origin_session),
+        ).fetchone()
+        if owner is None:
+            return False
+        if accepted:
+            cursor = conn.execute(
+                """UPDATE continuum_task_cards
+                   SET message_id=?, rendered_hash='', source_revision=0,
+                       revision=revision+1, last_published_at=?, last_attempt_at=?,
+                       create_state='', create_token='', create_started_at=NULL,
+                       updated_at=?, last_error=''
+                   WHERE delegation_id=? AND origin_session=? AND create_token=?
+                         AND message_id=''""",
+                (
+                    accepted,
+                    now,
+                    now,
+                    now,
+                    delegation_id,
+                    origin_session,
+                    create_token,
+                ),
+            )
+        else:
+            cursor = conn.execute(
+                """UPDATE continuum_task_cards
+                   SET create_state='', create_token='', create_started_at=NULL,
+                       last_attempt_at=NULL, updated_at=?, last_error=''
+                   WHERE delegation_id=? AND origin_session=? AND create_token=?
+                         AND message_id=''""",
+                (now, delegation_id, origin_session, create_token),
+            )
+        return cursor.rowcount == 1
+
+
+def list_durable_delegations(
+    limit: int = 20, *, origin_session: str | None = None
+) -> List[Dict[str, Any]]:
+    """Return newest durable task statuses for read-only operator surfaces.
+
+    Deliberately excludes goals, context, origin identifiers, and ownership
+    metadata. Result payloads stay available for exact-ID capability lookup.
+    """
+    bounded = max(1, min(int(limit), 50))
+    where = " WHERE origin_session=?" if origin_session else ""
+    params: tuple[Any, ...] = (origin_session, bounded) if origin_session else (bounded,)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"""SELECT delegation_id, state, dispatched_at, completed_at,
+                       updated_at, result_json, delivery_state, delivery_attempts
+                FROM async_delegations{where}
+                ORDER BY dispatched_at DESC, delegation_id DESC LIMIT ?""",
+            params,
+        ).fetchall()
+    return [
+        {
+            "delegation_id": row[0],
+            "state": row[1],
+            "dispatched_at": row[2],
+            "completed_at": row[3],
+            "updated_at": row[4],
+            "result": json.loads(row[5]) if row[5] else None,
+            "delivery_state": row[6],
+            "delivery_attempts": row[7],
+        }
+        for row in rows
+    ]
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
@@ -689,6 +2046,8 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    child_session_ids: Optional[List[str]] = None,
+    restart_policy: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -745,6 +2104,8 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "child_session_ids": list(child_session_ids or []),
+        "restart_policy": restart_policy,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -782,6 +2143,7 @@ def dispatch_async_delegation(
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
+        context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
         try:
             result = runner() or {}
             status = result.get("status") or "completed"
@@ -796,7 +2158,10 @@ def dispatch_async_delegation(
             }
             status = "error"
         finally:
-            _finalize(delegation_id, result, status)
+            try:
+                _finalize(delegation_id, result, status)
+            finally:
+                _CURRENT_DELEGATION_ID.reset(context_token)
 
     try:
         # Propagate the dispatching profile so the detached child resolves
@@ -826,6 +2191,11 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
+
+    if status == "interrupted" and defer_restartable_interruption(
+        delegation_id, str(event_record.get("_interrupt_reason") or "")
+    ):
+        return
 
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
@@ -945,6 +2315,9 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    child_session_ids: Optional[List[str]] = None,
+    restart_policy: str = "",
+    resume_claim: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -985,6 +2358,9 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "child_session_ids": list(child_session_ids or []),
+        "restart_policy": restart_policy,
+        "resume_claim": resume_claim,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -1012,12 +2388,19 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    if not _persist_dispatch(record):
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {
+            "status": "rejected",
+            "error": "Restart claim is no longer active",
+        }
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
+        context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
         try:
             combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
@@ -1038,7 +2421,10 @@ def dispatch_async_delegation_batch(
             }
             status = "error"
         finally:
-            _finalize_batch(delegation_id, combined, status)
+            try:
+                _finalize_batch(delegation_id, combined, status)
+            finally:
+                _CURRENT_DELEGATION_ID.reset(context_token)
 
     try:
         # Propagate the dispatching profile to the detached batch children.
@@ -1179,6 +2565,7 @@ def _stale_monitor_loop() -> None:
         now = time.time()
         stalled: List[tuple] = []  # (delegation_id, is_batch, quiet_for, in_tool)
         expired: List[str] = []  # stalling past grace → force-finalize
+        telemetry: List[tuple[str, Any, bool]] = []
         any_monitorable = False
         with _records_lock:
             for record in _records.values():
@@ -1201,6 +2588,7 @@ def _stale_monitor_loop() -> None:
                     # An unreadable child must not look permanently healthy —
                     # keep the last timestamp running instead of refreshing it.
                     token, in_tool = record.get("_progress_token"), False
+                telemetry.append((record["delegation_id"], token, bool(in_tool)))
                 if token != record.get("_progress_token"):
                     record["_progress_token"] = token
                     record["_progress_ts"] = now
@@ -1227,6 +2615,15 @@ def _stale_monitor_loop() -> None:
                             in_tool,
                         )
                     )
+        for delegation_id, token, in_tool in telemetry:
+            try:
+                _persist_progress_telemetry(delegation_id, token, in_tool)
+            except Exception:
+                logger.debug(
+                    "Async delegation %s telemetry persistence failed",
+                    delegation_id,
+                    exc_info=True,
+                )
         for delegation_id, _is_batch, quiet_for, in_tool in stalled:
             logger.warning(
                 "Async delegation %s made no progress for %.0fs "
@@ -1415,8 +2812,9 @@ def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 
     Used on ``/stop`` and gateway shutdown so a dangling background subagent
-    can't keep burning tokens with no one listening. The child still emits a
-    completion event (status='interrupted') via the normal finalize path.
+    can't keep burning tokens with no one listening. Explicit stops emit the
+    normal interrupted terminal; restart-enabled gateway-drain interruptions
+    are durably deferred for same-id recovery and emit no intermediate outcome.
     """
     count = 0
     with _records_lock:
@@ -1425,6 +2823,13 @@ def interrupt_all(reason: str = "shutdown") -> int:
             if r.get("status") in ("running", "stalling")
         ]
     for r in targets:
+        r["_interrupt_reason"] = (
+            "gateway_drain" if reason.startswith("gateway shutdown") else reason
+        )
+        if r["_interrupt_reason"] == "gateway_drain":
+            # Persist restart_pending before the hard child interrupt can race
+            # through normal interrupted finalization and publish a terminal.
+            defer_restartable_interruption(r["delegation_id"], "gateway_drain")
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:
@@ -1435,6 +2840,8 @@ def interrupt_all(reason: str = "shutdown") -> int:
                     "interrupt_all: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
                 )
+    if not reason.startswith("gateway shutdown"):
+        count += _interrupt_pending_restarts(reason, all_rows=True)
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
     return count
@@ -1489,6 +2896,12 @@ def interrupt_for_session(
                     "interrupt_for_session: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
                 )
+    count += _interrupt_pending_restarts(
+        reason,
+        session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+    )
     if count:
         logger.info(
             "Interrupted %d async delegation(s) for ending session (%s)",

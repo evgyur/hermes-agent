@@ -53,6 +53,7 @@ from hermes_cli.config import get_hermes_home
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+_RESTART_EVENT_TYPE = "async_delegation_restart"
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -451,7 +452,11 @@ class ProcessRegistry:
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
-            from tools.async_delegation import restore_undelivered_completions
+            from tools.async_delegation import (
+                restore_restartable_delegations,
+                restore_undelivered_completions,
+            )
+            restore_restartable_delegations(self.completion_queue)
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)

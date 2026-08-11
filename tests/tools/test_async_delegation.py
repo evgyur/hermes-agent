@@ -528,7 +528,7 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
 
 
-def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
+def test_pending_retention_never_count_prunes_undelivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
     for index, delivery_state in enumerate(("pending", "delivered", "pending")):
@@ -540,7 +540,7 @@ def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeyp
             "parent_session_id": None,
             "dispatched_at": float(index + 1),
         }
-        ad._persist_dispatch(record)
+        assert ad._persist_dispatch(record)
         ad._persist_completion(
             {
                 "delegation_id": delegation_id,
@@ -555,8 +555,34 @@ def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeyp
     ad._prune_durable_records()
 
     assert ad.get_durable_delegation("deleg_0") is not None
-    assert ad.get_durable_delegation("deleg_1") is None
+    assert ad.get_durable_delegation("deleg_1") is not None
     assert ad.get_durable_delegation("deleg_2") is not None
+
+    for index in (3, 4):
+        delegation_id = f"deleg_{index}"
+        assert ad._persist_dispatch({
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": float(index + 1),
+        })
+        ad._persist_completion(
+            {
+                "delegation_id": delegation_id,
+                "status": "completed",
+                "completed_at": float(index + 1),
+            },
+            {"status": "completed", "summary": delegation_id},
+        )
+        ad.mark_completion_delivered(delegation_id)
+
+    ad._prune_durable_records()
+    assert ad.get_durable_delegation("deleg_0") is not None
+    assert ad.get_durable_delegation("deleg_2") is not None
+    assert ad.get_durable_delegation("deleg_1") is None
+    assert ad.get_durable_delegation("deleg_3") is not None
+    assert ad.get_durable_delegation("deleg_4") is not None
 
 
 def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):

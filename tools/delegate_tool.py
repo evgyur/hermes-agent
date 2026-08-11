@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 import os
@@ -43,6 +44,20 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+_HOST_RESTART_CONTEXT = contextvars.ContextVar(
+    "HERMES_HOST_RESTART_CONTEXT", default=None
+)
+
+
+@contextmanager
+def host_restart_context(**private_values):
+    """Bind host-only retained-work metadata outside the tool schema."""
+    token = _HOST_RESTART_CONTEXT.set(dict(private_values))
+    try:
+        yield
+    finally:
+        _HOST_RESTART_CONTEXT.reset(token)
 
 
 # Tools that children must never have access to
@@ -1325,6 +1340,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    forced_session_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1651,6 +1667,7 @@ def _build_child_agent(
                 else dict(getattr(parent_agent, "request_overrides", {}) or {})
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
+            session_id=forced_session_id,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
@@ -2325,11 +2342,15 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                call_kwargs = {
+                    "user_message": goal,
+                    "task_id": child_task_id,
+                    "stream_callback": _relay_child_text,
+                }
+                restart_history = getattr(child, "_restart_history", None)
+                if restart_history:
+                    call_kwargs["conversation_history"] = restart_history
+                return child.run_conversation(**call_kwargs)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3147,6 +3168,9 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    # Trusted host metadata is absent from the model schema and signature.
+    _restart_ctx = _HOST_RESTART_CONTEXT.get() or {}
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -3290,9 +3314,17 @@ def delegate_task(
         wrap_progress_callback,
     )
 
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
-    )
+    if _restart_ctx.get("delegation_id"):
+        # Reuse the original public task and its existing manifest/card. The
+        # resumed child session itself remains durable in SessionDB; creating a
+        # second live-transcript directory would manufacture an orphan task id.
+        live_deleg_id = str(_restart_ctx["delegation_id"])
+        live_writers = [None] * len(task_list)
+        live_paths = []
+    else:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context
+        )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3353,6 +3385,10 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            forced_session_id=(
+                (_restart_ctx.get("child_session_ids") or [])[i]
+                if i < len(_restart_ctx.get("child_session_ids") or []) else None
+            ),
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -3361,6 +3397,11 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        _child_sid = str(getattr(child, "session_id", "") or "")
+        if _child_sid:
+            child._restart_history = (
+                _restart_ctx.get("transcripts") or {}
+            ).get(_child_sid)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3747,6 +3788,14 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            child_session_ids=[
+                str(getattr(child, "session_id", "") or "")
+                for child in _child_agents
+            ],
+            restart_policy=(
+                "gateway_owned_v1" if _restart_ctx.get("restartable") else ""
+            ),
+            resume_claim=bool(_restart_ctx.get("delegation_id")),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -3781,6 +3830,17 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
+        if _restart_ctx.get("delegation_id"):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "delegation_id": str(_restart_ctx["delegation_id"]),
+                    "error": dispatch.get("error", "Restart claim rejected"),
+                },
+                ensure_ascii=False,
+            )
+
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
         # never accepted, so re-attaching isn't needed: we just run inline).
@@ -3802,6 +3862,57 @@ def delegate_task(
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+
+
+_RECOVERY_NOTE = (
+    "Internal recovery after a gateway interruption. Inspect the existing "
+    "workspace artifacts and SessionDB history before continuing. Do not "
+    "repeat any external or destructive effect whose completion is unknown."
+)
+
+
+def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> bool:
+    """Rebuild retained children with their original sessions and public id."""
+    task = dict(claim.get("task") or {})
+    goals = task.get("goals") or []
+    if not goals:
+        return False
+    tasks = [
+        {"goal": f"{_RECOVERY_NOTE}\n\nOriginal goal: {goal}", "context": None,
+         "role": task.get("role", "leaf")}
+        for goal in goals
+    ]
+    session_db = getattr(parent_agent, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    transcripts = {}
+    from agent.replay_cleanup import sanitize_replay_history
+    for child_session_id in claim.get("child_session_ids") or []:
+        if session_db is None:
+            return False
+        reopen_session = getattr(session_db, "reopen_session", None)
+        if callable(reopen_session):
+            reopen_session(child_session_id)
+        history = session_db.get_messages_as_conversation(child_session_id)
+        transcripts[child_session_id] = sanitize_replay_history(history)
+    with host_restart_context(
+        restartable=True,
+        delegation_id=claim["delegation_id"],
+        child_session_ids=list(claim.get("child_session_ids") or []),
+        transcripts=transcripts,
+    ):
+        launch_kwargs = {
+            "background": True,
+            "parent_agent": parent_agent,
+        }
+        if len(tasks) == 1:
+            launch_kwargs.update(tasks[0])
+        else:
+            launch_kwargs["tasks"] = tasks
+        result = json.loads(delegate_task(**launch_kwargs))
+    return (
+        result.get("status") == "dispatched"
+        and result.get("delegation_id") == claim["delegation_id"]
+    )
 
 
 def _resolve_child_credential_pool(
