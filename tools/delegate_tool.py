@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -2929,6 +2930,37 @@ def _build_child_preserving_parent_tools(**kwargs):
     return child
 
 
+def _apply_child_capability_ceiling(child, capability_names: list[str]) -> None:
+    """Freeze a resumed child to its original exact tool-name capability set."""
+    ceiling = frozenset(
+        str(name) for name in capability_names
+        if isinstance(name, str) and name
+    )
+    digest = hashlib.sha256("\0".join(sorted(ceiling)).encode()).hexdigest()[:20]
+    toolset_name = f"delegate-capability-{digest}"
+    TOOLSETS.setdefault(
+        toolset_name,
+        {
+            "description": "Exact durable capability ceiling for a resumed subagent",
+            "tools": sorted(ceiling),
+            "includes": [],
+        },
+    )
+    child.enabled_toolsets = [toolset_name]
+    child._delegate_capability_name_ceiling = ceiling
+    child.tools = [
+        schema for schema in (getattr(child, "tools", None) or [])
+        if str((schema.get("function") or schema).get("name") or "") in ceiling
+    ]
+    child.valid_tool_names = {
+        str((schema.get("function") or schema).get("name") or "")
+        for schema in child.tools
+    }
+    engine_names = getattr(child, "_context_engine_tool_names", None)
+    if isinstance(engine_names, set):
+        engine_names.intersection_update(ceiling)
+
+
 def _parent_finalization_lock(parent_agent) -> threading.RLock:
     """Return the per-parent lock that serializes lifecycle side effects."""
     if parent_agent is None:
@@ -3353,6 +3385,9 @@ def delegate_task(
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
     children = []
+    _restart_capabilities = list(
+        _restart_ctx.get("child_capability_names") or []
+    )
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
@@ -3390,6 +3425,8 @@ def delegate_task(
                 if i < len(_restart_ctx.get("child_session_ids") or []) else None
             ),
         )
+        if _restart_ctx.get("delegation_id"):
+            _apply_child_capability_ceiling(child, _restart_capabilities[i])
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -3792,6 +3829,10 @@ def delegate_task(
                 str(getattr(child, "session_id", "") or "")
                 for child in _child_agents
             ],
+            child_capability_names=[
+                sorted(str(name) for name in getattr(child, "valid_tool_names", set()))
+                for child in _child_agents
+            ],
             restart_policy=(
                 "gateway_owned_v1" if _restart_ctx.get("restartable") else ""
             ),
@@ -3905,6 +3946,18 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
     goals = task.get("goals") or []
     if not goals:
         return _RESTART_FAILED
+    child_session_ids = list(claim.get("child_session_ids") or [])
+    child_capability_names = list(claim.get("child_capability_names") or [])
+    if (
+        len(child_session_ids) != len(goals)
+        or len(child_capability_names) != len(goals)
+        or any(
+            not isinstance(names, list)
+            or any(not isinstance(name, str) or not name for name in names)
+            for names in child_capability_names
+        )
+    ):
+        return _RESTART_FAILED
     tasks = [
         {"goal": f"{_RECOVERY_NOTE}\n\nOriginal goal: {goal}", "context": None,
          "role": task.get("role", "leaf")}
@@ -3914,7 +3967,7 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
     session_db = getattr(session_db, "_db", session_db)
     transcripts = {}
     from agent.replay_cleanup import sanitize_replay_history
-    for child_session_id in claim.get("child_session_ids") or []:
+    for child_session_id in child_session_ids:
         if session_db is None:
             return _RESTART_FAILED
         history = session_db.get_messages_as_conversation(child_session_id)
@@ -3927,7 +3980,8 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
     with host_restart_context(
         restartable=True,
         delegation_id=claim["delegation_id"],
-        child_session_ids=list(claim.get("child_session_ids") or []),
+        child_session_ids=child_session_ids,
+        child_capability_names=child_capability_names,
         transcripts=transcripts,
     ):
         launch_kwargs = {

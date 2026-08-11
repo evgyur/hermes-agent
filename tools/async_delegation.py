@@ -214,6 +214,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("current_tool", "TEXT NOT NULL DEFAULT ''"),
         ("status_revision", "INTEGER NOT NULL DEFAULT 1"),
         ("child_session_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("child_capability_names_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("restart_policy", "TEXT NOT NULL DEFAULT ''"),
         ("restart_count", "INTEGER NOT NULL DEFAULT 0"),
         ("restart_reason", "TEXT NOT NULL DEFAULT ''"),
@@ -337,11 +338,18 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
             changed = conn.execute(
                 """UPDATE async_delegations SET state='running', updated_at=?,
                    heartbeat_at=?, owner_pid=?, owner_started_at=?,
-                   child_session_ids_json=?, restart_reason='', runner_returned=0
+                   child_session_ids_json=?, child_capability_names_json=?,
+                   restart_reason='', runner_returned=0
                    WHERE delegation_id=? AND state='restarting'""",
-                (now, now, __import__("os").getpid(), owner_started_at,
-                 json.dumps(record.get("child_session_ids") or []),
-                 record["delegation_id"]),
+                (
+                    now,
+                    now,
+                    __import__("os").getpid(),
+                    owner_started_at,
+                    json.dumps(record.get("child_session_ids") or []),
+                    json.dumps(record.get("child_capability_names") or []),
+                    record["delegation_id"],
+                ),
             )
             return changed.rowcount == 1
         conn.execute(
@@ -369,10 +377,12 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
         )
         conn.execute(
             """UPDATE async_delegations SET child_session_ids_json=?,
-               restart_policy=?, restart_count=?, restart_reason=''
+               child_capability_names_json=?, restart_policy=?, restart_count=?,
+               restart_reason=''
                WHERE delegation_id=?""",
             (
                 json.dumps(record.get("child_session_ids") or []),
+                json.dumps(record.get("child_capability_names") or []),
                 record.get("restart_policy", ""),
                 int(record.get("restart_count", 0) or 0),
                 record["delegation_id"],
@@ -515,7 +525,8 @@ def claim_restartable_delegation(
         if not changed:
             return None
         row = conn.execute(
-            """SELECT task_json, child_session_ids_json, restart_count,
+            """SELECT task_json, child_session_ids_json,
+                      child_capability_names_json, restart_count,
                       parent_session_id, origin_session, origin_ui_session_id
                FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
@@ -524,10 +535,11 @@ def claim_restartable_delegation(
         "delegation_id": delegation_id,
         "task": json.loads(row[0] or "{}"),
         "child_session_ids": json.loads(row[1] or "[]"),
-        "restart_count": row[2],
-        "parent_session_id": row[3],
-        "session_key": row[4],
-        "origin_ui_session_id": row[5],
+        "child_capability_names": json.loads(row[2] or "[]"),
+        "restart_count": row[3],
+        "parent_session_id": row[4],
+        "session_key": row[5],
+        "origin_ui_session_id": row[6],
     }
 
 
@@ -2147,6 +2159,7 @@ def dispatch_async_delegation(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
     child_session_ids: Optional[List[str]] = None,
+    child_capability_names: Optional[List[List[str]]] = None,
     restart_policy: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
@@ -2205,6 +2218,10 @@ def dispatch_async_delegation(
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "child_session_ids": list(child_session_ids or []),
+        "child_capability_names": [
+            sorted({str(name) for name in names if str(name)})
+            for names in (child_capability_names or [])
+        ],
         "restart_policy": restart_policy,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -2417,6 +2434,7 @@ def dispatch_async_delegation_batch(
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
     child_session_ids: Optional[List[str]] = None,
+    child_capability_names: Optional[List[List[str]]] = None,
     restart_policy: str = "",
     resume_claim: bool = False,
 ) -> Dict[str, Any]:
@@ -2460,6 +2478,10 @@ def dispatch_async_delegation_batch(
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "child_session_ids": list(child_session_ids or []),
+        "child_capability_names": [
+            sorted({str(name) for name in names if str(name)})
+            for names in (child_capability_names or [])
+        ],
         "restart_policy": restart_policy,
         "resume_claim": resume_claim,
         "status": "running",
