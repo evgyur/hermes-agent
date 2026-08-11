@@ -24,8 +24,11 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    _FTS_BASE_TRIGGERS,
     _FTS_TRIGGERS,
+    _FTS_TRIGRAM_TRIGGERS,
     _ephemeral_child_sql,
+    trigram_fts_config_enabled,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -116,14 +119,23 @@ class SessionSchemaMixin:
             return False
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        triggers=_FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in triggers)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            triggers,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+
+    @staticmethod
+    def _drop_trigram_fts_triggers(cursor: sqlite3.Cursor) -> None:
+        """Stop maintaining trigram derivatives without deleting their data."""
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
 
 
     @staticmethod
@@ -184,17 +196,20 @@ class SessionSchemaMixin:
             cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
 
         # Re-apply current DDL so CREATE TRIGGER installs the OF variants.
-        # Choose legacy vs v23 the same way _init_schema does.
+        # Choose legacy vs v23 the same way _init_schema does. A disabled
+        # trigram derivative is deliberately not recreated.
         if legacy_layout:
             self._ensure_fts_schema(cursor, "messages_fts", LEGACY_FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
-            )
+            if trigram_fts_config_enabled():
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                )
         else:
             self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
+            if trigram_fts_config_enabled():
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
             # CJK triggers live on the host SessionDB; only recreate one that
             # this migration actually dropped. ``_ensure_fts_cjk_schema`` is
             # documented never-raises and soft-fails OperationalError by
@@ -1018,8 +1033,17 @@ class SessionSchemaMixin:
         if fts5_available:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
-            #
+            # an earlier no-FTS5 runtime. The trigram derivative is optional:
+            # disabling it removes its write amplification while leaving its
+            # stored pages untouched until an explicit maintenance window.
+            trigram_configured = trigram_fts_config_enabled()
+            if not trigram_configured:
+                self._drop_trigram_fts_triggers(cursor)
+                self._trigram_available = False
+            expected_triggers = (
+                _FTS_TRIGGERS if trigram_configured else _FTS_BASE_TRIGGERS
+            )
+
             # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
             # not yet opted into `hermes db optimize`) must keep its EXISTING
             # inline schema + triggers. Running the v23 external-content DDL
@@ -1030,12 +1054,13 @@ class SessionSchemaMixin:
             # DBs have no legacy inline FTS, so they get the v23 DDL.
             if self._db_has_legacy_inline_fts(cursor):
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    self._fts_trigger_count(cursor, expected_triggers)
+                    < len(expected_triggers)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", LEGACY_FTS_SQL
                 )
-                if self._fts_enabled:
+                if self._fts_enabled and trigram_configured:
                     trigram_enabled = self._ensure_fts_schema(
                         cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
                     )
@@ -1044,18 +1069,23 @@ class SessionSchemaMixin:
                         self._rebuild_legacy_fts_indexes(
                             cursor, include_trigram=trigram_enabled
                         )
+                elif self._fts_enabled and triggers_need_repair:
+                    self._rebuild_legacy_fts_indexes(
+                        cursor, include_trigram=False
+                    )
             else:
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    self._fts_trigger_count(cursor, expected_triggers)
+                    < len(expected_triggers)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", FTS_SQL
                 )
 
                 # Trigram FTS5 for CJK/substring search. This is optional
-                # relative to the main FTS table; if it cannot be created,
+                # relative to the main FTS table; if disabled or unavailable,
                 # CJK search falls back to LIKE.
-                if self._fts_enabled:
+                if self._fts_enabled and trigram_configured:
                     trigram_enabled = self._ensure_fts_schema(
                         cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
@@ -1065,6 +1095,9 @@ class SessionSchemaMixin:
                             cursor,
                             include_trigram=trigram_enabled,
                         )
+                elif self._fts_enabled and triggers_need_repair:
+                    self._rebuild_fts_indexes(cursor, include_trigram=False)
+                if self._fts_enabled:
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
