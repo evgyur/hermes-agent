@@ -3870,13 +3870,41 @@ _RECOVERY_NOTE = (
     "repeat any external or destructive effect whose completion is unknown."
 )
 
+_RESTART_DISPATCHED = "dispatched"
+_RESTART_FAILED = "failed"
+_RESTART_UNSAFE = "unsafe"
 
-def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> bool:
+
+def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> bool:
+    """Detect side-effecting calls without a durable successful tool result."""
+    from agent.replay_cleanup import is_interrupted_tool_result, tool_may_have_side_effect
+
+    for index, message in enumerate(history):
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        results: Dict[str, Dict[str, Any]] = {}
+        cursor = index + 1
+        while cursor < len(history) and history[cursor].get("role") == "tool":
+            result = history[cursor]
+            results[str(result.get("tool_call_id") or "")] = result
+            cursor += 1
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if not tool_may_have_side_effect(str(function.get("name") or "")):
+                continue
+            call_id = str(call.get("id") or "")
+            result = results.get(call_id)
+            if result is None or is_interrupted_tool_result(result.get("content", "")):
+                return True
+    return False
+
+
+def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
     """Rebuild retained children with their original sessions and public id."""
     task = dict(claim.get("task") or {})
     goals = task.get("goals") or []
     if not goals:
-        return False
+        return _RESTART_FAILED
     tasks = [
         {"goal": f"{_RECOVERY_NOTE}\n\nOriginal goal: {goal}", "context": None,
          "role": task.get("role", "leaf")}
@@ -3888,11 +3916,13 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> bool:
     from agent.replay_cleanup import sanitize_replay_history
     for child_session_id in claim.get("child_session_ids") or []:
         if session_db is None:
-            return False
+            return _RESTART_FAILED
+        history = session_db.get_messages_as_conversation(child_session_id)
+        if _restart_history_has_unknown_side_effect(history):
+            return _RESTART_UNSAFE
         reopen_session = getattr(session_db, "reopen_session", None)
         if callable(reopen_session):
             reopen_session(child_session_id)
-        history = session_db.get_messages_as_conversation(child_session_id)
         transcripts[child_session_id] = sanitize_replay_history(history)
     with host_restart_context(
         restartable=True,
@@ -3909,10 +3939,12 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> bool:
         else:
             launch_kwargs["tasks"] = tasks
         result = json.loads(delegate_task(**launch_kwargs))
-    return (
+    if (
         result.get("status") == "dispatched"
         and result.get("delegation_id") == claim["delegation_id"]
-    )
+    ):
+        return _RESTART_DISPATCHED
+    return _RESTART_FAILED
 
 
 def _resolve_child_credential_pool(

@@ -5886,7 +5886,9 @@ class TurnRunner:
                 from tools.async_delegation import (
                     claim_restartable_delegation,
                     finalize_exhausted_restarts,
+                    finalize_unsafe_restart,
                     release_restart_claim,
+                    restore_restartable_delegations,
                     restore_undelivered_completions,
                 )
                 from tools.delegate_tool import resume_async_delegation
@@ -5898,15 +5900,23 @@ class TurnRunner:
                     owner_pid=os.getpid(),
                     owner_started_at=get_process_start_time(os.getpid()) or 0,
                     expected_session_key=ctx.session_key,
+                    restart_nonce=str(_restart_wake.get("restart_nonce") or ""),
                 )
-                _accepted = bool(
-                    _claim and resume_async_delegation(_claim, agent)
+                _resume_outcome = (
+                    resume_async_delegation(_claim, agent) if _claim else "not_claimed"
                 )
-                if _claim and not _accepted:
+                if _claim and _resume_outcome == "unsafe":
+                    finalize_unsafe_restart(
+                        _delegation_id,
+                        "Automatic recovery stopped: an interrupted side-effecting "
+                        "tool has no durable successful result; outcome unknown.",
+                    )
+                elif _claim and _resume_outcome != "dispatched":
                     if release_restart_claim(_delegation_id, "dead_owner"):
-                        # Retry the same trusted wake. The claim CAS prevents a
-                        # second worker from being admitted for this task.
-                        process_registry.completion_queue.put(_restart_wake)
+                        # Rehydrate a fresh persisted wake with the rotated nonce.
+                        restore_restartable_delegations(
+                            process_registry.completion_queue
+                        )
                     elif finalize_exhausted_restarts():
                         # Exhaustion is a real terminal outcome. Reuse the
                         # normal durable delivery rail exactly once.
