@@ -71,8 +71,8 @@ def test_corrupt_restart_json_is_bounded_and_never_strands(
                 heartbeat_at, restart_policy, restart_nonce,
                 child_session_ids_json, child_capability_names_json)
                VALUES (?, 'origin', 'parent', 'restart_pending', 1, 1,
-                       'pending', '{', 1, 'gateway_owned_v1', 'nonce-1',
-                       '[', 'not-json')""",
+                       'pending', '"bad"', 1, 'gateway_owned_v1', 'nonce-1',
+                       '1', '{}')""",
             (delegation_id,),
         )
 

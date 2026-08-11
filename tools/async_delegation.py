@@ -308,11 +308,12 @@ def _sanitize_public_text(value: Any, *, limit: int) -> str:
 
 
 def _load_durable_json(value: Any, default: Any) -> Any:
-    """Decode persisted JSON without letting corruption strand a claimed row."""
+    """Decode typed persisted JSON without stranding a claimed row."""
     try:
-        return json.loads(value) if value else default
+        decoded = json.loads(value) if value else default
     except (TypeError, ValueError):
         return default
+    return decoded if isinstance(decoded, type(default)) else default
 
 
 def _public_title(record: Dict[str, Any]) -> str:
