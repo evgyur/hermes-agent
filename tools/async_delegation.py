@@ -307,6 +307,14 @@ def _sanitize_public_text(value: Any, *, limit: int) -> str:
     return text[:limit].rstrip()
 
 
+def _load_durable_json(value: Any, default: Any) -> Any:
+    """Decode persisted JSON without letting corruption strand a claimed row."""
+    try:
+        return json.loads(value) if value else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _public_title(record: Dict[str, Any]) -> str:
     goal = record.get("goal")
     if not isinstance(goal, str):
@@ -533,9 +541,9 @@ def claim_restartable_delegation(
         ).fetchone()
     return {
         "delegation_id": delegation_id,
-        "task": json.loads(row[0] or "{}"),
-        "child_session_ids": json.loads(row[1] or "[]"),
-        "child_capability_names": json.loads(row[2] or "[]"),
+        "task": _load_durable_json(row[0], {}),
+        "child_session_ids": _load_durable_json(row[1], []),
+        "child_capability_names": _load_durable_json(row[2], []),
         "restart_count": row[3],
         "parent_session_id": row[4],
         "session_key": row[5],
@@ -577,7 +585,7 @@ def finalize_exhausted_restarts() -> int:
             (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
         ).fetchall()
         for delegation_id, task_json, origin, origin_ui, parent_sid in rows:
-            task = json.loads(task_json or "{}")
+            task = _load_durable_json(task_json, {})
             event = {
                 "type": "async_delegation",
                 "delegation_id": delegation_id,
@@ -631,18 +639,27 @@ def release_restart_claim(delegation_id: str, reason: str) -> bool:
     if not restart_reason_is_eligible(reason):
         return False
     with _DB_LOCK, _transaction() as conn:
-        return bool(conn.execute(
+        row = conn.execute(
+            """SELECT restart_count FROM async_delegations
+               WHERE delegation_id=? AND state='restarting'""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        changed = conn.execute(
             """UPDATE async_delegations SET state='restart_pending',
                restart_reason=?, restart_nonce=?, updated_at=? WHERE delegation_id=?
-               AND state='restarting' AND restart_count < ?""",
+               AND state='restarting'""",
             (
                 reason,
                 _new_restart_nonce(),
                 time.time(),
                 delegation_id,
-                _MAX_RESTART_ATTEMPTS,
             ),
-        ).rowcount)
+        ).rowcount
+        # At the cap the row is deliberately returned to restart_pending but
+        # False tells the gateway to finalize+enqueue exhaustion immediately.
+        return bool(changed and int(row[0]) < _MAX_RESTART_ATTEMPTS)
 
 
 def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
@@ -659,7 +676,7 @@ def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
         ).fetchone()
         if row is None:
             return False
-        task = json.loads(row[0] or "{}")
+        task = _load_durable_json(row[0], {})
         result = {
             "status": "unknown",
             "summary": None,
