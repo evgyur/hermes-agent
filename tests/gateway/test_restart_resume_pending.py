@@ -41,6 +41,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _resume_recovery_is_interactive,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -325,6 +326,23 @@ class TestResumePendingSystemNote:
         assert "Review the conversation history" in note
         assert "CONTINUE the interrupted task" in note
         assert "ask what they would like to do next" not in note
+
+    def test_telegram_real_empty_event_stays_interactive(self):
+        """Captionless media must not be mistaken for a synthetic resume wake."""
+        adapter = MagicMock(interactive_resume=False)
+        assert _resume_recovery_is_interactive(adapter, internal_event=True) is False
+        assert _resume_recovery_is_interactive(adapter, internal_event=False) is True
+
+        real_event_note = build_resume_recovery_note(
+            "restart_timeout",
+            "",
+            interactive=_resume_recovery_is_interactive(
+                adapter,
+                internal_event=False,
+            ),
+        )
+        assert "ask what they would like to do next" in real_event_note
+        assert "CONTINUE the interrupted task" not in real_event_note
 
 
     def test_resume_pending_fires_without_tool_tail(self):

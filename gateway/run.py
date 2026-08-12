@@ -1119,6 +1119,13 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def _resume_recovery_is_interactive(adapter: Any, *, internal_event: bool) -> bool:
+    """Apply adapter auto-continue only to synthetic startup recovery turns."""
+    if not internal_event:
+        return True
+    return bool(getattr(adapter, "interactive_resume", True))
+
+
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
@@ -5772,9 +5779,14 @@ class TurnRunner:
             # present to answer and an acknowledgement would silently
             # abandon the task (#57056).
             _resume_adapter = self._runner._adapter_for_source(ctx.source)
-            _interactive_resume = bool(
-                getattr(_resume_adapter, "interactive_resume", True)
+            _interactive_resume = _resume_recovery_is_interactive(
+                _resume_adapter,
+                internal_event=ctx.internal_event,
             )
+            # Adapter-level non-interactive recovery is only valid for the
+            # empty synthetic startup turn. A real inbound event can carry
+            # empty text (for example a captionless photo) and must remain an
+            # interactive user turn.
             ctx.message = build_resume_recovery_note(
                 _reason, ctx.message, interactive=_interactive_resume,
             )
@@ -5818,12 +5830,14 @@ class TurnRunner:
                 getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             )
             _sn_adapter = self._runner._adapter_for_source(ctx.source)
+            _sn_interactive_resume = _resume_recovery_is_interactive(
+                _sn_adapter,
+                internal_event=ctx.internal_event,
+            )
             ctx.message = build_resume_recovery_note(
                 _sn_reason,
                 "",
-                interactive=bool(
-                    getattr(_sn_adapter, "interactive_resume", True)
-                ),
+                interactive=_sn_interactive_resume,
             )
 
         _approval_session_key = ctx.session_key or ""
@@ -19252,6 +19266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                internal_event=event.internal,
                 _trusted_restart_wake=getattr(
                     event, "_hermes_trusted_restart_event", None
                 ),
@@ -26792,6 +26807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        internal_event: bool = False,
         _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -26812,6 +26828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                internal_event=internal_event,
                 _trusted_restart_wake=_trusted_restart_wake,
             )
 
@@ -26825,6 +26842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                internal_event=internal_event,
                 _trusted_restart_wake=_trusted_restart_wake,
             )
 
@@ -26948,6 +26966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        internal_event: bool = False,
         _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """
@@ -27261,6 +27280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            internal_event=internal_event,
         )
         if _trusted_restart_wake is not None:
             from tools.async_delegation import TrustedRestartEvent

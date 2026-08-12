@@ -8694,6 +8694,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         return
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
+                    event = self._prepare_recent_visible_context(event)
                     await self.handle_message(event)
                     return
                 file_obj = await msg.voice.get_file()
@@ -8723,6 +8724,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         return
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
+                    event = self._prepare_recent_visible_context(event)
                     await self.handle_message(event)
                     return
                 file_obj = await msg.audio.get_file()
