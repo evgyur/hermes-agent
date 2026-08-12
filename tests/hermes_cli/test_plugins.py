@@ -2,6 +2,9 @@
 
 import logging
 import json
+import importlib
+import importlib.metadata
+import os
 import sys
 import types
 from pathlib import Path
@@ -335,7 +338,8 @@ class TestPluginDiscovery:
             n: p for n, p in mgr._plugins.items()
             if p.manifest.source != "bundled"
         }
-        assert len(non_bundled) == 1
+        assert "retry_plugin" in non_bundled
+        assert non_bundled["retry_plugin"].enabled is True
 
 
 
@@ -382,6 +386,49 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+
+    def test_force_rediscover_reloads_entrypoint_module_code(self, tmp_path, monkeypatch):
+        fixture = tmp_path / "reload_fixture.py"
+        fixture.write_text('VALUE = "v1"\n')
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        class EntryPoint:
+            name = "continuum"
+            value = "reload_fixture"
+
+            @staticmethod
+            def load():
+                return importlib.import_module("reload_fixture")
+
+        class EntryPoints(list):
+            def select(self, **kwargs):
+                assert kwargs == {"group": ENTRY_POINTS_GROUP}
+                return self
+
+        monkeypatch.setattr(
+            importlib.metadata,
+            "entry_points",
+            lambda: EntryPoints([EntryPoint()]),
+        )
+        manifest = PluginManifest(
+            name="continuum",
+            version="0.1.0",
+            description="reload fixture",
+            source="entrypoint",
+        )
+        manager = PluginManager()
+        manager._force_entrypoint_reload = False
+        first = manager._load_entrypoint_module(manifest)
+
+        fixture.write_text('VALUE = "version-two"\n')
+        os.utime(fixture, (fixture.stat().st_atime, fixture.stat().st_mtime + 2))
+        importlib.invalidate_caches()
+        manager._force_entrypoint_reload = True
+        second = manager._load_entrypoint_module(manifest)
+
+        assert first.VALUE == "v1"
+        assert second.VALUE == "version-two"
+        assert second is not first
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────

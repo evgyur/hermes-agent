@@ -738,19 +738,57 @@ def _hot_reload_entrypoint_plugins() -> list[str]:
             raise RuntimeError(
                 f"Plugin {key!r} has hooks/middleware and cannot be hot-reloaded safely"
             )
-        for tool_name in loaded.tools_registered:
-            registry.deregister(tool_name)
-            manager._plugin_tool_names.discard(tool_name)
-        for command_name in loaded.commands_registered:
-            manager._plugin_commands.pop(command_name, None)
+        old_module_state = dict(loaded.module.__dict__)
+        old_plugin_tool_names = set(manager._plugin_tool_names)
+        old_plugin_commands = dict(manager._plugin_commands)
+        old_tools = {
+            name: registry.get_entry(name) for name in loaded.tools_registered
+        }
+        try:
+            for tool_name in loaded.tools_registered:
+                registry.deregister(tool_name)
+                manager._plugin_tool_names.discard(tool_name)
+            for command_name in loaded.commands_registered:
+                manager._plugin_commands.pop(command_name, None)
 
-        importlib.reload(loaded.module)
-        manager._plugins.pop(key, None)
-        manager._load_plugin(loaded.manifest)
-        refreshed = manager._plugins.get(key)
-        if refreshed is None or not refreshed.enabled:
-            detail = refreshed.error if refreshed is not None else "plugin disappeared"
-            raise RuntimeError(f"Plugin {key!r} hot reload failed: {detail}")
+            importlib.reload(loaded.module)
+            manager._plugins.pop(key, None)
+            manager._load_plugin(loaded.manifest)
+            refreshed = manager._plugins.get(key)
+            if refreshed is None or not refreshed.enabled:
+                detail = refreshed.error if refreshed is not None else "plugin disappeared"
+                raise RuntimeError(f"Plugin {key!r} hot reload failed: {detail}")
+        except BaseException:
+            refreshed = manager._plugins.get(key)
+            if refreshed is not None and refreshed is not loaded:
+                for tool_name in refreshed.tools_registered:
+                    registry.deregister(tool_name)
+            for tool_name in set(manager._plugin_tool_names) - old_plugin_tool_names:
+                registry.deregister(tool_name)
+            loaded.module.__dict__.clear()
+            loaded.module.__dict__.update(old_module_state)
+            for tool_name, entry in old_tools.items():
+                if entry is None:
+                    continue
+                registry.register(
+                    name=entry.name,
+                    toolset=entry.toolset,
+                    schema=entry.schema,
+                    handler=entry.handler,
+                    check_fn=entry.check_fn,
+                    requires_env=entry.requires_env,
+                    is_async=entry.is_async,
+                    description=entry.description,
+                    emoji=entry.emoji,
+                    max_result_size_chars=entry.max_result_size_chars,
+                    dynamic_schema_overrides=entry.dynamic_schema_overrides,
+                )
+            manager._plugin_tool_names.clear()
+            manager._plugin_tool_names.update(old_plugin_tool_names)
+            manager._plugin_commands.clear()
+            manager._plugin_commands.update(old_plugin_commands)
+            manager._plugins[key] = loaded
+            raise
         reloaded.append(key)
     return sorted(reloaded)
 

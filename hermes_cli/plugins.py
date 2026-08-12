@@ -1330,6 +1330,7 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        self._force_entrypoint_reload: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1382,11 +1383,14 @@ class PluginManager:
         # permanently stranded on the early-return above (the "No web provider
         # configured" class of failures).
         self._discovered = True
+        self._force_entrypoint_reload = force
         try:
             self._discover_and_load_inner()
         except BaseException:
             self._discovered = False
             raise
+        finally:
+            self._force_entrypoint_reload = False
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -2101,7 +2105,29 @@ class PluginManager:
 
         for ep in group_eps:
             if ep.name == manifest.name:
-                return ep.load()
+                if not self._force_entrypoint_reload:
+                    return ep.load()
+
+                module_name = str(ep.value).partition(":")[0].strip()
+                if not module_name:
+                    raise ImportError(f"Entry point '{manifest.name}' has no module")
+                prefix = f"{module_name}."
+                previous = {
+                    name: module
+                    for name, module in sys.modules.items()
+                    if name == module_name or name.startswith(prefix)
+                }
+                for name in sorted(previous, key=len, reverse=True):
+                    sys.modules.pop(name, None)
+                importlib.invalidate_caches()
+                try:
+                    return ep.load()
+                except BaseException:
+                    for name in list(sys.modules):
+                        if name == module_name or name.startswith(prefix):
+                            sys.modules.pop(name, None)
+                    sys.modules.update(previous)
+                    raise
 
         raise ImportError(
             f"Entry point '{manifest.name}' not found in group '{ENTRY_POINTS_GROUP}'"
