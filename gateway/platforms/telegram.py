@@ -445,6 +445,11 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
+    # A restart-resume turn already has the interrupted transcript and must
+    # continue from it. Treating Telegram as "interactive" made the synthetic
+    # turn discard recoverable work and ask the owner what to do next.
+    interactive_resume: bool = False
+
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
@@ -1419,7 +1424,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _attach_recent_visible_context(self, event: MessageEvent) -> None:
         """Attach a short same-chat/topic recent-context block to an event."""
         store = getattr(self, "_recent_visible_messages", None) or {}
-        entries = list(store.get(self._recent_visible_context_key(event), []))[-8:]
+        entries = list(store.get(self._recent_visible_context_key(event), []))[-10:]
         current_id = str(event.message_id or "")
         rows = []
         for item in entries:

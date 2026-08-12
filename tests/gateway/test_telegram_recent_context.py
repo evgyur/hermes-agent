@@ -97,3 +97,25 @@ def test_recent_context_prompt_ignores_empty_context():
     event = SimpleNamespace(recent_context="")
 
     assert _append_recent_context_prompt("base", event) == "base"
+
+
+def test_recent_context_keeps_latest_ten_prior_messages():
+    adapter = _make_adapter()
+    for message_id in range(1, 13):
+        event = adapter._build_message_event(
+            _make_message(f"message {message_id}", message_id=message_id, thread_id=107),
+            MessageType.TEXT,
+        )
+        adapter._record_recent_visible_message(event)
+
+    current = adapter._build_message_event(
+        _make_message("current", message_id=13, thread_id=107),
+        MessageType.TEXT,
+    )
+    adapter._attach_recent_visible_context(current)
+
+    assert current.recent_context is not None
+    assert "ID 1 |" not in current.recent_context
+    assert "ID 2 |" not in current.recent_context
+    for message_id in range(3, 13):
+        assert f"ID {message_id} |" in current.recent_context

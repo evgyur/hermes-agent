@@ -2376,6 +2376,11 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Ephemeral same-chat/topic context supplied by a platform adapter. This is
+    # appended to the per-turn context prompt and must never be persisted as
+    # user text, transcript history, or long-term memory.
+    recent_context: Optional[str] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -2992,13 +2997,15 @@ class BasePlatformAdapter(ABC):
     # "session restored — what next?" prompt.  The startup auto-resume turn
     # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
     # branch in ``_handle_message_with_agent``) reads this to pick its
-    # guidance: interactive platforms (Telegram, Slack, Discord DMs, …) get
+    # guidance: interactive platforms (Slack, Discord DMs, …) get
     # "report the restore and ask what the user wants next"; non-interactive
     # event platforms (webhook) get "finish the interrupted work" because
     # nobody is there to answer, and an acknowledgement would silently
     # abandon the task (#57056).  Read generically via ``getattr(adapter,
     # "interactive_resume", True)`` — no per-platform branching at the call
-    # site.
+    # site. Telegram overrides this to False because its restart-resume turn
+    # has a durable transcript and must continue that recoverable task rather
+    # than ask the owner to restate what is already visible.
     interactive_resume: bool = True
 
     # Back-reference to the running ``GatewayRunner``, injected by
