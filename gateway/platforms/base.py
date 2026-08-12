@@ -2393,6 +2393,11 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Narrow provenance for the empty startup auto-resume turn. ``internal``
+    # is deliberately broader (background completions, handoffs, kickoffs), so
+    # recovery guidance must not use it as a synthetic-resume discriminator.
+    startup_resume: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     

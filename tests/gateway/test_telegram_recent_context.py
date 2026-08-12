@@ -142,15 +142,16 @@ def test_prepare_recent_context_wires_attach_before_record():
     assert "current" not in prepared.recent_context
 
 
-def test_oversized_voice_fallback_keeps_recent_context():
-    """Early oversized-media fallback must use the same context preparation."""
-    async def _run():
+def test_oversized_media_fallbacks_keep_recent_context():
+    """Early oversized voice/audio fallbacks must use context preparation."""
+    async def _run(media_field: str):
         adapter = _make_adapter()
         adapter.handle_message = AsyncMock()
         adapter._should_process_message = MagicMock(return_value=True)
         adapter._handle_business_voice_transcription_hook = AsyncMock(return_value=False)
+        note = f"{media_field} exceeds Bot API download limit"
         adapter._telegram_media_size_allowed = MagicMock(
-            return_value=(False, "voice message exceeds Bot API download limit")
+            return_value=(False, note)
         )
         adapter._recover_transcribe_route_media_via_telegram_chip = AsyncMock(return_value=False)
 
@@ -162,8 +163,9 @@ def test_oversized_voice_fallback_keeps_recent_context():
 
         msg = _make_message("", message_id=2, thread_id=107)
         msg.text = None
-        msg.voice = SimpleNamespace(file_size=999_999_999)
+        msg.voice = None
         msg.audio = None
+        setattr(msg, media_field, SimpleNamespace(file_size=999_999_999))
         msg.photo = None
         msg.video = None
         msg.document = None
@@ -176,6 +178,7 @@ def test_oversized_voice_fallback_keeps_recent_context():
         event = adapter.handle_message.await_args.args[0]
         assert event.recent_context is not None
         assert "ID 1 | prior" in event.recent_context
-        assert "voice message exceeds Bot API download limit" in event.text
+        assert note in event.text
 
-    asyncio.run(_run())
+    for media_field in ("voice", "audio"):
+        asyncio.run(_run(media_field))

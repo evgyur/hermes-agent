@@ -330,15 +330,15 @@ class TestResumePendingSystemNote:
     def test_telegram_real_empty_event_stays_interactive(self):
         """Captionless media must not be mistaken for a synthetic resume wake."""
         adapter = MagicMock(interactive_resume=False)
-        assert _resume_recovery_is_interactive(adapter, internal_event=True) is False
-        assert _resume_recovery_is_interactive(adapter, internal_event=False) is True
+        assert _resume_recovery_is_interactive(adapter, startup_resume=True) is False
+        assert _resume_recovery_is_interactive(adapter, startup_resume=False) is True
 
         real_event_note = build_resume_recovery_note(
             "restart_timeout",
             "",
             interactive=_resume_recovery_is_interactive(
                 adapter,
-                internal_event=False,
+                startup_resume=False,
             ),
         )
         assert "ask what they would like to do next" in real_event_note
@@ -640,6 +640,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True
+    assert event.startup_resume is True
     assert event.message_type == MessageType.TEXT
     assert event.source == source
     # Text is empty — the existing _is_resume_pending branch in

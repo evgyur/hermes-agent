@@ -1119,9 +1119,9 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
-def _resume_recovery_is_interactive(adapter: Any, *, internal_event: bool) -> bool:
+def _resume_recovery_is_interactive(adapter: Any, *, startup_resume: bool) -> bool:
     """Apply adapter auto-continue only to synthetic startup recovery turns."""
-    if not internal_event:
+    if not startup_resume:
         return True
     return bool(getattr(adapter, "interactive_resume", True))
 
@@ -5781,7 +5781,7 @@ class TurnRunner:
             _resume_adapter = self._runner._adapter_for_source(ctx.source)
             _interactive_resume = _resume_recovery_is_interactive(
                 _resume_adapter,
-                internal_event=ctx.internal_event,
+                startup_resume=ctx.startup_resume,
             )
             # Adapter-level non-interactive recovery is only valid for the
             # empty synthetic startup turn. A real inbound event can carry
@@ -5832,7 +5832,7 @@ class TurnRunner:
             _sn_adapter = self._runner._adapter_for_source(ctx.source)
             _sn_interactive_resume = _resume_recovery_is_interactive(
                 _sn_adapter,
-                internal_event=ctx.internal_event,
+                startup_resume=ctx.startup_resume,
             )
             ctx.message = build_resume_recovery_note(
                 _sn_reason,
@@ -11797,6 +11797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                startup_resume=True,
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -19266,7 +19267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
-                internal_event=event.internal,
+                startup_resume=event.startup_resume,
                 _trusted_restart_wake=getattr(
                     event, "_hermes_trusted_restart_event", None
                 ),
@@ -26807,7 +26808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
-        internal_event: bool = False,
+        startup_resume: bool = False,
         _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -26828,7 +26829,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
-                internal_event=internal_event,
+                startup_resume=startup_resume,
                 _trusted_restart_wake=_trusted_restart_wake,
             )
 
@@ -26842,7 +26843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
-                internal_event=internal_event,
+                startup_resume=startup_resume,
                 _trusted_restart_wake=_trusted_restart_wake,
             )
 
@@ -26966,7 +26967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
-        internal_event: bool = False,
+        startup_resume: bool = False,
         _trusted_restart_wake: Any = None,
     ) -> Dict[str, Any]:
         """
@@ -27280,7 +27281,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
-            internal_event=internal_event,
+            startup_resume=startup_resume,
         )
         if _trusted_restart_wake is not None:
             from tools.async_delegation import TrustedRestartEvent
