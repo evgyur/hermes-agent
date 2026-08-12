@@ -721,6 +721,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
 def _hot_reload_entrypoint_plugins() -> list[str]:
     """Reload command/tool-only pip-entrypoint plugins in this process."""
     import importlib
+    import sys
 
     from hermes_cli import plugins as plugins_mod
     from tools.registry import registry
@@ -738,7 +739,17 @@ def _hot_reload_entrypoint_plugins() -> list[str]:
             raise RuntimeError(
                 f"Plugin {key!r} has hooks/middleware and cannot be hot-reloaded safely"
             )
-        old_module_state = dict(loaded.module.__dict__)
+        namespace_root = loaded.module.__package__ or loaded.module.__name__
+        namespace_prefix = f"{namespace_root}."
+        old_namespace_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == namespace_root or name.startswith(namespace_prefix)
+        }
+        old_namespace_states = {
+            name: dict(module.__dict__)
+            for name, module in old_namespace_modules.items()
+        }
         old_plugin_tool_names = set(manager._plugin_tool_names)
         old_plugin_commands = dict(manager._plugin_commands)
         old_tools = {
@@ -765,9 +776,14 @@ def _hot_reload_entrypoint_plugins() -> list[str]:
                     registry.deregister(tool_name)
             for tool_name in set(manager._plugin_tool_names) - old_plugin_tool_names:
                 registry.deregister(tool_name)
-            loaded.module.__dict__.clear()
-            loaded.module.__dict__.update(old_module_state)
-            for tool_name, entry in old_tools.items():
+            for name in list(sys.modules):
+                if name == namespace_root or name.startswith(namespace_prefix):
+                    sys.modules.pop(name, None)
+            for name, module in old_namespace_modules.items():
+                module.__dict__.clear()
+                module.__dict__.update(old_namespace_states[name])
+                sys.modules[name] = module
+            for _tool_name, entry in old_tools.items():
                 if entry is None:
                     continue
                 registry.register(

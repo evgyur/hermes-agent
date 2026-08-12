@@ -24388,18 +24388,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 durable_delegation_id,
                             )
                     if card_state == "delivered":
+                        # The terminal card is only the first half of the user
+                        # contract. Continue through the normal origin-bound
+                        # completion injection so the agent emits one separate
+                        # plain-language recap. The durable completion claim is
+                        # acknowledged below only after that injection is
+                        # accepted; retries reuse the delivered card instead of
+                        # creating or editing it again.
+                        pass
+                    else:
                         await asyncio.to_thread(
-                            complete_completion_delivery,
+                            release_completion_delivery_waiting,
                             durable_delegation_id,
                             durable_claim_id,
                         )
-                        return True
-                    await asyncio.to_thread(
-                        release_completion_delivery_waiting,
-                        durable_delegation_id,
-                        durable_claim_id,
-                    )
-                    return False
+                        return False
             except Exception:
                 logger.exception("Continuum terminal card delivery failed")
                 try:

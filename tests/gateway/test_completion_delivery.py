@@ -186,6 +186,56 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     assert acknowledgements == ["deleg_duplicate"]
 
 
+@pytest.mark.parametrize("recap_fails", [False, True])
+def test_managed_terminal_card_is_followed_by_human_recap_before_ack(
+    monkeypatch, isolated_registry, recap_fails,
+):
+    from tools import async_delegation
+
+    event = _async_event("deleg_managed_recap")
+    _persist_pending_completion(event)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="678",
+    )
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(
+            side_effect=RuntimeError("temporary") if recap_fails else None
+        )
+    )
+    runner = _runner(adapter, origins={event["session_key"]: SimpleNamespace(origin=source)})
+    cards = []
+    runner._publish_continuum_task_cards = AsyncMock(
+        side_effect=lambda **_kwargs: cards.append("card") or {event["delegation_id"]}
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "continuum_task_card_delivery_state",
+        lambda _delegation_id: "pending",
+    )
+    acknowledgements = []
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
+    )
+
+    result = asyncio.run(
+        runner._deliver_completion_notification("human recap", dict(event))
+    )
+
+    assert cards == ["card"]
+    adapter.handle_message.assert_awaited_once()
+    if recap_fails:
+        assert result is False
+        assert acknowledgements == []
+    else:
+        assert result is True
+        assert acknowledgements == ["deleg_managed_recap"]
+
+
 def _persist_pending_completion(event):
     from tools import async_delegation
 
