@@ -430,6 +430,55 @@ class TestPluginDiscovery:
         assert second.VALUE == "version-two"
         assert second is not first
 
+    def test_force_rediscover_reloads_nested_entrypoint_package_siblings(
+        self, tmp_path, monkeypatch,
+    ):
+        package = tmp_path / "reload_package"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        helper = package / "helper.py"
+        plugin = package / "plugin.py"
+        helper.write_text('VALUE = "v1"\n')
+        plugin.write_text("from .helper import VALUE\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        class EntryPoint:
+            name = "continuum"
+            value = "reload_package.plugin:register"
+
+            @staticmethod
+            def load():
+                return importlib.import_module("reload_package.plugin")
+
+        class EntryPoints(list):
+            def select(self, **kwargs):
+                assert kwargs == {"group": ENTRY_POINTS_GROUP}
+                return self
+
+        monkeypatch.setattr(
+            importlib.metadata,
+            "entry_points",
+            lambda: EntryPoints([EntryPoint()]),
+        )
+        manifest = PluginManifest(
+            name="continuum",
+            version="0.1.0",
+            description="nested reload fixture",
+            source="entrypoint",
+        )
+        manager = PluginManager()
+        first = manager._load_entrypoint_module(manifest)
+
+        helper.write_text('VALUE = "version-two"\n')
+        os.utime(helper, (helper.stat().st_atime, helper.stat().st_mtime + 2))
+        importlib.invalidate_caches()
+        manager._force_entrypoint_reload = True
+        second = manager._load_entrypoint_module(manifest)
+
+        assert first.VALUE == "v1"
+        assert second.VALUE == "version-two"
+        assert second is not first
+
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
 

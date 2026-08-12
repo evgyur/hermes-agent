@@ -762,9 +762,13 @@ def _hot_reload_entrypoint_plugins() -> list[str]:
             for command_name in loaded.commands_registered:
                 manager._plugin_commands.pop(command_name, None)
 
-            importlib.reload(loaded.module)
             manager._plugins.pop(key, None)
-            manager._load_plugin(loaded.manifest)
+            old_force_reload = manager._force_entrypoint_reload
+            manager._force_entrypoint_reload = True
+            try:
+                manager._load_plugin(loaded.manifest)
+            finally:
+                manager._force_entrypoint_reload = old_force_reload
             refreshed = manager._plugins.get(key)
             if refreshed is None or not refreshed.enabled:
                 detail = refreshed.error if refreshed is not None else "plugin disappeared"
@@ -849,12 +853,21 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_skill_commands)
+    global _skill_commands, _skill_commands_platform
+
+    old_commands = dict(_skill_commands)
+    old_platform = _skill_commands_platform
+    before = _snapshot(old_commands)
 
     # Rescan the skills dir. ``scan_skill_commands`` resets
     # ``_skill_commands = {}`` internally and repopulates it.
     new_commands = scan_skill_commands()
-    reloaded_plugins = _hot_reload_entrypoint_plugins()
+    try:
+        reloaded_plugins = _hot_reload_entrypoint_plugins()
+    except BaseException:
+        _skill_commands = old_commands
+        _skill_commands_platform = old_platform
+        raise
 
     after = _snapshot(new_commands)
 

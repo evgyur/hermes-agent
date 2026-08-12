@@ -2111,11 +2111,12 @@ class PluginManager:
                 module_name = str(ep.value).partition(":")[0].strip()
                 if not module_name:
                     raise ImportError(f"Entry point '{manifest.name}' has no module")
-                prefix = f"{module_name}."
+                package_root = module_name.rpartition(".")[0] or module_name
+                prefix = f"{package_root}."
                 previous = {
                     name: module
                     for name, module in sys.modules.items()
-                    if name == module_name or name.startswith(prefix)
+                    if name == package_root or name.startswith(prefix)
                 }
                 for name in sorted(previous, key=len, reverse=True):
                     sys.modules.pop(name, None)
@@ -2124,7 +2125,7 @@ class PluginManager:
                     return ep.load()
                 except BaseException:
                     for name in list(sys.modules):
-                        if name == module_name or name.startswith(prefix):
+                        if name == package_root or name.startswith(prefix):
                             sys.modules.pop(name, None)
                     sys.modules.update(previous)
                     raise

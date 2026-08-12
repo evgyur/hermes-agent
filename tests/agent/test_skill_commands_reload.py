@@ -109,3 +109,26 @@ class TestReloadSkillsHelper:
             "prompt cache snapshot should be preserved — skills don't live "
             "in the system prompt so there's no reason to invalidate it"
         )
+
+    def test_plugin_reload_failure_restores_previous_skill_map(
+        self, hermes_home, monkeypatch,
+    ):
+        import agent.skill_commands as skill_commands
+
+        _write_skill(hermes_home / "skills", "old-skill", "old")
+        skill_commands.scan_skill_commands()
+        old_commands = dict(skill_commands._skill_commands)
+        old_platform = skill_commands._skill_commands_platform
+        shutil.rmtree(hermes_home / "skills" / "old-skill")
+        _write_skill(hermes_home / "skills", "new-skill", "new")
+        monkeypatch.setattr(
+            skill_commands,
+            "_hot_reload_entrypoint_plugins",
+            lambda: (_ for _ in ()).throw(RuntimeError("reload failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="reload failed"):
+            skill_commands.reload_skills()
+
+        assert skill_commands._skill_commands == old_commands
+        assert skill_commands._skill_commands_platform == old_platform

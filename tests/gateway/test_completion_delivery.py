@@ -183,12 +183,20 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
-    assert acknowledgements == ["deleg_duplicate"]
+    assert acknowledgements == []  # legacy queue event has no durable row to ack
 
 
-@pytest.mark.parametrize("recap_fails", [False, True])
+@pytest.mark.parametrize(
+    ("recap_fails", "ack_result", "ack_raises"),
+    [
+        (False, True, False),
+        (True, True, False),
+        (False, False, False),
+        (False, True, True),
+    ],
+)
 def test_managed_terminal_card_is_followed_by_human_recap_before_ack(
-    monkeypatch, isolated_registry, recap_fails,
+    monkeypatch, isolated_registry, recap_fails, ack_result, ack_raises,
 ):
     from tools import async_delegation
 
@@ -216,10 +224,17 @@ def test_managed_terminal_card_is_followed_by_human_recap_before_ack(
         lambda _delegation_id: "pending",
     )
     acknowledgements = []
+
+    def acknowledge(delegation_id, _claim_id):
+        acknowledgements.append(delegation_id)
+        if ack_raises:
+            raise RuntimeError("durable ack failed")
+        return ack_result
+
     monkeypatch.setattr(
         async_delegation,
         "complete_completion_delivery",
-        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
+        acknowledge,
     )
 
     result = asyncio.run(
@@ -228,9 +243,9 @@ def test_managed_terminal_card_is_followed_by_human_recap_before_ack(
 
     assert cards == ["card"]
     adapter.handle_message.assert_awaited_once()
-    if recap_fails:
+    if recap_fails or not ack_result or ack_raises:
         assert result is False
-        assert acknowledgements == []
+        assert acknowledgements == ([] if recap_fails else ["deleg_managed_recap"])
     else:
         assert result is True
         assert acknowledgements == ["deleg_managed_recap"]
