@@ -1171,6 +1171,29 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # A restricted session must reject direct dispatch of tools that were not
+    # assembled into its schema. Filtering definitions alone is insufficient:
+    # malformed/provider-injected calls can still reach this dispatcher by name.
+    #
+    # One narrow exception exists for Tool Search's deferred bridge: the agent
+    # executor validates the underlying name against the session-scoped deferred
+    # catalog, then binds an exact ContextVar authority before dispatch. The
+    # external allowlist intentionally contains ``tool_call`` rather than that
+    # deferred underlying name, so require the exact host-bound authority here.
+    # ``None`` keeps the historical unrestricted API.
+    if enabled_tools is not None and function_name not in set(enabled_tools):
+        deferred_authority = None
+        try:
+            from tools.tool_search import get_active_scoped_deferred_tool_authority
+
+            deferred_authority = get_active_scoped_deferred_tool_authority()
+        except Exception:
+            pass
+        if deferred_authority != function_name:
+            return tool_error(
+                f"'{function_name}' is not available in this session's effective tool allowlist."
+            )
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
