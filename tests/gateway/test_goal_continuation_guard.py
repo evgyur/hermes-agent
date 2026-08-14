@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -122,3 +122,38 @@ async def test_synthetic_continuation_does_not_pause_active_goal():
 
     assert paused is False
     assert GoalManager("blocked-goal-session").is_active() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["read", "write"])
+async def test_goal_pause_storage_failure_propagates(failure):
+    from hermes_cli.goals import GoalState
+
+    runner = _runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=_session_entry()),
+    )
+    runner._clear_goal_pending_continuations = MagicMock()
+    runner._goal_max_turns_from_config = MagicMock(return_value=20)
+    db = MagicMock()
+    if failure == "read":
+        db.get_meta.side_effect = OSError("read failed")
+    else:
+        db.get_meta.return_value = GoalState(
+            goal="old standing goal",
+            status="active",
+        ).to_json()
+        db.set_meta.side_effect = OSError("write failed")
+
+    with (
+        patch("hermes_cli.goals._get_session_db", return_value=db),
+        pytest.raises((OSError, RuntimeError)),
+    ):
+        await runner._pause_active_goal_for_user_turn(
+            source=_source(),
+            session_key="telegram:c1:u1",
+            user_initiated=True,
+        )
+
+    runner._clear_goal_pending_continuations.assert_not_called()

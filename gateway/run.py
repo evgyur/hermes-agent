@@ -21004,21 +21004,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not user_initiated:
             return False
 
-        from hermes_cli.goals import GoalManager
+        from hermes_cli.goals import GoalManager, load_goal_exact_strict
 
         entry = await self.async_session_store.get_or_create_session(source)
         sid = getattr(entry, "session_id", "") or ""
         if not sid:
             raise RuntimeError("goal pause could not resolve the current session")
+        persisted_before = load_goal_exact_strict(sid)
         mgr = GoalManager(
             session_id=sid,
             default_max_turns=self._goal_max_turns_from_config(),
         )
+        if persisted_before is not None:
+            # Bind the action to the exact state row whose read succeeded.
+            mgr._state = persisted_before
         if not mgr.is_active():
             return False
         paused = mgr.pause(reason="new-user-request")
         if paused is None or paused.status != "paused":
             raise RuntimeError("active goal did not persist paused state")
+        persisted_after = load_goal_exact_strict(sid)
+        if persisted_after is None or persisted_after.status != "paused":
+            raise RuntimeError("active goal pause was not durably persisted")
         adapter = self._adapter_for_source(source)
         if adapter is not None:
             self._clear_goal_pending_continuations(session_key, adapter)

@@ -1704,6 +1704,57 @@ class TestJudgeDrivenWait:
         assert decision["should_continue"] is True
         assert mgr.state.waiting_on_session is None
 
+    def test_already_fired_watch_callback_does_not_park(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import ProcessSession, process_registry
+
+        sid = "proc_watch_already_hit"
+        session = ProcessSession(
+            id=sid,
+            command="watch.sh",
+            task_id="goal-test",
+            session_key="gateway:test",
+            pid=4244,
+            cwd="/tmp",
+            started_at=time.time(),
+        )
+        session.watch_patterns = ["READY"]
+        session._watch_hits = 1
+        process_registry._running[sid] = session
+        try:
+            mgr = GoalManager(session_id="jw-watch-hit", default_max_turns=10)
+            mgr.set("finish the release")
+            with patch.object(
+                goals,
+                "judge_goal",
+                return_value=(
+                    "wait",
+                    "watch already fired",
+                    False,
+                    {"session_id": sid},
+                    False,
+                ),
+            ):
+                decision = mgr.evaluate_after_turn(
+                    "Waiting for a watch callback.",
+                    background_processes=[{
+                        "session_id": sid,
+                        "pid": 4244,
+                        "command": "watch.sh",
+                        "status": "running",
+                        "watch_patterns": ["READY"],
+                        "watch_hit": True,
+                    }],
+                )
+        finally:
+            process_registry._running.pop(sid, None)
+            process_registry._finished.pop(sid, None)
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.waiting_on_session is None
+
     def test_time_barrier_clears_after_deadline(self, hermes_home):
         from hermes_cli.goals import GoalManager
 

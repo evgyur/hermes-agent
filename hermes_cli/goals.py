@@ -715,6 +715,24 @@ def _load_goal_exact(session_id: str, db: Optional[Any] = None) -> Optional[Goal
         return None
 
 
+def load_goal_exact_strict(session_id: str) -> Optional[GoalState]:
+    """Read one goal row without suppressing storage or parse failures.
+
+    Most legacy goal lifecycle operations remain best-effort. The gateway's
+    latest-user scope gate uses this strict variant before and after pausing so
+    an in-memory state change can never masquerade as a persisted pause.
+    """
+    if not session_id:
+        raise RuntimeError("strict goal load requires a session id")
+    db = _get_session_db()
+    if db is None:
+        raise RuntimeError("goal storage is unavailable")
+    raw = db.get_meta(_meta_key(session_id))
+    if not raw:
+        return None
+    return GoalState.from_json(raw)
+
+
 def _session_row(db: Any, session_id: str) -> Optional[Dict[str, Any]]:
     """Best-effort direct read of the sessions row for compression lineage."""
     try:
@@ -1345,9 +1363,10 @@ def _registered_process_callback_is_live(
         status = str(process.get("status") or "").lower()
         if status not in {"running", "active"}:
             return False
-        has_wake = bool(process.get("notify_on_complete")) or bool(
-            process.get("watch_patterns")
+        has_pending_watch = bool(process.get("watch_patterns")) and not bool(
+            process.get("watch_hit")
         )
+        has_wake = bool(process.get("notify_on_complete")) or has_pending_watch
         if not has_wake:
             return False
         if wait_session and str(process.get("session_id") or "") == wait_session:
