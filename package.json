@@ -44,9 +44,7 @@
     "eslint-plugin-perfectionist": "5.10.0",
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-unused-imports": "4.4.1",
-    "globals": "17.7.0"
-  },
-  "devDependencies": {
+    "globals": "17.7.0",
     "esbuild": "^0.28.1",
     "vite": "^8.0.16"
   },
@@ -58,8 +56,9 @@
     "mermaid": "11.16.1",
     "dompurify": "3.4.13",
     "ip-address": "10.3.1",
-    "nanoid@^3": "3.3.17",
+    "nanoid@^3": "3.3.18",
     "nanoid@^6": "6.0.0",
+    "tar": "7.5.22",
     "js-yaml@^4": "4.3.1",
     "undici@^6": "6.28.0",
     "undici@^7": "7.29.0",
