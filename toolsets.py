@@ -507,7 +507,10 @@ TOOLSETS = {
 
     "hermes-telegram": {
         "description": "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        # Continuum owns no general gateway execution path. Its only host-side
+        # capability is the Telegram-origin card bridge, service-gated by the
+        # standalone daemon socket.
+        "tools": _HERMES_CORE_TOOLS + ["continuum_card_launch"],
         "includes": []
     },
     

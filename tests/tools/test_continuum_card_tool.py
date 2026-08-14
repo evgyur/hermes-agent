@@ -101,3 +101,11 @@ def test_durable_origin_rejects_extra_fields():
                 }
             )
         )
+
+
+def test_bridge_is_exposed_to_telegram_but_not_other_messaging_bundles():
+    from toolsets import resolve_toolset
+
+    assert "continuum_card_launch" in resolve_toolset("hermes-telegram")
+    assert "continuum_card_launch" not in resolve_toolset("hermes-discord")
+    assert "continuum_card_launch" not in resolve_toolset("hermes-whatsapp")
