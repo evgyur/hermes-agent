@@ -1933,11 +1933,12 @@ class GoalManager:
         It clears that newly-created barrier so the later evidence is still
         counted and judged; a barrier that predates the chain remains binding.
 
-        ``durable_resume_scheduled`` is a fail-closed parking gate. Callers may
-        set it only after verifying an enabled, goal-specific cron that will
-        restart this exact goal. A process callback or future deadline alone
-        is not durable enough: an otherwise-valid WAIT verdict is downgraded
-        to CONTINUE so the standing goal cannot silently fall asleep.
+        ``durable_resume_scheduled`` is a fail-closed parking gate for waits
+        that have no registered process callback. A live process/session from
+        ``background_processes`` is already owned by the process registry and
+        will emit its completion callback, so it may park without forcing the
+        caller to create a goal-specific cron. Bare deadlines still require a
+        durable resume schedule.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -2072,15 +2073,44 @@ class GoalManager:
         else:
             state.consecutive_transport_failures = 0
 
-        # WAIT verdict: parking is allowed only when the caller has already
-        # verified a durable, goal-specific resume cron. Process callbacks,
-        # watcher notifications and deadlines can be lost or routed to the
-        # wrong session, so they are not sufficient wake mechanisms by
-        # themselves. Fail closed to CONTINUE when the durable wake is absent.
-        if verdict == "wait" and wait_directive and not durable_resume_scheduled:
+        # A registered process/session is already coupled to the process
+        # registry's completion notification path, so it can park the goal
+        # without manufacturing a recurring cron.  Match the judge directive
+        # against the live registry snapshot; arbitrary PIDs/session IDs and
+        # bare time delays still fail closed unless a durable resume exists.
+        registered_process_wait = False
+        if verdict == "wait" and wait_directive:
+            wait_session = str(wait_directive.get("session_id") or "")
+            wait_pid = wait_directive.get("pid")
+            for process in background_processes or []:
+                if not isinstance(process, dict):
+                    continue
+                status = str(process.get("status") or "").lower()
+                if status not in {"running", "active"}:
+                    continue
+                if wait_session and str(process.get("session_id") or "") == wait_session:
+                    registered_process_wait = True
+                    break
+                if wait_pid is not None:
+                    process_pid = process.get("pid")
+                    if process_pid is None:
+                        continue
+                    try:
+                        if int(process_pid) == int(wait_pid):
+                            registered_process_wait = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+
+        if (
+            verdict == "wait"
+            and wait_directive
+            and not durable_resume_scheduled
+            and not registered_process_wait
+        ):
             reason = (
                 f"{reason}; WAIT rejected because no verified durable resume cron "
-                "was scheduled for this exact goal"
+                "or registered process callback was available for this exact goal"
             )
             verdict = "continue"
             wait_directive = None

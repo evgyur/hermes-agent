@@ -74,3 +74,51 @@ async def test_stale_internal_goal_continuation_is_dropped_before_agent_run():
     assert result is None
     runner._goal_still_active_for_session.assert_called_once_with("blocked-goal-session")
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_genuine_user_turn_pauses_active_goal_before_agent_run():
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=_session_entry()),
+    )
+    runner._clear_goal_pending_continuations = MagicMock()
+    runner._goal_max_turns_from_config = MagicMock(return_value=20)
+    GoalManager("blocked-goal-session").set("old standing goal")
+
+    paused = await runner._pause_active_goal_for_user_turn(
+        source=_source(),
+        session_key="telegram:c1:u1",
+        user_initiated=True,
+    )
+
+    state = GoalManager("blocked-goal-session").state
+    assert paused is True
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "new-user-request"
+    runner._clear_goal_pending_continuations.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_continuation_does_not_pause_active_goal():
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=_session_entry()),
+    )
+    GoalManager("blocked-goal-session").set("standing goal")
+
+    paused = await runner._pause_active_goal_for_user_turn(
+        source=_source(),
+        session_key="telegram:c1:u1",
+        user_initiated=False,
+    )
+
+    assert paused is False
+    assert GoalManager("blocked-goal-session").is_active() is True

@@ -294,6 +294,20 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_skill_maintenance_cannot_expand_completed_task(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "sample"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: sample\ndescription: Sample skill\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "blocks the current requested outcome" in result
+        assert "do not expand a completed task into skill maintenance" in result
+        assert "update it before finishing" not in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path

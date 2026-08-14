@@ -1572,8 +1572,8 @@ class TestJudgeDrivenWait:
         assert mgr.state.waiting_on_pid is None
         assert mgr.is_waiting() is True
 
-    def test_judge_wait_without_durable_resume_cron_keeps_goal_running(self, hermes_home):
-        """A process callback alone must never park a standing goal."""
+    def test_registered_process_callback_parks_without_durable_resume_cron(self, hermes_home):
+        """A registered process callback is already a bounded wake source."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
@@ -1600,13 +1600,10 @@ class TestJudgeDrivenWait:
                 }],
             )
 
-        assert decision["verdict"] == "continue"
-        assert decision["should_continue"] is True
-        assert decision["continuation_prompt"]
-        assert mgr.state.waiting_on_session is None
-        assert mgr.state.waiting_on_pid is None
-        assert mgr.state.waiting_until == 0.0
-        assert "durable resume cron" in decision["reason"]
+        assert decision["verdict"] == "wait"
+        assert decision["should_continue"] is False
+        assert decision["continuation_prompt"] is None
+        assert mgr.state.waiting_on_session == "proc_unbacked"
 
     def test_time_barrier_clears_after_deadline(self, hermes_home):
         from hermes_cli.goals import GoalManager
