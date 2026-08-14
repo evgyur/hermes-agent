@@ -9,6 +9,8 @@ duplicate agent.
 """
 
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class _FakeAdapter:
@@ -63,6 +65,19 @@ def _make_runner():
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
+    def _entry(source):
+        return SessionEntry(
+            session_key=build_session_key(source),
+            session_id=f"session-{source.chat_id}",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(side_effect=_entry),
+    )
     runner.delivery_router = MagicMock()
     return runner
 
@@ -101,6 +116,57 @@ async def test_sentinel_placed_before_agent_setup():
     assert sentinel_was_set, (
         "Sentinel must be in _running_agents when _handle_message_with_agent starts"
     )
+
+
+@pytest.mark.asyncio
+async def test_goal_pause_await_happens_after_session_claim():
+    runner = _make_runner()
+    first = _make_event(text="first")
+    second = _make_event(text="second")
+    session_key = build_session_key(first.source)
+    pause_entered = asyncio.Event()
+    release_pause = asyncio.Event()
+    agent_entries = []
+
+    async def slow_pause(**_kwargs):
+        pause_entered.set()
+        await release_pause.wait()
+        return True
+
+    async def record_agent(_event, _source, key, _generation):
+        agent_entries.append(key)
+        return "ok"
+
+    runner._pause_active_goal_for_user_turn = slow_pause
+    runner._handle_message_with_agent = record_agent
+
+    first_task = asyncio.create_task(runner._handle_message(first))
+    await asyncio.wait_for(pause_entered.wait(), timeout=1)
+    assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+
+    await runner._handle_message(second)
+    release_pause.set()
+    await first_task
+
+    assert agent_entries == [session_key]
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key].text == "second"
+
+
+@pytest.mark.asyncio
+async def test_goal_pause_failure_releases_claim_and_blocks_agent():
+    runner = _make_runner()
+    event = _make_event(text="new scope")
+    session_key = build_session_key(event.source)
+    runner._pause_active_goal_for_user_turn = AsyncMock(
+        side_effect=RuntimeError("state store unavailable")
+    )
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
+
+    result = await runner._handle_message(event)
+
+    assert "couldn't safely pause" in result
+    assert session_key not in runner._running_agents
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 # ------------------------------------------------------------------

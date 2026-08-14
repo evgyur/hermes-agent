@@ -1327,6 +1327,59 @@ def gather_background_processes(
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
+def _registered_process_callback_is_live(
+    wait_directive: Dict[str, Any],
+    background_processes: Optional[List[Dict[str, Any]]],
+) -> bool:
+    """Require an exact, still-running process with a real wake callback.
+
+    The supplied snapshot is session-scoped by the gateway, but it may become
+    stale while the judge call is in flight. Re-read the process registry and
+    require ``notify_on_complete`` or active ``watch_patterns`` before parking.
+    """
+
+    wait_session = str(wait_directive.get("session_id") or "")
+    wait_pid = wait_directive.get("pid")
+
+    def matches(process: Dict[str, Any]) -> bool:
+        status = str(process.get("status") or "").lower()
+        if status not in {"running", "active"}:
+            return False
+        has_wake = bool(process.get("notify_on_complete")) or bool(
+            process.get("watch_patterns")
+        )
+        if not has_wake:
+            return False
+        if wait_session and str(process.get("session_id") or "") == wait_session:
+            return True
+        if wait_pid is None or process.get("pid") is None:
+            return False
+        try:
+            return int(process["pid"]) == int(wait_pid)
+        except (TypeError, ValueError):
+            return False
+
+    if not any(
+        matches(process)
+        for process in background_processes or []
+        if isinstance(process, dict)
+    ):
+        return False
+
+    try:
+        from tools.process_registry import process_registry
+
+        live_processes = process_registry.list_sessions() or []
+    except Exception as exc:
+        logger.debug("process callback revalidation failed: %s", exc)
+        return False
+    return any(
+        matches(process)
+        for process in live_processes
+        if isinstance(process, dict)
+    )
+
+
 def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
@@ -2088,27 +2141,10 @@ class GoalManager:
         # bare time delays still fail closed unless a durable resume exists.
         registered_process_wait = False
         if verdict == "wait" and wait_directive:
-            wait_session = str(wait_directive.get("session_id") or "")
-            wait_pid = wait_directive.get("pid")
-            for process in background_processes or []:
-                if not isinstance(process, dict):
-                    continue
-                status = str(process.get("status") or "").lower()
-                if status not in {"running", "active"}:
-                    continue
-                if wait_session and str(process.get("session_id") or "") == wait_session:
-                    registered_process_wait = True
-                    break
-                if wait_pid is not None:
-                    process_pid = process.get("pid")
-                    if process_pid is None:
-                        continue
-                    try:
-                        if int(process_pid) == int(wait_pid):
-                            registered_process_wait = True
-                            break
-                    except (TypeError, ValueError):
-                        continue
+            registered_process_wait = _registered_process_callback_is_live(
+                wait_directive,
+                background_processes,
+            )
 
         if (
             verdict == "wait"

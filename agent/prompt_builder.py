@@ -190,12 +190,11 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities.\n"
+    "Skill maintenance never extends the current assignment after its requested "
+    "outcome is complete. If a loaded skill is materially wrong and blocks that "
+    "outcome, patch only the smallest necessary correction with "
+    "skill_manage(action='patch'). Otherwise report the issue separately and "
+    "wait for a separate user request before creating or updating a skill.\n"
     "\n"
     "## Skill Safety Rule\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"

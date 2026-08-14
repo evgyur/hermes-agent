@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
@@ -15,6 +15,7 @@ def _make_agent(**overrides):
         valid_tool_names=[],
         _task_completion_guidance=False,
         _tool_use_enforcement=False,
+        _emit_status=MagicMock(),
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
@@ -128,6 +129,15 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_full_skill_guidance_cannot_mandate_post_completion_maintenance():
+    stable = _stable_prompt(_make_agent(valid_tool_names=["skill_manage"]))
+
+    assert "Skill maintenance never extends the current assignment" in stable
+    assert "separate user request before creating or updating a skill" in stable
+    assert "After completing a complex task" not in stable
+    assert "patch it immediately" not in stable
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

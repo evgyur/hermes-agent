@@ -1572,8 +1572,8 @@ class TestJudgeDrivenWait:
         assert mgr.state.waiting_on_pid is None
         assert mgr.is_waiting() is True
 
-    def test_registered_process_callback_parks_without_durable_resume_cron(self, hermes_home):
-        """A registered process callback is already a bounded wake source."""
+    def test_process_without_wake_callback_does_not_park_without_cron(self, hermes_home):
+        """A running process without notify/watch cannot wake a parked goal."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
@@ -1600,10 +1600,109 @@ class TestJudgeDrivenWait:
                 }],
             )
 
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert decision["continuation_prompt"] is not None
+        assert mgr.state.waiting_on_session is None
+
+    def test_live_notify_callback_parks_without_durable_cron(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import ProcessSession, process_registry
+
+        sid = "proc_notify_callback"
+        session = ProcessSession(
+            id=sid,
+            command="review.sh",
+            task_id="goal-test",
+            session_key="gateway:test",
+            pid=4242,
+            cwd="/tmp",
+            started_at=time.time(),
+        )
+        session.notify_on_complete = True
+        process_registry._running[sid] = session
+        try:
+            mgr = GoalManager(session_id="jw-notify", default_max_turns=10)
+            mgr.set("finish the release")
+            with patch.object(
+                goals,
+                "judge_goal",
+                return_value=(
+                    "wait",
+                    "reviewer still running",
+                    False,
+                    {"session_id": sid},
+                    False,
+                ),
+            ):
+                decision = mgr.evaluate_after_turn(
+                    "Waiting for the reviewer callback.",
+                    background_processes=[{
+                        "session_id": sid,
+                        "pid": 4242,
+                        "command": "review.sh",
+                        "status": "running",
+                        "notify_on_complete": True,
+                    }],
+                )
+        finally:
+            process_registry._running.pop(sid, None)
+            process_registry._finished.pop(sid, None)
+
         assert decision["verdict"] == "wait"
         assert decision["should_continue"] is False
-        assert decision["continuation_prompt"] is None
-        assert mgr.state.waiting_on_session == "proc_unbacked"
+        assert mgr.state.waiting_on_session == sid
+
+    def test_stale_callback_snapshot_does_not_park(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import ProcessSession, process_registry
+
+        sid = "proc_stale_callback"
+        session = ProcessSession(
+            id=sid,
+            command="review.sh",
+            task_id="goal-test",
+            session_key="gateway:test",
+            pid=4243,
+            cwd="/tmp",
+            started_at=time.time(),
+        )
+        session.notify_on_complete = True
+        process_registry._running[sid] = session
+
+        def finish_during_judge(*_args, **_kwargs):
+            process_registry._running.pop(sid, None)
+            return (
+                "wait",
+                "reviewer still running",
+                False,
+                {"session_id": sid},
+                False,
+            )
+
+        try:
+            mgr = GoalManager(session_id="jw-stale", default_max_turns=10)
+            mgr.set("finish the release")
+            with patch.object(goals, "judge_goal", side_effect=finish_during_judge):
+                decision = mgr.evaluate_after_turn(
+                    "Waiting for the reviewer callback.",
+                    background_processes=[{
+                        "session_id": sid,
+                        "pid": 4243,
+                        "command": "review.sh",
+                        "status": "running",
+                        "notify_on_complete": True,
+                    }],
+                )
+        finally:
+            process_registry._running.pop(sid, None)
+            process_registry._finished.pop(sid, None)
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.waiting_on_session is None
 
     def test_time_barrier_clears_after_deadline(self, hermes_home):
         from hermes_cli.goals import GoalManager

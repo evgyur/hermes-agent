@@ -17161,17 +17161,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
-        # A genuine new user request owns the session scope.  Pause any older
-        # standing goal before building the agent prompt so the stale goal
-        # cannot influence this answer or re-enqueue itself after the turn.
-        # Synthetic goal continuations are ``internal=True`` and bypass this
-        # gate.  Resuming remains explicit via ``/goal resume``.
-        await self._pause_active_goal_for_user_turn(
-            source=source,
-            session_key=_quick_key,
-            user_initiated=not is_internal,
-        )
-
         # ── Claim this session before any await ────────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -17196,6 +17185,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+
+        # A genuine new user request owns the session scope. Claim first so
+        # no second same-session event can pass the running guard while goal
+        # state is loaded or persisted. Any pause/cleanup failure is fail-closed:
+        # release this claim and do not build a prompt under the stale goal.
+        try:
+            await self._pause_active_goal_for_user_turn(
+                source=source,
+                session_key=_quick_key,
+                user_initiated=not is_internal,
+            )
+        except Exception as exc:
+            self._release_running_agent_state(
+                _quick_key,
+                run_generation=_run_generation,
+            )
+            self._invalidate_session_run_generation(
+                _quick_key,
+                reason="goal-pause-failed",
+            )
+            logger.error(
+                "Refusing user turn for %s because the older standing goal "
+                "could not be paused: %s",
+                _quick_key,
+                exc,
+            )
+            return (
+                "⏸ I couldn't safely pause the older standing goal, so this "
+                "message was not run under stale scope. Please retry or use "
+                "/goal pause, then resend."
+            )
+
         await asyncio.to_thread(
             self._update_gateway_ledger,
             event,
@@ -20982,31 +21003,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Pause an older standing goal before a genuine new user turn."""
         if not user_initiated:
             return False
-        try:
-            from hermes_cli.goals import GoalManager
 
-            entry = await self.async_session_store.get_or_create_session(source)
-            sid = getattr(entry, "session_id", "") or ""
-            if not sid:
-                return False
-            mgr = GoalManager(
-                session_id=sid,
-                default_max_turns=self._goal_max_turns_from_config(),
-            )
-            if not mgr.is_active():
-                return False
-            mgr.pause(reason="new-user-request")
-            adapter = self._adapter_for_source(source)
-            if adapter is not None:
-                self._clear_goal_pending_continuations(session_key, adapter)
-            logger.info(
-                "Paused standing goal for %s before genuine user turn",
-                session_key,
-            )
-            return True
-        except Exception as exc:
-            logger.debug("user-turn goal pause failed: %s", exc)
+        from hermes_cli.goals import GoalManager
+
+        entry = await self.async_session_store.get_or_create_session(source)
+        sid = getattr(entry, "session_id", "") or ""
+        if not sid:
+            raise RuntimeError("goal pause could not resolve the current session")
+        mgr = GoalManager(
+            session_id=sid,
+            default_max_turns=self._goal_max_turns_from_config(),
+        )
+        if not mgr.is_active():
             return False
+        paused = mgr.pause(reason="new-user-request")
+        if paused is None or paused.status != "paused":
+            raise RuntimeError("active goal did not persist paused state")
+        adapter = self._adapter_for_source(source)
+        if adapter is not None:
+            self._clear_goal_pending_continuations(session_key, adapter)
+        logger.info(
+            "Paused standing goal for %s before genuine user turn",
+            session_key,
+        )
+        return True
 
     async def _post_turn_goal_continuation(
         self,
