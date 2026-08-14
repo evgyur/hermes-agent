@@ -30,12 +30,13 @@ def test_iter_skill_index_files_excludes_backups_vendor_and_node_modules(tmp_pat
     """Only active catalog skills should appear in prompt/tool skill indexes."""
     active = tmp_path / "active-skill"
     backup = tmp_path / ".sync-backups" / "snapshot" / "backup-skill"
+    dot_backups = tmp_path / ".backups" / "snapshot" / "old-skill"
     suffix_backup = tmp_path / "tg.bak"
     local_backup = tmp_path / "postcraft.local-backup"
     vendored = tmp_path / "some-project" / "vendor" / "vendored-skill"
     node = tmp_path / "node_modules" / "pkg" / "node-skill"
 
-    for skill_dir in (active, backup, suffix_backup, local_backup, vendored, node):
+    for skill_dir in (active, backup, dot_backups, suffix_backup, local_backup, vendored, node):
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: x\ndescription: test\n---\nbody\n", encoding="utf-8"
@@ -44,6 +45,34 @@ def test_iter_skill_index_files_excludes_backups_vendor_and_node_modules(tmp_pat
     found = [p.relative_to(tmp_path) for p in iter_skill_index_files(tmp_path, "SKILL.md")]
 
     assert found == [active.relative_to(tmp_path) / "SKILL.md"]
+
+
+def test_iter_skill_index_files_excludes_absorbed_archives(tmp_path):
+    active = tmp_path / "documents" / "active"
+    absorbed = tmp_path / "documents" / "references" / "absorbed" / "old"
+    for path in (active, absorbed):
+        path.mkdir(parents=True)
+        (path / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+
+    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+
+    assert found == [active / "SKILL.md"]
+    assert is_excluded_skill_path(absorbed / "SKILL.md") is True
+
+
+def test_iter_skill_index_files_prunes_embedded_skill_packages(tmp_path):
+    umbrella = tmp_path / "umbrella"
+    umbrella.mkdir()
+    (umbrella / "SKILL.md").write_text("---\nname: umbrella\n---\n", encoding="utf-8")
+    for support in ("skills", "runtime", "upstream"):
+        nested = umbrella / support / "package"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(f"---\nname: {support}-copy\n---\n", encoding="utf-8")
+
+    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+
+    assert found == [umbrella / "SKILL.md"]
+
 
 def test_iter_skill_index_files_prunes_dependency_dirs(tmp_path):
     real = tmp_path / "real-skill"

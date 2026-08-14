@@ -1,0 +1,132 @@
+[
+  {
+    "id": "ordinary-small-code-fix",
+    "risk_class": "low",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "lean_canary",
+    "required": [],
+    "optional": ["shaw"],
+    "forbidden": ["test-driven-development", "requesting-code-review", "exact-candidate-integrity"]
+  },
+  {
+    "id": "unknown-flaky-recurrent-failure",
+    "risk_class": "medium",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["systematic-debugging"],
+    "optional": ["shaw"],
+    "forbidden": []
+  },
+  {
+    "id": "explicit-strict-tdd",
+    "risk_class": "low",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "lean_canary",
+    "required": ["test-driven-development"],
+    "optional": ["shaw"],
+    "forbidden": []
+  },
+  {
+    "id": "explicit-independent-review",
+    "risk_class": "medium",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["requesting-code-review"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "auth-access-boundary",
+    "risk_class": "high",
+    "protected_boundaries": ["auth", "access"],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["authorization-specialist"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "payment-live-money-boundary",
+    "risk_class": "high",
+    "protected_boundaries": ["payment"],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["payment-specialist"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "control-plane-review",
+    "risk_class": "high",
+    "protected_boundaries": ["control_plane"],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["control-plane-code-review"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "exact-candidate-release",
+    "risk_class": "high",
+    "protected_boundaries": ["exact_candidate", "release_certification"],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["exact-candidate-integrity"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "explicit-supergoal",
+    "risk_class": "medium",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["supergoal"],
+    "optional": [],
+    "forbidden": []
+  },
+  {
+    "id": "generic-fix-and-push",
+    "risk_class": "low",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "lean_canary",
+    "required": ["shaw"],
+    "optional": [],
+    "forbidden": ["test-driven-development", "requesting-code-review", "exact-candidate-integrity"]
+  },
+  {
+    "id": "factual-writing-no-skill",
+    "risk_class": "low",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "lean_canary",
+    "required": [],
+    "optional": [],
+    "forbidden": ["shaw", "test-driven-development", "requesting-code-review"]
+  },
+  {
+    "id": "source-first-url",
+    "risk_class": "low",
+    "protected_boundaries": [],
+    "default_policy": "conservative",
+    "canary_policy": "lean_canary",
+    "required": ["chip-url-first"],
+    "optional": [],
+    "forbidden": ["shaw"]
+  },
+  {
+    "id": "production-destructive-approval",
+    "risk_class": "high",
+    "protected_boundaries": ["production", "destructive"],
+    "default_policy": "conservative",
+    "canary_policy": "conservative",
+    "required": ["approval-gate"],
+    "optional": [],
+    "forbidden": []
+  }
+]
