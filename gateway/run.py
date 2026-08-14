@@ -21044,7 +21044,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             from hermes_cli.goals import gather_background_processes as _gather_bg
-            _bg_procs = _gather_bg()
+            _bg_procs = _gather_bg(
+                session_key=self._session_key_for_source(source) if source is not None else None
+            )
         except Exception:
             _bg_procs = None
 

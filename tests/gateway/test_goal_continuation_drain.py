@@ -180,9 +180,15 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     runner.adapters = {Platform.SLACK: adapter}
 
     GoalManager(session_entry.session_id).set("ship it")
-    with patch(
-        "hermes_cli.goals.judge_goal",
-        return_value=("continue", "still needs work", False, None, False),
+    with (
+        patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "still needs work", False, None, False),
+        ),
+        patch(
+            "hermes_cli.goals.gather_background_processes",
+            return_value=[],
+        ) as gather_background_processes,
     ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
@@ -191,6 +197,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         )
         await asyncio.sleep(0.05)
 
+    gather_background_processes.assert_called_once_with(session_key=adapter_key)
     assert adapter_key in adapter._pending_messages, (
         "continuation enqueued under a different key than the adapter "
         f"drains: pending keys={list(adapter._pending_messages)} "

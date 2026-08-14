@@ -1299,10 +1299,15 @@ def judge_goal(
     return verdict, reason, parse_failed, wait_directive, False
 
 
-def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def gather_background_processes(
+    task_id: Optional[str] = None,
+    session_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Return the live background-process snapshot for the goal judge.
 
-    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
+    Thin, fail-safe wrapper over ``process_registry.list_sessions``. Gateway
+    callers pass a session key so one chat cannot park its goal on another
+    chat's process.
     Returns only RUNNING processes (an exited one is nothing to wait on) and
     never raises — any import/registry failure yields ``[]`` so the goal loop
     degrades to its pre-wait-barrier behavior (judge just won't see processes).
@@ -1312,7 +1317,10 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     try:
         from tools.process_registry import process_registry
 
-        sessions = process_registry.list_sessions(task_id=task_id) or []
+        sessions = process_registry.list_sessions(
+            task_id=task_id,
+            session_key=session_key,
+        ) or []
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []
