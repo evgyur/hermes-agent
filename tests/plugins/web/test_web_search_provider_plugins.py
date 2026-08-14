@@ -221,7 +221,7 @@ class TestIsAvailable:
         monkeypatch.setenv("PERPLEXITY_API_KEY", "real")
         assert p.is_available() is True
 
-    def test_perplexity_search_defaults_to_social_and_web_sources(
+    def test_perplexity_search_uses_agent_api_and_typed_search_results(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _ensure_plugins_loaded()
@@ -236,10 +236,25 @@ class TestIsAvailable:
 
             def json(self):
                 return {
-                    "choices": [
-                        {"message": {"content": "answer"}},
+                    "id": "resp_test",
+                    "output": [
+                        {
+                            "type": "search_results",
+                            "queries": ["test"],
+                            "results": [
+                                {
+                                    "title": "Source",
+                                    "url": "https://example.com/source",
+                                    "snippet": "grounded snippet",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "answer"}],
+                        },
                     ],
-                    "citations": ["https://example.com/source"],
+                    "usage": {"cost": {"total_cost": 0.004}},
                 }
 
         def fake_post(url, *, headers, json, timeout):
@@ -257,8 +272,53 @@ class TestIsAvailable:
         result = p.search("test", limit=1)
 
         assert result.get("success") is True
-        assert posted["json"]["model"] == "sonar"
-        assert posted["json"]["search_sources"] == ["social", "web"]
+        assert posted["url"] == "https://api.perplexity.ai/v1/agent"
+        assert posted["json"]["model"] == "perplexity/sonar"
+        assert posted["json"]["input"] == "test"
+        assert posted["json"]["tools"] == [
+            {"type": "web_search", "max_results": 1, "search_context_size": "low"}
+        ]
+        assert posted["json"]["max_tool_calls"] == 1
+        assert result["answer"] == "answer"
+        assert result["data"]["web"][0]["url"] == "https://example.com/source"
+        assert result["usage"]["cost"]["total_cost"] == 0.004
+        assert result["request_id"] == "resp_test"
+        assert result["grounded"] is True
+
+    def test_perplexity_does_not_fabricate_source_when_agent_returns_only_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+        from plugins.web.perplexity import provider as perplexity_provider
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "answer"}],
+                        }
+                    ]
+                }
+
+        monkeypatch.setenv("PPLX_API_KEY", "real")
+        monkeypatch.setattr(
+            perplexity_provider.requests,
+            "post",
+            lambda *args, **kwargs: FakeResponse(),
+        )
+        p = get_provider("perplexity")
+        assert p is not None
+        result = p.search("test", limit=1)
+        assert result["answer"] == "answer"
+        assert result["data"]["web"] == []
+        assert result["citations"] == []
+        assert result["grounded"] is False
 
     def test_firecrawl_requires_either_key_or_url(
         self, monkeypatch: pytest.MonkeyPatch
