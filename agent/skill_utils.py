@@ -30,6 +30,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
+        ".backups",
         ".sync-backups",
         ".venv",
         "venv",
@@ -50,10 +51,14 @@ EXCLUDED_SKILL_DIR_SUFFIXES = (
     ".local-backup",
 )
 
-# Supporting files live inside a skill package and are loaded explicitly via
-# skill_view(skill, file_path=...). They are not standalone skills and must not
-# be scanned for active SKILL.md/DESCRIPTION.md entries.
-SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+# Supporting files and embedded package snapshots live inside a concrete skill
+# root and are loaded explicitly by that skill. They are not standalone skills.
+# The names remain valid as top-level categories because the iterator prunes
+# them only when the current directory already owns a SKILL.md.
+SKILL_SUPPORT_DIRS = frozenset(
+    ("references", "templates", "assets", "scripts", "skills", "runtime", "upstream")
+)
+EXCLUDED_SKILL_PATH_SEGMENT_PAIRS = frozenset((("references", "absorbed"),))
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
@@ -130,8 +135,15 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(is_excluded_skill_dir(part) for part in parts) or is_skill_support_path(
-        path, root=root
+    normalized_parts = tuple(str(part).strip().lower() for part in parts)
+    has_excluded_pair = any(
+        pair in tuple(zip(normalized_parts, normalized_parts[1:]))
+        for pair in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
+    )
+    return (
+        any(is_excluded_skill_dir(part) for part in normalized_parts)
+        or has_excluded_pair
+        or is_skill_support_path(path, root=root)
     )
 
 
@@ -882,10 +894,19 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         elif root == org_root:
             # Inside _org/: descend ONLY into the active org's mirror.
             dirs[:] = [d for d in dirs if d == active_org]
+        try:
+            relative_root_parts = Path(root).relative_to(skills_dir).parts
+        except ValueError:
+            relative_root_parts = ()
         dirs[:] = [
             d
             for d in dirs
             if not is_excluded_skill_dir(d)
+            and not (
+                relative_root_parts
+                and (str(relative_root_parts[-1]).lower(), str(d).lower())
+                in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
+            )
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:

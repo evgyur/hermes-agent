@@ -310,6 +310,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # reach everything, and every name stays visible for recall). The
         # default coding posture leaves the index untouched.
         _compact_cats = set()
+        _skills_cfg = {}
         try:
             from agent.coding_context import coding_compact_skill_categories
 
@@ -343,10 +344,27 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
+        try:
+            from agent.skill_routing import (
+                agent_skill_routing_boundaries,
+                resolve_agent_skill_routing_policy,
+            )
+
+            _routing_policy = resolve_agent_skill_routing_policy(
+                agent,
+                config_policy=_skills_cfg.get("routing_policy"),
+            )
+            _routing_boundaries = agent_skill_routing_boundaries(agent) or ()
+        except Exception:
+            _routing_policy = "conservative"
+            _routing_boundaries = ()
+
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=frozenset(_compact_cats) or None,
+            routing_policy=_routing_policy,
+            protected_boundaries=_routing_boundaries,
         )
     else:
         skills_prompt = ""

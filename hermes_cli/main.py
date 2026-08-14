@@ -473,6 +473,7 @@ from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+from hermes_cli.subcommands.context import build_context_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
@@ -691,6 +692,16 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+
+# ``context audit --local`` is a strict diagnostic boundary. Dispatch it before
+# dotenv loading, file logging, plugin/hook/MCP discovery, or AIAgent creation.
+# The exact two-token match avoids stealing similarly named chat prompts.
+if len(sys.argv) >= 3 and sys.argv[1:3] == ["context", "audit"]:
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    from hermes_cli.context_audit import early_cli_main as _context_audit_main
+
+    raise SystemExit(_context_audit_main(sys.argv[3:]))
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -10659,7 +10670,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "pets", "plugins", "portal", "profile",
         "project", "proxy",
-        "prompt-size",
+        "prompt-size", "context",
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
@@ -12514,6 +12525,10 @@ def main():
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)
     # =========================================================================
     build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
+
+    # ``context audit`` executes via the strict pre-bootstrap dispatch above;
+    # registration here keeps top-level help and parser introspection complete.
+    build_context_parser(subparsers)
 
     # =========================================================================
     # Parse and execute

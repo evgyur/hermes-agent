@@ -1849,6 +1849,12 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Skill-body routing policy. `conservative` preserves the legacy
+        # mandatory loading contract. `lean_canary` is only an allow-list:
+        # it still requires an explicit task override, risk_class=low, and an
+        # explicitly empty protected-boundary set; otherwise resolution fails
+        # closed to conservative.
+        "routing_policy": "conservative",
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

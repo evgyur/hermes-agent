@@ -3,7 +3,7 @@
 Covers the design agreed 2026-07-23 (bare-name first-class org skills):
  1. TOKEN-GATED discovery — only the `.active_org`-marked mirror resolves;
     stale mirrors and marker-less trees never load.
- 2. Fail-loud collisions — a personal/org name clash lists BOTH sides flagged;
+ 2. Fail-loud collisions — a personal/org name clash lists one collision entry;
     skill_view's existing multi-candidate guard refuses the bare name.
  3. Load-time provenance header — org skill content announces org + author.
  4. Org mirrors are read-only (skill_manage guards) and curation-exempt.
@@ -14,7 +14,7 @@ import json
 import pytest
 
 from agent import skill_utils as sku
-from agent.prompt_builder import _build_snapshot_entry
+from agent.prompt_builder import _build_skills_manifest, _build_snapshot_entry
 
 
 def _mk_skill(root, rel, name=None, body="# body\n"):
@@ -60,6 +60,19 @@ class TestTokenGatedDiscovery:
         _mark_active(skills, "org-2")
         found = [p.parent.name for p in sku.iter_skill_index_files(skills, "SKILL.md")]
         assert found and "other-z" in found and "shared-x" not in found
+
+    def test_snapshot_manifest_tracks_only_active_org(self, tmp_path):
+        skills = tmp_path / "skills"
+        _mk_skill(skills, "personal-a")
+        _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
+        _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-OLD/stale-y", name="stale-y")
+        _mark_active(skills, "org-1")
+
+        manifest = _build_skills_manifest(skills)
+
+        assert "personal-a/SKILL.md" in manifest
+        assert f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x/SKILL.md" in manifest
+        assert all("org-OLD" not in path for path in manifest)
 
     def test_helpers(self, tmp_path):
         skills = tmp_path / "skills"
@@ -130,7 +143,7 @@ class TestListingCollisionsAndLabels:
         assert "[org-shared: by bens-macbook]" in out
         assert "personal-a" in out
 
-    def test_collision_flags_both_sides(self, tmp_path, monkeypatch):
+    def test_collision_renders_one_fail_closed_catalog_entry(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "k8s-debug", body="personal version\n")
         _mk_skill(
@@ -138,8 +151,9 @@ class TestListingCollisionsAndLabels:
         )
         _mark_active(skills, "org-1")
         out = pb.build_skills_system_prompt()
-        # BOTH entries flagged — neither silently wins.
-        assert out.count("[name collision") == 2
+        assert out.count("k8s-debug") == 1
+        assert out.count("[name collision") == 1
+        assert "bare skill_view is blocked" in out
 
     def test_no_collision_flag_when_unique(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
