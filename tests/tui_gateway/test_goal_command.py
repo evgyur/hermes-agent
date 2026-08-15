@@ -112,6 +112,14 @@ def test_goal_whitespace_only_shows_status(server, session):
     assert "No active goal" in r["result"]["output"]
 
 
+def test_post_turn_goal_wait_snapshot_is_scoped_to_tui_session(server):
+    import inspect
+
+    source = inspect.getsource(server._run_prompt_submit)
+    assert "_gather_bg(session_key=sid_key)" in source
+    assert "_gather_bg()" not in source
+
+
 def test_goal_status_alias_shows_status(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="status", session_id=sid)

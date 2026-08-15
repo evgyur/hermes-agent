@@ -20817,6 +20817,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:

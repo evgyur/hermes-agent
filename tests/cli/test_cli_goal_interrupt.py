@@ -125,6 +125,24 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
 
+    def test_goal_wait_snapshot_is_scoped_to_current_cli_session(self, hermes_home):
+        sid = f"sid-owner-{uuid.uuid4().hex}"
+        cli, _mgr = _make_cli_with_goal(sid)
+        cli.conversation_history = [
+            {"role": "assistant", "content": "waiting for owned process"},
+        ]
+
+        with patch(
+            "hermes_cli.goals.gather_background_processes",
+            return_value=[],
+        ) as gather, patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "no owned callback", False, None, False),
+        ):
+            cli._maybe_continue_goal_after_turn()
+
+        gather.assert_called_once_with(session_key=sid)
+
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
         sid = f"sid-done-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)

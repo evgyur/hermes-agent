@@ -10092,7 +10092,7 @@ def _run_prompt_submit(
                         if goal_mgr.is_active():
                             try:
                                 from hermes_cli.goals import gather_background_processes as _gather_bg
-                                _bg_procs = _gather_bg()
+                                _bg_procs = _gather_bg(session_key=sid_key)
                             except Exception:
                                 _bg_procs = None
                             decision = goal_mgr.evaluate_after_turn(

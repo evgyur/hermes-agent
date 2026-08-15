@@ -18,6 +18,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    SKILL_MANAGE_SCHEMA,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -57,6 +58,14 @@ description: Updated description.
 
 Step 1: Do the new thing.
 """
+
+
+def test_skill_manage_schema_does_not_mandate_post_completion_work():
+    description = SKILL_MANAGE_SCHEMA["description"]
+
+    assert "patch it immediately" not in description
+    assert "After difficult/iterative tasks, offer to save as a skill" not in description
+    assert "Do not extend a completed assignment" in description
 
 LONG_DESC_CONTENT = """\
 ---

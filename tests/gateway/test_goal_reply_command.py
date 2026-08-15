@@ -93,6 +93,7 @@ async def test_bare_goal_reply_uses_replied_to_text_as_goal(hermes_home, runner)
     assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
     assert state.goal in queued.text
     assert queued.source == runner.source
+    assert queued.internal is True
 
 
 @pytest.mark.asyncio

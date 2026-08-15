@@ -10995,7 +10995,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         try:
             from hermes_cli.goals import gather_background_processes as _gather_bg
-            _bg_procs = _gather_bg()
+            # Standalone CLI tool calls use the conversation session_id as the
+            # terminal process-registry session_key/task owner. Restrict the
+            # judge snapshot to that exact owner so another CLI session cannot
+            # authorize WAIT.
+            _bg_procs = _gather_bg(session_key=mgr.session_id)
         except Exception:
             _bg_procs = None
 
