@@ -1342,7 +1342,18 @@ def gather_background_processes(
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []
-    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
+    result: List[Dict[str, Any]] = []
+    for process in sessions:
+        if not isinstance(process, dict) or process.get("status") == "exited":
+            continue
+        owned = dict(process)
+        if session_key:
+            # Internal provenance for the post-judge live reread. The judge
+            # renderer ignores unknown/private fields, so raw routing identity
+            # never enters the model prompt.
+            owned["_hermes_owner_session_key"] = session_key
+        result.append(owned)
+    return result
 
 
 def _registered_process_callback_is_live(
@@ -1385,10 +1396,22 @@ def _registered_process_callback_is_live(
     ):
         return False
 
+    owners = {
+        str(process.get("_hermes_owner_session_key") or "")
+        for process in background_processes or []
+        if isinstance(process, dict)
+        and str(process.get("_hermes_owner_session_key") or "")
+    }
+    if len(owners) != 1:
+        return False
+    owner_session_key = next(iter(owners))
+
     try:
         from tools.process_registry import process_registry
 
-        live_processes = process_registry.list_sessions() or []
+        live_processes = process_registry.list_sessions(
+            session_key=owner_session_key,
+        ) or []
     except Exception as exc:
         logger.debug("process callback revalidation failed: %s", exc)
         return False

@@ -1644,6 +1644,7 @@ class TestJudgeDrivenWait:
                         "command": "review.sh",
                         "status": "running",
                         "notify_on_complete": True,
+                        "_hermes_owner_session_key": "gateway:test",
                     }],
                 )
         finally:
@@ -1653,6 +1654,73 @@ class TestJudgeDrivenWait:
         assert decision["verdict"] == "wait"
         assert decision["should_continue"] is False
         assert mgr.state.waiting_on_session == sid
+
+    def test_foreign_pid_replacement_does_not_authorize_wait(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import ProcessSession, process_registry
+
+        owner_key = "gateway:owner"
+        owned_id = "proc_owned_before_judge"
+        foreign_id = "proc_foreign_replacement"
+        reused_pid = 5151
+        owned = ProcessSession(
+            id=owned_id,
+            command="owned-review.sh",
+            task_id="owned-task",
+            session_key=owner_key,
+            pid=reused_pid,
+            cwd="/tmp",
+            started_at=time.time(),
+        )
+        owned.notify_on_complete = True
+        process_registry._running[owned_id] = owned
+
+        def replace_during_judge(*_args, **_kwargs):
+            process_registry._running.pop(owned_id, None)
+            foreign = ProcessSession(
+                id=foreign_id,
+                command="foreign-review.sh",
+                task_id="foreign-task",
+                session_key="gateway:foreign",
+                pid=reused_pid,
+                cwd="/tmp",
+                started_at=time.time(),
+            )
+            foreign.notify_on_complete = True
+            process_registry._running[foreign_id] = foreign
+            return (
+                "wait",
+                "owned reviewer still running",
+                False,
+                {"pid": reused_pid},
+                False,
+            )
+
+        try:
+            mgr = GoalManager(session_id="jw-foreign-replacement", default_max_turns=10)
+            mgr.set("finish the release")
+            with patch.object(goals, "judge_goal", side_effect=replace_during_judge):
+                decision = mgr.evaluate_after_turn(
+                    "Waiting for the owned reviewer callback.",
+                    background_processes=[{
+                        "session_id": owned_id,
+                        "pid": reused_pid,
+                        "command": "owned-review.sh",
+                        "status": "running",
+                        "notify_on_complete": True,
+                        "_hermes_owner_session_key": owner_key,
+                    }],
+                )
+        finally:
+            process_registry._running.pop(owned_id, None)
+            process_registry._running.pop(foreign_id, None)
+            process_registry._finished.pop(owned_id, None)
+            process_registry._finished.pop(foreign_id, None)
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.waiting_on_pid is None
 
     def test_stale_callback_snapshot_does_not_park(self, hermes_home):
         from hermes_cli import goals
