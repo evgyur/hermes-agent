@@ -104,11 +104,13 @@ async def _abort_parent_task_delivery(
     return True
 
 
-async def _settle_parent_task_delivery(response, *, delivered: bool) -> bool:
+async def _settle_parent_task_delivery(
+    response, *, delivered: bool, obligation_id: str = ""
+) -> bool:
     """Close an accepted continuation only after its platform outcome is known."""
     from tools.parent_task_barrier import (
         TrustedParentTaskDelivery,
-        complete_continuation,
+        complete_continuation_after_delivery,
     )
 
     if not isinstance(response, TrustedParentTaskDelivery) or not delivered:
@@ -117,10 +119,10 @@ async def _settle_parent_task_delivery(response, *, delivered: bool) -> bool:
     for attempt in range(3):
         try:
             closed = await asyncio.to_thread(
-                complete_continuation,
+                complete_continuation_after_delivery,
                 marker["barrier_id"],
                 marker["continuation_claim"],
-                result=marker.get("result") or {},
+                obligation_id=obligation_id,
             )
             if closed:
                 return True
@@ -6912,6 +6914,7 @@ class BasePlatformAdapter(ABC):
                     _closed_parent = await _settle_parent_task_delivery(
                         _parent_delivery_response,
                         delivered=True,
+                        obligation_id=_parent_obligation_id or "",
                     )
                     if not _closed_parent:
                         logger.error(

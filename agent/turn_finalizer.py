@@ -464,15 +464,13 @@ def finalize_turn(
         if _parent_task_policy.get("action") in {"withhold", "error"}:
             try:
                 _barrier_id = str(_parent_task_policy.get("barrier_id") or "")
-                _candidate = next(
-                    (
-                        item
-                        for item in reversed(messages)
-                        if isinstance(item, dict) and item.get("role") == "assistant"
-                    ),
-                    None,
-                )
-                if _candidate is None:
+                _turn_assistants = []
+                for _item in reversed(messages):
+                    if isinstance(_item, dict) and _item.get("role") == "user":
+                        break
+                    if isinstance(_item, dict) and _item.get("role") == "assistant":
+                        _turn_assistants.append(_item)
+                if not _turn_assistants:
                     raise RuntimeError(
                         "parent-task policy could not bind the provisional answer"
                     )
@@ -483,17 +481,18 @@ def finalize_turn(
                     raise RuntimeError(
                         "required-child barrier could not bind the provisional answer"
                     )
-                _candidate["content"] = ""
-                for _private_text_key in (
-                    "reasoning",
-                    "reasoning_content",
-                    "analysis",
-                    "thinking",
-                ):
-                    _candidate.pop(_private_text_key, None)
-                _candidate["_parent_task_candidate"] = True
-                _candidate["_parent_task_barrier_id"] = _barrier_id
-                _candidate.pop("_db_persisted", None)
+                for _candidate in _turn_assistants:
+                    _candidate["content"] = ""
+                    for _private_text_key in (
+                        "reasoning",
+                        "reasoning_content",
+                        "analysis",
+                        "thinking",
+                    ):
+                        _candidate.pop(_private_text_key, None)
+                    _candidate.pop("_db_persisted", None)
+                _turn_assistants[0]["_parent_task_candidate"] = True
+                _turn_assistants[0]["_parent_task_barrier_id"] = _barrier_id
                 agent._db_flush_scan_prefix = None
             except Exception as _barrier_err:
                 _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
@@ -715,8 +714,12 @@ def finalize_turn(
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    # First hook to return a string wins; provisional text never reaches plugins.
+    if (
+        final_response
+        and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -771,9 +774,12 @@ def finalize_turn(
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
-    # Plugins can use this to persist conversation data (e.g. sync
-    # to an external memory system).
-    if final_response and not interrupted:
+    # Plugins may persist responses, so provisional text is excluded entirely.
+    if (
+        final_response
+        and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -790,33 +796,33 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
-    # Context engine observation hook: notify the active engine that this
-    # turn has finished, with the finalized transcript. Complements the
-    # per-request select_context() hook (selection before the request;
-    # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    # Context engine observation hook can persist transcript content, so it is
+    # skipped for provisional/error parent-task turns.
+    if _parent_task_policy.get("action") == "deliver":
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
+
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything

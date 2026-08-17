@@ -231,6 +231,18 @@ async def test_platform_ack_settles_trusted_parent_delivery():
         continuation_claim=claim["continuation_claim"],
         result={"final_response": "final"},
     )
+    empty_delivery = barrier.TrustedParentTaskDelivery(
+        "",
+        barrier_id=barrier_id,
+        continuation_claim=claim["continuation_claim"],
+        result={},
+    )
+    assert not await _settle_parent_task_delivery(
+        empty_delivery, delivered=True, obligation_id=""
+    )
+    unbound_snapshot = barrier.barrier_snapshot(barrier_id)
+    assert unbound_snapshot is not None
+    assert unbound_snapshot["barrier"]["state"] == "continuing"
     record_obligation(
         obligation_id="oid",
         session_key="origin",
@@ -242,7 +254,9 @@ async def test_platform_ack_settles_trusted_parent_delivery():
     mark_attempting("oid")
     assert await _prepare_parent_task_delivery(delivery, "oid")
     mark_delivered("oid")
-    assert await _settle_parent_task_delivery(delivery, delivered=True)
+    assert await _settle_parent_task_delivery(
+        delivery, delivered=True, obligation_id="oid"
+    )
     snapshot = barrier.barrier_snapshot(barrier_id)
     assert snapshot is not None
     assert snapshot["barrier"]["state"] == "closed"

@@ -112,6 +112,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             next_attempt_at REAL,
             accepted_turn_id TEXT NOT NULL DEFAULT '',
             accepted_owner_pid INTEGER,
+            accepted_owner_started_at INTEGER,
             accepted_at REAL,
             generation INTEGER NOT NULL DEFAULT 0,
             delivery_obligation_id TEXT NOT NULL DEFAULT '',
@@ -168,6 +169,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "next_attempt_at": "REAL",
         "accepted_turn_id": "TEXT NOT NULL DEFAULT ''",
         "accepted_owner_pid": "INTEGER",
+        "accepted_owner_started_at": "INTEGER",
         "accepted_at": "REAL",
         "generation": "INTEGER NOT NULL DEFAULT 0",
         "delivery_obligation_id": "TEXT NOT NULL DEFAULT ''",
@@ -188,6 +190,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             "next_attempt_at",
             "accepted_turn_id",
             "accepted_owner_pid",
+            "accepted_owner_started_at",
             "accepted_at",
             "generation",
             "delivery_obligation_id",
@@ -202,8 +205,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if integrity is None or str(integrity[0]).lower() != "ok":
             raise RuntimeError("parent-task barrier migration failed integrity_check")
         conn.execute(
-            "UPDATE parent_task_barrier_meta SET schema_version=5 "
-            "WHERE singleton=1 AND schema_version<5"
+            "UPDATE parent_task_barrier_meta SET schema_version=6 "
+            "WHERE singleton=1 AND schema_version<6"
         )
 
 
@@ -333,7 +336,8 @@ def admit_required_child(
                        continuation_owner='', continuation_lease_until=NULL,
                        continuation_attempts=0, terminal_delivery_attempts=0,
                        next_attempt_at=NULL, accepted_turn_id='',
-                       accepted_owner_pid=NULL, accepted_at=NULL,
+                       accepted_owner_pid=NULL, accepted_owner_started_at=NULL,
+                       accepted_at=NULL,
                        delivery_obligation_id='',
                        generation=generation+1, updated_at=?
                    WHERE barrier_id=?""",
@@ -658,7 +662,7 @@ def claim_next_ready_continuation(
                 )
         accepted_rows = conn.execute(
             """SELECT barrier_id, continuation_claim, accepted_owner_pid,
-                      delivery_obligation_id
+                      accepted_owner_started_at, delivery_obligation_id
                FROM parent_task_barriers
                WHERE state='continuing' AND continuation_status='accepted'"""
         ).fetchall()
@@ -667,9 +671,6 @@ def claim_next_ready_continuation(
                WHERE type='table' AND name='delivery_obligations'"""
         ).fetchone() is not None
         for accepted_row in accepted_rows:
-            owner_pid = accepted_row["accepted_owner_pid"]
-            if owner_pid is None or not _pid_is_dead(int(owner_pid)):
-                continue
             obligation_id = str(accepted_row["delivery_obligation_id"] or "")
             delivery_state = ""
             if obligation_id and delivery_table_exists:
@@ -695,14 +696,20 @@ def claim_next_ready_continuation(
                     ),
                 )
                 continue
-            if delivery_state in {"pending", "attempting", "failed"}:
-                continue
+            if delivery_state not in {"failed", "abandoned"}:
+                owner_pid = int(accepted_row["accepted_owner_pid"] or 0)
+                owner_started = accepted_row["accepted_owner_started_at"]
+                if not _owner_is_dead(owner_pid, owner_started):
+                    continue
+                if delivery_state in {"pending", "attempting"}:
+                    continue
             conn.execute(
                 """UPDATE parent_task_barriers
                    SET state='ready', continuation_status='pending',
                        continuation_claim='', continuation_owner='',
                        continuation_lease_until=NULL, accepted_turn_id='',
-                       accepted_owner_pid=NULL, accepted_at=NULL,
+                       accepted_owner_pid=NULL, accepted_owner_started_at=NULL,
+                       accepted_at=NULL,
                        delivery_obligation_id='',
                        updated_at=?
                    WHERE barrier_id=? AND state='continuing'
@@ -849,22 +856,33 @@ def accept_continuation(
     *,
     accepted_turn_id: str,
     owner_pid: int,
+    owner_started_at: Optional[int] = None,
 ) -> bool:
     turn_id = str(accepted_turn_id or "").strip()
     if not turn_id or int(owner_pid) <= 0:
         return False
+    if owner_started_at is None:
+        try:
+            from gateway.status import get_process_start_time
+
+            started = get_process_start_time(int(owner_pid))
+            owner_started_at = int(started) if started is not None else None
+        except Exception:
+            owner_started_at = None
     now = time.time()
     with _transaction() as conn:
         changed = conn.execute(
             """UPDATE parent_task_barriers
                SET state='continuing', continuation_status='accepted',
-                   accepted_turn_id=?, accepted_owner_pid=?, accepted_at=?,
+                   accepted_turn_id=?, accepted_owner_pid=?,
+                   accepted_owner_started_at=?, accepted_at=?,
                    continuation_lease_until=NULL, updated_at=?
                WHERE barrier_id=? AND state='resuming'
                  AND continuation_status='claimed' AND continuation_claim=?""",
             (
                 turn_id,
                 int(owner_pid),
+                owner_started_at,
                 now,
                 now,
                 str(barrier_id),
@@ -908,7 +926,8 @@ def release_accepted_continuation(barrier_id: str, claim: str) -> bool:
             """UPDATE parent_task_barriers
                SET state='ready', continuation_status='pending',
                    continuation_claim='', continuation_owner='',
-                   accepted_turn_id='', accepted_owner_pid=NULL, accepted_at=NULL,
+                   accepted_turn_id='', accepted_owner_pid=NULL, accepted_owner_started_at=NULL,
+                       accepted_at=NULL,
                    delivery_obligation_id='',
                    next_attempt_at=?, updated_at=?
                WHERE barrier_id=? AND state='continuing'
@@ -940,9 +959,38 @@ def complete_continuation(
     return changed == 1
 
 
-def cancel_session_barriers(*, origin_session: str = "", parent_session_id: str = "") -> int:
-    """Terminally cancel open ownership on explicit /stop, /new, or /reset."""
+def complete_continuation_after_delivery(
+    barrier_id: str,
+    claim: str,
+    *,
+    obligation_id: str,
+) -> bool:
+    """Close only after the exact bound obligation is durably delivered."""
+    obligation = str(obligation_id or "").strip()
+    if not obligation:
+        return False
+    now = time.time()
+    sql = (
+        "UPDATE parent_task_barriers SET state='closed', "
+        "continuation_status='generated', continuation_lease_until=NULL, "
+        "updated_at=?, closed_at=? WHERE barrier_id=? AND state='continuing' "
+        "AND continuation_status='accepted' AND continuation_claim=? "
+        "AND delivery_obligation_id=? AND EXISTS ("
+        "SELECT 1 FROM delivery_obligations "
+        "WHERE obligation_id=? AND state='delivered')"
+    )
+    with _transaction() as conn:
+        changed = conn.execute(
+            sql,
+            (now, now, str(barrier_id), str(claim), obligation, obligation),
+        ).rowcount
+    return changed == 1
 
+
+def cancel_session_barriers(
+    *, origin_session: str = "", parent_session_id: str = ""
+) -> int:
+    """Terminally cancel open ownership on explicit session controls."""
     clauses = []
     params: list[Any] = []
     if str(origin_session or "").strip():
@@ -956,8 +1004,8 @@ def cancel_session_barriers(*, origin_session: str = "", parent_session_id: str 
     now = time.time()
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT barrier_id FROM parent_task_barriers
-               WHERE state NOT IN ('closed','cancelled','failed') AND ("""
+            "SELECT barrier_id FROM parent_task_barriers "
+            "WHERE state NOT IN ('closed','cancelled','failed') AND ("
             + " OR ".join(clauses)
             + ")",
             params,
@@ -965,21 +1013,18 @@ def cancel_session_barriers(*, origin_session: str = "", parent_session_id: str 
         ids = [str(row["barrier_id"]) for row in rows]
         for barrier_id in ids:
             conn.execute(
-                """UPDATE parent_task_children
-                   SET state='cancelled', terminal_at=COALESCE(terminal_at, ?),
-                       updated_at=?
-                   WHERE barrier_id=? AND state NOT IN (
-                     'completed','failed','error','timeout','stalled','interrupted',
-                     'cancelled','unknown'
-                   )""",
+                "UPDATE parent_task_children SET state='cancelled', "
+                "terminal_at=COALESCE(terminal_at, ?), updated_at=? "
+                "WHERE barrier_id=? AND state NOT IN ("
+                "'completed','failed','error','timeout','stalled','interrupted',"
+                "'cancelled','unknown')",
                 (now, now, barrier_id),
             )
             conn.execute(
-                """UPDATE parent_task_barriers
-                   SET state='cancelled', continuation_status='cancelled',
-                       continuation_claim='', continuation_owner='',
-                       continuation_lease_until=NULL, updated_at=?, closed_at=?
-                   WHERE barrier_id=?""",
+                "UPDATE parent_task_barriers SET state='cancelled', "
+                "continuation_status='cancelled', continuation_claim='', "
+                "continuation_owner='', continuation_lease_until=NULL, "
+                "updated_at=?, closed_at=? WHERE barrier_id=?",
                 (now, now, barrier_id),
             )
     return len(ids)

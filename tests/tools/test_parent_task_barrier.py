@@ -262,6 +262,31 @@ def test_accepted_live_owner_is_not_reclaimed_but_dead_owner_is(
     assert second["continuation_claim"] != first["continuation_claim"]
 
 
+def test_accepted_pid_reuse_is_reclaimed(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    first = barrier.claim_next_ready_continuation(owner="gateway")
+    assert first is not None
+    assert barrier.accept_continuation(
+        barrier_id,
+        first["continuation_claim"],
+        accepted_turn_id="accepted",
+        owner_pid=os.getpid(),
+        owner_started_at=1,
+    )
+    second = barrier.claim_next_ready_continuation(owner="recovery")
+    assert second is not None
+    assert second["continuation_claim"] != first["continuation_claim"]
+
+
 def test_terminal_delivery_retries_are_bounded(monkeypatch, tmp_path):
     _use_db(monkeypatch, tmp_path)
     barrier_id = barrier.admit_required_child(
@@ -307,7 +332,7 @@ def test_terminal_delivery_retries_are_bounded(monkeypatch, tmp_path):
     )
 
 
-def test_delivered_obligation_closes_dead_accepted_continuation(monkeypatch, tmp_path):
+def test_delivered_obligation_closes_live_accepted_continuation(monkeypatch, tmp_path):
     _use_db(monkeypatch, tmp_path)
     barrier_id = barrier.admit_required_child(
         origin_session="origin",
@@ -335,11 +360,6 @@ def test_delivered_obligation_closes_dead_accepted_continuation(monkeypatch, tmp
         )
         conn.execute(
             "INSERT INTO delivery_obligations VALUES ('delivery-1', 'delivered')"
-        )
-        conn.execute(
-            "UPDATE parent_task_barriers SET accepted_owner_pid=99999999 "
-            "WHERE barrier_id=?",
-            (barrier_id,),
         )
     assert barrier.claim_next_ready_continuation(owner="recovery") is None
     snapshot = barrier.barrier_snapshot(barrier_id)
@@ -563,7 +583,7 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
         conn.execute(
             "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
         ).fetchone()[0]
-        == 5
+        == 6
     )
     conn.close()
     assert {"parent_task_barriers", "parent_task_children"} <= tables

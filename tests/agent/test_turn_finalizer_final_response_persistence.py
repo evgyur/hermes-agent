@@ -242,6 +242,18 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
     setattr(barrier, "mark_initial_persisted", lambda _barrier_id: True)
     monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached lifecycle hook")
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("provisional transcript reached context hook")
+        ),
+    )
 
     agent = FakeAgent()
     setattr(agent, "_db_flush_scan_prefix", [])
@@ -259,7 +271,22 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
             AssertionError("provisional answer reached external memory")
         ),
     )
-    messages = [{"role": "user", "content": "delegate and finish"}]
+    messages = [
+        {"role": "user", "content": "delegate and finish"},
+        {
+            "role": "assistant",
+            "content": "PRE_TOOL_PROVISIONAL_SECRET",
+            "reasoning": "PRIVATE_REASONING",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "delegate_task", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "dispatched"},
+    ]
 
     result = finalize_turn(
         agent,
@@ -284,6 +311,13 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
     assert agent.persisted_messages[-1]["content"] == ""
     assert "Initial parent answer must stay hidden" not in str(
         agent.persisted_messages
+    )
+    assert "PRE_TOOL_PROVISIONAL_SECRET" not in str(agent.persisted_messages)
+    assert "PRIVATE_REASONING" not in str(agent.persisted_messages)
+    assert all(
+        message.get("content") == ""
+        for message in agent.persisted_messages
+        if message.get("role") == "assistant"
     )
     assert agent.persisted_messages[-1]["_parent_task_candidate"] is True
     assert agent.persisted_messages[-1]["_parent_task_barrier_id"] == "barrier-1"
