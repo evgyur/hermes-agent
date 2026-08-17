@@ -39,6 +39,7 @@ from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
+    _generic_startup_auto_resume_enabled,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _resume_recovery_is_interactive,
@@ -161,9 +162,12 @@ def _simulate_note_injection(
     elif has_fresh_tool_tail:
         message = (
             "[System note: A new message has arrived. The conversation "
-            "history contains pending tool outputs from an interrupted turn. "
-            "IGNORE those pending results. Address the user's NEW message "
-            "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
+            "history contains recorded tool outputs from an interrupted turn. "
+            "Address the user's NEW message below FIRST and treat it as steering. "
+            "Unless the user explicitly cancels or supersedes the interrupted "
+            "task, reuse those tool results and CONTINUE from the first unrecorded "
+            "step to a user-visible result or real blocker. Do NOT blindly "
+            "re-execute side-effectful calls; inspect state first.]\n\n"
             + message
         )
 
@@ -357,6 +361,18 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "NEW message" in result
+        assert "CONTINUE the interrupted work" in result
+        assert "skip any unfinished work" not in result
+
+    def test_new_message_steers_without_abandoning_interrupted_task(self):
+        note = build_resume_recovery_note(
+            "restart_timeout", "?", interactive=True
+        )
+        assert "treat it as steering" in note
+        assert "CONTINUE the interrupted work" in note
+        assert "user-visible result or real blocker" in note
+        assert "skip any unfinished work" not in note
+        assert "first unrecorded step" in note
 
 
     def test_no_resume_pending_preserves_tool_tail_note(self):
@@ -370,8 +386,9 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert "[System note:" in result
-        assert "pending tool outputs" in result
-        assert "Do NOT re-execute" in result
+        assert "recorded tool outputs" in result
+        assert "reuse those tool results" in result
+        assert "CONTINUE from the first unrecorded step" in result
 
     def test_stale_resume_pending_does_not_inject_restart_note(self):
         """Old restart markers must not revive an unrelated stale task.
@@ -485,8 +502,9 @@ class TestResumePendingSystemNote:
             history, "ping", resume_entry=None, window_secs=0,
         )
         assert "[System note:" in result
-        assert "pending tool outputs" in result
-        assert "Do NOT re-execute" in result
+        assert "recorded tool outputs" in result
+        assert "reuse those tool results" in result
+        assert "CONTINUE from the first unrecorded step" in result
 
     def test_legacy_history_without_timestamps_still_injects(self):
         """Transcripts predating timestamp persistence must keep the old
@@ -499,8 +517,9 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert "[System note:" in result
-        assert "pending tool outputs" in result
-        assert "Do NOT re-execute" in result
+        assert "recorded tool outputs" in result
+        assert "reuse those tool results" in result
+        assert "CONTINUE from the first unrecorded step" in result
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +528,22 @@ class TestResumePendingSystemNote:
 
 
 class TestFreshnessHelpers:
+
+    def test_startup_auto_resume_reads_profile_config(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_STARTUP_AUTO_RESUME", raising=False)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"agent": {"gateway_startup_auto_resume": True}},
+        ):
+            assert _generic_startup_auto_resume_enabled() is True
+
+    def test_startup_auto_resume_env_override_remains_authoritative(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_STARTUP_AUTO_RESUME", "0")
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"agent": {"gateway_startup_auto_resume": True}},
+        ):
+            assert _generic_startup_auto_resume_enabled() is False
 
 
     def test_coerce_iso_string(self):
@@ -674,7 +709,9 @@ async def test_startup_auto_resume_disabled_by_default_waits_for_real_user_messa
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
     adapter.handle_message = AsyncMock()
 
-    with patch.dict("os.environ", {}, clear=True):
+    with patch.dict("os.environ", {}, clear=True), patch(
+        "hermes_cli.config.load_config", return_value={}
+    ):
         scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
