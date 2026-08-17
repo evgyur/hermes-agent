@@ -39,6 +39,58 @@ def _drain_one(timeout=5.0):
     return None
 
 
+def _assert_reentry_policy_contract(text: str) -> None:
+    """Async callbacks must resume active parents without reviving stale ones."""
+    normalized = " ".join(text.lower().split())
+
+    assert "not a new user request" in normalized
+    assert "original task is unfinished" in normalized
+    assert "awaited this result" in normalized
+    assert "resume it now" in normalized
+    assert "user-visible result or real blocker" in normalized
+
+    # Silence is valid only for explicitly stale/terminal parent requests.
+    assert "already terminally answered" in normalized
+    assert "explicitly cancelled" in normalized
+    assert "clearly superseded" in normalized
+    assert "respond exactly no_reply" in normalized
+
+    # An internal substep alone must never suppress continuation.
+    assert "never use silence merely because" in normalized
+    assert "internal substep" in normalized
+    assert "do not automatically re-dispatch, resume the old task" not in normalized
+
+
+def test_async_reentry_policy_contract_single():
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "contract-single",
+        "goal": "finish the original user task",
+        "status": "completed",
+        "summary": "synthetic result",
+    })
+
+    assert text is not None
+    _assert_reentry_policy_contract(text)
+
+
+def test_async_reentry_policy_contract_batch():
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "contract-batch",
+        "goals": ["first", "second"],
+        "is_batch": True,
+        "status": "completed",
+        "results": [
+            {"task_index": 0, "status": "completed", "summary": "one"},
+            {"task_index": 1, "status": "completed", "summary": "two"},
+        ],
+    })
+
+    assert text is not None
+    _assert_reentry_policy_contract(text)
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
@@ -142,10 +194,7 @@ def test_rich_reinjection_block_is_self_contained():
         "API calls: 7",
     ]:
         assert needle in text, f"missing {needle!r}"
-    assert "not a new user request" in text
-    assert "respond exactly NO_REPLY" in text
-    assert "Do not automatically re-dispatch" in text
-    assert "act on the result or re-dispatch" not in text
+    _assert_reentry_policy_contract(text)
 
 
 def test_dispatch_rejected_at_capacity():
@@ -833,10 +882,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert text is not None
     assert "TASK 1/3" in text and "TASK 2/3" in text and "TASK 3/3" in text
     assert "done: a" in text and "done: b" in text and "done: c" in text
-    assert "not a new user request" in text
-    assert "respond exactly NO_REPLY" in text
-    assert "Do not automatically re-dispatch" in text
-    assert "act on these or re-dispatch" not in text
+    _assert_reentry_policy_contract(text)
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
 

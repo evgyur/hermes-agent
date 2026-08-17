@@ -2633,9 +2633,11 @@ def _format_age(seconds: float) -> str:
 
 _ASYNC_DELEGATION_REENTRY_POLICY = (
     "INTERNAL CALLBACK POLICY: this completion is system-generated and is not a new user request.",
-    "Check the latest real user message before acting. Do not automatically re-dispatch, resume the old task, "
-    "or send progress/status. If the user has moved on, or this result contains neither a user-relevant final "
-    "deliverable nor a blocker that requires their decision, respond exactly NO_REPLY.",
+    "If the original task is unfinished and awaited this result, resume it now and continue until you reach a "
+    "user-visible result or real blocker.",
+    "Respond exactly NO_REPLY only when the original task is already terminally answered, explicitly cancelled, "
+    "or clearly superseded.",
+    "Never use silence merely because this completion is an internal substep.",
 )
 
 
