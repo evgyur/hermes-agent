@@ -108,6 +108,10 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
     adapter = CaptureAdapter()
     runner = _make_runner(adapter)
+    from hermes_state import SessionDB
+
+    ledger_db = SessionDB(tmp_path / "state.db")
+    runner._session_db = ledger_db
 
     image_path = tmp_path / "queued-image.png"
     image_path.write_bytes(_ONE_BY_ONE_PNG)
@@ -124,7 +128,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         thread_id="17585",
     )
 
-    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+    pending_event = MessageEvent(
         text="describe this",
         message_type=MessageType.PHOTO,
         source=pending_source,
@@ -132,6 +136,12 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         media_types=["image/png"],
         message_id="queued-1",
     )
+    adapter._pending_messages["agent:main:telegram:group:-1001"] = pending_event
+    ledger_id = runner._record_gateway_ledger_received(
+        pending_event,
+        session_key="agent:main:telegram:group:-1001",
+    )
+    runner._set_gateway_ledger_deferred(pending_event)
 
     result = await runner._run_agent(
         message="hello",
@@ -149,3 +159,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    ledger_row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert ledger_row is not None
+    assert ledger_row["status"] == "completed"
+    assert ledger_row["session_id"] == "sess-native-image-followup"

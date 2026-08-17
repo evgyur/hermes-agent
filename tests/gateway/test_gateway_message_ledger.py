@@ -102,6 +102,18 @@ def test_ledger_schema_and_direct_api_transition(ledger_db):
         status="in_progress",
         reason="duplicate-claimed",
     )
+    assert ledger_db.update_gateway_message_ledger(
+        ledger_id,
+        status="failed",
+        reason="late-failure",
+        timestamp=160.0,
+    )
+    assert ledger_db.update_gateway_message_ledger(
+        ledger_id,
+        status="drained",
+        reason="late-drain",
+        timestamp=170.0,
+    )
     duplicate_id = ledger_db.record_gateway_message_received(
         platform="telegram",
         chat_id="chat-1",
@@ -115,6 +127,8 @@ def test_ledger_schema_and_direct_api_transition(ledger_db):
     assert row["status"] == "completed"
     assert row["reason"] == "done"
     assert row["metadata"] == {"message_type": "text"}
+    assert row["failed_at"] is None
+    assert row["drained_at"] is None
 
     found = ledger_db.find_gateway_message_ledger(
         platform="telegram",
@@ -283,6 +297,19 @@ def test_startup_reconciliation_only_drains_previous_process_rows(ledger_db):
         message_id="old-active",
         received_at=100.0,
     )
+    replayed_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="old-replayed",
+        received_at=100.0,
+    )
+    assert ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="old-replayed",
+        reason="current-process-replay",
+        received_at=300.0,
+    ) == replayed_id
     current_id = ledger_db.record_gateway_message_received(
         platform="telegram",
         chat_id="chat-1",
@@ -307,6 +334,7 @@ def test_startup_reconciliation_only_drains_previous_process_rows(ledger_db):
     assert old_row["status"] == "drained"
     assert old_row["drained_at"] == 400.0
     assert old_row["reason"] == "gateway-startup-reconciliation"
+    assert ledger_db.get_gateway_message_ledger(replayed_id)["status"] == "received"
     assert ledger_db.get_gateway_message_ledger(current_id)["status"] == "received"
     assert ledger_db.get_gateway_message_ledger(done_id)["status"] == "completed"
 
@@ -363,6 +391,31 @@ async def test_handler_wrapper_terminalizes_command_style_early_return(ledger_db
     assert row["status"] == "completed"
     assert row["reason"] == "handled-without-agent-turn"
     assert row["metadata"] == {"completed": True, "agent_turn": False}
+
+
+@pytest.mark.asyncio
+async def test_busy_handler_records_and_preserves_deferred_event(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    event = _event(text="queued while busy", message_id="busy-deferred")
+    expected_session_key = "agent:main:telegram:dm:chat-1"
+
+    async def queue_in_busy_path(event, session_key):
+        assert session_key == expected_session_key
+        runner._set_gateway_ledger_deferred(event)
+        return True
+
+    runner._handle_active_session_busy_message_impl = queue_in_busy_path
+    assert await runner._handle_active_session_busy_message(event, expected_session_key) is True
+
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="busy-deferred",
+    )
+    assert row is not None
+    assert row["status"] == "requeued"
+    assert row["session_key"] == expected_session_key
+    assert row["reason"] == "handler-deferred"
 
 
 @pytest.mark.asyncio

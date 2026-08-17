@@ -10123,11 +10123,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 row["status"] if isinstance(row, sqlite3.Row) else row[1]
             )
             active_statuses = {"received", "requeued", "in_progress"}
-            if current_status not in active_statuses and status_s in active_statuses:
+            if current_status not in active_statuses:
                 # Platform retries and startup replays can traverse the ingress
                 # path again after the original turn has already reached a
-                # terminal state.  Lifecycle state is monotonic: never reopen
-                # completed/failed/drained work as merely received or active.
+                # terminal state.  Lifecycle state is immutable once terminal:
+                # neither active nor a different late terminal outcome may
+                # rewrite completed/failed/drained evidence.
                 return True
             assignments = [
                 "status = ?",
@@ -10213,7 +10214,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     updated_at = ?,
                     reason = ?
                 WHERE status IN ('received', 'requeued', 'in_progress')
-                  AND received_at < ?
+                  AND updated_at < ?
                 """,
                 (now, now, reason_s, cutoff),
             )

@@ -9665,7 +9665,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _handle_active_session_busy_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Handle busy-session ingress with a complete ledger lifecycle."""
+        try:
+            setattr(event, "_hermes_gateway_ledger_deferred", False)
+        except Exception:
+            pass
+        await asyncio.to_thread(
+            self._record_gateway_ledger_received,
+            event,
+            session_key=session_key,
+            reason="busy-handler-entry",
+        )
+        try:
+            handled = await self._handle_active_session_busy_message_impl(
+                event,
+                session_key,
+            )
+        except BaseException as exc:
+            await asyncio.to_thread(
+                self._finalize_gateway_ledger_after_handler,
+                event,
+                error=exc,
+            )
+            raise
+        if handled:
+            await asyncio.to_thread(
+                self._finalize_gateway_ledger_after_handler,
+                event,
+                None,
+            )
+        return handled
+
+    async def _handle_active_session_busy_message_impl(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -29214,6 +29254,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
+                            if pending_event is not None:
+                                self._update_gateway_ledger(
+                                    pending_event,
+                                    "drained",
+                                    session_key=session_key,
+                                    session_id=session_id,
+                                    reason="queued-command-discarded",
+                                )
                             pending_event = None
                             pending = None
                     except Exception:
@@ -29225,6 +29273,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None:
+                    self._update_gateway_ledger(
+                        pending_event,
+                        "drained",
+                        session_key=session_key,
+                        session_id=session_id,
+                        reason="queued-followup-drained",
+                    )
                 pending_event = None
                 pending = None
 
@@ -29248,6 +29304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
                         merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._set_gateway_ledger_deferred(pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -29372,6 +29429,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
                         )
+                        self._update_gateway_ledger(
+                            pending_event,
+                            "drained",
+                            session_key=session_key,
+                            session_id=session_id,
+                            reason="queued-goal-no-longer-active",
+                        )
                         return result
                     # Resolve the follow-up's session key BEFORE preparing the
                     # inbound text: _prepare_inbound_message_text buffers native
@@ -29393,6 +29457,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=next_session_key,
                     )
                     if next_message is None:
+                        self._update_gateway_ledger(
+                            pending_event,
+                            "failed",
+                            session_key=next_session_key,
+                            session_id=session_id,
+                            reason="queued-followup-preparation-failed",
+                        )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -29440,19 +29511,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
+                assert next_message is not None
+                if pending_event is not None:
+                    self._update_gateway_ledger(
+                        pending_event,
+                        "in_progress",
+                        session_key=next_session_key,
+                        session_id=session_id,
+                        reason="queued-followup-claimed",
+                    )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                except BaseException as exc:
+                    if pending_event is not None:
+                        self._update_gateway_ledger(
+                            pending_event,
+                            "drained" if isinstance(exc, asyncio.CancelledError) else "failed",
+                            session_key=next_session_key,
+                            session_id=session_id,
+                            reason=(
+                                "queued-followup-cancelled"
+                                if isinstance(exc, asyncio.CancelledError)
+                                else "queued-followup-error"
+                            ),
+                        )
+                    raise
+                if pending_event is not None:
+                    self._mark_gateway_ledger_after_agent_result(
+                        pending_event,
+                        followup_result,
+                        session_key=next_session_key,
+                        session_id=session_id,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
