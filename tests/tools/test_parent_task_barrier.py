@@ -296,6 +296,7 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     conn.close()
     assert {"parent_task_barriers", "parent_task_children"} <= tables
 
