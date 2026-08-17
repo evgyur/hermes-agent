@@ -163,6 +163,21 @@ def protected_boundary_guidance(boundaries: Iterable[Any] | None) -> str:
     )
 
 
+SCOPE_OWNERSHIP_GUIDANCE = (
+    "### Scope-owner lock\n"
+    "Durability, autonomy, multi-agent, scale, or reliability requirements do not authorize replacing the assigned "
+    "object. If the user names Hermes, its ordinary tools, Shaw, `/goal`, or the current runtime, keep work inside that "
+    "owner. A loaded skill informs execution; it never transfers task ownership. Use another runtime only when it is a "
+    "strict prerequisite or the user explicitly authorizes migration; otherwise report it separately instead of "
+    "acting on it.\n"
+)
+
+
+def scope_ownership_guidance() -> str:
+    """Return the policy-independent lock against semantic owner substitution."""
+    return SCOPE_OWNERSHIP_GUIDANCE
+
+
 CONSERVATIVE_GUIDANCE = (
     "## Skills (mandatory)\n"
     "Before replying, scan the skills below. If a skill matches or is even partially relevant to your task, "

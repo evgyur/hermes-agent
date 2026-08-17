@@ -1,0 +1,19 @@
+[
+  {
+    "id": "abe21b59-hermes-durability-must-not-transfer-to-continuum",
+    "source": "anonymized exact-turn review, 2026-08-17",
+    "request_class": "make ordinary Hermes tools, Shaw, and goals continue reliably for days or weeks",
+    "assigned_owner": "Hermes native runtime",
+    "forbidden_owner_substitutions": [
+      "Continuum",
+      "GoClaw",
+      "an independent replacement runtime"
+    ],
+    "required_guidance_phrases": [
+      "do not authorize replacing the assigned object",
+      "keep work inside that owner",
+      "A loaded skill informs execution; it never transfers task ownership",
+      "report it separately instead of acting on it"
+    ]
+  }
+]
