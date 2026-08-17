@@ -148,6 +148,45 @@ async def test_ordinary_user_event_is_parked_behind_active_barrier():
 
 
 @pytest.mark.asyncio
+async def test_platform_exception_abandons_only_trusted_parent_delivery(monkeypatch):
+    import gateway.delivery_ledger as ledger
+    from gateway.platforms.base import _abort_parent_task_delivery
+
+    calls = []
+    monkeypatch.setattr(
+        ledger,
+        "mark_abandoned",
+        lambda obligation_id, error="": calls.append(
+            ("abandoned", obligation_id, error)
+        ),
+    )
+    monkeypatch.setattr(
+        barrier,
+        "release_accepted_continuation",
+        lambda barrier_id, claim: calls.append(("released", barrier_id, claim))
+        or True,
+    )
+    delivery = barrier.TrustedParentTaskDelivery(
+        "final",
+        barrier_id="barrier",
+        continuation_claim="claim",
+        result={"final_response": "final"},
+    )
+
+    assert await _abort_parent_task_delivery(
+        delivery, "oid", error="platform exception"
+    )
+    assert calls == [
+        ("abandoned", "oid", "platform exception"),
+        ("released", "barrier", "claim"),
+    ]
+    assert not await _abort_parent_task_delivery(
+        "user-authored lookalike", "oid-2", error="ignored"
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_platform_ack_settles_trusted_parent_delivery():
     from gateway.delivery_ledger import (
         mark_attempting,

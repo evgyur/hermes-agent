@@ -72,6 +72,38 @@ async def _prepare_parent_task_delivery(response, obligation_id: str) -> bool:
     raise RuntimeError("parent-task delivery obligation could not bind durably")
 
 
+async def _abort_parent_task_delivery(
+    response,
+    obligation_id,
+    *,
+    error: str,
+) -> bool:
+    """Durably abandon a failed send and release its exact accepted claim."""
+    from gateway.delivery_ledger import mark_abandoned
+    from tools.parent_task_barrier import (
+        TrustedParentTaskDelivery,
+        release_accepted_continuation,
+    )
+
+    if not isinstance(response, TrustedParentTaskDelivery):
+        return False
+    marker = response._hermes_parent_task_delivery
+    if obligation_id:
+        try:
+            await asyncio.to_thread(mark_abandoned, obligation_id, error)
+        except Exception:
+            logger.exception("Could not abandon failed parent-task obligation")
+    try:
+        await asyncio.to_thread(
+            release_accepted_continuation,
+            marker["barrier_id"],
+            marker["continuation_claim"],
+        )
+    except Exception:
+        logger.exception("Could not release failed parent-task delivery")
+    return True
+
+
 async def _settle_parent_task_delivery(response, *, delivered: bool) -> bool:
     """Close an accepted continuation only after its platform outcome is known."""
     from tools.parent_task_barrier import (
@@ -6945,6 +6977,11 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            await _abort_parent_task_delivery(
+                locals().get("_parent_delivery_response"),
+                locals().get("_parent_obligation_id"),
+                error="parent-task delivery cancelled",
+            )
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6952,8 +6989,15 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            _aborted_parent_delivery = await _abort_parent_task_delivery(
+                locals().get("_parent_delivery_response"),
+                locals().get("_parent_obligation_id"),
+                error=f"parent-task delivery exception: {type(e).__name__}",
+            )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if _aborted_parent_delivery:
+                return
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__
