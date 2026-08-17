@@ -1018,30 +1018,6 @@ def _auto_continue_freshness_window() -> float:
     return auto_continue_freshness_window()
 
 
-def _generic_startup_auto_resume_enabled() -> bool:
-    """Return the native all-session startup-resume policy.
-
-    An explicit environment value remains authoritative for service-managed
-    deployments. Otherwise read ``agent.gateway_startup_auto_resume`` from the
-    active Hermes profile. The conservative default remains off for shared
-    installs; Chip's private gateway enables it explicitly.
-    """
-    raw = os.environ.get("HERMES_GATEWAY_STARTUP_AUTO_RESUME")
-    if raw is not None and raw != "":
-        return raw.lower() in {"1", "true", "yes", "on"}
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config()
-        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
-        return bool(
-            isinstance(agent_config, dict)
-            and agent_config.get("gateway_startup_auto_resume") is True
-        )
-    except Exception:
-        return False
-
-
 def _startup_restore_drain_timeout_secs() -> float:
     """Max seconds ``_finish_startup_restore`` waits on boot auto-resume turns
     before releasing the inbound gate and draining the queue.
@@ -1181,15 +1157,12 @@ def build_resume_recovery_note(
     )
     if message:
         resume_guidance = (
-            "Address the user's NEW message below FIRST and treat it as "
-            "steering for the interrupted task. Unless the user explicitly "
-            "cancels or supersedes that task, CONTINUE the interrupted work "
-            "in this same turn until a user-visible result or real blocker."
+            "Address the user's NEW message below FIRST and focus "
+            "on what the user is asking now."
         )
         tail_guidance = (
-            "Do NOT blindly re-execute old tool calls. Reuse results already "
-            "recorded in the history, inspect state before retrying an "
-            "unknown side effect, and resume from the first unrecorded step."
+            "Do NOT re-execute old tool calls — skip any "
+            "unfinished work from the conversation history."
         )
     elif interactive:
         resume_guidance = (
@@ -5821,12 +5794,9 @@ class TurnRunner:
             _persist_user_message_override = ctx.message
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
-                "history contains recorded tool outputs from an interrupted turn. "
-                "Address the user's NEW message below FIRST and treat it as steering. "
-                "Unless the user explicitly cancels or supersedes the interrupted "
-                "task, reuse those tool results and CONTINUE from the first unrecorded "
-                "step to a user-visible result or real blocker. Do NOT blindly "
-                "re-execute side-effectful calls; inspect state first.]\n\n"
+                "history contains pending tool outputs from an interrupted turn. "
+                "IGNORE those pending results. Address the user's NEW message "
+                "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
                 + ctx.message
             )
 
@@ -11540,7 +11510,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         if generic_auto_resume_enabled is None:
-            generic_auto_resume_enabled = _generic_startup_auto_resume_enabled()
+            generic_auto_resume_enabled = os.environ.get(
+                "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+            ).lower() in {"1", "true", "yes", "on"}
         if (
             not generic_auto_resume_enabled
             and not self._startup_recovery_source_is_configured_private_workroom(source)
@@ -11914,7 +11886,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh private active goals and safe pending sessions."""
-        generic_enabled = _generic_startup_auto_resume_enabled()
+        generic_enabled = os.environ.get(
+            "HERMES_GATEWAY_STARTUP_AUTO_RESUME", ""
+        ).lower() in {"1", "true", "yes", "on"}
         try:
             with self.session_store._lock:
                 self.session_store._ensure_loaded_locked()

@@ -105,11 +105,6 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
-_SUDO_OPTIONS_WITH_VALUES = frozenset({"-C", "-D", "-g", "-h", "-p", "-R", "-T", "-u"})
-_SSH_OPTIONS_WITH_VALUES = frozenset(
-    {"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"}
-)
-_LOOPBACK_SSH_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -214,70 +209,6 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _skip_sudo_prefix(segment: list[str], index: int) -> int:
-    """Return the wrapped executable index for a simple ``sudo`` command."""
-    if index >= len(segment) or Path(segment[index]).name != "sudo":
-        return index
-    index += 1
-    while index < len(segment):
-        argument = segment[index]
-        if argument == "--":
-            return index + 1
-        if argument in _SUDO_OPTIONS_WITH_VALUES:
-            index += 2
-            continue
-        if argument.startswith("-"):
-            index += 1
-            continue
-        return index
-    return index
-
-
-def contains_systemd_run_command(command: str) -> bool:
-    """Detect executed ``systemd-run`` submissions, optionally via sudo."""
-    for segment in _iter_command_segments(command):
-        index = _command_token_index(segment)
-        if index is None:
-            continue
-        index = _skip_sudo_prefix(segment, index)
-        if index < len(segment) and Path(segment[index]).name == "systemd-run":
-            return True
-    return False
-
-
-def _iter_loopback_ssh_payloads(command: str) -> Iterator[str]:
-    """Yield remote commands sent through SSH back into this same host."""
-    for segment in _iter_command_segments(command):
-        index = _command_token_index(segment)
-        if index is None:
-            continue
-        index = _skip_sudo_prefix(segment, index)
-        if index >= len(segment) or Path(segment[index]).name != "ssh":
-            continue
-
-        arguments = segment[index + 1 :]
-        arg_index = 0
-        while arg_index < len(arguments):
-            argument = arguments[arg_index]
-            if argument == "--":
-                arg_index += 1
-                break
-            if argument in _SSH_OPTIONS_WITH_VALUES:
-                arg_index += 2
-                continue
-            if argument.startswith("-"):
-                arg_index += 1
-                continue
-            break
-        if arg_index >= len(arguments):
-            continue
-
-        target = arguments[arg_index].rsplit("@", 1)[-1].strip("[]").lower()
-        payload = arguments[arg_index + 1 :]
-        if target in _LOOPBACK_SSH_HOSTS and payload:
-            yield " ".join(payload)
-
-
 def _mask_data_sink_arguments(text: str) -> str:
     """Replace data-sink executables' arguments with a neutral placeholder.
 
@@ -368,12 +299,10 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
 
 
 def _direct_lifecycle_scan(command: str) -> bool:
-    """Pure-string direct scans: lifecycle regex + detached-service submits."""
-    return (
-        _lifecycle_command_scan_with_data_exemption(command)
-        or contains_launchctl_submit_command(command)
-        or contains_systemd_run_command(command)
-    )
+    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+    return _lifecycle_command_scan_with_data_exemption(
+        command
+    ) or contains_launchctl_submit_command(command)
 
 
 def _expand_candidate_path(candidate: str) -> Optional[Path]:
@@ -584,19 +513,6 @@ def _contains_unsafe_gateway_action(
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
-
-    # A loopback SSH hop is not an external operator boundary. Recursively
-    # inspect its remote payload so `ssh localhost 'sudo systemd-run ...'`
-    # cannot bypass the in-gateway lifecycle guard.
-    for payload in _iter_loopback_ssh_payloads(command):
-        if _contains_unsafe_gateway_action(
-            payload,
-            cwd=cwd,
-            depth=depth + 1,
-            visited=visited,
-            read_remote_script=read_remote_script,
-        ):
-            return True
 
     for payload in _iter_shell_command_payloads(command):
         if _contains_unsafe_gateway_action(

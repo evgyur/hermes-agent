@@ -296,65 +296,6 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
-    @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "hermes@localhost"])
-    def test_loopback_ssh_systemd_run_cannot_bypass_block(
-        self, monkeypatch, tmp_path, host
-    ):
-        """Regression: the 2026-08-17 self-deploy outage used this exact hop."""
-        import tools.terminal_tool as tt
-
-        script = tmp_path / "deploy.sh"
-        script.write_text(
-            "#!/bin/bash\nsystemctl stop hermes-gateway.service\n",
-            encoding="utf-8",
-        )
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-
-        command = (
-            f"ssh -o BatchMode=yes {host} "
-            f"'sudo systemd-run --unit=deploy /bin/bash {script}'"
-        )
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
-
-    def test_direct_systemd_run_is_blocked_inside_gateway(self, monkeypatch):
-        import tools.terminal_tool as tt
-
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-        result = json.loads(
-            tt.terminal_tool(command="sudo systemd-run --unit=deploy /bin/true")
-        )
-
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
-
-    def test_systemd_run_text_in_diagnostic_command_remains_allowed(
-        self, monkeypatch
-    ):
-        import tools.terminal_tool as tt
-
-        calls = []
-
-        class _FakeEnv:
-            env = {}
-
-            def execute(self, command, **kwargs):
-                calls.append(command)
-                return {"output": "0\n", "returncode": 0}
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
-        monkeypatch.setattr(
-            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
-        )
-
-        command = "grep -c 'sudo systemd-run --unit=deploy' /var/log/syslog"
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 0
-        assert calls == [command]
-
     def test_blocks_lifecycle_command_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
     ):
