@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from agent.turn_finalizer import finalize_turn
@@ -223,3 +224,47 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     )
 
     assert agent._db_flush_scan_prefix is None
+
+
+def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
+    """A required child makes the root turn provisional before persistence."""
+
+    barrier = ModuleType("tools.parent_task_barrier")
+    setattr(
+        barrier,
+        "finalization_policy",
+        lambda **_kwargs: {
+            "action": "withhold",
+            "barrier_id": "barrier-1",
+            "defer_goal_evaluation": True,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = FakeAgent()
+    setattr(agent, "_db_flush_scan_prefix", [])
+    messages = [{"role": "user", "content": "delegate and finish"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="Initial parent answer must stay hidden.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="root-turn",
+        user_message="delegate and finish",
+        original_user_message="delegate and finish",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["suppress_delivery"] is True
+    assert result["defer_goal_evaluation"] is True
+    assert result["parent_task_barrier_id"] == "barrier-1"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["_parent_task_candidate"] is True
+    assert agent.persisted_messages[-1]["_parent_task_barrier_id"] == "barrier-1"
