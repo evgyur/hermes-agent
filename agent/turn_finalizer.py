@@ -571,15 +571,6 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
-        if _parent_task_policy.get("action") == "withhold":
-            from tools.parent_task_barrier import mark_initial_persisted
-
-            if not mark_initial_persisted(
-                str(_parent_task_policy.get("barrier_id") or "")
-            ):
-                raise RuntimeError(
-                    "parent-task provisional transcript persisted without barrier commit"
-                )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

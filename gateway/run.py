@@ -5333,10 +5333,16 @@ class TurnRunner:
             ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
-        # Cached agents may retain this per-turn flag from a prior provisional
-        # root. Reset it before installing callbacks; delegate_task sets it
-        # again only after durable required-child admission succeeds.
-        agent._parent_task_barrier_stream_suppressed = False
+        # Cached agents may retain per-turn parent-barrier state. Reset it from
+        # the trusted continuation marker; delegate_task can re-arm streaming
+        # suppression and reuse this exact barrier for a nested generation.
+        _parent_marker = getattr(
+            ctx, "_trusted_parent_task_continuation", None
+        )
+        agent._parent_task_barrier_stream_suppressed = bool(_parent_marker)
+        agent._parent_task_continuation_barrier_id = str(
+            (_parent_marker or {}).get("barrier_id") or ""
+        )
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
@@ -19589,25 +19595,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _trusted_restart_wake=getattr(
                     event, "_hermes_trusted_restart_event", None
                 ),
+                _trusted_parent_task_continuation=_parent_continuation_start,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             _parent_continuation = getattr(
                 event, "_hermes_parent_task_continuation", None
             )
+            _parent_delivery_result = None
             if _parent_continuation is not None:
                 try:
                     from tools.parent_task_barrier import (
                         TrustedParentTaskContinuation,
-                        complete_continuation,
                     )
 
                     if not isinstance(
                         _parent_continuation, TrustedParentTaskContinuation
                     ):
-                        raise RuntimeError("untrusted parent-task continuation marker")
+                        raise RuntimeError(
+                            "untrusted parent-task continuation marker"
+                        )
                     if isinstance(agent_result, dict):
-                        _continuation_result = {
+                        _parent_delivery_result = {
                             "final_response": str(
                                 agent_result.get("final_response") or ""
                             ),
@@ -19619,22 +19628,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             ),
                         }
                     else:
-                        _continuation_result = {
+                        _parent_delivery_result = {
                             "final_response": str(agent_result or "")
                         }
-                    _closed = await asyncio.to_thread(
-                        complete_continuation,
-                        str(_parent_continuation.get("barrier_id") or ""),
-                        str(
-                            _parent_continuation.get("continuation_claim") or ""
-                        ),
-                        result=_continuation_result,
-                    )
-                    if not _closed:
-                        raise RuntimeError(
-                            "parent-task continuation claim was not current"
-                        )
-                except Exception as _parent_close_exc:
+                except Exception as _parent_prepare_exc:
                     try:
                         from tools.parent_task_barrier import (
                             release_accepted_continuation,
@@ -19650,19 +19647,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         logger.exception(
-                            "Could not release unclosed parent-task continuation"
+                            "Could not release invalid parent-task continuation"
                         )
                     logger.error(
-                        "Parent-task continuation could not close durably: %s",
-                        _parent_close_exc,
+                        "Parent-task continuation delivery could not prepare: %s",
+                        _parent_prepare_exc,
                         exc_info=True,
                     )
                     if isinstance(agent_result, dict):
                         agent_result["suppress_delivery"] = True
                         agent_result["defer_goal_evaluation"] = True
                         agent_result["error"] = (
-                            "parent-task continuation closure failed: "
-                            + str(_parent_close_exc)
+                            "parent-task continuation preparation failed: "
+                            + str(_parent_prepare_exc)
                         )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -19719,6 +19716,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 _intentional_silence = False
             if agent_result.get("suppress_delivery"):
+                if _parent_continuation is not None:
+                    _nested_barrier = str(
+                        agent_result.get("parent_task_barrier_id") or ""
+                    )
+                    _current_barrier = str(
+                        _parent_continuation.get("barrier_id") or ""
+                    )
+                    if _nested_barrier != _current_barrier:
+                        try:
+                            from tools.parent_task_barrier import (
+                                release_accepted_continuation,
+                            )
+
+                            await asyncio.to_thread(
+                                release_accepted_continuation,
+                                _current_barrier,
+                                str(
+                                    _parent_continuation.get(
+                                        "continuation_claim"
+                                    )
+                                    or ""
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not release suppressed parent continuation"
+                            )
                 logger.info(
                     "agent result suppressed delivery: platform=%s chat=%s error=%s",
                     _platform_name,
@@ -20246,7 +20270,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                not _streaming_tts_done
+                _parent_continuation is None
+                and not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -20286,6 +20311,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            if (
+                _parent_continuation is not None
+                and _parent_delivery_result is not None
+            ):
+                from tools.parent_task_barrier import TrustedParentTaskDelivery
+
+                return TrustedParentTaskDelivery(
+                    response,
+                    barrier_id=str(
+                        _parent_continuation.get("barrier_id") or ""
+                    ),
+                    continuation_claim=str(
+                        _parent_continuation.get("continuation_claim") or ""
+                    ),
+                    result=_parent_delivery_result,
+                )
             return response
             
         except Exception as e:
@@ -27369,6 +27410,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         startup_resume: bool = False,
         _trusted_restart_wake: Any = None,
+        _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27390,6 +27432,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 startup_resume=startup_resume,
                 _trusted_restart_wake=_trusted_restart_wake,
+                _trusted_parent_task_continuation=(
+                    _trusted_parent_task_continuation
+                ),
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27404,6 +27449,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 startup_resume=startup_resume,
                 _trusted_restart_wake=_trusted_restart_wake,
+                _trusted_parent_task_continuation=(
+                    _trusted_parent_task_continuation
+                ),
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -27528,6 +27576,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         startup_resume: bool = False,
         _trusted_restart_wake: Any = None,
+        _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -27847,6 +27896,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if isinstance(_trusted_restart_wake, TrustedRestartEvent):
                 setattr(turn_ctx, "_trusted_restart_wake", _trusted_restart_wake)
+        if _trusted_parent_task_continuation is not None:
+            from tools.parent_task_barrier import TrustedParentTaskContinuation
+
+            if isinstance(
+                _trusted_parent_task_continuation,
+                TrustedParentTaskContinuation,
+            ):
+                setattr(
+                    turn_ctx,
+                    "_trusted_parent_task_continuation",
+                    _trusted_parent_task_continuation,
+                )
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback

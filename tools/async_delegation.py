@@ -443,6 +443,31 @@ def _prune_durable_records() -> None:
             )
 
 
+def _record_parent_terminal_in_tx(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+    state: str,
+    result: Dict[str, Any],
+    now: float,
+) -> None:
+    has_barrier_schema = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='parent_task_children'"
+    ).fetchone()
+    if has_barrier_schema is None:
+        return
+    from tools.parent_task_barrier import record_child_terminal_in_tx
+
+    record_child_terminal_in_tx(
+        conn,
+        task_id=str(delegation_id),
+        state=str(state or "unknown"),
+        result=result,
+        now=now,
+    )
+
+
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
     """CAS one terminal outcome; lose cleanly to a concurrent restart defer."""
     now = time.time()
@@ -464,22 +489,14 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
             ),
         ).rowcount
         if changed:
-            # Parent closure is feature-owned and atomically follows the child
-            # terminal CAS. A crash can therefore expose neither half alone.
-            has_barrier_schema = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='parent_task_children'"
-            ).fetchone()
-            if has_barrier_schema is not None:
-                from tools.parent_task_barrier import record_child_terminal_in_tx
-
-                record_child_terminal_in_tx(
-                    conn,
-                    task_id=str(event["delegation_id"]),
-                    state=str(event.get("status") or "unknown"),
-                    result=result,
-                    now=now,
-                )
+            # Parent closure atomically follows the authoritative terminal CAS.
+            _record_parent_terminal_in_tx(
+                conn,
+                delegation_id=str(event["delegation_id"]),
+                state=str(event.get("status") or "unknown"),
+                result=result,
+                now=now,
+            )
     return bool(changed)
 
 
@@ -627,6 +644,14 @@ def finalize_exhausted_restarts() -> int:
                 (now, now, json.dumps(event), json.dumps(event["result"]),
                  delegation_id, _MAX_RESTART_ATTEMPTS),
             ).rowcount
+            if changed:
+                _record_parent_terminal_in_tx(
+                    conn,
+                    delegation_id=str(delegation_id),
+                    state="error",
+                    result=event["result"],
+                    now=now,
+                )
             finalized += int(bool(changed))
     return finalized
 
@@ -729,6 +754,14 @@ def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
                 delegation_id,
             ),
         ).rowcount
+        if changed:
+            _record_parent_terminal_in_tx(
+                conn,
+                delegation_id=str(delegation_id),
+                state="unknown",
+                result=result,
+                now=now,
+            )
     if not changed or event is None:
         return False
     with _records_lock:
@@ -825,6 +858,13 @@ def _interrupt_pending_restarts(
                 ),
             ).rowcount
             if changed:
+                _record_parent_terminal_in_tx(
+                    conn,
+                    delegation_id=str(delegation_id),
+                    state="interrupted",
+                    result=result,
+                    now=now,
+                )
                 events.append(event)
     if not events:
         return set()
@@ -906,15 +946,23 @@ def recover_abandoned_delegations() -> int:
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
             result = {"status": "unknown", "summary": None, "error": event["error"]}
-            conn.execute(
+            changed = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, heartbeat_at=?, event_json=?, result_json=?,
                    delivery_state='pending', status_revision=status_revision+1,
                    restart_nonce=''
                    WHERE delegation_id=?""",
                 (now, now, now, json.dumps(event), json.dumps(result), delegation_id),
-            )
-            recovered += 1
+            ).rowcount
+            if changed:
+                _record_parent_terminal_in_tx(
+                    conn,
+                    delegation_id=str(delegation_id),
+                    state="unknown",
+                    result=result,
+                    now=now,
+                )
+                recovered += 1
     return recovered
 
 
@@ -2191,6 +2239,7 @@ def dispatch_async_delegation(
     session_key: str,
     parent_session_id: Optional[str] = None,
     root_turn_id: str = "",
+    existing_parent_barrier_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
@@ -2309,6 +2358,7 @@ def dispatch_async_delegation(
                 parent_session_id=str(parent_session_id or ""),
                 root_turn_id=root_turn_id,
                 task_id=delegation_id,
+                existing_barrier_id=existing_parent_barrier_id,
             )
         except Exception:
             with _records_lock:
@@ -2501,6 +2551,7 @@ def dispatch_async_delegation_batch(
     session_key: str,
     parent_session_id: Optional[str] = None,
     root_turn_id: str = "",
+    existing_parent_barrier_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
@@ -2602,6 +2653,7 @@ def dispatch_async_delegation_batch(
                 parent_session_id=str(parent_session_id or ""),
                 root_turn_id=root_turn_id,
                 task_id=delegation_id,
+                existing_barrier_id=existing_parent_barrier_id,
             )
         except Exception:
             with _records_lock:

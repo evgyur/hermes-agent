@@ -3,7 +3,9 @@ import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
-import tools.parent_task_barrier as barrier
+import pytest
+
+from tools import parent_task_barrier as barrier
 
 
 def _use_db(monkeypatch, tmp_path):
@@ -305,6 +307,118 @@ def test_terminal_delivery_retries_are_bounded(monkeypatch, tmp_path):
     )
 
 
+def test_delivered_obligation_closes_dead_accepted_continuation(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    claim = barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    _accept(claim)
+    assert barrier.bind_delivery_obligation(
+        barrier_id,
+        claim["continuation_claim"],
+        obligation_id="delivery-1",
+        result={"final_response": "done"},
+    )
+    with barrier._transaction() as conn:
+        conn.execute(
+            """CREATE TABLE delivery_obligations(
+                   obligation_id TEXT PRIMARY KEY, state TEXT NOT NULL
+               )"""
+        )
+        conn.execute(
+            "INSERT INTO delivery_obligations VALUES ('delivery-1', 'delivered')"
+        )
+        conn.execute(
+            "UPDATE parent_task_barriers SET accepted_owner_pid=99999999 "
+            "WHERE barrier_id=?",
+            (barrier_id,),
+        )
+    assert barrier.claim_next_ready_continuation(owner="recovery") is None
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "closed"
+
+
+def test_nested_generation_limit_fails_closed(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn-limit",
+        task_id="child-limit",
+    )
+    barrier.finalization_policy(
+        parent_session_id="parent", root_turn_id="turn-limit"
+    )
+    _put_result("child-limit", {"summary": "first"})
+    barrier.record_child_terminal(
+        task_id="child-limit", state="completed", result={}
+    )
+    claim = barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    _accept(claim)
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_barriers SET generation=? WHERE barrier_id=?",
+            (barrier._MAX_GENERATIONS, barrier_id),
+        )
+    with pytest.raises(RuntimeError, match="generation limit"):
+        barrier.admit_required_child(
+            origin_session="origin",
+            parent_session_id="parent",
+            root_turn_id="turn-too-far",
+            task_id="child-too-far",
+            existing_barrier_id=barrier_id,
+        )
+
+
+def test_nested_required_child_advances_same_barrier_generation(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn-1",
+        task_id="child-1",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn-1")
+    _put_result("child-1", {"summary": "first"})
+    barrier.record_child_terminal(task_id="child-1", state="completed", result={})
+    first = barrier.claim_next_ready_continuation(owner="gateway")
+    assert first is not None
+    _accept(first)
+
+    nested_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn-2",
+        task_id="child-2",
+        existing_barrier_id=barrier_id,
+    )
+    assert nested_id == barrier_id
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["generation"] == 1
+    assert snapshot["barrier"]["root_turn_id"] == "turn-2"
+    assert snapshot["barrier"]["state"] == "open"
+    policy = barrier.finalization_policy(
+        parent_session_id="parent", root_turn_id="turn-2"
+    )
+    assert policy["action"] == "withhold"
+    _put_result("child-2", {"summary": "second"})
+    barrier.record_child_terminal(task_id="child-2", state="completed", result={})
+    second = barrier.claim_next_ready_continuation(owner="gateway")
+    assert second is not None
+    assert second["barrier_id"] == barrier_id
+
+
 def test_duplicate_terminal_callbacks_and_concurrent_claims_are_idempotent(
     monkeypatch, tmp_path
 ):
@@ -344,6 +458,67 @@ def test_duplicate_terminal_callbacks_and_concurrent_claims_are_idempotent(
     ).fetchone()[0]
     conn.close()
     assert json.loads(stored)["summary"] == "first"
+
+
+def test_dead_initial_owner_recovers_after_child_terminal(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    with barrier._transaction() as conn:
+        conn.execute(
+            """UPDATE parent_task_barriers
+               SET initial_owner_pid=99999999, initial_owner_started_at=1
+               WHERE barrier_id=?""",
+            (barrier_id,),
+        )
+    claim = barrier.claim_next_ready_continuation(owner="recovery")
+    assert claim is not None
+    assert claim["barrier_id"] == barrier_id
+
+
+def test_transcript_and_initial_persisted_commit_atomically(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    db = SessionDB(db_path=path)
+    db.create_session("parent", "telegram")
+    inserted = db.append_messages_batch(
+        "parent",
+        [{"role": "assistant", "content": "", "timestamp": 1.0}],
+        parent_task_barrier_id=barrier_id,
+    )
+    assert inserted == 1
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["initial_persisted"] == 1
+
+    db.create_session("parent-rollback", "telegram")
+    with pytest.raises(RuntimeError, match="atomic commit failed"):
+        db.append_messages_batch(
+            "parent-rollback",
+            [{"role": "assistant", "content": "", "timestamp": 2.0}],
+            parent_task_barrier_id="missing",
+        )
+    conn = sqlite3.connect(path)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='parent-rollback'"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 0
+    db.close()
 
 
 def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
@@ -388,7 +563,7 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
         conn.execute(
             "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
         ).fetchone()[0]
-        == 2
+        == 5
     )
     conn.close()
     assert {"parent_task_barriers", "parent_task_children"} <= tables

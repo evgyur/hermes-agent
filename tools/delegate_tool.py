@@ -3806,15 +3806,33 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _raw_turn_id = getattr(parent_agent, "_current_turn_id", "")
+        _raw_platform = getattr(parent_agent, "platform", "")
+        _platform_name = (
+            _raw_platform.strip().lower()
+            if isinstance(_raw_platform, str)
+            else ""
+        )
         _required_root_turn_id = (
-            ""
+            _raw_turn_id.strip()
             if (
-                _restart_ctx.get("delegation_id")
-                or not _session_key
-                or str(getattr(parent_agent, "platform", "") or "").lower()
-                in {"cli", "tui", "api"}
+                isinstance(_raw_turn_id, str)
+                and _raw_turn_id.strip()
+                and not _restart_ctx.get("delegation_id")
+                and bool(_session_key)
+                and _platform_name not in {"cli", "tui", "api"}
             )
-            else str(getattr(parent_agent, "_current_turn_id", "") or "")
+            else ""
+        )
+        _raw_existing_barrier_id = getattr(
+            parent_agent,
+            "_parent_task_continuation_barrier_id",
+            "",
+        )
+        _existing_parent_barrier_id = (
+            _raw_existing_barrier_id.strip()
+            if isinstance(_raw_existing_barrier_id, str)
+            else ""
         )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
@@ -3829,6 +3847,7 @@ def delegate_task(
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,
             root_turn_id=_required_root_turn_id,
+            existing_parent_barrier_id=_existing_parent_barrier_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),

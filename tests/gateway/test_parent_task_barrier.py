@@ -1,3 +1,4 @@
+import sqlite3
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -144,6 +145,68 @@ async def test_ordinary_user_event_is_parked_behind_active_barrier():
         session_key="agent:main:telegram:dm:1",
         parent_session_id="parent",
     )
+
+
+@pytest.mark.asyncio
+async def test_platform_ack_settles_trusted_parent_delivery():
+    from gateway.delivery_ledger import (
+        mark_attempting,
+        mark_delivered,
+        record_obligation,
+    )
+    from gateway.platforms.base import (
+        _prepare_parent_task_delivery,
+        _settle_parent_task_delivery,
+    )
+
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="root",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="root")
+    conn = sqlite3.connect(barrier._db_path())
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegations(
+               delegation_id TEXT PRIMARY KEY, result_json TEXT
+           )"""
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO async_delegations VALUES ('child', '{\"summary\":\"done\"}')"
+    )
+    conn.commit()
+    conn.close()
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    claim = barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    assert barrier.accept_continuation(
+        barrier_id,
+        claim["continuation_claim"],
+        accepted_turn_id="turn",
+        owner_pid=1,
+    )
+    delivery = barrier.TrustedParentTaskDelivery(
+        "final",
+        barrier_id=barrier_id,
+        continuation_claim=claim["continuation_claim"],
+        result={"final_response": "final"},
+    )
+    record_obligation(
+        obligation_id="oid",
+        session_key="origin",
+        platform="telegram",
+        chat_id="1",
+        thread_id=None,
+        content="final",
+    )
+    mark_attempting("oid")
+    assert await _prepare_parent_task_delivery(delivery, "oid")
+    mark_delivered("oid")
+    assert await _settle_parent_task_delivery(delivery, delivered=True)
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "closed"
 
 
 def test_streaming_is_blocked_after_required_child_admission():

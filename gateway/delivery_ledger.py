@@ -223,6 +223,10 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def mark_abandoned(obligation_id: str, error: str = "") -> None:
+    _update_state(obligation_id, "abandoned", error=error)
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(

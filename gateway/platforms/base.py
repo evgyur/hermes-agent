@@ -28,6 +28,78 @@ from utils import normalize_proxy_url
 logger = logging.getLogger(__name__)
 
 
+async def _prepare_parent_task_delivery(response, obligation_id: str) -> bool:
+    """Bind a trusted parent outcome to the durable platform obligation."""
+    from tools.parent_task_barrier import (
+        TrustedParentTaskDelivery,
+        bind_delivery_obligation,
+        release_accepted_continuation,
+    )
+
+    if not isinstance(response, TrustedParentTaskDelivery):
+        return False
+    marker = response._hermes_parent_task_delivery
+    try:
+        bound = await asyncio.to_thread(
+            bind_delivery_obligation,
+            marker["barrier_id"],
+            marker["continuation_claim"],
+            obligation_id=obligation_id,
+            result=marker.get("result") or {},
+        )
+    except Exception:
+        bound = False
+    if bound:
+        return True
+    try:
+        from gateway.delivery_ledger import mark_abandoned
+
+        await asyncio.to_thread(
+            mark_abandoned,
+            obligation_id,
+            "parent-task barrier binding failed",
+        )
+    except Exception:
+        logger.exception("Could not abandon unbound parent-task obligation")
+    try:
+        await asyncio.to_thread(
+            release_accepted_continuation,
+            marker["barrier_id"],
+            marker["continuation_claim"],
+        )
+    except Exception:
+        logger.exception("Could not release unbound parent-task delivery")
+    raise RuntimeError("parent-task delivery obligation could not bind durably")
+
+
+async def _settle_parent_task_delivery(response, *, delivered: bool) -> bool:
+    """Close an accepted continuation only after its platform outcome is known."""
+    from tools.parent_task_barrier import (
+        TrustedParentTaskDelivery,
+        complete_continuation,
+    )
+
+    if not isinstance(response, TrustedParentTaskDelivery) or not delivered:
+        return False
+    marker = response._hermes_parent_task_delivery
+    for attempt in range(3):
+        try:
+            closed = await asyncio.to_thread(
+                complete_continuation,
+                marker["barrier_id"],
+                marker["continuation_claim"],
+                result=marker.get("result") or {},
+            )
+            if closed:
+                return True
+        except Exception:
+            if attempt == 2:
+                logger.exception("Parent-task delivery ACK could not close barrier")
+        if attempt < 2:
+            await asyncio.sleep(0.05 * (2**attempt))
+    return False
+
+
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback retrieving a detached fatal-error handler's exception.
 
@@ -6268,6 +6340,13 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            _parent_delivery_response = response
+            from tools.parent_task_barrier import TrustedParentTaskDelivery
+
+            _is_parent_task_delivery = isinstance(
+                _parent_delivery_response, TrustedParentTaskDelivery
+            )
+            _parent_obligation_id = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6400,6 +6479,14 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+
+                # Parent continuations require a text delivery obligation. This
+                # keeps restart recovery exact; media may accompany the text but
+                # cannot be the only terminal receipt.
+                if _is_parent_task_delivery and not text_content:
+                    raise RuntimeError(
+                        "parent-task final outcome requires a durable text receipt"
+                    )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6554,6 +6641,16 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
+                    if _is_parent_task_delivery:
+                        if _obligation_id is None:
+                            raise RuntimeError(
+                                "parent-task final text lacks a durable delivery obligation"
+                            )
+                        await _prepare_parent_task_delivery(
+                            _parent_delivery_response,
+                            _obligation_id,
+                        )
+                        _parent_obligation_id = _obligation_id
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
@@ -6561,7 +6658,7 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
-                    if _obligation_id is not None:
+                    if _obligation_id is not None and not _is_parent_task_delivery:
                         try:
                             from gateway.delivery_ledger import (
                                 mark_delivered,
@@ -6749,6 +6846,45 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            if _is_parent_task_delivery:
+                if _parent_obligation_id is not None:
+                    from gateway.delivery_ledger import (
+                        mark_abandoned,
+                        mark_delivered,
+                    )
+
+                    if processing_ok:
+                        await asyncio.to_thread(
+                            mark_delivered, _parent_obligation_id
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            mark_abandoned,
+                            _parent_obligation_id,
+                            "parent-task platform delivery failed",
+                        )
+                        from tools.parent_task_barrier import (
+                            release_accepted_continuation,
+                        )
+
+                        marker = (
+                            _parent_delivery_response._hermes_parent_task_delivery
+                        )
+                        await asyncio.to_thread(
+                            release_accepted_continuation,
+                            marker["barrier_id"],
+                            marker["continuation_claim"],
+                        )
+                if processing_ok:
+                    _closed_parent = await _settle_parent_task_delivery(
+                        _parent_delivery_response,
+                        delivered=True,
+                    )
+                    if not _closed_parent:
+                        logger.error(
+                            "Parent-task delivery succeeded but barrier closure "
+                            "is pending durable-ledger recovery"
+                        )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(

@@ -678,15 +678,26 @@ def test_pending_retention_never_count_prunes_undelivered(tmp_path, monkeypatch)
 
 
 def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
+    from tools import parent_task_barrier as parent_barrier
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
         "delegation_id": "deleg_abandoned",
-        "session_key": "owner",
+        "session_key": "origin",
         "origin_ui_session_id": "",
-        "parent_session_id": None,
+        "parent_session_id": "parent",
         "dispatched_at": 1.0,
     }
     ad._persist_dispatch(record)
+    barrier_id = parent_barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="deleg_abandoned",
+    )
+    parent_barrier.finalization_policy(
+        parent_session_id="parent", root_turn_id="turn"
+    )
     with ad._DB_LOCK, ad._connect() as conn:
         conn.execute(
             "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
@@ -697,6 +708,11 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
     durable = ad.get_durable_delegation("deleg_abandoned")
     assert durable["state"] == "unknown"
     assert durable["delivery_state"] == "pending"
+    snapshot = parent_barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["children"][0]["state"] == "unknown"
+    claim = parent_barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
     assert restored.get_nowait()["status"] == "unknown"

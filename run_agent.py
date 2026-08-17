@@ -2284,12 +2284,23 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
+                _parent_barrier_ids = {
+                    str(msg.get("_parent_task_barrier_id") or "")
+                    for msg in _batch_msgs
+                    if str(msg.get("_parent_task_barrier_id") or "")
+                }
+                if len(_parent_barrier_ids) > 1:
+                    raise RuntimeError(
+                        "one transcript flush cannot commit multiple parent-task barriers"
+                    )
+                _parent_barrier_id = next(iter(_parent_barrier_ids), None)
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    parent_task_barrier_id=_parent_barrier_id,
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True

@@ -32,11 +32,34 @@ _TERMINAL_CHILD_STATES = {
 _DEFAULT_LEASE_SECONDS = 1800.0
 _MAX_CONTINUATION_ATTEMPTS = 8
 _MAX_TERMINAL_DELIVERY_ATTEMPTS = 8
+_MAX_GENERATIONS = 8
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 class TrustedParentTaskContinuation(dict):
     """Host-created wake carrying one durable barrier continuation claim."""
+
+
+class TrustedParentTaskDelivery(str):
+    """Final text bound to an accepted continuation until platform ACK."""
+
+    _hermes_parent_task_delivery: Dict[str, Any]
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        barrier_id: str,
+        continuation_claim: str,
+        result: Dict[str, Any],
+    ):
+        value = str.__new__(cls, str(text or ""))
+        value._hermes_parent_task_delivery = {
+            "barrier_id": str(barrier_id),
+            "continuation_claim": str(continuation_claim),
+            "result": dict(result or {}),
+        }
+        return value
 
 
 def _db_path() -> Path:
@@ -70,13 +93,14 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
+    schema_sql = """
         CREATE TABLE IF NOT EXISTS parent_task_barriers (
             barrier_id TEXT PRIMARY KEY,
             origin_session TEXT NOT NULL,
             parent_session_id TEXT NOT NULL,
             root_turn_id TEXT NOT NULL,
+            initial_owner_pid INTEGER NOT NULL DEFAULT 0,
+            initial_owner_started_at INTEGER,
             state TEXT NOT NULL DEFAULT 'open',
             initial_persisted INTEGER NOT NULL DEFAULT 0,
             continuation_status TEXT NOT NULL DEFAULT 'pending',
@@ -89,7 +113,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             accepted_turn_id TEXT NOT NULL DEFAULT '',
             accepted_owner_pid INTEGER,
             accepted_at REAL,
-            continuation_result_json TEXT,
+            generation INTEGER NOT NULL DEFAULT 0,
+            delivery_obligation_id TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             closed_at REAL,
@@ -121,26 +146,65 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
         INSERT OR IGNORE INTO parent_task_barrier_meta(singleton, schema_version)
         VALUES (1, 0);
-        """
-    )
+    """
+    for statement in schema_sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
+    version_row = conn.execute(
+        "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
+    ).fetchone()
+    needs_migration = version_row is None or int(version_row[0] or 0) < 5
     barrier_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(parent_task_barriers)")
     }
+    if "continuation_result_json" in barrier_columns:
+        conn.execute(
+            "UPDATE parent_task_barriers SET continuation_result_json=NULL "
+            "WHERE continuation_result_json IS NOT NULL"
+        )
     for name, definition in {
         "terminal_delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
         "next_attempt_at": "REAL",
         "accepted_turn_id": "TEXT NOT NULL DEFAULT ''",
         "accepted_owner_pid": "INTEGER",
         "accepted_at": "REAL",
+        "generation": "INTEGER NOT NULL DEFAULT 0",
+        "delivery_obligation_id": "TEXT NOT NULL DEFAULT ''",
+        "initial_owner_pid": "INTEGER NOT NULL DEFAULT 0",
+        "initial_owner_started_at": "INTEGER",
     }.items():
         if name not in barrier_columns:
             conn.execute(
                 f"ALTER TABLE parent_task_barriers ADD COLUMN {name} {definition}"
             )
-    conn.execute(
-        "UPDATE parent_task_barrier_meta SET schema_version=2 "
-        "WHERE singleton=1 AND schema_version<2"
-    )
+    if needs_migration:
+        migrated_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(parent_task_barriers)")
+        }
+        required_columns = {
+            "terminal_delivery_attempts",
+            "next_attempt_at",
+            "accepted_turn_id",
+            "accepted_owner_pid",
+            "accepted_at",
+            "generation",
+            "delivery_obligation_id",
+            "initial_owner_pid",
+            "initial_owner_started_at",
+        }
+        if not required_columns <= migrated_columns:
+            raise RuntimeError("parent-task barrier migration is structurally incomplete")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("parent-task barrier migration violated foreign keys")
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("parent-task barrier migration failed integrity_check")
+        conn.execute(
+            "UPDATE parent_task_barrier_meta SET schema_version=5 "
+            "WHERE singleton=1 AND schema_version<5"
+        )
 
 
 def _normalize_terminal_state(state: str) -> str:
@@ -167,6 +231,33 @@ def _pid_is_dead(pid: int) -> bool:
     return False
 
 
+def _current_owner_stamp() -> tuple[int, Optional[int]]:
+    pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        started = get_process_start_time(pid)
+        return pid, int(started) if started is not None else None
+    except Exception:
+        return pid, None
+
+
+def _owner_is_dead(pid: int, started_at: Optional[int]) -> bool:
+    if int(pid) <= 0:
+        return True
+    if _pid_is_dead(pid):
+        return True
+    if started_at is None:
+        return False
+    try:
+        from gateway.status import get_process_start_time
+
+        current = get_process_start_time(pid)
+        return current is None or int(current) != int(started_at)
+    except Exception:
+        return False
+
+
 def _gateway_owner_is_dead(owner: str) -> bool:
     parts = str(owner or "").split(":", 2)
     if len(parts) < 2 or parts[0] != "gateway" or not parts[1].isdigit():
@@ -180,6 +271,7 @@ def admit_required_child(
     parent_session_id: str,
     root_turn_id: str,
     task_id: str,
+    existing_barrier_id: str = "",
 ) -> str:
     """Durably bind a required child before its worker is submitted.
 
@@ -202,33 +294,88 @@ def admit_required_child(
         )
 
     now = time.time()
+    owner_pid, owner_started_at = _current_owner_stamp()
     with _transaction() as conn:
         _prune_terminal_in_tx(conn, now)
-        row = conn.execute(
-            """SELECT barrier_id, origin_session FROM parent_task_barriers
-               WHERE parent_session_id=? AND root_turn_id=?""",
-            (identities["parent_session_id"], identities["root_turn_id"]),
-        ).fetchone()
-        if row is None:
-            barrier_id = str(uuid.uuid4())
+        existing_id = str(existing_barrier_id or "").strip()
+        if existing_id:
+            row = conn.execute(
+                """SELECT barrier_id, origin_session, parent_session_id,
+                          state, continuation_status, generation
+                   FROM parent_task_barriers WHERE barrier_id=?""",
+                (existing_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("nested required child references a missing barrier")
+            if (
+                str(row["origin_session"]) != identities["origin_session"]
+                or str(row["parent_session_id"])
+                != identities["parent_session_id"]
+            ):
+                raise RuntimeError(
+                    "nested required child changed parent barrier ownership"
+                )
+            if (
+                str(row["state"]) != "continuing"
+                or str(row["continuation_status"]) != "accepted"
+            ):
+                raise RuntimeError(
+                    "nested required child lacks an accepted continuation"
+                )
+            if int(row["generation"] or 0) >= _MAX_GENERATIONS:
+                raise RuntimeError("parent-task continuation generation limit reached")
+            barrier_id = existing_id
             conn.execute(
-                """INSERT INTO parent_task_barriers(
-                       barrier_id, origin_session, parent_session_id, root_turn_id,
-                       state, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, 'open', ?, ?)""",
+                """UPDATE parent_task_barriers
+                   SET root_turn_id=?, initial_owner_pid=?,
+                       initial_owner_started_at=?, state='open', initial_persisted=0,
+                       continuation_status='pending', continuation_claim='',
+                       continuation_owner='', continuation_lease_until=NULL,
+                       continuation_attempts=0, terminal_delivery_attempts=0,
+                       next_attempt_at=NULL, accepted_turn_id='',
+                       accepted_owner_pid=NULL, accepted_at=NULL,
+                       delivery_obligation_id='',
+                       generation=generation+1, updated_at=?
+                   WHERE barrier_id=?""",
                 (
-                    barrier_id,
-                    identities["origin_session"],
-                    identities["parent_session_id"],
                     identities["root_turn_id"],
+                    owner_pid,
+                    owner_started_at,
                     now,
-                    now,
+                    barrier_id,
                 ),
             )
         else:
-            barrier_id = str(row["barrier_id"])
-            if str(row["origin_session"]) != identities["origin_session"]:
-                raise RuntimeError("root turn is already bound to another origin session")
+            row = conn.execute(
+                """SELECT barrier_id, origin_session FROM parent_task_barriers
+                   WHERE parent_session_id=? AND root_turn_id=?""",
+                (identities["parent_session_id"], identities["root_turn_id"]),
+            ).fetchone()
+            if row is None:
+                barrier_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO parent_task_barriers(
+                           barrier_id, origin_session, parent_session_id,
+                           root_turn_id, initial_owner_pid,
+                           initial_owner_started_at, state, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                    (
+                        barrier_id,
+                        identities["origin_session"],
+                        identities["parent_session_id"],
+                        identities["root_turn_id"],
+                        owner_pid,
+                        owner_started_at,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                barrier_id = str(row["barrier_id"])
+                if str(row["origin_session"]) != identities["origin_session"]:
+                    raise RuntimeError(
+                        "root turn is already bound to another origin session"
+                    )
         conn.execute(
             """INSERT INTO parent_task_children(
                    barrier_id, task_id, required, state, created_at, updated_at
@@ -462,6 +609,31 @@ def claim_next_ready_continuation(
     token = uuid.uuid4().hex
     with _transaction() as conn:
         _prune_terminal_in_tx(conn, now)
+        incomplete_rows = conn.execute(
+            """SELECT barrier_id, initial_owner_pid, initial_owner_started_at
+               FROM parent_task_barriers AS b
+               WHERE b.state IN ('open','ready') AND b.initial_persisted=0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM parent_task_children AS c
+                   WHERE c.barrier_id=b.barrier_id AND c.required=1
+                     AND c.state NOT IN (
+                       'completed','failed','error','timeout','stalled','interrupted',
+                       'cancelled','unknown'
+                     )
+                 )"""
+        ).fetchall()
+        for incomplete in incomplete_rows:
+            if _owner_is_dead(
+                int(incomplete["initial_owner_pid"] or 0),
+                incomplete["initial_owner_started_at"],
+            ):
+                conn.execute(
+                    """UPDATE parent_task_barriers
+                       SET initial_persisted=1, state='ready', updated_at=?
+                       WHERE barrier_id=? AND state IN ('open','ready')
+                         AND initial_persisted=0""",
+                    (now, str(incomplete["barrier_id"])),
+                )
         claimed_rows = conn.execute(
             """SELECT barrier_id, continuation_claim, continuation_owner
                FROM parent_task_barriers
@@ -485,27 +657,62 @@ def claim_next_ready_continuation(
                     ),
                 )
         accepted_rows = conn.execute(
-            """SELECT barrier_id, continuation_claim, accepted_owner_pid
+            """SELECT barrier_id, continuation_claim, accepted_owner_pid,
+                      delivery_obligation_id
                FROM parent_task_barriers
                WHERE state='continuing' AND continuation_status='accepted'"""
         ).fetchall()
+        delivery_table_exists = conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='delivery_obligations'"""
+        ).fetchone() is not None
         for accepted_row in accepted_rows:
             owner_pid = accepted_row["accepted_owner_pid"]
-            if owner_pid is not None and _pid_is_dead(int(owner_pid)):
+            if owner_pid is None or not _pid_is_dead(int(owner_pid)):
+                continue
+            obligation_id = str(accepted_row["delivery_obligation_id"] or "")
+            delivery_state = ""
+            if obligation_id and delivery_table_exists:
+                delivery_row = conn.execute(
+                    "SELECT state FROM delivery_obligations WHERE obligation_id=?",
+                    (obligation_id,),
+                ).fetchone()
+                delivery_state = (
+                    str(delivery_row[0] or "") if delivery_row is not None else ""
+                )
+            if delivery_state == "delivered":
                 conn.execute(
                     """UPDATE parent_task_barriers
-                       SET state='ready', continuation_status='pending',
-                           continuation_claim='', continuation_owner='',
-                           continuation_lease_until=NULL, accepted_turn_id='',
-                           accepted_owner_pid=NULL, accepted_at=NULL, updated_at=?
+                       SET state='closed', continuation_status='generated',
+                           continuation_lease_until=NULL, updated_at=?, closed_at=?
                        WHERE barrier_id=? AND state='continuing'
                          AND continuation_claim=?""",
                     (
+                        now,
                         now,
                         str(accepted_row["barrier_id"]),
                         str(accepted_row["continuation_claim"]),
                     ),
                 )
+                continue
+            if delivery_state in {"pending", "attempting", "failed"}:
+                continue
+            conn.execute(
+                """UPDATE parent_task_barriers
+                   SET state='ready', continuation_status='pending',
+                       continuation_claim='', continuation_owner='',
+                       continuation_lease_until=NULL, accepted_turn_id='',
+                       accepted_owner_pid=NULL, accepted_at=NULL,
+                       delivery_obligation_id='',
+                       updated_at=?
+                   WHERE barrier_id=? AND state='continuing'
+                     AND continuation_claim=?""",
+                (
+                    now,
+                    str(accepted_row["barrier_id"]),
+                    str(accepted_row["continuation_claim"]),
+                ),
+            )
         conn.execute(
             """UPDATE parent_task_barriers
                SET state='ready', continuation_status='pending',
@@ -667,6 +874,33 @@ def accept_continuation(
     return changed == 1
 
 
+def bind_delivery_obligation(
+    barrier_id: str,
+    claim: str,
+    *,
+    obligation_id: str,
+    result: Optional[Dict[str, Any]] = None,
+) -> bool:
+    obligation = str(obligation_id or "").strip()
+    if not obligation:
+        return False
+    now = time.time()
+    with _transaction() as conn:
+        changed = conn.execute(
+            """UPDATE parent_task_barriers
+               SET delivery_obligation_id=?, updated_at=?
+               WHERE barrier_id=? AND state='continuing'
+                 AND continuation_status='accepted' AND continuation_claim=?""",
+            (
+                obligation,
+                now,
+                str(barrier_id),
+                str(claim),
+            ),
+        ).rowcount
+    return changed == 1
+
+
 def release_accepted_continuation(barrier_id: str, claim: str) -> bool:
     now = time.time()
     with _transaction() as conn:
@@ -675,6 +909,7 @@ def release_accepted_continuation(barrier_id: str, claim: str) -> bool:
                SET state='ready', continuation_status='pending',
                    continuation_claim='', continuation_owner='',
                    accepted_turn_id='', accepted_owner_pid=NULL, accepted_at=NULL,
+                   delivery_obligation_id='',
                    next_attempt_at=?, updated_at=?
                WHERE barrier_id=? AND state='continuing'
                  AND continuation_status='accepted' AND continuation_claim=?""",
@@ -691,12 +926,11 @@ def complete_continuation(
         changed = conn.execute(
             """UPDATE parent_task_barriers
                SET state='closed', continuation_status='generated',
-                   continuation_result_json=?, continuation_lease_until=NULL,
+                   continuation_lease_until=NULL,
                    updated_at=?, closed_at=?
                WHERE barrier_id=? AND state='continuing'
                  AND continuation_status='accepted' AND continuation_claim=?""",
             (
-                json.dumps(result or {}, ensure_ascii=False),
                 now,
                 now,
                 str(barrier_id),
