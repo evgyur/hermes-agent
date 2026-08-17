@@ -337,6 +337,29 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
+CREATE TABLE IF NOT EXISTS gateway_message_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lookup_key TEXT UNIQUE,
+    platform TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    message_id TEXT,
+    user_id TEXT,
+    session_key TEXT,
+    session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    origin_type TEXT NOT NULL DEFAULT 'real_user',
+    received_at REAL NOT NULL,
+    dispatch_started_at REAL,
+    completed_at REAL,
+    drained_at REAL,
+    failed_at REAL,
+    updated_at REAL NOT NULL,
+    reason TEXT,
+    metadata TEXT,
+    snippet TEXT
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -371,6 +394,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup ON gateway_message_ledger(lookup_key);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session ON gateway_message_ledger(session_key, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_platform ON gateway_message_ledger(platform, chat_id, thread_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status ON gateway_message_ledger(status, updated_at DESC);
 -- Partial index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of

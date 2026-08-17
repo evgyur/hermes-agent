@@ -8281,6 +8281,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         else:
             pending_slot[session_key] = queued_event
+        self._set_gateway_ledger_deferred(queued_event)
 
     def _promote_queued_event(
         self,
@@ -8508,6 +8509,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_id=session_id,
                 reason="turn-completed",
                 metadata={"completed": True},
+            )
+
+    def _set_gateway_ledger_deferred(self, event: MessageEvent) -> None:
+        """Mark an inbound event as durably queued for a later handler pass."""
+        try:
+            setattr(event, "_hermes_gateway_ledger_deferred", True)
+        except Exception:
+            pass
+        self._update_gateway_ledger(
+            event,
+            "requeued",
+            reason="handler-deferred",
+            metadata={"deferred": True},
+        )
+
+    def _finalize_gateway_ledger_after_handler(
+        self,
+        event: MessageEvent,
+        result: Any = None,
+        *,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Close any lifecycle row the handler left active.
+
+        Agent turns normally terminalize through
+        ``_mark_gateway_ledger_after_agent_result``.  This fallback owns the
+        many valid early-return paths (commands, policy ignores, steering,
+        queueing, and pre-agent failures) so they cannot remain indefinitely
+        ``received`` or ``in_progress``.
+        """
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        if db is None or ledger_id is None:
+            return
+        try:
+            row = db.get_gateway_message_ledger(ledger_id)
+            if not row or row.get("status") not in {"received", "requeued", "in_progress"}:
+                return
+            if error is None and row.get("status") == "requeued":
+                # Queue helpers persist this state immediately, including when
+                # a hook replaced the in-memory event object.  The later
+                # replay owns the terminal transition.
+                return
+            if error is not None:
+                status = "drained" if isinstance(error, asyncio.CancelledError) else "failed"
+                reason = "handler-cancelled" if status == "drained" else "handler-error"
+                metadata = {"handler_error": type(error).__name__}
+            elif bool(getattr(event, "_hermes_gateway_ledger_deferred", False)):
+                status = "requeued"
+                reason = "handler-deferred"
+                metadata = {"deferred": True}
+            else:
+                status = "completed"
+                reason = "handled-without-agent-turn"
+                metadata = {"completed": True, "agent_turn": False}
+            db.update_gateway_message_ledger(
+                ledger_id=ledger_id,
+                status=status,
+                reason=reason,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug(
+                "gateway message ledger handler finalization failed: %s",
+                exc,
+                exc_info=True,
             )
 
     def _mark_gateway_ledger_session_drained(
@@ -9541,6 +9609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
+            self._set_gateway_ledger_deferred(event)
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
@@ -9548,6 +9617,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
+            )
+            self._update_gateway_ledger(
+                event,
+                "failed",
+                session_key=session_key,
+                reason="pending-queue-cap",
             )
             return
 
@@ -11423,6 +11498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queue = []
             self._startup_restore_queue = queue
         queue.append(event)
+        self._set_gateway_ledger_deferred(event)
         try:
             source = event.source
             logger.info(
@@ -11516,6 +11592,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        await asyncio.to_thread(self._reconcile_previous_gateway_ledger)
+
+    def _reconcile_previous_gateway_ledger(self) -> None:
+        """Terminalize active lifecycle rows left by the prior process."""
+        cutoff = getattr(self, "_gateway_ledger_startup_cutoff", None)
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        reconcile = getattr(db, "reconcile_stale_gateway_message_ledger", None)
+        if cutoff is None or not callable(reconcile):
+            return
+        try:
+            changed = reconcile(
+                cutoff,
+                reason="gateway-startup-reconciliation",
+            )
+            if changed:
+                logger.warning(
+                    "Reconciled %d stale gateway ledger row(s) from the previous process",
+                    changed,
+                )
+        except Exception as exc:
+            logger.warning("Gateway ledger startup reconciliation failed: %s", exc)
 
     @staticmethod
     def _log_background_resume_result(task: "asyncio.Task") -> None:
@@ -11925,6 +12023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
+        self._gateway_ledger_startup_cutoff = time.time()
         logger.info("Starting Hermes Gateway...")
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
@@ -15682,6 +15781,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Run one inbound lifecycle and guarantee a terminal ledger outcome."""
+        try:
+            setattr(event, "_hermes_gateway_ledger_deferred", False)
+        except Exception:
+            pass
+        await asyncio.to_thread(
+            self._record_gateway_ledger_received,
+            event,
+            reason="handle-message-entry",
+        )
+        try:
+            result = await self._handle_message_impl(event)
+        except BaseException as exc:
+            await asyncio.to_thread(
+                self._finalize_gateway_ledger_after_handler,
+                event,
+                error=exc,
+            )
+            raise
+        await asyncio.to_thread(
+            self._finalize_gateway_ledger_after_handler,
+            event,
+            result,
+        )
+        return result
+
+    async def _handle_message_impl(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -15695,11 +15821,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
-        await asyncio.to_thread(
-            self._record_gateway_ledger_received,
-            event,
-            reason="handle-message-entry",
-        )
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -16261,6 +16382,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._set_gateway_ledger_deferred(event)
                 return None
 
             _telegram_followup_grace = float(
@@ -16291,6 +16413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event,
                             merge_text=True,
                         )
+                        self._set_gateway_ledger_deferred(event)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -16312,6 +16435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event,
                         merge_text=True,
                     )
+                    self._set_gateway_ledger_deferred(event)
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():

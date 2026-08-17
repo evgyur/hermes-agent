@@ -90,6 +90,32 @@ def test_ledger_schema_and_direct_api_transition(ledger_db):
     assert row["drained_at"] is None
     assert row["failed_at"] is None
 
+    # A duplicate platform delivery may traverse ingress again, but a
+    # terminal lifecycle must never reopen as received/in_progress.
+    assert ledger_db.update_gateway_message_ledger(
+        ledger_id,
+        status="received",
+        reason="duplicate-ingress",
+    )
+    assert ledger_db.update_gateway_message_ledger(
+        ledger_id,
+        status="in_progress",
+        reason="duplicate-claimed",
+    )
+    duplicate_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+        message_id="msg-1",
+        reason="duplicate-ingress",
+        metadata={"duplicate": True},
+    )
+    assert duplicate_id == ledger_id
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row["status"] == "completed"
+    assert row["reason"] == "done"
+    assert row["metadata"] == {"message_type": "text"}
+
     found = ledger_db.find_gateway_message_ledger(
         platform="telegram",
         chat_id="chat-1",
@@ -250,6 +276,58 @@ def test_session_drain_bulk_update_leaves_completed_rows_alone(ledger_db):
     assert ledger_db.get_gateway_message_ledger(done_id)["status"] == "completed"
 
 
+def test_startup_reconciliation_only_drains_previous_process_rows(ledger_db):
+    old_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="old-active",
+        received_at=100.0,
+    )
+    current_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="current-active",
+        received_at=300.0,
+    )
+    done_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="old-done",
+        received_at=100.0,
+    )
+    ledger_db.update_gateway_message_ledger(done_id, status="completed", timestamp=150.0)
+
+    changed = ledger_db.reconcile_stale_gateway_message_ledger(
+        200.0,
+        timestamp=400.0,
+    )
+
+    assert changed == 1
+    old_row = ledger_db.get_gateway_message_ledger(old_id)
+    assert old_row["status"] == "drained"
+    assert old_row["drained_at"] == 400.0
+    assert old_row["reason"] == "gateway-startup-reconciliation"
+    assert ledger_db.get_gateway_message_ledger(current_id)["status"] == "received"
+    assert ledger_db.get_gateway_message_ledger(done_id)["status"] == "completed"
+
+
+def test_runner_reconciles_ledger_at_recorded_startup_boundary(ledger_db):
+    old_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="prior-process",
+        received_at=100.0,
+    )
+    runner = _runner_with_ledger(ledger_db)
+    runner._gateway_ledger_startup_cutoff = 200.0
+
+    runner._reconcile_previous_gateway_ledger()
+
+    row = ledger_db.get_gateway_message_ledger(old_id)
+    assert row["status"] == "drained"
+    assert row["reason"] == "gateway-startup-reconciliation"
+
+
 def test_ledger_writes_are_best_effort_and_do_not_crash_gateway():
     class BrokenDB:
         def record_gateway_message_received(self, **_kwargs):
@@ -267,3 +345,76 @@ def test_ledger_writes_are_best_effort_and_do_not_crash_gateway():
     assert runner._record_gateway_ledger_received(event) is None
     assert runner._update_gateway_ledger(event, "in_progress") is False
     runner._mark_gateway_ledger_session_drained("sk", reason="restart_timeout")
+
+
+@pytest.mark.asyncio
+async def test_handler_wrapper_terminalizes_command_style_early_return(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    runner._handle_message_impl = AsyncMock(return_value="command handled")
+    event = _event(text="/model", message_id="command-early-return")
+
+    assert await runner._handle_message(event) == "command handled"
+
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="command-early-return",
+    )
+    assert row["status"] == "completed"
+    assert row["reason"] == "handled-without-agent-turn"
+    assert row["metadata"] == {"completed": True, "agent_turn": False}
+
+
+@pytest.mark.asyncio
+async def test_handler_wrapper_preserves_deferred_then_terminalizes_replay(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    event = _event(text="queued follow-up", message_id="queued-follow-up")
+
+    async def queue_once(queued_event):
+        runner._set_gateway_ledger_deferred(queued_event)
+        return None
+
+    runner._handle_message_impl = queue_once
+    assert await runner._handle_message(event) is None
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="queued-follow-up",
+    )
+    assert row["status"] == "requeued"
+
+    async def replay_once(replayed_event):
+        runner._update_gateway_ledger(
+            replayed_event,
+            "received",
+            reason="session-key-resolved",
+        )
+        return "replayed"
+
+    runner._handle_message_impl = replay_once
+    assert await runner._handle_message(event) == "replayed"
+    row = ledger_db.get_gateway_message_ledger(row["id"])
+    assert row["status"] == "completed"
+    assert row["reason"] == "handled-without-agent-turn"
+
+
+@pytest.mark.asyncio
+async def test_handler_wrapper_marks_pre_agent_exception_failed(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    event = _event(text="boom", message_id="pre-agent-error")
+
+    async def fail_before_agent(_event):
+        raise RuntimeError("boom")
+
+    runner._handle_message_impl = fail_before_agent
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._handle_message(event)
+
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="pre-agent-error",
+    )
+    assert row["status"] == "failed"
+    assert row["reason"] == "handler-error"
+    assert row["metadata"] == {"handler_error": "RuntimeError"}

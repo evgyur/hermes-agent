@@ -10001,11 +10001,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             if lookup_key:
                 existing = conn.execute(
-                    "SELECT id FROM gateway_message_ledger WHERE lookup_key = ?",
+                    "SELECT id, status FROM gateway_message_ledger WHERE lookup_key = ?",
                     (lookup_key,),
                 ).fetchone()
                 if existing is not None:
                     row_id = int(existing["id"] if isinstance(existing, sqlite3.Row) else existing[0])
+                    current_status = str(
+                        existing["status"] if isinstance(existing, sqlite3.Row) else existing[1]
+                    )
+                    if current_status not in {"received", "requeued", "in_progress"}:
+                        return row_id
                     conn.execute(
                         """
                         UPDATE gateway_message_ledger
@@ -10109,11 +10114,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where = "id = ?" if ledger_id is not None else "lookup_key = ?"
             ident = ledger_id if ledger_id is not None else lookup_key
             row = conn.execute(
-                f"SELECT id FROM gateway_message_ledger WHERE {where}",
+                f"SELECT id, status FROM gateway_message_ledger WHERE {where}",
                 (ident,),
             ).fetchone()
             if row is None:
                 return False
+            current_status = str(
+                row["status"] if isinstance(row, sqlite3.Row) else row[1]
+            )
+            active_statuses = {"received", "requeued", "in_progress"}
+            if current_status not in active_statuses and status_s in active_statuses:
+                # Platform retries and startup replays can traverse the ingress
+                # path again after the original turn has already reached a
+                # terminal state.  Lifecycle state is monotonic: never reopen
+                # completed/failed/drained work as merely received or active.
+                return True
             assignments = [
                 "status = ?",
                 "session_key = COALESCE(?, session_key)",
@@ -10167,6 +10182,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND status IN ('received', 'requeued', 'in_progress')
                 """,
                 (now, now, reason_s, session_key),
+            )
+            return int(cursor.rowcount or 0)
+
+        return self._execute_write(_do)
+
+    def reconcile_stale_gateway_message_ledger(
+        self,
+        before: float,
+        *,
+        reason: str = "gateway-startup-reconciliation",
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Drain active rows owned by a previous gateway process.
+
+        Call only after startup recovery has had its chance to redeliver or
+        replay durable work.  ``before`` must be the new process' startup
+        boundary, so current-process ingress remains untouched.
+        """
+        cutoff = float(before)
+        now = float(timestamp or time.time())
+        reason_s = str(reason or "gateway-startup-reconciliation")[:500]
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                UPDATE gateway_message_ledger
+                SET status = 'drained',
+                    drained_at = COALESCE(drained_at, ?),
+                    updated_at = ?,
+                    reason = ?
+                WHERE status IN ('received', 'requeued', 'in_progress')
+                  AND received_at < ?
+                """,
+                (now, now, reason_s, cutoff),
             )
             return int(cursor.rowcount or 0)
 
