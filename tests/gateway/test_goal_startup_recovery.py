@@ -78,6 +78,8 @@ async def test_active_goal_resume_pending_auto_resumes_without_global_flag(herme
     assert event.source == entry.origin
     assert event.text.startswith("[Continuing toward your standing goal]\nGoal:")
     assert "continue this active goal after restart" in event.text
+    assert "keep taking every safe dependent step" in event.text
+    assert "gateway restart or tool-turn boundary is not a blocker" in event.text
     assert entry.session_id == "active-goal-sid"
     assert GoalManager(session_id=entry.session_id).is_active()
 

@@ -90,10 +90,20 @@ DEFAULT_GATE_MAX_RETRIES = 3
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+CONTINUATION_EXECUTION_POLICY = (
+    "Execution policy: keep taking every safe dependent step you can execute now in this same turn. "
+    "Do not stop after one step, a plan, a checkpoint, a local commit, a review dispatch, or a progress report. "
+    "Do not ask for approval the user already granted. Continue until the goal is verified complete or you hit "
+    "a genuine blocker that requires missing user-only input. A gateway restart or tool-turn boundary is not a "
+    "blocker: persist authoritative goal state and resume automatically after recovery."
+)
+
+
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
-    "Continue working toward this goal. Take the next concrete step. "
+    "Continue working toward this goal. "
+    + CONTINUATION_EXECUTION_POLICY + " "
     "If you believe the goal is complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
 )
@@ -107,7 +117,8 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Completion contract:\n"
     "{contract_block}\n\n"
-    "Continue working toward the outcome above. Take the next concrete step. "
+    "Continue working toward the outcome above. "
+    + CONTINUATION_EXECUTION_POLICY + " "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
@@ -123,8 +134,9 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
-    "Continue working toward the goal AND all additional criteria. Take "
-    "the next concrete step. If you believe the goal and every "
+    "Continue working toward the goal AND all additional criteria. "
+    + CONTINUATION_EXECUTION_POLICY + " "
+    "If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
@@ -146,7 +158,8 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "```\n\n"
     "Fix the underlying problem so this gate passes, then re-run it to "
     "confirm. Do not declare the goal complete while any gate fails. If the "
-    "gate itself is wrong or cannot pass, say so clearly and stop."
+    "gate itself is wrong or cannot pass, say so clearly and stop. "
+    + CONTINUATION_EXECUTION_POLICY
 )
 
 
