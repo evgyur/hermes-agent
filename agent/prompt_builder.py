@@ -1681,6 +1681,7 @@ def build_skills_system_prompt(
     from agent.skill_routing import (
         normalize_routing_policy,
         protected_boundary_guidance,
+        scope_ownership_guidance,
         skill_routing_guidance,
     )
 
@@ -1942,6 +1943,7 @@ def build_skills_system_prompt(
 
         result = (
             skill_routing_guidance(effective_routing_policy)
+            + scope_ownership_guidance()
             + protected_boundary_guidance(effective_protected_boundaries)
             + "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "

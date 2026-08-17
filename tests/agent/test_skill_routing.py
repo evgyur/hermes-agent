@@ -17,6 +17,7 @@ from agent.skill_routing import (
     protected_boundary_guidance,
     resolve_agent_skill_routing_policy,
     resolve_skill_routing_policy,
+    scope_ownership_guidance,
     skill_routing_guidance,
 )
 
@@ -135,6 +136,42 @@ def test_lean_guidance_deconflicts_related_metadata_and_generic_words():
     assert "without loading a coding skill" in guidance
     assert "Do not load the Shaw body merely because" in guidance
     assert "conservative specialist policy" in guidance
+
+
+def test_scope_owner_regression_fixtures_are_enforced_in_shared_guidance():
+    fixture_path = Path(__file__).resolve().parents[1] / "fixtures" / "scope_owner_regressions.json"
+    fixtures = json.loads(fixture_path.read_text(encoding="utf-8"))
+    guidance = scope_ownership_guidance()
+
+    assert fixtures
+    assert len({fixture["id"] for fixture in fixtures}) == len(fixtures)
+    for fixture in fixtures:
+        assert fixture["assigned_owner"]
+        assert fixture["forbidden_owner_substitutions"]
+        for phrase in fixture["required_guidance_phrases"]:
+            assert phrase in guidance, fixture["id"]
+
+
+def test_scope_owner_lock_is_rendered_for_both_routing_policies(tmp_path, monkeypatch):
+    from agent import prompt_builder as pb
+
+    home = tmp_path / ".hermes"
+    skill = home / "skills" / "demo" / "shaw"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: shaw\ndescription: coding governor\n---\nbody\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    pb.clear_skills_system_prompt_cache()
+
+    for policy in (CONSERVATIVE, LEAN_CANARY):
+        rendered = pb.build_skills_system_prompt(
+            persist_snapshot=False,
+            routing_policy=policy,
+        )
+        assert rendered.count("### Scope-owner lock") == 1
+        assert scope_ownership_guidance() in rendered
 
 
 def test_router_policy_changes_guidance_not_registry(tmp_path, monkeypatch):
