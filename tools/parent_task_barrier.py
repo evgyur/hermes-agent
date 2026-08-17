@@ -48,6 +48,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
     return conn
@@ -98,7 +99,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             task_id TEXT NOT NULL,
             required INTEGER NOT NULL DEFAULT 1,
             state TEXT NOT NULL DEFAULT 'required',
-            result_json TEXT,
             terminal_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -234,14 +234,13 @@ def record_child_terminal_in_tx(
     if previous not in _TERMINAL_CHILD_STATES:
         conn.execute(
             """UPDATE parent_task_children
-               SET state=?, result_json=?, terminal_at=?, updated_at=?
+               SET state=?, terminal_at=?, updated_at=?
                WHERE task_id=? AND state NOT IN (
                  'completed','failed','error','timeout','stalled','interrupted',
                  'cancelled','unknown'
                )""",
             (
                 terminal,
-                json.dumps(result or {}, ensure_ascii=False),
                 current,
                 current,
                 str(task_id),
@@ -327,8 +326,12 @@ def barrier_for_child(task_id: str) -> Optional[str]:
 
 def _aggregate_prompt(conn: sqlite3.Connection, barrier_id: str) -> str:
     rows = conn.execute(
-        """SELECT task_id, state, result_json FROM parent_task_children
-           WHERE barrier_id=? AND required=1 ORDER BY created_at, task_id""",
+        """SELECT c.task_id, c.state, a.result_json
+           FROM parent_task_children AS c
+           LEFT JOIN async_delegations AS a
+             ON a.delegation_id=c.task_id
+           WHERE c.barrier_id=? AND c.required=1
+           ORDER BY c.created_at, c.task_id""",
         (barrier_id,),
     ).fetchall()
     payload = []
@@ -337,15 +340,21 @@ def _aggregate_prompt(conn: sqlite3.Connection, barrier_id: str) -> str:
             result = json.loads(row["result_json"] or "{}")
         except (TypeError, ValueError):
             result = {"error": "stored child result is unreadable"}
-        payload.append(
-            {
-                "task_id": str(row["task_id"]),
-                "status": str(row["state"]),
-                "summary": result.get("summary"),
-                "error": result.get("error"),
-                "result": result.get("result"),
-            }
-        )
+        outcome: Dict[str, Any] = {
+            "task_id": str(row["task_id"]),
+            "status": str(row["state"]),
+        }
+        if isinstance(result.get("results"), list):
+            outcome["results"] = result["results"]
+            if result.get("error"):
+                outcome["error"] = result["error"]
+        else:
+            outcome.update(
+                summary=result.get("summary"),
+                error=result.get("error"),
+                result=result.get("result"),
+            )
+        payload.append(outcome)
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     return (
         "[INTERNAL PARENT-TASK BARRIER — trusted host continuation]\n"
@@ -354,6 +363,17 @@ def _aggregate_prompt(conn: sqlite3.Connection, barrier_id: str) -> str:
         "Produce one final user-facing answer; do not repeat the provisional parent "
         "answer and do not emit separate child notifications.\n\n"
         f"barrier_id={barrier_id}\nrequired_child_outcomes={rendered}"
+    )
+
+
+def _terminal_failure_prompt(conn: sqlite3.Connection, barrier_id: str) -> str:
+    return (
+        "[INTERNAL PARENT-TASK BARRIER — terminal recovery]\n"
+        "Automatic parent continuation recovery exhausted its bounded retry budget. "
+        "Do not launch or replay child work. Give the user one truthful final technical "
+        "result through the normal response path, using the already persisted child "
+        "outcomes below and naming any uncertainty.\n\n"
+        + _aggregate_prompt(conn, barrier_id)
     )
 
 
@@ -401,17 +421,9 @@ def claim_next_ready_continuation(
                  AND continuation_lease_until<?""",
             (now, now),
         )
-        conn.execute(
-            """UPDATE parent_task_barriers
-               SET state='failed', continuation_status='exhausted',
-                   continuation_claim='', continuation_owner='',
-                   continuation_lease_until=NULL, updated_at=?, closed_at=?
-               WHERE state='ready' AND initial_persisted=1
-                 AND continuation_attempts >= ?""",
-            (now, now, _MAX_CONTINUATION_ATTEMPTS),
-        )
         row = conn.execute(
-            """SELECT barrier_id, origin_session, parent_session_id
+            """SELECT barrier_id, origin_session, parent_session_id,
+                      continuation_attempts
                FROM parent_task_barriers AS b
                WHERE b.state='ready' AND b.initial_persisted=1
                  AND b.continuation_status='pending'
@@ -433,7 +445,11 @@ def claim_next_ready_continuation(
                SET state='resuming', continuation_status='claimed',
                    continuation_claim=?, continuation_owner=?,
                    continuation_lease_until=?,
-                   continuation_attempts=continuation_attempts+1,
+                   continuation_attempts=CASE
+                     WHEN continuation_attempts < ?
+                     THEN continuation_attempts+1
+                     ELSE continuation_attempts
+                   END,
                    updated_at=?
                WHERE barrier_id=? AND state='ready'
                  AND continuation_status='pending'""",
@@ -441,13 +457,19 @@ def claim_next_ready_continuation(
                 token,
                 owner_id,
                 now + max(1.0, float(lease_seconds)),
+                _MAX_CONTINUATION_ATTEMPTS,
                 now,
                 barrier_id,
             ),
         ).rowcount
         if changed != 1:
             return None
-        prompt = _aggregate_prompt(conn, barrier_id)
+        terminal_failure = int(row["continuation_attempts"] or 0) >= _MAX_CONTINUATION_ATTEMPTS
+        prompt = (
+            _terminal_failure_prompt(conn, barrier_id)
+            if terminal_failure
+            else _aggregate_prompt(conn, barrier_id)
+        )
         return TrustedParentTaskContinuation(
             type="parent_task_continuation",
             barrier_id=barrier_id,
@@ -455,6 +477,7 @@ def claim_next_ready_continuation(
             session_key=str(row["origin_session"]),
             origin_session=str(row["origin_session"]),
             parent_session_id=str(row["parent_session_id"]),
+            terminal_failure=terminal_failure,
             text=prompt,
             synthetic_message=prompt,
         )
@@ -553,7 +576,7 @@ def barrier_snapshot(barrier_id: str) -> Optional[Dict[str, Any]]:
         if barrier is None:
             return None
         children = conn.execute(
-            """SELECT task_id, required, state, result_json, terminal_at
+            """SELECT task_id, required, state, terminal_at
                FROM parent_task_children WHERE barrier_id=?
                ORDER BY created_at, task_id""",
             (str(barrier_id),),

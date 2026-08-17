@@ -244,6 +244,13 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
 
     agent = FakeAgent()
     setattr(agent, "_db_flush_scan_prefix", [])
+    setattr(
+        agent,
+        "_sync_external_memory_for_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached external memory")
+        ),
+    )
     messages = [{"role": "user", "content": "delegate and finish"}]
 
     result = finalize_turn(
@@ -266,6 +273,10 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
     assert result["defer_goal_evaluation"] is True
     assert result["parent_task_barrier_id"] == "barrier-1"
     assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == ""
+    assert "Initial parent answer must stay hidden" not in str(
+        agent.persisted_messages
+    )
     assert agent.persisted_messages[-1]["_parent_task_candidate"] is True
     assert agent.persisted_messages[-1]["_parent_task_barrier_id"] == "barrier-1"
 

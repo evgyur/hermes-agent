@@ -453,6 +453,14 @@ def finalize_turn(
                     raise RuntimeError(
                         "required-child barrier could not bind the provisional answer"
                     )
+                _candidate["content"] = ""
+                for _private_text_key in (
+                    "reasoning",
+                    "reasoning_content",
+                    "analysis",
+                    "thinking",
+                ):
+                    _candidate.pop(_private_text_key, None)
                 _candidate["_parent_task_candidate"] = True
                 _candidate["_parent_task_barrier_id"] = _barrier_id
                 _candidate.pop("_db_persisted", None)
@@ -500,6 +508,7 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    and _parent_task_policy.get("action") == "deliver"
                     # Persistence-isolated agents (background review fork)
                     # must not micro-compact: the pass burns a real aux-LLM
                     # call on a throwaway replay transcript, and if the
@@ -848,7 +857,9 @@ def finalize_turn(
     }
     if _parent_task_policy.get("action") in {"withhold", "error"}:
         result["suppress_delivery"] = True
+        result["delivery_suppressed"] = True
         result["defer_goal_evaluation"] = True
+        result["completed"] = False
         _barrier_id = str(_parent_task_policy.get("barrier_id") or "")
         if _barrier_id:
             result["parent_task_barrier_id"] = _barrier_id
@@ -906,13 +917,14 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    # External memory provider: sync only a committed user-visible turn.
+    if _parent_task_policy.get("action") == "deliver":
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -922,6 +934,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
