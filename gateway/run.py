@@ -3117,6 +3117,15 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     return cleaned.strip()
 
 
+def _parent_task_turn_buffers_streaming(agent: Any, marker: Any = None) -> bool:
+    """Buffer a gateway turn before any potentially provisional token escapes."""
+    valid_tools = getattr(agent, "valid_tool_names", set()) if agent is not None else set()
+    can_launch_required_child = isinstance(
+        valid_tools, (set, frozenset, list, tuple)
+    ) and "delegate_task" in valid_tools
+    return bool(marker or can_launch_required_child)
+
+
 def _parent_task_stream_allowed(agent: Any, *, run_still_current: bool) -> bool:
     """Block response/interim streaming after durable required-child admission."""
     return bool(run_still_current) and not bool(
@@ -5333,13 +5342,17 @@ class TurnRunner:
             ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
-        # Cached agents may retain per-turn parent-barrier state. Reset it from
-        # the trusted continuation marker; delegate_task can re-arm streaming
-        # suppression and reuse this exact barrier for a nested generation.
+        # Cached agents may retain per-turn parent-barrier state. Persistent
+        # messaging turns that can launch required delegation are buffered from
+        # their first token: prose can precede a tool call, so waiting until
+        # admission would leak a provisional prefix. CLI/non-gateway paths do
+        # not pass through this adapter.
         _parent_marker = getattr(
             ctx, "_trusted_parent_task_continuation", None
         )
-        agent._parent_task_barrier_stream_suppressed = bool(_parent_marker)
+        agent._parent_task_barrier_stream_suppressed = (
+            _parent_task_turn_buffers_streaming(agent, _parent_marker)
+        )
         agent._parent_task_continuation_barrier_id = str(
             (_parent_marker or {}).get("barrier_id") or ""
         )

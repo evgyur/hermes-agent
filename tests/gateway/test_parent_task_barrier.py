@@ -248,8 +248,17 @@ async def test_platform_ack_settles_trusted_parent_delivery():
     assert snapshot["barrier"]["state"] == "closed"
 
 
-def test_streaming_is_blocked_after_required_child_admission():
-    from gateway.run import _parent_task_stream_allowed
+def test_streaming_is_buffered_before_required_child_admission():
+    from gateway.run import (
+        _parent_task_stream_allowed,
+        _parent_task_turn_buffers_streaming,
+    )
+
+    capable = SimpleNamespace(valid_tool_names={"delegate_task", "terminal"})
+    incapable = SimpleNamespace(valid_tool_names={"terminal"})
+    assert _parent_task_turn_buffers_streaming(capable)
+    assert not _parent_task_turn_buffers_streaming(incapable)
+    assert _parent_task_turn_buffers_streaming(incapable, {"barrier_id": "b"})
 
     agent = SimpleNamespace(_parent_task_barrier_stream_suppressed=False)
     assert _parent_task_stream_allowed(agent, run_still_current=True)
