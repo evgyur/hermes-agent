@@ -789,6 +789,12 @@ class StreamingRefineAgent:
         }
 
 
+class DelegationCapableStreamingAgent(StreamingRefineAgent):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.valid_tool_names = {"delegate_task"}
+
+
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -1024,6 +1030,30 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_delegation_capable_non_delegating_turn_flushes_stream(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DelegationCapableStreamingAgent,
+        session_id="sess-delegation-capable-stream",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    delivered = [call["content"] for call in adapter.sent]
+    delivered.extend(edit["content"] for edit in adapter.edits)
+    assert any("Continuing to refine: Final answer." in text for text in delivered)
 
 
 class TransformedStreamAgent:

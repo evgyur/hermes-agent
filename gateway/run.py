@@ -4938,6 +4938,7 @@ class TurnRunner:
         # Set up stream consumer for token streaming or interim commentary.
         _stream_consumer = None
         _stream_delta_cb = None
+        _parent_task_stream_buffer: list[tuple[str, str, bool]] = []
         # #60671 — streaming TTS consumer is created on the outer
         # event-loop thread before run_sync launches.  run_sync only
         # reads it via ``streaming_tts_consumer_holder[0]`` for delta
@@ -4990,6 +4991,9 @@ class TurnRunner:
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
+                            if getattr(agent, "_parent_task_prebuffering", False):
+                                _parent_task_stream_buffer.append(("delta", text, False))
+                                return
                             if _parent_task_stream_allowed(
                                 agent,
                                 run_still_current=ctx._run_still_current(),
@@ -5007,6 +5011,9 @@ class TurnRunner:
         # receives LLM deltas for audio synthesis (#60671).
         if _stream_delta_cb is None and _stts_consumer_ref is not None:
             def _stream_delta_cb(text: str) -> None:
+                if getattr(agent, "_parent_task_prebuffering", False):
+                    _parent_task_stream_buffer.append(("delta", text, False))
+                    return
                 if _parent_task_stream_allowed(
                     agent,
                     run_still_current=ctx._run_still_current(),
@@ -5014,6 +5021,11 @@ class TurnRunner:
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            if getattr(agent, "_parent_task_prebuffering", False):
+                _parent_task_stream_buffer.append(
+                    ("interim", text, bool(already_streamed))
+                )
+                return
             if not _parent_task_stream_allowed(
                 agent,
                 run_still_current=ctx._run_still_current(),
@@ -5350,9 +5362,11 @@ class TurnRunner:
         _parent_marker = getattr(
             ctx, "_trusted_parent_task_continuation", None
         )
-        agent._parent_task_barrier_stream_suppressed = (
-            _parent_task_turn_buffers_streaming(agent, _parent_marker)
+        _buffer_from_first_token = _parent_task_turn_buffers_streaming(
+            agent, _parent_marker
         )
+        agent._parent_task_prebuffering = _buffer_from_first_token
+        agent._parent_task_barrier_stream_suppressed = bool(_parent_marker)
         agent._parent_task_continuation_barrier_id = str(
             (_parent_marker or {}).get("barrier_id") or ""
         )
@@ -6000,6 +6014,22 @@ class TurnRunner:
                 pass
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
+
+        if getattr(agent, "_parent_task_prebuffering", False):
+            agent._parent_task_prebuffering = False
+            _publish_parent_buffer = not bool(
+                result.get("suppress_delivery") or result.get("delivery_suppressed")
+            )
+            if _publish_parent_buffer:
+                agent._parent_task_barrier_stream_suppressed = False
+                for _kind, _text, _already_streamed in _parent_task_stream_buffer:
+                    if _kind == "delta" and _stream_delta_cb is not None:
+                        _stream_delta_cb(_text)
+                    elif _kind == "interim":
+                        _interim_assistant_cb(
+                            _text, already_streamed=_already_streamed
+                        )
+            _parent_task_stream_buffer.clear()
 
         # Signal the stream consumer that the agent is done
         if _stream_consumer is not None:
