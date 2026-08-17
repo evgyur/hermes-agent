@@ -3818,6 +3818,16 @@ def delegate_task(
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,
+            root_turn_id=(
+                ""
+                if (
+                    _restart_ctx.get("delegation_id")
+                    or not _session_key
+                    or str(getattr(parent_agent, "platform", "") or "").lower()
+                    in {"cli", "tui", "api"}
+                )
+                else str(getattr(parent_agent, "_current_turn_id", "") or "")
+            ),
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),

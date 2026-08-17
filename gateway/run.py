@@ -3905,6 +3905,7 @@ def _goal_turn_outcome(
         "delivery_suppressed": bool(result.get("delivery_suppressed"))
         or bool(result.get("suppress_delivery"))
         or response.strip() in silence_markers,
+        "defer_goal_evaluation": bool(result.get("defer_goal_evaluation")),
     }
 
 
@@ -17483,6 +17484,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_entry = None
                     if session_entry is not None:
                         _auto_dispatched = False
+                        _defer_goal = any(
+                            bool(item.get("defer_goal_evaluation"))
+                            for item in _goal_outcomes
+                            if isinstance(item, dict)
+                        )
                         session_key_for_goal = getattr(session_entry, "session_key", None) or _quick_key
                         _suppressed_callback_start = self._consume_goal_callback_started_session(session_key_for_goal)
                         if _suppressed_callback_start:
@@ -17494,13 +17500,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_entry=session_entry,
                                 source=source,
                             )
-                        elif _final_text.strip():
+                        elif _final_text.strip() and not _defer_goal:
                             _auto_dispatched = await self._auto_dispatch_supergoal_from_response(
                                 session_entry=session_entry,
                                 source=source,
                                 final_response=_final_text,
                             )
-                        if not _auto_dispatched and not _suppressed_callback_start:
+                        if (
+                            not _auto_dispatched
+                            and not _suppressed_callback_start
+                            and not _defer_goal
+                        ):
                             await self._post_turn_goal_continuation(
                                 session_entry=session_entry,
                                 source=source,
@@ -19456,6 +19466,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Genuine user input supersedes any older required-child barrier for
+        # this routed session. Trusted internal continuation events carry their
+        # own exact barrier claim and are never attached by session proximity.
+        if not bool(getattr(event, "internal", False)):
+            try:
+                from tools.parent_task_barrier import cancel_session_barriers
+
+                await asyncio.to_thread(
+                    cancel_session_barriers,
+                    origin_session=session_key,
+                    parent_session_id=str(session_entry.session_id or ""),
+                )
+            except Exception:
+                logger.exception("Could not cancel superseded parent-task barrier")
+                return
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
@@ -19511,6 +19537,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+
+            _parent_continuation = getattr(
+                event, "_hermes_parent_task_continuation", None
+            )
+            if _parent_continuation is not None:
+                try:
+                    from tools.parent_task_barrier import (
+                        TrustedParentTaskContinuation,
+                        complete_continuation,
+                    )
+
+                    if not isinstance(
+                        _parent_continuation, TrustedParentTaskContinuation
+                    ):
+                        raise RuntimeError("untrusted parent-task continuation marker")
+                    if isinstance(agent_result, dict):
+                        _continuation_result = {
+                            "final_response": str(
+                                agent_result.get("final_response") or ""
+                            ),
+                            "turn_exit_reason": str(
+                                agent_result.get("turn_exit_reason") or ""
+                            ),
+                            "suppress_delivery": bool(
+                                agent_result.get("suppress_delivery")
+                            ),
+                        }
+                    else:
+                        _continuation_result = {
+                            "final_response": str(agent_result or "")
+                        }
+                    _closed = await asyncio.to_thread(
+                        complete_continuation,
+                        str(_parent_continuation.get("barrier_id") or ""),
+                        str(
+                            _parent_continuation.get("continuation_claim") or ""
+                        ),
+                        result=_continuation_result,
+                    )
+                    if not _closed:
+                        raise RuntimeError(
+                            "parent-task continuation claim was not current"
+                        )
+                except Exception as _parent_close_exc:
+                    logger.error(
+                        "Parent-task continuation could not close durably: %s",
+                        _parent_close_exc,
+                        exc_info=True,
+                    )
+                    if isinstance(agent_result, dict):
+                        agent_result["suppress_delivery"] = True
+                        agent_result["defer_goal_evaluation"] = True
+                        agent_result["error"] = (
+                            "parent-task continuation closure failed: "
+                            + str(_parent_close_exc)
+                        )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -24518,12 +24600,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
             from tools.async_delegation import TrustedRestartEvent
+            from tools.parent_task_barrier import TrustedParentTaskContinuation
 
             if isinstance(evt, TrustedRestartEvent):
                 # Preserve the trusted in-process object through a busy-session
                 # FIFO. A ContextVar around handle_message would be reset before
                 # that queued event eventually creates its TurnContext.
                 setattr(synth_event, "_hermes_trusted_restart_event", evt)
+            elif isinstance(evt, TrustedParentTaskContinuation):
+                setattr(synth_event, "_hermes_parent_task_continuation", evt)
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -25003,6 +25088,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return accepted
 
+    async def _consume_parent_barrier_child(self, evt: dict) -> Optional[bool]:
+        """Acknowledge a child outcome absorbed by a parent barrier."""
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return False
+        from tools.parent_task_barrier import barrier_for_child
+
+        barrier_id = await asyncio.to_thread(barrier_for_child, delegation_id)
+        if not barrier_id:
+            return False
+
+        from tools.async_delegation import (
+            claim_completion_delivery,
+            complete_completion_delivery,
+            completion_delivery_disposition,
+        )
+
+        claim_id = f"parent-barrier:{id(self)}:{__import__('uuid').uuid4().hex}"
+        claimed = await asyncio.to_thread(
+            claim_completion_delivery, delegation_id, claim_id
+        )
+        if not claimed:
+            disposition = await asyncio.to_thread(
+                completion_delivery_disposition, delegation_id
+            )
+            return True if disposition not in {"pending", "claimed"} else None
+        completed = await asyncio.to_thread(
+            complete_completion_delivery, delegation_id, claim_id
+        )
+        if not completed:
+            raise RuntimeError(
+                f"could not acknowledge barrier child completion {delegation_id}"
+            )
+        return True
+
+    async def _deliver_parent_task_continuation(self, evt: dict) -> bool:
+        """Inject one trusted aggregate continuation under its durable claim."""
+        from tools.parent_task_barrier import (
+            TrustedParentTaskContinuation,
+            release_continuation_claim,
+        )
+
+        if not isinstance(evt, TrustedParentTaskContinuation):
+            return False
+        accepted = await self._inject_watch_notification(
+            str(evt.get("synthetic_message") or ""), evt
+        )
+        if accepted is True:
+            return True
+        await asyncio.to_thread(
+            release_continuation_claim,
+            str(evt.get("barrier_id") or ""),
+            str(evt.get("continuation_claim") or ""),
+        )
+        return False
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -25044,8 +25185,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
+                from tools.parent_task_barrier import claim_next_ready_continuation
+
+                parent_continuation = await asyncio.to_thread(
+                    claim_next_ready_continuation,
+                    owner=f"gateway:{os.getpid()}:{id(self)}",
+                )
+                if parent_continuation is not None:
+                    async_events.append(parent_continuation)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    if evt.get("type") == "parent_task_continuation":
+                        await self._deliver_parent_task_continuation(evt)
+                        continue
                     if evt.get("type") == "async_delegation_restart":
                         from tools.async_delegation import TrustedRestartEvent
                         if not isinstance(evt, TrustedRestartEvent):
@@ -25056,6 +25208,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if delivered is False:
                             _pr.completion_queue.put(evt)
+                        continue
+                    consumed = await self._consume_parent_barrier_child(evt)
+                    if consumed is True:
+                        continue
+                    if consumed is None:
+                        _pr.completion_queue.put(evt)
                         continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:

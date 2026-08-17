@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls run in the background automatically. Hermes returns a handle to the parent immediately. In persistent messaging-gateway conversations, a background child spawned during a user turn is required work for that root turn: the parent's provisional response is withheld and Hermes resumes the parent once with the aggregate child outcome. Other surfaces keep their existing completion-notification behavior. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
 ## Single Task
 
@@ -121,7 +121,7 @@ When a top-level agent provides a `tasks` array, Hermes returns one background h
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
-- **Cancellation:** Follow-up messages do not cancel a top-level background batch. `/stop` or closing/resetting the owning session cancels its active children. Synchronous orchestrator children still follow their parent's interrupt state
+- **Cancellation:** Follow-up messages do not stop a top-level background batch, but on messaging gateways they supersede the old parent barrier so a stale child outcome cannot be attached to the new user turn. `/stop` or closing/resetting the owning session cancels its active children and the associated barrier. Synchronous orchestrator children still follow their parent's interrupt state
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
@@ -139,6 +139,14 @@ This does not resume child execution after a crash. A delegation whose owner
 process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
+
+### Durable parent-task convergence
+
+On persistent messaging gateways, Hermes also writes a feature-owned parent barrier before submitting a required background child. The barrier binds the routed origin session, the parent's durable session ID, the root turn ID, and every required delegation ID.
+
+The initial parent response is saved as a provisional candidate and is not delivered while required children remain non-terminal. Child callbacks update the barrier atomically with their normal durable completion record. After all required children are terminal, one gateway process leases the aggregate continuation, re-enters the original parent session with all child outcomes, and lets the parent generate the single user-facing final answer. Individual child completion messages are consumed by the barrier rather than sent separately.
+
+A gateway restart does not lose a ready continuation: expired claims return to `pending` and are leased again. A genuine new user message, `/stop`, `/new`, or `/reset` cancels the old barrier so unrelated input cannot be attached to it. Parent barriers do not change child capability rules and do not replay protected side effects.
 
 ## Model Override
 

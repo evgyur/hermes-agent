@@ -463,6 +463,23 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
                 event["delegation_id"],
             ),
         ).rowcount
+        if changed:
+            # Parent closure is feature-owned and atomically follows the child
+            # terminal CAS. A crash can therefore expose neither half alone.
+            has_barrier_schema = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='parent_task_children'"
+            ).fetchone()
+            if has_barrier_schema is not None:
+                from tools.parent_task_barrier import record_child_terminal_in_tx
+
+                record_child_terminal_in_tx(
+                    conn,
+                    task_id=str(event["delegation_id"]),
+                    state=str(event.get("status") or "unknown"),
+                    result=result,
+                    now=now,
+                )
     return bool(changed)
 
 
@@ -2173,6 +2190,7 @@ def dispatch_async_delegation(
     model: Optional[str],
     session_key: str,
     parent_session_id: Optional[str] = None,
+    root_turn_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
@@ -2275,7 +2293,28 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    if not _persist_dispatch(record):
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {
+            "status": "rejected",
+            "error": "Async delegation dispatch could not be persisted",
+        }
+    if root_turn_id:
+        try:
+            from tools.parent_task_barrier import admit_required_child
+
+            admit_required_child(
+                origin_session=session_key or str(parent_session_id or ""),
+                parent_session_id=str(parent_session_id or ""),
+                root_turn_id=root_turn_id,
+                task_id=delegation_id,
+            )
+        except Exception:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            _delete_durable_delegation(delegation_id)
+            raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -2307,9 +2346,21 @@ def dispatch_async_delegation(
         # get_hermes_home() under the right profile.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        if root_turn_id:
+            _finalize(
+                delegation_id,
+                {
+                    "status": "error",
+                    "summary": None,
+                    "error": f"Failed to schedule async delegation: {exc}",
+                    "api_calls": 0,
+                },
+                "error",
+            )
+        else:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -2449,6 +2500,7 @@ def dispatch_async_delegation_batch(
     model: Optional[str],
     session_key: str,
     parent_session_id: Optional[str] = None,
+    root_turn_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
@@ -2541,6 +2593,21 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": "Restart claim is no longer active",
         }
+    if root_turn_id:
+        try:
+            from tools.parent_task_barrier import admit_required_child
+
+            admit_required_child(
+                origin_session=session_key or str(parent_session_id or ""),
+                parent_session_id=str(parent_session_id or ""),
+                root_turn_id=root_turn_id,
+                task_id=delegation_id,
+            )
+        except Exception:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            _delete_durable_delegation(delegation_id)
+            raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -2577,9 +2644,19 @@ def dispatch_async_delegation_batch(
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        if root_turn_id:
+            _finalize_batch(
+                delegation_id,
+                {
+                    "results": [],
+                    "error": f"Failed to schedule async delegation batch: {exc}",
+                },
+                "error",
+            )
+        else:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -3026,6 +3103,12 @@ def interrupt_for_session(
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return 0
+    from tools.parent_task_barrier import cancel_session_barriers
+
+    cancel_session_barriers(
+        origin_session=session_key,
+        parent_session_id=parent_session_id,
+    )
     with _records_lock:
         targets = [
             r for r in _records.values()

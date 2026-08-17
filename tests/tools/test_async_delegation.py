@@ -169,6 +169,49 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_required_dispatch_binds_parent_before_worker_and_converges():
+    from tools import parent_task_barrier as parent_barrier
+
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=3)
+        return {
+            "status": "completed",
+            "summary": "required evidence",
+            "api_calls": 1,
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="required child",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="telegram:chat:thread",
+        parent_session_id="parent-session",
+        root_turn_id="root-turn",
+        runner=runner,
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    barrier_id = parent_barrier.barrier_for_child(res["delegation_id"])
+    assert barrier_id
+    assert parent_barrier.finalization_policy(
+        parent_session_id="parent-session", root_turn_id="root-turn"
+    )["action"] == "withhold"
+    assert parent_barrier.claim_next_ready_continuation(owner="gateway") is None
+
+    gate.set()
+    evt = _drain_one()
+    assert evt is not None
+    claim = parent_barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    assert claim["barrier_id"] == barrier_id
+    assert "required evidence" in claim["synthetic_message"]
+    assert parent_barrier.claim_next_ready_continuation(owner="other") is None
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",

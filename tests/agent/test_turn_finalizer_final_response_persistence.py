@@ -268,3 +268,36 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1]["_parent_task_candidate"] is True
     assert agent.persisted_messages[-1]["_parent_task_barrier_id"] == "barrier-1"
+
+
+def test_parent_barrier_lookup_failure_suppresses_delivery(monkeypatch):
+    barrier = ModuleType("tools.parent_task_barrier")
+
+    def _broken_policy(**_kwargs):
+        raise RuntimeError("state db unavailable")
+
+    setattr(barrier, "finalization_policy", _broken_policy)
+    monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = FakeAgent()
+    setattr(agent, "_db_flush_scan_prefix", [])
+    result = finalize_turn(
+        agent,
+        final_response="must not leak",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "delegate"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="root-turn",
+        user_message="delegate",
+        original_user_message="delegate",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["suppress_delivery"] is True
+    assert result["defer_goal_evaluation"] is True
+    assert "state db unavailable" in result["error"]
