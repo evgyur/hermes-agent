@@ -18,6 +18,12 @@ def _use_db(monkeypatch, tmp_path):
                result_json TEXT
            )"""
     )
+    conn.execute(
+        """CREATE TABLE delivery_obligations (
+               obligation_id TEXT PRIMARY KEY,
+               state TEXT NOT NULL
+           )"""
+    )
     conn.commit()
     conn.close()
     return path
@@ -40,6 +46,28 @@ def _accept(claim):
         claim["continuation_claim"],
         accepted_turn_id="test-turn",
         owner_pid=os.getpid(),
+    )
+
+
+def _complete(barrier_id, claim, *, result=None):
+    obligation_id = f"delivery-{claim}"
+    if not barrier.bind_delivery_obligation(
+        barrier_id,
+        claim,
+        obligation_id=obligation_id,
+        result=result,
+    ):
+        return False
+    with barrier._transaction() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO delivery_obligations(obligation_id, state) "
+            "VALUES (?, 'delivered')",
+            (obligation_id,),
+        )
+    return barrier.complete_continuation_after_delivery(
+        barrier_id,
+        claim,
+        obligation_id=obligation_id,
     )
 
 
@@ -153,12 +181,12 @@ def test_continuation_claim_releases_reclaims_and_closes_once(monkeypatch, tmp_p
     assert second is not None
     assert second["continuation_claim"] != first["continuation_claim"]
     _accept(second)
-    assert barrier.complete_continuation(
+    assert _complete(
         barrier_id,
         second["continuation_claim"],
         result={"final_response": "done"},
     )
-    assert not barrier.complete_continuation(
+    assert not _complete(
         barrier_id, second["continuation_claim"], result={}
     )
     assert barrier.claim_next_ready_continuation(owner="g3") is None
@@ -198,7 +226,7 @@ def test_expired_claim_is_recovered_and_retry_budget_parks(monkeypatch, tmp_path
     assert terminal["terminal_failure"] is True
     assert "terminal recovery" in terminal["synthetic_message"]
     _accept(terminal)
-    assert barrier.complete_continuation(
+    assert _complete(
         barrier_id,
         terminal["continuation_claim"],
         result={"final_response": "truthful terminal result"},
@@ -354,7 +382,7 @@ def test_delivered_obligation_closes_live_accepted_continuation(monkeypatch, tmp
     )
     with barrier._transaction() as conn:
         conn.execute(
-            """CREATE TABLE delivery_obligations(
+            """CREATE TABLE IF NOT EXISTS delivery_obligations(
                    obligation_id TEXT PRIMARY KEY, state TEXT NOT NULL
                )"""
         )
@@ -587,6 +615,26 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
     )
     conn.close()
     assert {"parent_task_barriers", "parent_task_children"} <= tables
+
+
+def test_schema_version_five_advances_to_six(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_barrier_meta SET schema_version=5 WHERE singleton=1"
+        )
+    assert barrier.barrier_snapshot(barrier_id) is not None
+    conn = sqlite3.connect(barrier._db_path())
+    assert conn.execute(
+        "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
+    ).fetchone()[0] == 6
+    conn.close()
 
 
 def test_explicit_session_cancellation_terminalizes_open_barrier(monkeypatch, tmp_path):

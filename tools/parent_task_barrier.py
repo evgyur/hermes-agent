@@ -155,7 +155,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     version_row = conn.execute(
         "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
     ).fetchone()
-    needs_migration = version_row is None or int(version_row[0] or 0) < 5
+    needs_migration = version_row is None or int(version_row[0] or 0) < 6
     barrier_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(parent_task_barriers)")
     }
@@ -933,28 +933,6 @@ def release_accepted_continuation(barrier_id: str, claim: str) -> bool:
                WHERE barrier_id=? AND state='continuing'
                  AND continuation_status='accepted' AND continuation_claim=?""",
             (now + 1.0, now, str(barrier_id), str(claim)),
-        ).rowcount
-    return changed == 1
-
-
-def complete_continuation(
-    barrier_id: str, claim: str, *, result: Optional[Dict[str, Any]] = None
-) -> bool:
-    now = time.time()
-    with _transaction() as conn:
-        changed = conn.execute(
-            """UPDATE parent_task_barriers
-               SET state='closed', continuation_status='generated',
-                   continuation_lease_until=NULL,
-                   updated_at=?, closed_at=?
-               WHERE barrier_id=? AND state='continuing'
-                 AND continuation_status='accepted' AND continuation_claim=?""",
-            (
-                now,
-                now,
-                str(barrier_id),
-                str(claim),
-            ),
         ).rowcount
     return changed == 1
 
