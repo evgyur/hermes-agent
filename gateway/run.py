@@ -3117,6 +3117,14 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     return cleaned.strip()
 
 
+def _parent_task_stream_allowed(agent: Any, *, run_still_current: bool) -> bool:
+    """Block response/interim streaming after durable required-child admission."""
+    return bool(run_still_current) and not bool(
+        agent is not None
+        and getattr(agent, "_parent_task_barrier_stream_suppressed", False)
+    )
+
+
 def _queued_first_response_delivery_policy(
     *, final_text_delivered: bool, failed: bool,
 ) -> tuple[bool, bool]:
@@ -4973,7 +4981,10 @@ class TurnRunner:
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
-                            if ctx._run_still_current():
+                            if _parent_task_stream_allowed(
+                                agent,
+                                run_still_current=ctx._run_still_current(),
+                            ):
                                 _stream_consumer.on_delta(text)
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
@@ -4987,11 +4998,17 @@ class TurnRunner:
         # receives LLM deltas for audio synthesis (#60671).
         if _stream_delta_cb is None and _stts_consumer_ref is not None:
             def _stream_delta_cb(text: str) -> None:
-                if ctx._run_still_current():
+                if _parent_task_stream_allowed(
+                    agent,
+                    run_still_current=ctx._run_still_current(),
+                ):
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not _parent_task_stream_allowed(
+                agent,
+                run_still_current=ctx._run_still_current(),
+            ):
                 return
             display_text = text
             if _stream_consumer is not None:
@@ -5316,6 +5333,10 @@ class TurnRunner:
             ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
+        # Cached agents may retain this per-turn flag from a prior provisional
+        # root. Reset it before installing callbacks; delegate_task sets it
+        # again only after durable required-child admission succeeds.
+        agent._parent_task_barrier_stream_suppressed = False
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
@@ -19466,20 +19487,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
-        # Genuine user input supersedes any older required-child barrier for
-        # this routed session. Trusted internal continuation events carry their
-        # own exact barrier claim and are never attached by session proximity.
+        # Ordinary user input is parked behind an active required-child
+        # continuation instead of cancelling it or entering the wrong root turn.
+        # Explicit /stop, /new, and /reset are handled by the existing command
+        # paths before this point and still cancel child + barrier ownership.
         if not bool(getattr(event, "internal", False)):
             try:
-                from tools.parent_task_barrier import cancel_session_barriers
-
-                await asyncio.to_thread(
-                    cancel_session_barriers,
-                    origin_session=session_key,
+                parked = await self._park_user_event_for_parent_barrier(
+                    event=event,
+                    session_key=session_key,
                     parent_session_id=str(session_entry.session_id or ""),
                 )
             except Exception:
-                logger.exception("Could not cancel superseded parent-task barrier")
+                logger.exception("Could not inspect active parent-task barrier")
+                return
+            if parked:
                 return
 
         # Stage the collected must-deliver notes for this turn's agent run
@@ -19516,6 +19538,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _parent_continuation_start = getattr(
+                event, "_hermes_parent_task_continuation", None
+            )
+            if _parent_continuation_start is not None:
+                from tools.parent_task_barrier import (
+                    TrustedParentTaskContinuation,
+                    accept_continuation,
+                )
+
+                if not isinstance(
+                    _parent_continuation_start, TrustedParentTaskContinuation
+                ):
+                    logger.error("Rejected untrusted parent-task continuation start")
+                    return
+                accepted_turn_id = (
+                    f"{session_key}:{run_generation}:"
+                    f"{getattr(event, 'message_id', '') or 'internal'}"
+                )
+                accepted = await asyncio.to_thread(
+                    accept_continuation,
+                    str(_parent_continuation_start.get("barrier_id") or ""),
+                    str(
+                        _parent_continuation_start.get("continuation_claim") or ""
+                    ),
+                    accepted_turn_id=accepted_turn_id,
+                    owner_pid=os.getpid(),
+                )
+                if not accepted:
+                    logger.error(
+                        "Parent-task continuation claim was not current at turn start"
+                    )
+                    return
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -19581,6 +19635,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "parent-task continuation claim was not current"
                         )
                 except Exception as _parent_close_exc:
+                    try:
+                        from tools.parent_task_barrier import (
+                            release_accepted_continuation,
+                        )
+
+                        await asyncio.to_thread(
+                            release_accepted_continuation,
+                            str(_parent_continuation.get("barrier_id") or ""),
+                            str(
+                                _parent_continuation.get("continuation_claim")
+                                or ""
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not release unclosed parent-task continuation"
+                        )
                     logger.error(
                         "Parent-task continuation could not close durably: %s",
                         _parent_close_exc,
@@ -20218,6 +20289,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            _failed_parent_continuation = locals().get(
+                "_parent_continuation_start"
+            )
+            if _failed_parent_continuation is not None:
+                try:
+                    from tools.parent_task_barrier import (
+                        release_accepted_continuation,
+                    )
+
+                    await asyncio.to_thread(
+                        release_accepted_continuation,
+                        str(_failed_parent_continuation.get("barrier_id") or ""),
+                        str(
+                            _failed_parent_continuation.get(
+                                "continuation_claim"
+                            )
+                            or ""
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not release failed parent-task continuation"
+                    )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -25087,6 +25181,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 accepted.add(delegation_id)
 
         return accepted
+
+    async def _park_user_event_for_parent_barrier(
+        self,
+        *,
+        event: Any,
+        session_key: str,
+        parent_session_id: str,
+    ) -> bool:
+        """Park ordinary steering behind an active required-child continuation."""
+        from tools.parent_task_barrier import has_active_barrier
+
+        active = await asyncio.to_thread(
+            has_active_barrier,
+            origin_session=session_key,
+            parent_session_id=parent_session_id,
+        )
+        if not active:
+            return False
+        self._queue_or_replace_pending_event(session_key, event)
+        logger.info(
+            "Parked user event behind active parent-task barrier: session=%s",
+            session_key,
+        )
+        return True
 
     async def _consume_parent_barrier_child(self, evt: dict) -> Optional[bool]:
         """Acknowledge a child outcome absorbed by a parent barrier."""

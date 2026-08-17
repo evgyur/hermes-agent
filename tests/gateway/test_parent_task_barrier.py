@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -110,6 +111,49 @@ async def test_failed_aggregate_injection_releases_durable_claim():
     assert snapshot is not None
     assert snapshot["barrier"]["state"] == "ready"
     assert snapshot["barrier"]["continuation_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_user_event_is_parked_behind_active_barrier():
+    from gateway.run import GatewayRunner
+
+    barrier.admit_required_child(
+        origin_session="agent:main:telegram:dm:1",
+        parent_session_id="parent",
+        root_turn_id="root",
+        task_id="child",
+    )
+    runner = object.__new__(GatewayRunner)
+    queued = []
+    runner._queue_or_replace_pending_event = (
+        lambda session_key, event: queued.append((session_key, event))
+    )
+    event = SimpleNamespace(text="steer me after the child")
+
+    parked = await runner._park_user_event_for_parent_barrier(
+        event=event,
+        session_key="agent:main:telegram:dm:1",
+        parent_session_id="parent",
+    )
+    assert parked is True
+    assert queued == [("agent:main:telegram:dm:1", event)]
+
+    barrier.cancel_session_barriers(origin_session="agent:main:telegram:dm:1")
+    assert not await runner._park_user_event_for_parent_barrier(
+        event=event,
+        session_key="agent:main:telegram:dm:1",
+        parent_session_id="parent",
+    )
+
+
+def test_streaming_is_blocked_after_required_child_admission():
+    from gateway.run import _parent_task_stream_allowed
+
+    agent = SimpleNamespace(_parent_task_barrier_stream_suppressed=False)
+    assert _parent_task_stream_allowed(agent, run_still_current=True)
+    agent._parent_task_barrier_stream_suppressed = True
+    assert not _parent_task_stream_allowed(agent, run_still_current=True)
+    assert not _parent_task_stream_allowed(agent, run_still_current=False)
 
 
 def test_goal_outcome_defers_standing_goal_judge_for_provisional_turn():

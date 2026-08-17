@@ -3806,6 +3806,16 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _required_root_turn_id = (
+            ""
+            if (
+                _restart_ctx.get("delegation_id")
+                or not _session_key
+                or str(getattr(parent_agent, "platform", "") or "").lower()
+                in {"cli", "tui", "api"}
+            )
+            else str(getattr(parent_agent, "_current_turn_id", "") or "")
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3818,16 +3828,7 @@ def delegate_task(
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,
-            root_turn_id=(
-                ""
-                if (
-                    _restart_ctx.get("delegation_id")
-                    or not _session_key
-                    or str(getattr(parent_agent, "platform", "") or "").lower()
-                    in {"cli", "tui", "api"}
-                )
-                else str(getattr(parent_agent, "_current_turn_id", "") or "")
-            ),
+            root_turn_id=_required_root_turn_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
@@ -3850,6 +3851,12 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            if _required_root_turn_id:
+                setattr(
+                    parent_agent,
+                    "_parent_task_barrier_stream_suppressed",
+                    True,
+                )
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "

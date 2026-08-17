@@ -326,14 +326,43 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
     _parent_task_policy = {"action": "deliver"}
-
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
     try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+        from tools.parent_task_barrier import finalization_policy
+
+        _parent_task_policy = finalization_policy(
+            parent_session_id=str(agent.session_id or ""),
+            root_turn_id=str(turn_id or ""),
+            persist=False,
+        )
+    except Exception as _barrier_err:
+        _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
+        _parent_task_policy = {
+            "action": "error",
+            "error": str(_barrier_err),
+            "defer_goal_evaluation": True,
+        }
+        logger.error(
+            "finalize_turn: parent-task barrier policy failed closed: %s",
+            _barrier_err,
+            exc_info=True,
+        )
+
+    # Save trajectory only for a committed ordinary turn. Provisional parent
+    # text must not escape through trajectory storage before transcript policy.
+    if _parent_task_policy.get("action") == "deliver":
+        try:
+            agent._save_trajectory(
+                messages,
+                _summarize_user_message_for_log(user_message),
+                completed,
+            )
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error(
+                "finalize_turn: _save_trajectory failed: %s",
+                _save_err,
+                exc_info=True,
+            )
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -430,16 +459,10 @@ def finalize_turn(
                 agent._db_flush_scan_prefix = None
 
         # Required background children make this root turn provisional. The
-        # feature-owned barrier decides closure from its own durable tables;
-        # the finalizer only applies that policy at the persistence chokepoint.
-        try:
-            from tools.parent_task_barrier import finalization_policy
-
-            _parent_task_policy = finalization_policy(
-                parent_session_id=str(agent.session_id or ""),
-                root_turn_id=str(turn_id or ""),
-            )
-            if _parent_task_policy.get("action") == "withhold":
+        # early policy lookup already blocked trajectory writes; at the durable
+        # transcript chokepoint retain only an empty role marker.
+        if _parent_task_policy.get("action") in {"withhold", "error"}:
+            try:
                 _barrier_id = str(_parent_task_policy.get("barrier_id") or "")
                 _candidate = next(
                     (
@@ -449,7 +472,14 @@ def finalize_turn(
                     ),
                     None,
                 )
-                if _candidate is None or not _barrier_id:
+                if _candidate is None:
+                    raise RuntimeError(
+                        "parent-task policy could not bind the provisional answer"
+                    )
+                if (
+                    _parent_task_policy.get("action") == "withhold"
+                    and not _barrier_id
+                ):
                     raise RuntimeError(
                         "required-child barrier could not bind the provisional answer"
                     )
@@ -465,20 +495,18 @@ def finalize_turn(
                 _candidate["_parent_task_barrier_id"] = _barrier_id
                 _candidate.pop("_db_persisted", None)
                 agent._db_flush_scan_prefix = None
-        except Exception as _barrier_err:
-            # Ambiguous ownership must never leak a normal final answer. Keep
-            # the transcript recoverable and surface the failure on the result.
-            _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
-            _parent_task_policy = {
-                "action": "error",
-                "error": str(_barrier_err),
-                "defer_goal_evaluation": True,
-            }
-            logger.error(
-                "finalize_turn: parent-task barrier policy failed closed: %s",
-                _barrier_err,
-                exc_info=True,
-            )
+            except Exception as _barrier_err:
+                _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
+                _parent_task_policy = {
+                    "action": "error",
+                    "error": str(_barrier_err),
+                    "defer_goal_evaluation": True,
+                }
+                logger.error(
+                    "finalize_turn: parent-task barrier policy failed closed: %s",
+                    _barrier_err,
+                    exc_info=True,
+                )
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -543,6 +571,15 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        if _parent_task_policy.get("action") == "withhold":
+            from tools.parent_task_barrier import mark_initial_persisted
+
+            if not mark_initial_persisted(
+                str(_parent_task_policy.get("barrier_id") or "")
+            ):
+                raise RuntimeError(
+                    "parent-task provisional transcript persisted without barrier commit"
+                )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

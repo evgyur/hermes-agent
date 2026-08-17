@@ -239,11 +239,19 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
             "defer_goal_evaluation": True,
         },
     )
+    setattr(barrier, "mark_initial_persisted", lambda _barrier_id: True)
     monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
 
     agent = FakeAgent()
     setattr(agent, "_db_flush_scan_prefix", [])
+    setattr(
+        agent,
+        "_save_trajectory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached trajectory storage")
+        ),
+    )
     setattr(
         agent,
         "_sync_external_memory_for_turn",
@@ -312,3 +320,7 @@ def test_parent_barrier_lookup_failure_suppresses_delivery(monkeypatch):
     assert result["suppress_delivery"] is True
     assert result["defer_goal_evaluation"] is True
     assert "state db unavailable" in result["error"]
+    assert agent.persisted_messages is not None
+    assert all(
+        "must not leak" not in repr(message) for message in agent.persisted_messages
+    )

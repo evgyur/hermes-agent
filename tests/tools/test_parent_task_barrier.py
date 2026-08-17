@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,6 +30,15 @@ def _put_result(task_id, result):
     )
     conn.commit()
     conn.close()
+
+
+def _accept(claim):
+    assert barrier.accept_continuation(
+        claim["barrier_id"],
+        claim["continuation_claim"],
+        accepted_turn_id="test-turn",
+        owner_pid=os.getpid(),
+    )
 
 
 def _admit_pair():
@@ -140,6 +150,7 @@ def test_continuation_claim_releases_reclaims_and_closes_once(monkeypatch, tmp_p
     second = barrier.claim_next_ready_continuation(owner="g2")
     assert second is not None
     assert second["continuation_claim"] != first["continuation_claim"]
+    _accept(second)
     assert barrier.complete_continuation(
         barrier_id,
         second["continuation_claim"],
@@ -184,6 +195,7 @@ def test_expired_claim_is_recovered_and_retry_budget_parks(monkeypatch, tmp_path
     assert terminal is not None
     assert terminal["terminal_failure"] is True
     assert "terminal recovery" in terminal["synthetic_message"]
+    _accept(terminal)
     assert barrier.complete_continuation(
         barrier_id,
         terminal["continuation_claim"],
@@ -216,6 +228,81 @@ def test_dead_gateway_owner_is_reconciled_without_waiting_for_lease(
     assert second is not None
     assert second["barrier_id"] == barrier_id
     assert second["continuation_claim"] != first["continuation_claim"]
+
+
+def test_accepted_live_owner_is_not_reclaimed_but_dead_owner_is(
+    monkeypatch, tmp_path
+):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    first = barrier.claim_next_ready_continuation(owner=f"gateway:{os.getpid()}:one")
+    assert first is not None
+    _accept(first)
+    # Accepted work is owned by the live executor, not by the expired pre-start lease.
+    assert barrier.claim_next_ready_continuation(owner="other") is None
+
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_barriers SET accepted_owner_pid=99999999 "
+            "WHERE barrier_id=?",
+            (barrier_id,),
+        )
+    second = barrier.claim_next_ready_continuation(owner="gateway:1:recovery")
+    assert second is not None
+    assert second["continuation_claim"] != first["continuation_claim"]
+
+
+def test_terminal_delivery_retries_are_bounded(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_barriers SET continuation_attempts=? "
+            "WHERE barrier_id=?",
+            (barrier._MAX_CONTINUATION_ATTEMPTS, barrier_id),
+        )
+
+    for index in range(barrier._MAX_TERMINAL_DELIVERY_ATTEMPTS):
+        with barrier._transaction() as conn:
+            conn.execute(
+                "UPDATE parent_task_barriers SET next_attempt_at=0 WHERE barrier_id=?",
+                (barrier_id,),
+            )
+        claim = barrier.claim_next_ready_continuation(owner=f"gateway-{index}")
+        assert claim is not None and claim["terminal_failure"] is True
+        assert barrier.release_continuation_claim(
+            barrier_id, claim["continuation_claim"]
+        )
+
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_barriers SET next_attempt_at=0 WHERE barrier_id=?",
+            (barrier_id,),
+        )
+    assert barrier.claim_next_ready_continuation(owner="gateway-final") is None
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "failed"
+    assert (
+        snapshot["barrier"]["continuation_status"]
+        == "terminal_delivery_exhausted"
+    )
 
 
 def test_duplicate_terminal_callbacks_and_concurrent_claims_are_idempotent(
@@ -297,6 +384,12 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
         ).fetchall()
     }
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert (
+        conn.execute(
+            "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
+        ).fetchone()[0]
+        == 2
+    )
     conn.close()
     assert {"parent_task_barriers", "parent_task_children"} <= tables
 

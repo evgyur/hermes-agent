@@ -121,7 +121,7 @@ When a top-level agent provides a `tasks` array, Hermes returns one background h
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
-- **Cancellation:** Follow-up messages do not stop a top-level background batch, but on messaging gateways they supersede the old parent barrier so a stale child outcome cannot be attached to the new user turn. `/stop` or closing/resetting the owning session cancels its active children and the associated barrier. Synchronous orchestrator children still follow their parent's interrupt state
+- **Cancellation:** Ordinary follow-up messages do not stop a top-level background batch; on messaging gateways they are parked behind the required aggregate continuation so they cannot enter the wrong root turn. `/stop` or closing/resetting the owning session cancels its active children and the associated barrier. Synchronous orchestrator children still follow their parent's interrupt state
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
@@ -144,9 +144,9 @@ delivered records are bounded and profile-local.
 
 On persistent messaging gateways, Hermes also writes a feature-owned parent barrier before submitting a required background child. The barrier binds the routed origin session, the parent's durable session ID, the root turn ID, and every required delegation ID.
 
-The initial parent response is saved as a provisional candidate and is not delivered while required children remain non-terminal. Child callbacks update the barrier atomically with their normal durable completion record. After all required children are terminal, one gateway process leases the aggregate continuation, re-enters the original parent session with all child outcomes, and lets the parent generate the single user-facing final answer. Individual child completion messages are consumed by the barrier rather than sent separately.
+The initial parent response is represented only by a content-free provisional transcript marker and is not delivered while required children remain non-terminal. Provisional answer and reasoning text are excluded from transcript, trajectory, external-memory, and background-review sinks. Child callbacks update the barrier atomically with their normal durable completion record. After all required children are terminal, one gateway process leases the aggregate continuation, re-enters the original parent session with all child outcomes, and lets the parent generate the single user-facing final answer. Individual child completion messages are consumed by the barrier rather than sent separately.
 
-A gateway restart does not lose a ready continuation: expired claims return to `pending` and are leased again. A genuine new user message, `/stop`, `/new`, or `/reset` cancels the old barrier so unrelated input cannot be attached to it. Parent barriers do not change child capability rules and do not replay protected side effects.
+A gateway restart does not lose a ready continuation: expired pre-start claims return to `pending` and are leased again. Once a live executor accepts a continuation turn, lease expiry alone cannot create a duplicate; restart recovery reclaims accepted work only after the owning process is dead. Ordinary new user messages are parked behind the active barrier, while `/stop`, `/new`, and `/reset` cancel it. Continuation and terminal-delivery retries are bounded and terminal routing failures are retained diagnostically. Parent barriers do not change child capability rules and do not replay protected side effects.
 
 ## Model Override
 
