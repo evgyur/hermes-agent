@@ -2709,6 +2709,24 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _gateway_ledger_ids(event: MessageEvent) -> list[int]:
+    """Return every durable ingress identity represented by one event."""
+    values = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+    primary = getattr(event, "_hermes_gateway_ledger_id", None)
+    if primary is not None:
+        values.append(primary)
+    return list(dict.fromkeys(int(value) for value in values if value is not None))
+
+
+def _merge_gateway_ledger_ids(retained: MessageEvent, incoming: MessageEvent) -> None:
+    """Attach merged ingress identities to the event that will be replayed."""
+    merged = list(dict.fromkeys(_gateway_ledger_ids(retained) + _gateway_ledger_ids(incoming)))
+    if merged:
+        setattr(retained, "_hermes_gateway_ledger_ids", merged)
+        if getattr(retained, "_hermes_gateway_ledger_id", None) is None:
+            setattr(retained, "_hermes_gateway_ledger_id", merged[0])
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2729,6 +2747,7 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        _merge_gateway_ledger_ids(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -5636,6 +5655,7 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
+            _merge_gateway_ledger_ids(state.event, event)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"

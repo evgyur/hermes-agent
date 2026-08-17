@@ -356,6 +356,41 @@ def test_runner_reconciles_ledger_at_recorded_startup_boundary(ledger_db):
     assert row["reason"] == "gateway-startup-reconciliation"
 
 
+@pytest.mark.asyncio
+async def test_startup_replay_is_owned_before_adapter_background_race(ledger_db):
+    event = _event(text="replayed", message_id="startup-race")
+    ledger_id = ledger_db.record_gateway_message_received(
+        platform="telegram",
+        chat_id="chat-1",
+        message_id="startup-race",
+        received_at=100.0,
+    )
+    reconciled = []
+
+    class BackgroundSpawningAdapter:
+        async def handle_message(self, _event):
+            reconciled.append(
+                ledger_db.reconcile_stale_gateway_message_ledger(
+                    200.0,
+                    timestamp=400.0,
+                )
+            )
+
+    runner = _runner_with_ledger(ledger_db)
+    runner._startup_restore_queue = [event]
+    runner._adapter_for_source = lambda source: BackgroundSpawningAdapter()
+    runner._session_key_for_source = lambda source: "agent:main:telegram:dm:chat-1"
+
+    assert await runner._drain_startup_restore_queue() == 1
+
+    assert reconciled == [0]
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row is not None
+    assert row["status"] == "received"
+    assert row["reason"] == "startup-replay-admitted"
+    assert row["updated_at"] > 200.0
+
+
 def test_ledger_writes_are_best_effort_and_do_not_crash_gateway():
     class BrokenDB:
         def record_gateway_message_received(self, **_kwargs):

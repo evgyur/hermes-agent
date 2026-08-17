@@ -3,11 +3,18 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    merge_pending_message_event,
+)
 from gateway.session import SessionSource
 
 
@@ -143,6 +150,25 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     )
     runner._set_gateway_ledger_deferred(pending_event)
 
+    merged_event = MessageEvent(
+        text="and this",
+        message_type=MessageType.PHOTO,
+        source=pending_source,
+        media_urls=[str(image_path)],
+        media_types=["image/png"],
+        message_id="queued-2",
+    )
+    merged_ledger_id = runner._record_gateway_ledger_received(
+        merged_event,
+        session_key="agent:main:telegram:group:-1001",
+    )
+    runner._set_gateway_ledger_deferred(merged_event)
+    merge_pending_message_event(
+        adapter._pending_messages,
+        "agent:main:telegram:group:-1001",
+        merged_event,
+    )
+
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
@@ -163,3 +189,71 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert ledger_row is not None
     assert ledger_row["status"] == "completed"
     assert ledger_row["session_id"] == "sess-native-image-followup"
+    merged_row = ledger_db.get_gateway_message_ledger(merged_ledger_id)
+    assert merged_row is not None
+    assert merged_row["status"] == "completed"
+    assert merged_row["session_id"] == "sess-native-image-followup"
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_preparation_exception_terminalizes_ledger(
+    monkeypatch,
+    tmp_path,
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    from hermes_state import SessionDB
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    ledger_db = SessionDB(tmp_path / "state.db")
+    runner._session_db = ledger_db
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    pending_event = MessageEvent(
+        text="queued text",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-prep-error",
+    )
+    session_key = "agent:main:telegram:group:-1001"
+    adapter._pending_messages[session_key] = pending_event
+    ledger_id = runner._record_gateway_ledger_received(
+        pending_event,
+        session_key=session_key,
+    )
+    runner._set_gateway_ledger_deferred(pending_event)
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
+        side_effect=RuntimeError("prep exploded")
+    )
+
+    with pytest.raises(RuntimeError, match="prep exploded"):
+        await runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-prep-error",
+            session_key=session_key,
+        )
+
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["reason"] == "queued-followup-preparation-error"
+    assert row["dispatch_started_at"] is not None
+    assert row["failed_at"] is not None

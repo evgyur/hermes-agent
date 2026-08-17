@@ -8402,6 +8402,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 snippet=self._gateway_ledger_snippet(event),
             )
             setattr(event, "_hermes_gateway_ledger_id", ledger_id)
+            ledger_ids = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+            if ledger_id not in ledger_ids:
+                ledger_ids.append(ledger_id)
+            setattr(event, "_hermes_gateway_ledger_ids", ledger_ids)
             return ledger_id
         except Exception as exc:
             logger.debug("gateway message ledger receive failed: %s", exc, exc_info=True)
@@ -8422,10 +8426,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = getattr(event, "source", None)
         if db is None or source is None:
             return False
-        ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        ledger_ids = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+        primary_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        if primary_id is not None:
+            ledger_ids.append(primary_id)
+        ledger_ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
         try:
+            if ledger_ids:
+                results = [
+                    db.update_gateway_message_ledger(
+                        ledger_id=ledger_id,
+                        status=status,
+                        session_key=session_key,
+                        session_id=session_id,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+                    for ledger_id in ledger_ids
+                ]
+                return bool(results) and all(results)
+
             ok = db.update_gateway_message_ledger(
-                ledger_id=ledger_id,
                 platform=getattr(
                     getattr(source, "platform", None),
                     "value",
@@ -8440,7 +8461,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason=reason,
                 metadata=metadata,
             )
-            if not ok and ledger_id is None:
+            if not ok:
                 ledger_id = self._record_gateway_ledger_received(
                     event,
                     session_key=session_key,
@@ -9828,7 +9849,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Normal busy case (agent actively running a task)
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return False  # let default path handle it
+            self._update_gateway_ledger(
+                event,
+                "failed",
+                session_key=session_key,
+                reason="busy-adapter-unavailable",
+            )
+            return True
 
         # --- Internal synthetic events must never interrupt/steer ---
         # Async-delegation completions (delegate_task(background=true)) and
@@ -9838,11 +9865,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (the default busy_text_mode) aborts the active turn AND sends a "⚡
         # Interrupting current task" ack — exactly the opposite of the design
         # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # never splices into a running turn. Queue it on the runner-owned FIFO
+        # so ledger identity and eventual terminalization stay attached.
         if getattr(event, "internal", False):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -9854,7 +9881,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -11565,12 +11593,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(getattr(source, "platform", None), "value", None),
                 )
                 continue
+            assert source is not None
             # Mark this replay so _handle_message does not queue it again while
             # the restore gate remains closed for any fresh inbound arrivals.
             try:
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
+            # Persist current-process ownership before adapter.handle_message can
+            # return after merely spawning its background task.  Reconciliation
+            # runs immediately after this drain and must not win the race against
+            # the replay's later runner callback.
+            await asyncio.to_thread(
+                self._record_gateway_ledger_received,
+                event,
+                session_key=self._session_key_for_source(source),
+                reason="startup-replay-admitted",
+            )
             await adapter.handle_message(event)
             drained += 1
         return drained
@@ -29450,12 +29489,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
-                    next_message = await self._prepare_profile_scoped_inbound_message_text(
-                        event=pending_event,
-                        source=next_source,
-                        history=updated_history,
+                    self._update_gateway_ledger(
+                        pending_event,
+                        "in_progress",
                         session_key=next_session_key,
+                        session_id=session_id,
+                        reason="queued-followup-preparing",
                     )
+                    try:
+                        next_message = await self._prepare_profile_scoped_inbound_message_text(
+                            event=pending_event,
+                            source=next_source,
+                            history=updated_history,
+                            session_key=next_session_key,
+                        )
+                    except BaseException as exc:
+                        self._update_gateway_ledger(
+                            pending_event,
+                            "drained" if isinstance(exc, asyncio.CancelledError) else "failed",
+                            session_key=next_session_key,
+                            session_id=session_id,
+                            reason=(
+                                "queued-followup-preparation-cancelled"
+                                if isinstance(exc, asyncio.CancelledError)
+                                else "queued-followup-preparation-error"
+                            ),
+                        )
+                        raise
                     if next_message is None:
                         self._update_gateway_ledger(
                             pending_event,
