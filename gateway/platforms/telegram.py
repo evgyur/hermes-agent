@@ -445,11 +445,6 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
-    # A restart-resume turn already has the interrupted transcript and must
-    # continue from it. Treating Telegram as "interactive" made the synthetic
-    # turn discard recoverable work and ask the owner what to do next.
-    interactive_resume: bool = False
-
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks

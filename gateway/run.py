@@ -1119,34 +1119,21 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
-def _resume_recovery_is_interactive(adapter: Any, *, startup_resume: bool) -> bool:
-    """Apply adapter auto-continue only to synthetic startup recovery turns."""
-    if not startup_resume:
-        return True
-    return bool(getattr(adapter, "interactive_resume", True))
-
-
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
     *,
-    interactive: bool = True,
+    startup_resume: bool = False,
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
     ``reason`` is the session's ``resume_reason`` (``restart_timeout``,
     ``shutdown_timeout``, or anything else → generic interruption phrasing).
-    ``message`` is the user's NEW message text; empty means this is the
-    startup auto-resume turn synthesized by
-    ``_schedule_resume_pending_sessions`` with no human message attached.
-
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``startup_resume`` is exact event provenance, not a platform capability.
+    ``True`` means ``_schedule_resume_pending_sessions`` synthesized this turn
+    with no new human message, so the interrupted work must continue from the
+    transcript. ``False`` means a real inbound event is present and wins even
+    when its text is empty (for example captionless media).
     """
     reason_phrase = (
         "a gateway restart"
@@ -1155,7 +1142,7 @@ def build_resume_recovery_note(
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
-    if message:
+    if not startup_resume:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus "
             "on what the user is asking now."
@@ -1164,18 +1151,9 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
+            "No new user message is attached to this startup recovery turn, "
             "so do NOT emit a 'session restored' acknowledgement "
             "or ask questions. Review at least the latest 10 messages "
             "in the conversation history, infer the active user request, and "
@@ -5828,23 +5806,14 @@ class TurnRunner:
             _persist_user_message_override = ctx.message
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
-            # no NEW user message to address.  Guidance is adapter-aware:
-            # interactive platforms report the restore and ask what next;
-            # non-interactive event platforms (webhook, API server)
-            # continue the interrupted work instead, because nobody is
-            # present to answer and an acknowledgement would silently
-            # abandon the task (#57056).
-            _resume_adapter = self._runner._adapter_for_source(ctx.source)
-            _interactive_resume = _resume_recovery_is_interactive(
-                _resume_adapter,
-                startup_resume=ctx.startup_resume,
-            )
-            # Adapter-level non-interactive recovery is only valid for the
-            # empty synthetic startup turn. A real inbound event can carry
-            # empty text (for example a captionless photo) and must remain an
-            # interactive user turn.
+            # no NEW user message to address. Exact event provenance decides
+            # the policy: every synthetic startup turn continues its durable
+            # transcript; every real inbound event wins, including
+            # captionless media whose text is empty.
             ctx.message = build_resume_recovery_note(
-                _reason, ctx.message, interactive=_interactive_resume,
+                _reason,
+                ctx.message or "",
+                startup_resume=ctx.startup_resume,
             )
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
@@ -5885,15 +5854,10 @@ class TurnRunner:
             _sn_reason = (
                 getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             )
-            _sn_adapter = self._runner._adapter_for_source(ctx.source)
-            _sn_interactive_resume = _resume_recovery_is_interactive(
-                _sn_adapter,
-                startup_resume=ctx.startup_resume,
-            )
             ctx.message = build_resume_recovery_note(
                 _sn_reason,
                 "",
-                interactive=_sn_interactive_resume,
+                startup_resume=ctx.startup_resume,
             )
 
         _approval_session_key = ctx.session_key or ""

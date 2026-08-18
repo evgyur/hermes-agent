@@ -34,15 +34,12 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
-from gateway.platforms.telegram import TelegramAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter as PluginTelegramAdapter
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
-    _resume_recovery_is_interactive,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -115,6 +112,7 @@ def _simulate_note_injection(
     *,
     agent_history: list | None = None,
     window_secs: float | None = None,
+    startup_resume: bool = False,
 ) -> str:
     """Mirror the note-injection logic in gateway/run.py _run_agent().
 
@@ -158,7 +156,11 @@ def _simulate_note_injection(
         reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
         # Real production note builder — extracted to module scope in
         # gateway/run.py so tests exercise the actual strings.
-        message = build_resume_recovery_note(reason, message)
+        message = build_resume_recovery_note(
+            reason,
+            message,
+            startup_resume=startup_resume,
+        )
     elif has_fresh_tool_tail:
         message = (
             "[System note: A new message has arrived. The conversation "
@@ -177,7 +179,11 @@ def _simulate_note_injection(
         and getattr(resume_entry, "resume_pending", False)
     ):
         sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        message = build_resume_recovery_note(sn_reason, "")
+        message = build_resume_recovery_note(
+            sn_reason,
+            "",
+            startup_resume=startup_resume,
+        )
     return message
 
 
@@ -303,11 +309,13 @@ class TestResumePendingSystemNote:
         )
 
 
-    def test_empty_message_noninteractive_note_continues_task(self):
-        """Non-interactive platforms (webhook, API server): nobody can answer
-        'what next?', so the resumed turn must complete the interrupted work
-        instead of acknowledging (#57056)."""
-        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+    def test_synthetic_startup_resume_continues_task(self):
+        """A startup wake has no new human message on any platform."""
+        note = build_resume_recovery_note(
+            "restart_timeout",
+            "",
+            startup_resume=True,
+        )
         assert "CONTINUE the interrupted task" in note
         assert "session was restored" not in note
         assert "ask what they would like to do next" not in note
@@ -316,37 +324,26 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
-    def test_telegram_restart_resume_continues_from_visible_history(self):
-        """Telegram startup recovery must finish the interrupted task.
-
-        A human being reachable later is not a reason to discard the task that
-        is already recoverable from the transcript and ask ``what next?``.
-        """
-        # Production routes Telegram through the platform plugin; the legacy
-        # adapter remains covered so the two implementations cannot drift.
-        assert TelegramAdapter.interactive_resume is False
-        assert PluginTelegramAdapter.interactive_resume is False
-        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+    def test_startup_resume_reads_latest_history_before_continuing(self):
+        note = build_resume_recovery_note(
+            "restart_timeout",
+            "",
+            startup_resume=True,
+        )
         assert "latest 10 messages" in note
         assert "infer the active user request" in note
         assert "CONTINUE the interrupted task" in note
         assert "ask what they would like to do next" not in note
 
-    def test_telegram_real_empty_event_stays_interactive(self):
-        """Captionless media must not be mistaken for a synthetic resume wake."""
-        adapter = MagicMock(interactive_resume=False)
-        assert _resume_recovery_is_interactive(adapter, startup_resume=True) is False
-        assert _resume_recovery_is_interactive(adapter, startup_resume=False) is True
-
+    def test_real_empty_event_is_still_a_new_user_event(self):
+        """Captionless media must not be mistaken for a startup wake."""
         real_event_note = build_resume_recovery_note(
             "restart_timeout",
             "",
-            interactive=_resume_recovery_is_interactive(
-                adapter,
-                startup_resume=False,
-            ),
+            startup_resume=False,
         )
-        assert "ask what they would like to do next" in real_event_note
+        assert "NEW message" in real_event_note
+        assert "ask what they would like to do next" not in real_event_note
         assert "CONTINUE the interrupted task" not in real_event_note
 
 

@@ -672,12 +672,6 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
-    # Synthetic startup recovery already replays the interrupted transcript.
-    # Continue from that history instead of discarding recoverable work and
-    # asking the owner what to do next. Keep this in sync with the legacy
-    # gateway.platforms.telegram adapter while the plugin is the live route.
-    interactive_resume: bool = False
-
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
