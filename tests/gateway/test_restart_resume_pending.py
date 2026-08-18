@@ -321,8 +321,11 @@ class TestResumePendingSystemNote:
         assert "ask what they would like to do next" not in note
         # Must not tell the model to skip the unfinished work it should finish.
         assert "skip any unfinished work" not in note
-        # But still guards against re-running already-recorded tool calls.
-        assert "already appear in the history" in note
+        # A missing tool result is not permission to retry: the provider may
+        # have performed the effect before the gateway persisted its receipt.
+        assert "UNKNOWN outcome" in note
+        assert "do not execute it again" in note
+        assert "reconcile" in note
 
     def test_startup_resume_reads_latest_history_before_continuing(self):
         note = build_resume_recovery_note(

@@ -7,9 +7,8 @@ Phase 4 implements the target behavior mapped in Phase 1:
 - recovery runs on the same session key/session id through the official
   GoalManager continuation prompt;
 - paused/done/cleared goals fail closed;
-- side-effectful uncheckpointed tool tails still auto-resume active goals,
-  with an explicit recovery note telling the agent to inspect state before
-  repeating side effects.
+- a persisted tool call without a correlated result is an ambiguous external
+  outcome and fails closed for both active goals and generic resume-pending.
 """
 
 from __future__ import annotations
@@ -429,9 +428,27 @@ class _RiskyToolTailDB:
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"function": {"name": "terminal"}}],
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
             },
         ]
+
+
+class _CompletedToolTailDB(_RiskyToolTailDB):
+    def get_messages(self, _session_id):
+        return super().get_messages(_session_id) + [{
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "tool_name": "terminal",
+            "content": "completed",
+        }]
+
+
+class _UnavailableToolHistoryDB:
+    def get_messages(self, _session_id):
+        raise RuntimeError("history unavailable")
 
 
 def test_startup_goal_recovery_unwraps_async_session_db(hermes_home):
@@ -442,17 +459,17 @@ def test_startup_goal_recovery_unwraps_async_session_db(hermes_home):
 
     decision = runner._classify_startup_goal_recovery(entry)
 
-    assert decision.status == "auto_resume"
-    assert decision.reason == "active-goal-startup-recovery-with-open-tool-tail"
-    assert "terminal" in decision.prompt
+    assert decision.status == "alert_only"
+    assert "ambiguous-tool-outcome" in decision.reason
+    assert "terminal" in decision.reason
 
 
 @pytest.mark.asyncio
-async def test_uncheckpointed_side_effectful_tool_tail_still_auto_resumes_goal(hermes_home):
+async def test_unresolved_tool_outcome_withholds_active_goal_resume(hermes_home):
     runner, adapter = make_restart_runner()
     entry = _goal_entry(session_id="risky-tail-sid")
     runner.session_store._entries = {entry.session_key: entry}
-    runner._session_db = _RiskyToolTailDB()
+    setattr(runner, "_session_db", _RiskyToolTailDB())
     adapter.handle_message = AsyncMock()
     GoalManager(session_id=entry.session_id).set("recover safely without duplicating deploy")
 
@@ -460,15 +477,69 @@ async def test_uncheckpointed_side_effectful_tool_tail_still_auto_resumes_goal(h
         scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
-    assert not adapter.sent
-    event = adapter.handle_message.await_args.args[0]
-    assert event.internal is True
-    assert "recover safely without duplicating deploy" in event.text
-    assert "Startup recovery note" in event.text
-    assert "uncheckpointed assistant tool call(s): terminal" in event.text
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    sent = getattr(adapter, "sent")
+    assert len(sent) == 1
+    assert "auto-resume was withheld" in sent[0]
+    assert "ambiguous-tool-outcome" in sent[0]
+    assert "terminal" in sent[0]
     decision = runner._classify_startup_goal_recovery(entry)
+    assert decision.status == "alert_only"
+    assert "ambiguous-tool-outcome" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_unresolved_tool_outcome_withholds_generic_resume(hermes_home):
+    runner, adapter = make_restart_runner()
+    entry = _goal_entry(session_id="generic-risky-tail-sid")
+    runner.session_store._entries = {entry.session_key: entry}
+    setattr(runner, "_session_db", _RiskyToolTailDB())
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict(
+        "os.environ", {"HERMES_GATEWAY_STARTUP_AUTO_RESUME": "1"}, clear=True
+    ):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    sent = getattr(adapter, "sent")
+    assert len(sent) == 1
+    assert "Interrupted session" in sent[0]
+    assert "Active /goal" not in sent[0]
+    assert "ambiguous-tool-outcome" in sent[0]
+    assert "terminal" in sent[0]
+
+    decision = runner._classify_startup_goal_recovery(
+        entry, generic_auto_resume_enabled=True
+    )
+    assert decision.status == "alert_only"
+    assert "ambiguous-tool-outcome" in decision.reason
+
+
+def test_recorded_tool_result_allows_generic_resume(hermes_home):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="generic-completed-tail-sid")
+    setattr(runner, "_session_db", _CompletedToolTailDB())
+
+    decision = runner._classify_startup_goal_recovery(
+        entry, generic_auto_resume_enabled=True
+    )
+
     assert decision.status == "auto_resume"
-    assert decision.reason == "active-goal-startup-recovery-with-open-tool-tail"
-    assert "terminal" in decision.prompt
+    assert decision.reason == "generic-resume-pending"
+
+
+def test_unavailable_history_withholds_generic_resume(hermes_home):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="generic-history-unavailable-sid")
+    setattr(runner, "_session_db", _UnavailableToolHistoryDB())
+
+    decision = runner._classify_startup_goal_recovery(
+        entry, generic_auto_resume_enabled=True
+    )
+
+    assert decision.status == "alert_only"
+    assert "tool history unavailable" in decision.reason

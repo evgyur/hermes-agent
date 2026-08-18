@@ -97,11 +97,6 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
 _STARTUP_GOAL_RECOVERY_REASON = "active_goal_startup_recovery"
-_STARTUP_GOAL_RISKY_TOOLS = frozenset({
-    "terminal", "send_message", "cronjob", "patch", "write_file",
-    "skill_manage", "memory", "tool_call",
-})
-
 
 @dataclasses.dataclass(frozen=True)
 class StartupGoalRecoveryDecision:
@@ -1160,9 +1155,12 @@ def build_resume_recovery_note(
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step "
-            "that has no recorded result."
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history. A tool call with no recorded result has an UNKNOWN "
+            "outcome — do not execute it again; reconcile it from durable or "
+            "read-only state; if that is impossible, report the blocker. "
+            "Continue from the first step proven not to duplicate an "
+            "external effect."
         )
     return (
         f"[System note: The previous turn was interrupted by "
@@ -11233,60 +11231,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     )
 
     @staticmethod
-    def _goal_tool_names_from_message(msg: Dict[str, Any]) -> List[str]:
-        names: List[str] = []
-        tool_name = msg.get("tool_name")
-        if tool_name:
-            names.append(str(tool_name))
+    def _startup_tool_calls_from_message(
+        msg: Dict[str, Any],
+    ) -> List[tuple[str, str]]:
+        """Return ``(call_id, tool_name)`` pairs from a persisted assistant row."""
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, str):
             try:
                 tool_calls = json.loads(tool_calls)
             except Exception:
                 tool_calls = []
+        calls: List[tuple[str, str]] = []
         if isinstance(tool_calls, list):
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
+                call_id = call.get("id") or call.get("tool_call_id") or ""
                 name = call.get("name")
                 function = call.get("function")
                 if not name and isinstance(function, dict):
                     name = function.get("name")
-                if name:
-                    names.append(str(name))
-        return names
+                calls.append((str(call_id), str(name or "unknown-tool")))
+        return calls
 
-    def _uncheckpointed_goal_side_effect_risk(self, session_id: str) -> Optional[str]:
+    def _unresolved_startup_tool_call_risk(self, session_id: str) -> Optional[str]:
+        """Describe a tool dispatch whose durable outcome is ambiguous.
+
+        The assistant tool-call row is flushed before execution, while the
+        correlated tool-result row is flushed only after the provider call
+        returns. A restart between the external effect and that second flush
+        leaves a real ambiguity: retrying may duplicate the effect. Startup
+        recovery therefore fails closed whenever a recent assistant call has
+        no matching persisted result.
+
+        A plain assistant response is a checkpoint and bounds the scan. This
+        prevents an ancient malformed tail from blocking a later completed
+        conversation forever.
+        """
         raw_store = getattr(self, "_session_db", None)
         if raw_store is None:
             raw_store = getattr(getattr(self, "session_store", None), "_db", None)
         raw_store = getattr(raw_store, "_db", raw_store)
         if raw_store is None or not session_id:
-            return None
+            return "tool history unavailable"
         try:
             get_messages = getattr(raw_store, "get_messages", None)
             if not callable(get_messages):
-                return None
+                return "tool history unavailable"
             messages = get_messages(session_id)
         except Exception as exc:
-            logger.debug("startup goal recovery: message risk lookup failed for %s: %s", session_id, exc)
-            return None
+            logger.warning(
+                "startup recovery: tool outcome lookup failed for %s: %s",
+                session_id,
+                exc,
+            )
+            return "tool history unavailable"
+        if not isinstance(messages, (list, tuple)):
+            return "tool history unavailable"
+
         checkpoint_idx = -1
-        for idx, msg in enumerate(messages or []):
+        for idx, msg in enumerate(messages):
             if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
                 checkpoint_idx = idx
-        for msg in (messages or [])[checkpoint_idx + 1:]:
+
+        unresolved: Dict[str, str] = {}
+        missing_id = 0
+        for msg in messages[checkpoint_idx + 1:]:
             role = msg.get("role")
-            risky_names = sorted({
-                name for name in self._goal_tool_names_from_message(msg)
-                if name in _STARTUP_GOAL_RISKY_TOOLS
-            })
             if role == "assistant" and msg.get("tool_calls"):
-                suffix = f": {', '.join(risky_names)}" if risky_names else ""
-                return f"uncheckpointed assistant tool call(s){suffix}"
-            if role == "tool":
-                suffix = f": {', '.join(risky_names)}" if risky_names else ""
-                return f"uncheckpointed tool result(s){suffix}"
+                for call_id, name in self._startup_tool_calls_from_message(msg):
+                    if call_id:
+                        unresolved[call_id] = name
+                    else:
+                        missing_id += 1
+                        unresolved[f"__missing_call_id_{missing_id}"] = name
+            elif role == "tool":
+                call_id = str(msg.get("tool_call_id") or "")
+                if call_id:
+                    unresolved.pop(call_id, None)
+
+        if unresolved:
+            names = ", ".join(sorted(set(unresolved.values())))
+            return f"unresolved tool call(s): {names}"
         return None
 
     def _startup_goal_ledger_statuses(self, session_key: str) -> tuple[str, ...]:
@@ -11508,7 +11534,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
                 return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
 
-            side_effect_risk = self._uncheckpointed_goal_side_effect_risk(session_id)
+            ambiguous_outcome = self._unresolved_startup_tool_call_risk(session_id)
+            if ambiguous_outcome:
+                return _decision(
+                    "alert_only",
+                    f"ambiguous-tool-outcome: {ambiguous_outcome}",
+                    goal_status=goal_status,
+                )
             history_result = None
             if getattr(source, "chat_type", "dm") != "dm":
                 history_result = self._startup_chip_history_reconciliation(entry)
@@ -11532,15 +11564,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt = ""
             if not prompt:
                 return _decision("alert_only", "active-goal-continuation-unavailable", goal_status=goal_status)
-            if side_effect_risk:
-                prompt += (
-                    "\n\n[Startup recovery note]\nGateway restarted while the prior turn had "
-                    f"{side_effect_risk}. Do not repeat irreversible side effects blindly; "
-                    "inspect persisted state/artifacts first."
-                )
             return _decision(
                 "auto_resume",
-                "active-goal-startup-recovery-with-open-tool-tail" if side_effect_risk else "active-goal-startup-recovery",
+                "active-goal-startup-recovery",
                 goal_status=goal_status,
                 prompt=prompt,
             )
@@ -11564,6 +11590,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return _decision("skip", "resume-pending-stale")
         if session_key in getattr(self, "_running_agents", {}):
             return _decision("skip", "agent-already-running")
+        ambiguous_outcome = self._unresolved_startup_tool_call_risk(session_id)
+        if ambiguous_outcome:
+            return _decision(
+                "alert_only",
+                f"ambiguous-tool-outcome: {ambiguous_outcome}",
+            )
         return _decision("auto_resume", "generic-resume-pending")
 
     async def _run_startup_resume_event(
@@ -11895,10 +11927,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata = self._thread_metadata_for_source(source)
             except Exception:
                 metadata = None
+            subject = "Active /goal" if decision.goal_status else "Interrupted session"
+            next_step = (
+                "Use `/goal status` or send a new message after reconciling the "
+                "external effect."
+                if decision.goal_status
+                else "Send a new message after reconciling the external effect."
+            )
             message = (
-                "⚠️ Active /goal was found after gateway startup, but auto-resume "
-                f"was withheld: {decision.reason}.\n"
-                "Send a new message or `/goal status` to inspect it."
+                f"⚠️ {subject} was found after gateway startup, but auto-resume "
+                f"was withheld: {decision.reason}.\n{next_step}"
             )
             try:
                 await adapter.send(source.chat_id, message, metadata=metadata)
