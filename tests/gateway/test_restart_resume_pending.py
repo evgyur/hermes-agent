@@ -35,6 +35,7 @@ import pytest
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter as PluginTelegramAdapter
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -321,9 +322,13 @@ class TestResumePendingSystemNote:
         A human being reachable later is not a reason to discard the task that
         is already recoverable from the transcript and ask ``what next?``.
         """
+        # Production routes Telegram through the platform plugin; the legacy
+        # adapter remains covered so the two implementations cannot drift.
         assert TelegramAdapter.interactive_resume is False
+        assert PluginTelegramAdapter.interactive_resume is False
         note = build_resume_recovery_note("restart_timeout", "", interactive=False)
-        assert "Review the conversation history" in note
+        assert "latest 10 messages" in note
+        assert "infer the active user request" in note
         assert "CONTINUE the interrupted task" in note
         assert "ask what they would like to do next" not in note
 

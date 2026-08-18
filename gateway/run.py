@@ -1177,7 +1177,8 @@ def build_resume_recovery_note(
         resume_guidance = (
             "No user is present on this non-interactive platform, "
             "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "or ask questions. Review at least the latest 10 messages "
+            "in the conversation history, infer the active user request, and "
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
