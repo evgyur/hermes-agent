@@ -11246,7 +11246,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
-                call_id = call.get("id") or call.get("tool_call_id") or ""
+                # Responses/Codex uses a provider item ``id`` (fc_*) plus the
+                # distinct call correlation key ``call_id`` (call_*). Tool
+                # results answer the latter, so prefer it when present.
+                call_id = (
+                    call.get("call_id")
+                    or call.get("id")
+                    or call.get("tool_call_id")
+                    or ""
+                )
                 name = call.get("name")
                 function = call.get("function")
                 if not name and isinstance(function, dict):

@@ -446,6 +446,28 @@ class _CompletedToolTailDB(_RiskyToolTailDB):
         }]
 
 
+class _CompletedCodexResponsesToolTailDB:
+    def get_messages(self, _session_id):
+        return [
+            {"role": "user", "content": "run a deploy"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "fc_123",
+                    "call_id": "call_ABC",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_ABC",
+                "tool_name": "terminal",
+                "content": "completed",
+            },
+        ]
+
+
 class _UnavailableToolHistoryDB:
     def get_messages(self, _session_id):
         raise RuntimeError("history unavailable")
@@ -523,6 +545,19 @@ def test_recorded_tool_result_allows_generic_resume(hermes_home):
     runner, _adapter = make_restart_runner()
     entry = _goal_entry(session_id="generic-completed-tail-sid")
     setattr(runner, "_session_db", _CompletedToolTailDB())
+
+    decision = runner._classify_startup_goal_recovery(
+        entry, generic_auto_resume_enabled=True
+    )
+
+    assert decision.status == "auto_resume"
+    assert decision.reason == "generic-resume-pending"
+
+
+def test_codex_responses_call_id_allows_generic_resume(hermes_home):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="generic-completed-codex-tail-sid")
+    setattr(runner, "_session_db", _CompletedCodexResponsesToolTailDB())
 
     decision = runner._classify_startup_goal_recovery(
         entry, generic_auto_resume_enabled=True
