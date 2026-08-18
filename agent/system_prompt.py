@@ -49,6 +49,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
+from agent.skill_routing import scope_ownership_guidance
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
@@ -202,6 +203,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
+    # Policy invariant for every tool-capable agent, independent of whether the
+    # skills toolset/index is loaded.  Keeping this in the stable tier prevents
+    # restricted-tool cron/subagent sessions from losing owner binding, while
+    # preserving the exact bytes across turns for prompt-cache reuse.
+    if agent.valid_tool_names:
+        stable_parts.append(scope_ownership_guidance().rstrip())
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes

@@ -131,6 +131,13 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_tool_capable_prompt_has_scope_owner_lock_without_skills_tools():
+    parts = _prompt_parts(_make_agent(valid_tool_names=["terminal"]))
+
+    assert parts["stable"].count("### Scope-owner lock") == 1
+    assert "### Scope-owner lock" not in parts["volatile"]
+
+
 def test_full_skill_guidance_cannot_mandate_post_completion_maintenance():
     stable = _stable_prompt(_make_agent(valid_tool_names=["skill_manage"]))
 
@@ -163,6 +170,12 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        "### Scope-owner lock\n"
+        "Durability, autonomy, multi-agent, scale, or reliability requirements do not authorize replacing the assigned "
+        "object. If the user names Hermes, its ordinary tools, Shaw, `/goal`, or the current runtime, keep work inside that "
+        "owner. A loaded skill informs execution; it never transfers task ownership. Use another runtime only when it is a "
+        "strict prerequisite or the user explicitly authorizes migration; otherwise report it separately instead of "
+        "acting on it.",
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -192,7 +205,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

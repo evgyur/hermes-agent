@@ -152,7 +152,7 @@ def test_scope_owner_regression_fixtures_are_enforced_in_shared_guidance():
             assert phrase in guidance, fixture["id"]
 
 
-def test_scope_owner_lock_is_rendered_for_both_routing_policies(tmp_path, monkeypatch):
+def test_scope_owner_lock_is_not_coupled_to_the_skills_index(tmp_path, monkeypatch):
     from agent import prompt_builder as pb
 
     home = tmp_path / ".hermes"
@@ -170,8 +170,7 @@ def test_scope_owner_lock_is_rendered_for_both_routing_policies(tmp_path, monkey
             persist_snapshot=False,
             routing_policy=policy,
         )
-        assert rendered.count("### Scope-owner lock") == 1
-        assert scope_ownership_guidance() in rendered
+        assert "### Scope-owner lock" not in rendered
 
 
 def test_router_policy_changes_guidance_not_registry(tmp_path, monkeypatch):

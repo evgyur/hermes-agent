@@ -623,7 +623,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if stored_prompt:
         stored_state = "stale_runtime"
         logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
+            "Stored system prompt for session %s has stale runtime identity or required prompt policy; "
             "rebuilding for model=%s provider=%s.",
             agent.session_id,
             getattr(agent, "model", "") or "",
@@ -691,7 +691,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted runtime-identity lines are stale."""
+    """Return False when runtime identity or a mandatory prompt policy is stale."""
+
+    # A stored prompt may predate a mandatory owner-binding policy.  Reusing it
+    # verbatim would let a resumed session reach its first tool call without the
+    # lock.  Fail closed only for tool-capable agents; tool-less model-only
+    # sessions cannot perform the protected effect and retain cache stability.
+    if getattr(agent, "valid_tool_names", None):
+        from agent.skill_routing import scope_ownership_guidance
+
+        if scope_ownership_guidance().strip() not in prompt:
+            return False
 
     def line_value(label: str) -> str:
         """Last matching line wins.
