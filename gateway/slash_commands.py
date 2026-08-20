@@ -2021,7 +2021,7 @@ class GatewaySlashCommandsMixin:
                                     _sw_config_ctx = int(_sw_raw)
                         except Exception:
                             pass
-                        ctx = resolve_display_context_length(
+                        ctx = await resolve_display_context_length_async(
                             result.new_model,
                             result.target_provider,
                             base_url=result.base_url or current_base_url or "",
@@ -2282,7 +2282,7 @@ class GatewaySlashCommandsMixin:
                         _sw2_config_ctx = int(_sw2_raw)
             except Exception:
                 pass
-            ctx = resolve_display_context_length(
+            ctx = await resolve_display_context_length_async(
                 result.new_model,
                 result.target_provider,
                 base_url=result.base_url or current_base_url or "",
