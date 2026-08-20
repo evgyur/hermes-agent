@@ -18950,8 +18950,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    # ``run_in_executor`` does not propagate
+                                    # ContextVars on its own. Under a multiplexed
+                                    # gateway this dropped the per-profile secret
+                                    # scope installed by the inbound handler, so the
+                                    # auxiliary summarizer failed closed before it
+                                    # could produce a summary. Carry the current
+                                    # profile context into the hygiene worker exactly
+                                    # like the normal agent-turn executor.
+                                    _hyg_worker_context = copy_context()
                                     _hyg_future = loop.run_in_executor(
                                         None,
+                                        _hyg_worker_context.run,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,

@@ -3954,10 +3954,14 @@ class GatewaySlashCommandsMixin:
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
-                loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
-                    lambda: tmp_agent._compress_context(head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
+                compressed, _ = await self._run_in_executor_with_context(
+                    lambda: tmp_agent._compress_context(
+                        head,
+                        "",
+                        approx_tokens=approx_tokens,
+                        focus_topic=focus_topic or "",
+                        force=True,
+                    )
                 )
 
                 # Re-append the verbatim tail after the compressed head,

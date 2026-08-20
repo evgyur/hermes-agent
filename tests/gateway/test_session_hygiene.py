@@ -9,6 +9,7 @@ so CLI and messaging platforms behave identically.
 """
 
 import asyncio
+from contextvars import ContextVar
 import importlib
 import sys
 import threading
@@ -685,6 +686,10 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         ),
     )
 
+    profile_scope: ContextVar[str | None] = ContextVar(
+        "test_hygiene_profile_scope", default=None
+    )
+
     class FakeInPlaceCompressAgent:
         last_instance = None
 
@@ -707,6 +712,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
+            assert profile_scope.get() == "default-profile"
             assert self.compression_in_place is True
             assert self._session_db is fake_db
             # At >=95% of the model context, hygiene must bypass a stale
@@ -806,7 +812,11 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
     )
 
-    result = await runner._handle_message(event)
+    scope_token = profile_scope.set("default-profile")
+    try:
+        result = await runner._handle_message(event)
+    finally:
+        profile_scope.reset(scope_token)
 
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
