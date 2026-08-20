@@ -177,11 +177,27 @@ def test_reclaim_preserves_terminal_child_and_stale_generation_cannot_commit():
         execution_generation=0,
     )
     assert ad.defer_restartable_interruption(delegation_id, "gateway_drain")
+    assert not ad.commit_child_terminal(
+        1,
+        {
+            "task_index": 1,
+            "status": "interrupted",
+            "summary": "stale shutdown result",
+        },
+        delegation_id=delegation_id,
+        execution_generation=0,
+    )
     with ad._transaction() as conn:
         nonce = conn.execute(
             "SELECT restart_nonce FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()[0]
+        deferred_child = conn.execute(
+            """SELECT state, result_json FROM async_delegation_children
+               WHERE delegation_id=? AND child_index=1""",
+            (delegation_id,),
+        ).fetchone()
+    assert deferred_child == ("running", None)
     claim = ad.claim_restartable_delegation(
         delegation_id,
         owner_pid=1234,

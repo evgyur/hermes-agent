@@ -1335,13 +1335,16 @@ def commit_child_terminal(
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT execution_generation FROM async_delegations
+            """SELECT state, execution_generation FROM async_delegations
                WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return False
-        current_generation = int(row[0] or 0)
+        parent_state = str(row[0] or "")
+        current_generation = int(row[1] or 0)
+        if parent_state not in {"running", "stalling", "finalizing", "restarting"}:
+            return False
         expected_generation = (
             int(execution_generation)
             if execution_generation is not None
