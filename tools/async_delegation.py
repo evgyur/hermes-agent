@@ -508,14 +508,16 @@ def _delete_durable_delegation(delegation_id: str) -> None:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
-def _mark_runner_returned(delegation_id: str) -> None:
-    """Close the dead-owner replay window immediately after runner return."""
+def _mark_runner_returned(delegation_id: str, execution_generation: int) -> bool:
+    """Close the dead-owner replay window for exactly one execution generation."""
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        changed = conn.execute(
             """UPDATE async_delegations SET runner_returned=1, updated_at=?
-               WHERE delegation_id=? AND state IN ('running','stalling')""",
-            (time.time(), delegation_id),
-        )
+               WHERE delegation_id=? AND execution_generation=?
+                 AND state IN ('running','stalling')""",
+            (time.time(), delegation_id, int(execution_generation)),
+        ).rowcount
+        return changed == 1
 
 
 def _prune_durable_records() -> None:
@@ -2613,7 +2615,7 @@ def dispatch_async_delegation(
         try:
             result = runner() or {}
             commit_child_terminal(0, result, delegation_id=delegation_id)
-            _mark_runner_returned(delegation_id)
+            _mark_runner_returned(delegation_id, 0)
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
@@ -2933,16 +2935,18 @@ def dispatch_async_delegation_batch(
                     child_result,
                     delegation_id=delegation_id,
                 )
-            _mark_runner_returned(delegation_id)
-            # Batch status: completed unless every child errored/was interrupted.
+            _mark_runner_returned(
+                delegation_id, int(record.get("execution_generation", 0))
+            )
+            # A mixed batch is successful only when every child is successful.
             child_results = combined.get("results") or []
             if child_results and all(
-                (r.get("status") not in ("completed", "success"))
+                r.get("status") in ("completed", "success")
                 for r in child_results
             ):
-                status = "error"
-            else:
                 status = "completed"
+            else:
+                status = "error"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {

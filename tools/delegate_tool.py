@@ -3988,9 +3988,55 @@ _RESTART_FAILED = "failed"
 _RESTART_UNSAFE = "unsafe"
 
 
+def _side_effect_result_proves_safe_completion(
+    tool_name: str, result: Dict[str, Any]
+) -> bool:
+    """Fail closed unless a durable tool result proves a known outcome."""
+    from agent.replay_cleanup import is_interrupted_tool_result
+    from agent.tool_result_classification import file_mutation_result_landed
+
+    disposition = str(result.get("effect_disposition") or "").lower()
+    if disposition == "none":
+        return True
+    if disposition == "unknown":
+        return False
+    content = result.get("content")
+    if content is None or (isinstance(content, str) and not content.strip()):
+        return False
+    if is_interrupted_tool_result(content):
+        return False
+    if tool_name in {"write_file", "patch"}:
+        return file_mutation_result_landed(tool_name, content)
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    lowered = text.strip().lower()
+    if (
+        lowered.startswith(("error", "failed", "failure"))
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "thread did not return" in lowered
+    ):
+        return False
+    try:
+        payload = json.loads(text) if isinstance(text, str) else content
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("error") or payload.get("success") is False:
+            return False
+        if str(payload.get("status") or "").lower() in {
+            "error", "failed", "failure", "rejected", "blocked", "timeout",
+            "interrupted", "cancelled", "canceled", "unknown",
+        }:
+            return False
+        exit_code = payload.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return False
+    return True
+
+
 def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> bool:
     """Detect side-effecting calls without a durable successful tool result."""
-    from agent.replay_cleanup import is_interrupted_tool_result, tool_may_have_side_effect
+    from agent.replay_cleanup import tool_may_have_side_effect
 
     for index, message in enumerate(history):
         if message.get("role") != "assistant" or not message.get("tool_calls"):
@@ -4003,11 +4049,14 @@ def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> b
             cursor += 1
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
-            if not tool_may_have_side_effect(str(function.get("name") or "")):
+            tool_name = str(function.get("name") or "")
+            if not tool_may_have_side_effect(tool_name):
                 continue
             call_id = str(call.get("id") or "")
             result = results.get(call_id)
-            if result is None or is_interrupted_tool_result(result.get("content", "")):
+            if result is None or not _side_effect_result_proves_safe_completion(
+                tool_name, result
+            ):
                 return True
     return False
 

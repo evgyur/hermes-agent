@@ -28,7 +28,12 @@ def _isolated_state(tmp_path, monkeypatch):
         process_registry.completion_queue.get_nowait()
 
 
-def _dispatch_blocked_batch(gate: threading.Event, **overrides):
+def _dispatch_blocked_batch(
+    gate: threading.Event,
+    *,
+    delegation_id: str = "deleg_contract_v2",
+    **overrides,
+):
     def runner():
         gate.wait(timeout=5)
         return {
@@ -52,7 +57,7 @@ def _dispatch_blocked_batch(gate: threading.Event, **overrides):
         existing_parent_barrier_id="",
         runner=runner,
         max_async_children=3,
-        delegation_id="deleg_contract_v2",
+        delegation_id=delegation_id,
         child_session_ids=["child-0", "child-1"],
         child_capability_names=[["read_file"], ["read_file", "web_search"]],
         task_specs=[
@@ -325,3 +330,125 @@ def test_resume_fails_closed_on_output_schema_fingerprint_mismatch(monkeypatch):
         }],
     }
     assert dt.resume_async_delegation(claim, SimpleNamespace()) == "failed"
+
+
+def test_side_effect_recovery_requires_a_durable_known_success():
+    from tools.delegate_tool import _restart_history_has_unknown_side_effect
+
+    def history(content, *, disposition=None, tool_name="terminal"):
+        result = {"role": "tool", "tool_call_id": "call-1", "content": content}
+        if disposition is not None:
+            result["effect_disposition"] = disposition
+        return [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }],
+            },
+            result,
+        ]
+
+    assert _restart_history_has_unknown_side_effect(
+        history('{"output":"late","exit_code":0}', disposition="unknown")
+    )
+    assert _restart_history_has_unknown_side_effect(history(""))
+    assert _restart_history_has_unknown_side_effect(
+        history('{"error":"remote timeout"}')
+    )
+    assert not _restart_history_has_unknown_side_effect(
+        history('{"output":"ok","exit_code":0}')
+    )
+    assert not _restart_history_has_unknown_side_effect(
+        history("blocked before execution", disposition="none")
+    )
+    assert _restart_history_has_unknown_side_effect(
+        history('{"success":true}', tool_name="write_file")
+    )
+    assert not _restart_history_has_unknown_side_effect(
+        history('{"verified":true,"bytes_written":12}', tool_name="write_file")
+    )
+
+
+def test_stale_generation_cannot_mark_current_runner_returned():
+    gate = threading.Event()
+    result = _dispatch_blocked_batch(
+        gate, delegation_id="deleg_stale_generation"
+    )
+    delegation_id = result["delegation_id"]
+    assert result["status"] == "dispatched"
+    assert ad.defer_restartable_interruption(delegation_id, "gateway_drain")
+    with ad._transaction() as conn:
+        origin, nonce = conn.execute(
+            "SELECT origin_session, restart_nonce FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    claim = ad.claim_restartable_delegation(
+        delegation_id,
+        owner_pid=4321,
+        owner_started_at=8765,
+        expected_session_key=origin,
+        restart_nonce=nonce,
+    )
+    assert claim and claim["execution_generation"] == 1
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='running', runner_returned=0 WHERE delegation_id=?",
+            (delegation_id,),
+        )
+    assert not ad._mark_runner_returned(delegation_id, 0)
+    with ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT runner_returned FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    assert row == (0,)
+    gate.set()
+
+
+def test_mixed_unknown_effect_batch_terminalizes_parent_as_error():
+    def runner():
+        return {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "safe"},
+                {
+                    "task_index": 1,
+                    "status": "blocked_unknown_effect",
+                    "summary": None,
+                    "error": "unknown effect",
+                },
+            ]
+        }
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["safe child", "unknown child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="origin",
+        parent_session_id="parent",
+        root_turn_id="",
+        runner=runner,
+        max_async_children=3,
+        delegation_id="deleg_mixed_terminal",
+        child_session_ids=["mixed-0", "mixed-1"],
+        child_capability_names=[["read_file"], ["terminal"]],
+        task_specs=[{"goal": "safe child"}, {"goal": "unknown child"}],
+        output_schemas=[None, None],
+        output_schema_fingerprints=["", ""],
+        restart_policy="gateway_owned_v1",
+    )
+    assert result["status"] == "dispatched"
+    _wait_for_state(result["delegation_id"], "error")
+    with ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT state, result_json FROM async_delegations WHERE delegation_id=?",
+            (result["delegation_id"],),
+        ).fetchone()
+    assert row[0] == "error"
+    payload = json.loads(row[1])
+    assert {item["status"] for item in payload["results"]} == {
+        "completed", "blocked_unknown_effect"
+    }
