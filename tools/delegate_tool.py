@@ -4043,7 +4043,7 @@ def _side_effect_result_proves_safe_completion(
     }:
         return True
     return any(
-        key in payload
+        payload.get(key) not in (None, "", [], {})
         for key in ("job_id", "message_id", "bytes_written", "files_modified", "image")
     )
 
@@ -4068,14 +4068,16 @@ def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> b
             cursor += 1
         if invalid_result_correlation:
             return True
+        seen_call_ids: set[str] = set()
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
             tool_name = str(function.get("name") or "")
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id in seen_call_ids:
+                return True
+            seen_call_ids.add(call_id)
             if not tool_may_have_side_effect(tool_name):
                 continue
-            call_id = str(call.get("id") or "")
-            if not call_id:
-                return True
             result = results.get(call_id)
             if result is None or not _side_effect_result_proves_safe_completion(
                 tool_name, result

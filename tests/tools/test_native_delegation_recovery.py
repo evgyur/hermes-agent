@@ -333,7 +333,10 @@ def test_resume_fails_closed_on_output_schema_fingerprint_mismatch(monkeypatch):
 
 
 def test_side_effect_recovery_requires_a_durable_known_success():
-    from tools.delegate_tool import _restart_history_has_unknown_side_effect
+    from tools.delegate_tool import (
+        _restart_history_has_unknown_side_effect,
+        _side_effect_result_proves_safe_completion,
+    )
 
     def history(content, *, disposition=None, tool_name="terminal"):
         result = {"role": "tool", "tool_call_id": "call-1", "content": content}
@@ -381,6 +384,22 @@ def test_side_effect_recovery_requires_a_durable_known_success():
             }],
         },
         {"role": "tool", "tool_call_id": "", "content": '{"exit_code":0}'},
+    ])
+    assert not _side_effect_result_proves_safe_completion(
+        "plugin_effect", {"content": '{"job_id":""}'}
+    )
+    assert not _side_effect_result_proves_safe_completion(
+        "plugin_effect", {"content": '{"image":null}'}
+    )
+    assert _restart_history_has_unknown_side_effect([
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "dup", "function": {"name": "terminal", "arguments": "{}"}},
+                {"id": "dup", "function": {"name": "terminal", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "dup", "content": '{"exit_code":0}'},
     ])
 
 
