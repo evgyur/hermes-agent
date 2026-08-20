@@ -53,16 +53,22 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     return agent
 
 
-def _run_prologue(agent, history, user_message="hello again"):
+def _run_prologue(
+    agent,
+    history,
+    user_message="hello again",
+    *,
+    preflight_estimate=False,
+):
     """Invoke ``build_turn_context`` the way ``conversation_loop`` does.
 
-    The token-threshold preflight gate is pinned False so these tests
-    exercise the IDLE trigger in isolation (the preflight path has its own
-    coverage in ``test_turn_context.py``).
+    The token-threshold preflight gate is pinned False by default so most tests
+    exercise the IDLE trigger in isolation.  A regression test can opt in to
+    prove the idle/preflight interaction.
     """
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate",
-               return_value=False), \
+               return_value=preflight_estimate), \
          patch("agent.turn_context.estimate_request_tokens_rough",
                return_value=999_999):
         return build_turn_context(
@@ -183,6 +189,45 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     compressor.compress.assert_not_called()
     assert agent.session_id == sid
     assert len(ctx.messages) == len(_history()) + 1
+
+
+def test_successful_idle_compaction_does_not_repeat_in_preflight(
+    tmp_path: Path,
+) -> None:
+    """A turn-start idle boundary must not be rewritten again by preflight.
+
+    Regression for the live 887→887 double compaction: the idle pass returned a
+    distinct compacted transcript, then the rough threshold gate immediately
+    compacted that same transcript again before any provider usage could judge
+    the first boundary.  In-place persistence archived and reinserted the live
+    tail twice, leaving duplicate active completion rows.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_THEN_PREFLIGHT"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid)
+    calls = []
+
+    def _compress_once(messages, *_args, **_kwargs):
+        calls.append(list(messages))
+        return list(messages), "SYSTEM"
+
+    agent._compress_context = _compress_once
+    compressor = getattr(agent, "context_compressor")
+    compressor.should_compress = MagicMock(return_value=True)
+    compressor.should_defer_preflight_to_real_usage = MagicMock(
+        return_value=False
+    )
+
+    ctx = _run_prologue(
+        agent,
+        _history(),
+        preflight_estimate=True,
+    )
+
+    assert len(calls) == 1
+    assert len(ctx.messages) == len(_history()) + 1
+    compressor.should_compress.assert_not_called()
 
 
 
