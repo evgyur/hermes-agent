@@ -58,6 +58,10 @@ async def test_tool_uses_trusted_session_origin_and_complete_plan(monkeypatch):
             )
             return {"task_id": "con_test", "message_id": "42", "card": "card"}
 
+        def control(self, origin, request):
+            captured.update(control_origin=json.loads(origin), control=request)
+            return {"root_id": request["root_id"], "state": "running"}
+
     monkeypatch.setattr(tool, "Bridge", FakeBridge)
     result = json.loads(
         tool._handle(
@@ -77,6 +81,11 @@ async def test_tool_uses_trusted_session_origin_and_complete_plan(monkeypatch):
         "Execute",
         "Verify",
     ]
+    controlled = json.loads(
+        tool._handle({"control": {"operation": "status", "root_id": "root-control"}})
+    )
+    assert controlled == {"root_id": "root-control", "state": "running"}
+    assert captured["control_origin"]["user_id"] == "617744661"
     definition = tool.registry.get_entry("continuum_card_launch")
     assert definition is not None
     assert definition.check_fn is tool._check_requirements
