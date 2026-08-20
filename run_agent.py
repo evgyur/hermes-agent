@@ -46,7 +46,7 @@ import time
 import threading
 import uuid
 import warnings
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Iterable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -600,6 +600,16 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+
+    def configure_tool_allowlist(self, qualified_tools: Iterable[str]) -> None:
+        """Apply an exact, process-local execution allowlist.
+
+        This is narrower than toolsets and is intended for externally supervised
+        sessions whose authority may only shrink between turns.
+        """
+        names = tuple(sorted({str(name) for name in qualified_tools if str(name)}))
+        self.qualified_tool_allowlist = frozenset(names)
+        self._tool_search_scope_cache = None
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
