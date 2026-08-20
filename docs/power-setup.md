@@ -15,6 +15,7 @@ Hermes Power Setup is an opinionated multimodal setup layer for Hermes Agent. It
 - Telegram user bridge foundation: single Telethon-client companion service pattern.
 - Browser relay, media intake, cron/watchdogs, memory/skill hygiene, `/rp` reasoning-personas, MCP/webhook starter modules.
 - Ops doctor: local readiness checks and secret-scan guardrails.
+- Plan-authorized execution: one approved plan continues through same-scope fixes, candidate churn, deploy/restart, retries, and callbacks until a verified result.
 
 ## Explicitly not included by default
 
@@ -40,6 +41,8 @@ hermes setup power
 
 `hermes power install` writes a conservative config preset only. It does not publish, push, copy private overlays, or move secrets.
 
+The preset installs and activates the public-safe `power` personality on a fresh config. An existing non-neutral personality selection is preserved. The personality treats one request/approved plan as one bounded Task Authorization Envelope: same-scope SHA changes refresh evidence but do not require another `GO`. It does not disable Hermes tool approvals or remove protected-effect boundaries for money, DNS/network/TLS, secrets, new access, destructive production data, mass/public messaging, price/entitlement changes, or non-user-owned mutation.
+
 ## MVP acceptance
 
 A fresh public install should be able to:
@@ -50,9 +53,10 @@ A fresh public install should be able to:
 4. run auxiliary vision readiness checks;
 5. verify image-generation readiness through the `image_gen` surface;
 6. verify PiAPI video-generation readiness through the bundled `piapi-video-toolkit` skill and local `PIAPI_API_KEY` env hook;
-7. run a public-artifact secret scan.
+7. verify the plan-level authorization personality and bundled Shaw contract;
+8. run a public-artifact secret scan.
 
-`hermes power inventory --json` exposes the smoke surfaces as `stt`, `tts`, `auxiliary_vision`, `image_generation`, and `video_generation`. Templates list these surfaces without private keys; real provider credentials stay in `.env` or the user's local config.
+`hermes power inventory --json` exposes the smoke surfaces as `plan_authorization`, `stt`, `tts`, `auxiliary_vision`, `image_generation`, and `video_generation`. Templates list these surfaces without private keys; real provider credentials stay in `.env` or the user's local config.
 
 ## Private overlay rule
 

@@ -20,6 +20,16 @@ voice:
 
 agent:
   image_input_mode: auto
+  personalities:
+    power:
+      description: One plan-level authorization; autonomous execution to verified result
+      system_prompt: >-
+        You are a result-oriented Hermes assistant. Treat an authenticated direct request or approved plan as one bounded Task Authorization Envelope covering its goal, owned object, allowed surfaces/effects, exclusions, risk caps, rollback, and completion proof. Inside an unchanged envelope, continue through implementation, tests, reviewer fixes, same-scope candidate regeneration, refreshed evidence, commit/push when in scope, rollback-capable deploy/restart, smoke/rollback validation, retries, and successful callback re-entry without another GO. Candidate SHA or manifest changes invalidate candidate-bound evidence and technical receipts, not plan authority. Stage boundaries and successful callbacks are not user-facing stop points. Ask once only for a real target/surface/effect/risk expansion, an excluded protected effect, explicit revocation, loss of rollback, or missing irretrievable input. Protected effects include money/external spend, DNS/network/TLS, secrets or a new trust boundary, new human access, destructive production data, mass/public messaging, customer-facing price/entitlement changes, and non-user-owned mutation. Require fresh evidence from the actual consumer before claiming completion.
+      tone: direct, concise, result-first
+      style: Report verified results or one precise blocker.
+
+display:
+  personality: power
 
 auxiliary:
   vision:
@@ -92,6 +102,7 @@ power:
     - browser-relay
     - media-intake
     - ops-doctor
+    - plan-authorized-execution
     - memory-skill-hygiene
     - mcp-webhook-starter
   private_overlay_required: false
@@ -101,6 +112,7 @@ power:
     - rp
     - decision
     - superpowers
+    - shaw
   smoke_surfaces:
     # Public smoke inventory only; real provider keys stay in .env, never in templates.
     - stt
@@ -109,3 +121,4 @@ power:
     - image_generation
     - video_generation
     - reasoning_personas
+    - plan_authorization

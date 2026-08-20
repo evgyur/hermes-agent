@@ -24,6 +24,8 @@ from hermes_cli.config import get_hermes_home, get_project_root, load_config, sa
 
 EXCLUDED_DEFAULT_MODULES = frozenset({"tg", "postcraft"})
 
+POWER_AUTONOMY_PROMPT = """You are a result-oriented Hermes assistant. Treat an authenticated direct request or approved plan as one bounded Task Authorization Envelope covering its goal, owned object, allowed surfaces/effects, exclusions, risk caps, rollback, and completion proof. Inside an unchanged envelope, continue through implementation, tests, reviewer fixes, same-scope candidate regeneration, refreshed evidence, commit/push when in scope, rollback-capable deploy/restart, smoke/rollback validation, retries, and successful callback re-entry without another GO. Candidate SHA or manifest changes invalidate candidate-bound evidence and technical receipts, not plan authority. Stage boundaries and successful callbacks are not user-facing stop points. Ask once only for a real target/surface/effect/risk expansion, an excluded protected effect, explicit revocation, loss of rollback, or missing irretrievable input. Protected effects include money/external spend, DNS/network/TLS, secrets or a new trust boundary, new human access, destructive production data, mass/public messaging, customer-facing price/entitlement changes, and non-user-owned mutation. Require fresh evidence from the actual consumer before claiming completion."""
+
 POWER_DEFAULT_MODULES: tuple[str, ...] = (
     "voice-studio",
     "vision-doc-intake",
@@ -35,6 +37,7 @@ POWER_DEFAULT_MODULES: tuple[str, ...] = (
     "browser-relay",
     "media-intake",
     "ops-doctor",
+    "plan-authorized-execution",
     "memory-skill-hygiene",
     "reasoning-personas",
     "mcp-webhook-starter",
@@ -48,6 +51,14 @@ POWER_OPTIONAL_MODULES: tuple[str, ...] = (
 )
 
 POWER_SMOKE_SURFACES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "plan_authorization",
+        "label": "Plan authorization",
+        "module": "plan-authorized-execution",
+        "config_paths": ["display.personality=power", "agent.personalities.power"],
+        "doctor_check": "Plan authorization",
+        "requires_private_key_in_template": False,
+    },
     {
         "id": "stt",
         "label": "STT",
@@ -193,7 +204,16 @@ def power_preset_defaults() -> dict[str, Any]:
         },
         "agent": {
             "image_input_mode": "auto",
+            "personalities": {
+                "power": {
+                    "description": "One plan-level authorization; autonomous execution to verified result",
+                    "system_prompt": POWER_AUTONOMY_PROMPT,
+                    "tone": "direct, concise, result-first",
+                    "style": "Report verified results or one precise blocker.",
+                }
+            },
         },
+        "display": {"personality": "power"},
         "auxiliary": {
             "vision": {
                 "provider": "auto",
@@ -270,6 +290,7 @@ def power_preset_defaults() -> dict[str, Any]:
                 "rp",
                 "decision",
                 "superpowers",
+                "shaw",
             ],
             "private_overlay_required": False,
             "smoke_surfaces": [surface["id"] for surface in POWER_SMOKE_SURFACES],
@@ -328,6 +349,31 @@ def collect_power_checks() -> list[CheckResult]:
         checks.append(CheckResult("default module boundary", "fail", "tg/postcraft present in default pack"))
     else:
         checks.append(CheckResult("default module boundary", "ok", "tg/postcraft excluded"))
+
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+    personalities = agent_cfg.get("personalities", {}) if isinstance(agent_cfg.get("personalities"), dict) else {}
+    power_personality = personalities.get("power", {}) if isinstance(personalities.get("power"), dict) else {}
+    power_prompt = str(power_personality.get("system_prompt", ""))
+    display_cfg = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
+    selected_personality = str(display_cfg.get("personality", "") or "").strip().lower()
+    autonomy_markers = (
+        "Task Authorization Envelope",
+        "without another GO",
+        "invalidate candidate-bound evidence",
+        "not plan authority",
+    )
+    power_cfg = cfg.get("power", {}) if isinstance(cfg.get("power"), dict) else {}
+    if all(marker in power_prompt for marker in autonomy_markers):
+        detail = "power personality installed"
+        if selected_personality == "power":
+            detail += " and active"
+        else:
+            detail += f"; active personality is {selected_personality or 'none'}"
+        checks.append(CheckResult("Plan authorization", "ok", detail))
+    elif power_cfg.get("enabled") is True:
+        checks.append(CheckResult("Plan authorization", "fail", "power personality is missing the plan-level authorization contract"))
+    else:
+        checks.append(CheckResult("Plan authorization", "warn", "run `hermes power install` to install the plan-level authorization contract"))
 
     stt_cfg = cfg.get("stt", {}) if isinstance(cfg.get("stt"), dict) else {}
     stt_enabled = stt_cfg.get("enabled", True)
@@ -428,7 +474,12 @@ def run_doctor(json_output: bool = False) -> int:
 
 def apply_power_preset(dry_run: bool = False) -> dict[str, Any]:
     current = load_config()
-    updated = _merge_dict(dict(current), power_preset_defaults())
+    preset = power_preset_defaults()
+    current_display = current.get("display", {}) if isinstance(current.get("display"), dict) else {}
+    current_personality = str(current_display.get("personality", "") or "").strip().lower()
+    if current_personality not in {"", "none", "default", "neutral"}:
+        preset.pop("display", None)
+    updated = _merge_dict(dict(current), preset)
     if not dry_run:
         save_config(updated)
     return updated

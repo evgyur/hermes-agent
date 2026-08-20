@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from hermes_cli import power, power_quick
 
 
@@ -17,12 +19,28 @@ def test_power_default_modules_exclude_tg_postcraft():
     assert inventory["default_exclusion_violations"] == []
 
 
+def test_power_template_matches_plan_authorization_defaults():
+    template = yaml.safe_load(Path("templates/configs/power-default.yaml").read_text(encoding="utf-8"))
+    preset = power.power_preset_defaults()
+
+    assert template["display"] == preset["display"]
+    assert template["agent"]["personalities"]["power"] == preset["agent"]["personalities"]["power"]
+    assert "plan-authorized-execution" in template["power"]["modules"]
+    assert "plan_authorization" in template["power"]["smoke_surfaces"]
+
+
 def test_power_preset_has_voice_vision_and_no_private_overlay():
     preset = power.power_preset_defaults()
 
     assert preset["stt"]["enabled"] is True
     assert preset["tts"]["provider"] == "edge"
     assert preset["agent"]["image_input_mode"] == "auto"
+    assert preset["display"]["personality"] == "power"
+    power_prompt = preset["agent"]["personalities"]["power"]["system_prompt"]
+    assert "Task Authorization Envelope" in power_prompt
+    assert "without another GO" in power_prompt
+    assert "invalidate candidate-bound evidence" in power_prompt
+    assert "not plan authority" in power_prompt
     assert preset["auxiliary"]["vision"]["provider"] == "auto"
     assert preset["video_generation"]["provider"] == "piapi"
     assert preset["video_generation"]["piapi"]["api_key_env"] == "PIAPI_API_KEY"
@@ -36,6 +54,7 @@ def test_power_preset_has_voice_vision_and_no_private_overlay():
         "rp",
         "decision",
         "superpowers",
+        "shaw",
     ]
     assert {"gptprof", "gptt", "mmfast", "xai", "say", "img", "video"} <= set(preset["quick_commands"])
     assert preset["quick_commands"]["say"]["append_args"] is True
@@ -72,6 +91,19 @@ def test_power_install_writes_config_when_not_dry_run():
     saved = save_config.call_args.args[0]
     assert saved["stt"]["provider"] == "local"
     assert saved["tts"]["provider"] == "edge"
+    assert saved["display"]["personality"] == "power"
+    assert "power" in saved["agent"]["personalities"]
+
+
+def test_power_install_preserves_existing_personality_selection():
+    current = {"display": {"personality": "technical"}}
+    with patch("hermes_cli.power.load_config", return_value=current), \
+         patch("hermes_cli.power.save_config") as save_config:
+        power.apply_power_preset(dry_run=False)
+
+    saved = save_config.call_args.args[0]
+    assert saved["display"]["personality"] == "technical"
+    assert "power" in saved["agent"]["personalities"]
 
 
 def test_collect_power_checks_reports_voice_and_vision(monkeypatch):
@@ -95,8 +127,18 @@ def test_collect_power_checks_reports_voice_and_vision(monkeypatch):
     assert by_name["TTS"].status == "ok"
     assert by_name["Auxiliary vision"].status == "ok"
     assert "Image generation" in by_name
+    assert "Plan authorization" in by_name
     assert by_name["PiAPI video generation"].status == "ok"
     assert "STT" in by_name
+
+
+def test_power_doctor_fails_closed_when_enabled_contract_is_missing():
+    cfg = {"power": {"enabled": True}}
+    with patch("hermes_cli.power.load_config", return_value=cfg):
+        checks = power.collect_power_checks()
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["Plan authorization"].status == "fail"
 
 
 def test_secret_scan_flags_realistic_tokens(tmp_path):

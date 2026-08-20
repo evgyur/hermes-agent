@@ -3060,10 +3060,15 @@ def cmd_whatsapp_cloud(args):
 
 
 def cmd_setup(args):
-    """Interactive setup wizard."""
+    """Interactive setup wizard, with deterministic Powerpack setup routing."""
+    if getattr(args, "section", None) == "power":
+        from hermes_cli.power import run_power_setup
+
+        return run_power_setup(args)
+
     from hermes_cli.setup import run_setup_wizard
 
-    run_setup_wizard(args)
+    return run_setup_wizard(args)
 
 
 def cmd_model(args):
@@ -11489,6 +11494,11 @@ def main():
     # setup command  (parser built in hermes_cli/subcommands/setup.py)
     # =========================================================================
     build_setup_parser(subparsers, cmd_setup=cmd_setup)
+
+    # Powerpack-owned setup and diagnostics surface.
+    from hermes_cli.power import add_power_parser as _add_power_parser
+
+    _add_power_parser(subparsers)
 
 
     # =========================================================================

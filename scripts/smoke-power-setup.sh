@@ -23,9 +23,9 @@ assert 'postcraft' not in inventory['default_modules']
 assert not inventory['default_exclusion_violations']
 checks = json.loads(Path('/tmp/hermes-power-doctor.json').read_text())
 surface_ids = {s['id'] for s in inventory['smoke_surfaces']}
-assert {'stt', 'tts', 'auxiliary_vision', 'image_generation', 'video_generation'} <= surface_ids
+assert {'stt', 'tts', 'auxiliary_vision', 'image_generation', 'video_generation', 'plan_authorization'} <= surface_ids
 assert all(s['requires_private_key_in_template'] is False for s in inventory['smoke_surfaces'])
 check_names = {c['name'] for c in checks}
-assert {'STT', 'TTS', 'Auxiliary vision', 'Image generation', 'PiAPI video generation'} <= check_names
+assert {'STT', 'TTS', 'Auxiliary vision', 'Image generation', 'PiAPI video generation', 'Plan authorization'} <= check_names
 print('hermes-power-smoke: PASS')
 PY
