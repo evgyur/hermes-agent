@@ -580,7 +580,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                heartbeat_at=?, event_json=?, result_json=?, delivery_state='pending',
                status_revision=status_revision+1
-               WHERE delegation_id=?
+               WHERE delegation_id=? AND execution_generation=?
                  AND state IN ('running','stalling','finalizing')""",
             (
                 event.get("status", "completed"),
@@ -590,6 +590,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
                 json.dumps(event),
                 json.dumps(result),
                 event["delegation_id"],
+                int(event.get("execution_generation", 0)),
             ),
         ).rowcount
         if changed:
@@ -1346,9 +1347,7 @@ def commit_child_terminal(
             if execution_generation is not None
             else int(_CURRENT_EXECUTION_GENERATION.get())
         )
-        if expected_generation < 0:
-            expected_generation = current_generation
-        if expected_generation != current_generation:
+        if expected_generation < 0 or expected_generation != current_generation:
             return False
         changed = conn.execute(
             """UPDATE async_delegation_children
@@ -2626,6 +2625,7 @@ def dispatch_async_delegation(
                 "api_calls": 0,
                 "duration_seconds": round(time.time() - dispatched_at, 2),
             }
+            commit_child_terminal(0, result, delegation_id=delegation_id)
             status = "error"
         finally:
             try:
@@ -2640,6 +2640,18 @@ def dispatch_async_delegation(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         if root_turn_id:
+            commit_child_terminal(
+                0,
+                {
+                    "task_index": 0,
+                    "status": "error",
+                    "summary": None,
+                    "error": f"Failed to schedule async delegation: {exc}",
+                },
+                delegation_id=delegation_id,
+                replay_decision="schedule_failure",
+                execution_generation=0,
+            )
             _finalize(
                 delegation_id,
                 {
@@ -2745,6 +2757,7 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "execution_generation": int(record.get("execution_generation", 0)),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -2949,9 +2962,24 @@ def dispatch_async_delegation_batch(
                 status = "error"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
+            error_text = f"{type(exc).__name__}: {exc}"
+            child_count = max(len(record.get("goals") or []), 1)
+            for child_index in range(child_count):
+                commit_child_terminal(
+                    child_index,
+                    {
+                        "task_index": child_index,
+                        "status": "error",
+                        "summary": None,
+                        "error": error_text,
+                        "replay_decision": "runner_exception",
+                    },
+                    delegation_id=delegation_id,
+                    replay_decision="runner_exception",
+                )
             combined = {
-                "results": [],
-                "error": f"{type(exc).__name__}: {exc}",
+                "results": durable_child_results(delegation_id),
+                "error": error_text,
                 "total_duration_seconds": round(time.time() - dispatched_at, 2),
             }
             status = "error"
@@ -2967,6 +2995,19 @@ def dispatch_async_delegation_batch(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         if root_turn_id:
+            for child_index in range(max(len(goals), 1)):
+                commit_child_terminal(
+                    child_index,
+                    {
+                        "task_index": child_index,
+                        "status": "error",
+                        "summary": None,
+                        "error": f"Failed to schedule async delegation batch: {exc}",
+                    },
+                    delegation_id=delegation_id,
+                    replay_decision="schedule_failure",
+                    execution_generation=int(execution_generation),
+                )
             _finalize_batch(
                 delegation_id,
                 {
@@ -3047,6 +3088,7 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "execution_generation": int(event_record.get("execution_generation", 0)),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),

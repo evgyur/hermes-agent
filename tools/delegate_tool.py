@@ -4020,18 +4020,32 @@ def _side_effect_result_proves_safe_completion(
         payload = json.loads(text) if isinstance(text, str) else content
     except Exception:
         payload = None
-    if isinstance(payload, dict):
-        if payload.get("error") or payload.get("success") is False:
-            return False
-        if str(payload.get("status") or "").lower() in {
-            "error", "failed", "failure", "rejected", "blocked", "timeout",
-            "interrupted", "cancelled", "canceled", "unknown",
-        }:
-            return False
-        exit_code = payload.get("exit_code")
-        if isinstance(exit_code, int) and exit_code != 0:
-            return False
-    return True
+    if not isinstance(payload, dict) or not payload:
+        return tool_name == "text_to_speech" and lowered.startswith("media:")
+    if payload.get("error") or payload.get("success") is False:
+        return False
+    payload_status = str(payload.get("status") or "").lower()
+    if payload_status in {
+        "error", "failed", "failure", "rejected", "blocked", "timeout",
+        "interrupted", "cancelled", "canceled", "unknown",
+    }:
+        return False
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int):
+        return exit_code == 0
+    if payload.get("success") is True or payload.get("ok") is True:
+        return True
+    if payload.get("verified") is True:
+        return True
+    if payload_status in {
+        "success", "completed", "delivered", "dispatched", "created",
+        "updated", "removed", "paused", "resumed", "running",
+    }:
+        return True
+    return any(
+        key in payload
+        for key in ("job_id", "message_id", "bytes_written", "files_modified", "image")
+    )
 
 
 def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> bool:
@@ -4042,17 +4056,26 @@ def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> b
         if message.get("role") != "assistant" or not message.get("tool_calls"):
             continue
         results: Dict[str, Dict[str, Any]] = {}
+        invalid_result_correlation = False
         cursor = index + 1
         while cursor < len(history) and history[cursor].get("role") == "tool":
             result = history[cursor]
-            results[str(result.get("tool_call_id") or "")] = result
+            result_id = str(result.get("tool_call_id") or "")
+            if not result_id or result_id in results:
+                invalid_result_correlation = True
+            else:
+                results[result_id] = result
             cursor += 1
+        if invalid_result_correlation:
+            return True
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
             tool_name = str(function.get("name") or "")
             if not tool_may_have_side_effect(tool_name):
                 continue
             call_id = str(call.get("id") or "")
+            if not call_id:
+                return True
             result = results.get(call_id)
             if result is None or not _side_effect_result_proves_safe_completion(
                 tool_name, result

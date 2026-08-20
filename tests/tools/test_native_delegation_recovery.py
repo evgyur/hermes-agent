@@ -369,6 +369,19 @@ def test_side_effect_recovery_requires_a_durable_known_success():
     assert not _restart_history_has_unknown_side_effect(
         history('{"verified":true,"bytes_written":12}', tool_name="write_file")
     )
+    assert _restart_history_has_unknown_side_effect(
+        history("unstructured but nonempty", tool_name="plugin_effect")
+    )
+    assert _restart_history_has_unknown_side_effect([
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "", "content": '{"exit_code":0}'},
+    ])
 
 
 def test_stale_generation_cannot_mark_current_runner_returned():
@@ -404,6 +417,26 @@ def test_stale_generation_cannot_mark_current_runner_returned():
             (delegation_id,),
         ).fetchone()
     assert row == (0,)
+    assert not ad.commit_child_terminal(
+        0,
+        {"task_index": 0, "status": "completed", "summary": "stale"},
+        delegation_id=delegation_id,
+    )
+    assert not ad._persist_completion(
+        {
+            "delegation_id": delegation_id,
+            "status": "completed",
+            "execution_generation": 0,
+            "completed_at": time.time(),
+        },
+        {"status": "completed", "summary": "stale"},
+    )
+    with ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    assert row == ("running",)
     gate.set()
 
 
@@ -452,3 +485,46 @@ def test_mixed_unknown_effect_batch_terminalizes_parent_as_error():
     assert {item["status"] for item in payload["results"]} == {
         "completed", "blocked_unknown_effect"
     }
+
+
+def test_batch_runner_exception_terminalizes_children_and_parent():
+    def runner():
+        raise RuntimeError("synthetic runner crash")
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["first child", "second child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="origin",
+        parent_session_id="parent",
+        root_turn_id="",
+        runner=runner,
+        max_async_children=3,
+        delegation_id="deleg_runner_exception",
+        child_session_ids=["exception-0", "exception-1"],
+        child_capability_names=[["read_file"], ["read_file"]],
+        task_specs=[{"goal": "first child"}, {"goal": "second child"}],
+        output_schemas=[None, None],
+        output_schema_fingerprints=["", ""],
+        restart_policy="gateway_owned_v1",
+    )
+    assert result["status"] == "dispatched"
+    _wait_for_state(result["delegation_id"], "error")
+    with ad._transaction() as conn:
+        parent = conn.execute(
+            "SELECT state, result_json FROM async_delegations WHERE delegation_id=?",
+            (result["delegation_id"],),
+        ).fetchone()
+        children = conn.execute(
+            """SELECT state, replay_decision FROM async_delegation_children
+               WHERE delegation_id=? ORDER BY child_index""",
+            (result["delegation_id"],),
+        ).fetchall()
+    assert parent[0] == "error"
+    assert len(json.loads(parent[1])["results"]) == 2
+    assert children == [
+        ("failed", "runner_exception"),
+        ("failed", "runner_exception"),
+    ]
