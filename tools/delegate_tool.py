@@ -3462,22 +3462,44 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        durable_existing = {
+            int(entry.get("task_index", -1)): dict(entry)
+            for entry in (_restart_ctx.get("completed_results") or [])
+            if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)
+        }
+
+        def _commit_durable(entry: Dict[str, Any], decision: str = "executed") -> None:
+            if not _restart_ctx.get("delegation_id") and not background:
+                return
+            try:
+                from tools.async_delegation import commit_child_terminal
+
+                commit_child_terminal(
+                    int(entry.get("task_index", -1)), entry,
+                    replay_decision=decision,
+                )
+            except Exception:
+                logger.exception("Could not durably commit child terminal outcome")
+
+        results.extend(durable_existing.values())
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(
-                _i,
-                _t["goal"],
-                child,
-                parent_agent,
-                owner_session_id=_origin_ui_session_id or None,
-                owner_transport=_origin_owner_transport,
-                owner_session_record=_origin_owner_session_record,
-            )
-            results.append(result)
+            if _i not in durable_existing:
+                result = _run_single_child(
+                    _i,
+                    _t["goal"],
+                    child,
+                    parent_agent,
+                    owner_session_id=_origin_ui_session_id or None,
+                    owner_transport=_origin_owner_transport,
+                    owner_session_record=_origin_owner_session_record,
+                )
+                _commit_durable(result)
+                results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
-            completed_count = 0
+            completed_count = len(durable_existing)
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
             # Daemon workers (tools.daemon_pool): the `with` block still joins
@@ -3487,6 +3509,8 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    if i in durable_existing:
+                        continue
                     child_context = contextvars.copy_context()
                     future = executor.submit(
                         child_context.run,
@@ -3549,6 +3573,7 @@ def delegate_task(
                                     ),
                                 }
                             results.append(entry)
+                            _commit_durable(entry)
                             completed_count += 1
                         break
 
@@ -3574,6 +3599,7 @@ def delegate_task(
                                 ),
                             }
                         results.append(entry)
+                        _commit_durable(entry)
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
@@ -3863,10 +3889,20 @@ def delegate_task(
                 sorted(str(name) for name in getattr(child, "valid_tool_names", set()))
                 for child in _child_agents
             ],
+            task_specs=task_list,
+            output_schemas=task_schemas,
+            output_schema_fingerprints=[
+                hashlib.sha256(
+                    json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                if schema is not None else ""
+                for schema in task_schemas
+            ],
             restart_policy=(
                 "gateway_owned_v1" if _restart_ctx.get("restartable") else ""
             ),
             resume_claim=bool(_restart_ctx.get("delegation_id")),
+            execution_generation=int(_restart_ctx.get("execution_generation", 0) or 0),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -3977,16 +4013,24 @@ def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> b
 
 
 def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
-    """Rebuild retained children with their original sessions and public id."""
+    """Resume only unfinished replay-safe children under the persisted contract."""
     task = dict(claim.get("task") or {})
     goals = task.get("goals") or []
-    if not goals:
+    task_json = json.dumps(task, sort_keys=True, separators=(",", ":"))
+    if (
+        not goals
+        or int(claim.get("contract_version") or 0) < 2
+        or hashlib.sha256(task_json.encode()).hexdigest()
+        != str(claim.get("task_fingerprint") or "")
+    ):
         return _RESTART_FAILED
     child_session_ids = list(claim.get("child_session_ids") or [])
     child_capability_names = list(claim.get("child_capability_names") or [])
+    children = list(claim.get("children") or [])
     if (
         len(child_session_ids) != len(goals)
         or len(child_capability_names) != len(goals)
+        or len(children) != len(goals)
         or any(
             not isinstance(names, list)
             or any(not isinstance(name, str) or not name for name in names)
@@ -3994,31 +4038,88 @@ def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
         )
     ):
         return _RESTART_FAILED
-    tasks = [
-        {"goal": f"{_RECOVERY_NOTE}\n\nOriginal goal: {goal}", "context": None,
-         "role": task.get("role", "leaf")}
-        for goal in goals
-    ]
+
+    original_tasks = list(task.get("tasks") or [])
+    output_schemas = list(task.get("output_schemas") or [])
+    tasks = []
+    for index, goal in enumerate(goals):
+        source = dict(original_tasks[index]) if index < len(original_tasks) else {}
+        source["goal"] = str(source.get("goal") or goal)
+        prior_context = source.get("context")
+        source["context"] = (
+            f"{_RECOVERY_NOTE}\n\n{prior_context}" if prior_context else _RECOVERY_NOTE
+        )
+        source["role"] = source.get("role") or task.get("role", "leaf")
+        if index < len(output_schemas) and output_schemas[index] is not None:
+            source["output_schema"] = output_schemas[index]
+        tasks.append(source)
+
     session_db = getattr(parent_agent, "_session_db", None)
     session_db = getattr(session_db, "_db", session_db)
-    transcripts = {}
+    transcripts: Dict[str, List[Dict[str, Any]]] = {}
+    completed_results: List[Dict[str, Any]] = []
     from agent.replay_cleanup import sanitize_replay_history
-    for child_session_id in child_session_ids:
+    from tools.async_delegation import commit_child_terminal
+
+    terminal_states = {"completed", "failed", "unknown", "cancelled"}
+    for index, child_session_id in enumerate(child_session_ids):
+        child_record = children[index]
+        if int(child_record.get("child_index", -1)) != index:
+            return _RESTART_FAILED
+        expected_schema = output_schemas[index] if index < len(output_schemas) else None
+        expected_schema_fingerprint = (
+            hashlib.sha256(
+                json.dumps(expected_schema, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if expected_schema is not None else ""
+        )
+        if expected_schema_fingerprint != str(
+            child_record.get("output_schema_fingerprint") or ""
+        ):
+            return _RESTART_FAILED
+        if child_record.get("state") in terminal_states and child_record.get("result"):
+            result = dict(child_record["result"])
+            result.setdefault("task_index", index)
+            result.setdefault("replay_decision", "reuse_terminal")
+            completed_results.append(result)
+            continue
         if session_db is None:
             return _RESTART_FAILED
         history = session_db.get_messages_as_conversation(child_session_id)
         if _restart_history_has_unknown_side_effect(history):
-            return _RESTART_UNSAFE
+            result = {
+                "task_index": index,
+                "status": "blocked_unknown_effect",
+                "summary": None,
+                "error": (
+                    "Recovery blocked: a side-effecting tool has no durable "
+                    "successful result, so its outcome is unknown."
+                ),
+                "replay_decision": "blocked_unknown_effect",
+            }
+            if not commit_child_terminal(
+                index,
+                result,
+                delegation_id=str(claim["delegation_id"]),
+                replay_decision="blocked_unknown_effect",
+                execution_generation=int(claim.get("execution_generation") or 0),
+            ):
+                return _RESTART_FAILED
+            completed_results.append(result)
+            continue
         reopen_session = getattr(session_db, "reopen_session", None)
         if callable(reopen_session):
             reopen_session(child_session_id)
         transcripts[child_session_id] = sanitize_replay_history(history)
+
     with host_restart_context(
         restartable=True,
         delegation_id=claim["delegation_id"],
         child_session_ids=child_session_ids,
         child_capability_names=child_capability_names,
         transcripts=transcripts,
+        completed_results=completed_results,
+        execution_generation=int(claim.get("execution_generation") or 0),
     ):
         launch_kwargs = {
             "background": True,

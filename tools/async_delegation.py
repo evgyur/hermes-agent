@@ -55,7 +55,7 @@ from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
-CONTINUUM_RUNTIME_REVISION = "0.1.0rc18-restartable-task-cards-v1"
+CONTINUUM_RUNTIME_REVISION = "0.1.0rc19-native-delegation-recovery-v2"
 logger.info("Continuum async runtime loaded revision=%s", CONTINUUM_RUNTIME_REVISION)
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
@@ -94,9 +94,13 @@ _STALE_RESERVATION_SECONDS = 300
 _MAX_DELIVERY_ATTEMPTS = 8
 _MAX_RESTART_ATTEMPTS = 3
 _RESTART_POLICY = "gateway_owned_v1"
+_DELEGATION_CONTRACT_VERSION = 2
 _DB_LOCK = threading.Lock()
 _CURRENT_DELEGATION_ID: ContextVar[str] = ContextVar(
     "HERMES_CURRENT_ASYNC_DELEGATION_ID", default=""
+)
+_CURRENT_EXECUTION_GENERATION: ContextVar[int] = ContextVar(
+    "HERMES_CURRENT_ASYNC_DELEGATION_GENERATION", default=-1
 )
 _PRIVATE_PATH_RE = re.compile(r"(?<![\w:])/(?:[^\s`]+)")
 _PRIVATE_METADATA_RE = re.compile(
@@ -220,9 +224,38 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("restart_reason", "TEXT NOT NULL DEFAULT ''"),
         ("restart_nonce", "TEXT NOT NULL DEFAULT ''"),
         ("runner_returned", "INTEGER NOT NULL DEFAULT 0"),
+        ("contract_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("task_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("restart_budget", "INTEGER NOT NULL DEFAULT 3"),
+        ("execution_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("child_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("output_schema_fingerprints_json", "TEXT NOT NULL DEFAULT '[]'"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegation_children (
+            delegation_id TEXT NOT NULL,
+            child_index INTEGER NOT NULL,
+            child_session_id TEXT NOT NULL,
+            capability_names_json TEXT NOT NULL DEFAULT '[]',
+            capability_fingerprint TEXT NOT NULL DEFAULT '',
+            output_schema_fingerprint TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'pending',
+            execution_generation INTEGER NOT NULL DEFAULT 0,
+            replay_decision TEXT NOT NULL DEFAULT '',
+            result_json TEXT,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(delegation_id, child_index),
+            FOREIGN KEY(delegation_id) REFERENCES async_delegations(delegation_id)
+                ON DELETE CASCADE
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_async_children_state "
+        "ON async_delegation_children(delegation_id, state, execution_generation)"
+    )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS continuum_status_rails (
             origin_session TEXT PRIMARY KEY,
@@ -333,42 +366,90 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in (
+            "goal", "goals", "tasks", "output_schemas", "context", "toolsets",
+            "role", "model", "is_batch",
+        )
         if key in record
     }
+    task_json = json.dumps(task_payload, sort_keys=True, separators=(",", ":"))
+    task_fingerprint = hashlib.sha256(task_json.encode()).hexdigest()
+    child_sessions = list(record.get("child_session_ids") or [])
+    child_capabilities = list(record.get("child_capability_names") or [])
+    output_fingerprints = list(record.get("output_schema_fingerprints") or [])
     with _DB_LOCK, _transaction() as conn:
         existing = conn.execute(
-            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            """SELECT state, task_fingerprint, child_count
+               FROM async_delegations WHERE delegation_id=?""",
             (record["delegation_id"],),
         ).fetchone()
         if record.get("resume_claim"):
             if not existing or existing[0] != "restarting":
                 return False
+            if len(child_sessions) != int(existing[2] or 0):
+                return False
+            stored_children = conn.execute(
+                """SELECT child_index, child_session_id, capability_fingerprint
+                   FROM async_delegation_children WHERE delegation_id=?
+                   ORDER BY child_index""",
+                (record["delegation_id"],),
+            ).fetchall()
+            if len(stored_children) != len(child_sessions):
+                return False
+            for index, child_session_id in enumerate(child_sessions):
+                names = child_capabilities[index] if index < len(child_capabilities) else []
+                fingerprint = hashlib.sha256(
+                    "\0".join(sorted({str(name) for name in names if str(name)})).encode()
+                ).hexdigest()
+                stored = stored_children[index]
+                if int(stored[0]) != index or stored[1] != child_session_id or stored[2] != fingerprint:
+                    return False
             changed = conn.execute(
                 """UPDATE async_delegations SET state='running', updated_at=?,
                    heartbeat_at=?, owner_pid=?, owner_started_at=?,
                    child_session_ids_json=?, child_capability_names_json=?,
                    restart_reason='', runner_returned=0
-                   WHERE delegation_id=? AND state='restarting'""",
+                   WHERE delegation_id=? AND state='restarting'
+                     AND task_fingerprint=? AND child_count=?""",
                 (
                     now,
                     now,
                     __import__("os").getpid(),
                     owner_started_at,
-                    json.dumps(record.get("child_session_ids") or []),
-                    json.dumps(record.get("child_capability_names") or []),
+                    json.dumps(child_sessions),
+                    json.dumps(child_capabilities),
                     record["delegation_id"],
+                    existing[1],
+                    int(existing[2] or 0),
                 ),
             )
+            if changed.rowcount == 1:
+                conn.execute(
+                    """UPDATE async_delegation_children
+                       SET state=CASE WHEN state IN ('completed','failed','unknown','cancelled')
+                                      THEN state ELSE 'running' END,
+                           replay_decision=CASE WHEN state IN ('completed','failed','unknown','cancelled')
+                                      THEN 'reuse_terminal' ELSE 'resume' END,
+                           execution_generation=(SELECT execution_generation
+                              FROM async_delegations WHERE delegation_id=?),
+                           updated_at=?
+                       WHERE delegation_id=?""",
+                    (record["delegation_id"], now, record["delegation_id"]),
+                )
             return changed.rowcount == 1
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+        try:
+            conn.execute(
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id,
-                public_title, heartbeat_at, status_revision)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, 1)""",
+                public_title, heartbeat_at, status_revision, restart_policy,
+                restart_count, restart_budget, contract_version,
+                task_fingerprint, execution_generation, child_count,
+                output_schema_fingerprints_json)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, 1,
+                       ?, 0, ?, ?, ?, 0, ?, ?)""",
             (
                 record["delegation_id"],
                 record.get("session_key", ""),
@@ -378,25 +459,46 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
                 now,
                 __import__("os").getpid(),
                 owner_started_at,
-                json.dumps(task_payload),
+                task_json,
                 record.get("origin_session_id", ""),
                 _public_title(record),
                 now,
+                record.get("restart_policy", ""),
+                int(record.get("restart_budget", _MAX_RESTART_ATTEMPTS) or 0),
+                _DELEGATION_CONTRACT_VERSION,
+                task_fingerprint,
+                len(child_sessions),
+                json.dumps(output_fingerprints),
             ),
         )
+        except sqlite3.IntegrityError:
+            return False
         conn.execute(
             """UPDATE async_delegations SET child_session_ids_json=?,
-               child_capability_names_json=?, restart_policy=?, restart_count=?,
-               restart_reason=''
+               child_capability_names_json=?, restart_reason=''
                WHERE delegation_id=?""",
-            (
-                json.dumps(record.get("child_session_ids") or []),
-                json.dumps(record.get("child_capability_names") or []),
-                record.get("restart_policy", ""),
-                int(record.get("restart_count", 0) or 0),
-                record["delegation_id"],
-            ),
+            (json.dumps(child_sessions), json.dumps(child_capabilities),
+             record["delegation_id"]),
         )
+        for index, child_session_id in enumerate(child_sessions):
+            names = child_capabilities[index] if index < len(child_capabilities) else []
+            names = sorted({str(name) for name in names if str(name)})
+            capability_fingerprint = hashlib.sha256(
+                "\0".join(names).encode()
+            ).hexdigest()
+            output_fingerprint = (
+                output_fingerprints[index] if index < len(output_fingerprints) else ""
+            )
+            conn.execute(
+                """INSERT INTO async_delegation_children
+                   (delegation_id, child_index, child_session_id,
+                    capability_names_json, capability_fingerprint,
+                    output_schema_fingerprint, state, execution_generation,
+                    updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?)""",
+                (record["delegation_id"], index, child_session_id,
+                 json.dumps(names), capability_fingerprint, output_fingerprint, now),
+            )
     _prune_durable_records()
     return True
 
@@ -528,7 +630,8 @@ def defer_restartable_interruption(delegation_id: str, reason: str) -> bool:
                result_json=NULL, updated_at=?, heartbeat_at=?
                WHERE delegation_id=? AND restart_policy=?
                  AND child_session_ids_json NOT IN ('', '[]')
-                 AND restart_count < ? AND state IN ('running','stalling','finalizing')""",
+                 AND restart_count < restart_budget
+                 AND state IN ('running','stalling','finalizing')""",
             (
                 reason,
                 _new_restart_nonce(),
@@ -536,7 +639,6 @@ def defer_restartable_interruption(delegation_id: str, reason: str) -> bool:
                 now,
                 delegation_id,
                 _RESTART_POLICY,
-                _MAX_RESTART_ATTEMPTS,
             ),
         ).rowcount
     if changed:
@@ -560,23 +662,41 @@ def claim_restartable_delegation(
         changed = conn.execute(
             """UPDATE async_delegations SET state='restarting', owner_pid=?,
                owner_started_at=?, restart_count=restart_count+1,
+               execution_generation=execution_generation+1,
                restart_nonce='', updated_at=?
                WHERE delegation_id=? AND state='restart_pending'
-                 AND restart_policy=? AND restart_count < ?
+                 AND restart_policy=? AND restart_count < restart_budget
                  AND origin_session=? AND restart_nonce=?""",
             (owner_pid, owner_started_at, now, delegation_id,
-             _RESTART_POLICY, _MAX_RESTART_ATTEMPTS, expected_session_key,
-             restart_nonce),
+             _RESTART_POLICY, expected_session_key, restart_nonce),
         ).rowcount
         if not changed:
             return None
+        conn.execute(
+            """UPDATE async_delegation_children
+               SET execution_generation=(SELECT execution_generation
+                    FROM async_delegations WHERE delegation_id=?),
+                   state='restarting', replay_decision='', updated_at=?
+               WHERE delegation_id=?
+                 AND state NOT IN ('completed','failed','unknown','cancelled')""",
+            (delegation_id, now, delegation_id),
+        )
         row = conn.execute(
             """SELECT task_json, child_session_ids_json,
                       child_capability_names_json, restart_count,
-                      parent_session_id, origin_session, origin_ui_session_id
+                      parent_session_id, origin_session, origin_ui_session_id,
+                      execution_generation, task_fingerprint, contract_version
                FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
+        children = conn.execute(
+            """SELECT child_index, child_session_id, capability_names_json,
+                      capability_fingerprint, output_schema_fingerprint,
+                      state, result_json, replay_decision
+               FROM async_delegation_children WHERE delegation_id=?
+               ORDER BY child_index""",
+            (delegation_id,),
+        ).fetchall()
     return {
         "delegation_id": delegation_id,
         "task": _load_durable_json(row[0], {}),
@@ -586,6 +706,22 @@ def claim_restartable_delegation(
         "parent_session_id": row[4],
         "session_key": row[5],
         "origin_ui_session_id": row[6],
+        "execution_generation": row[7],
+        "task_fingerprint": row[8],
+        "contract_version": row[9],
+        "children": [
+            {
+                "child_index": child[0],
+                "child_session_id": child[1],
+                "capability_names": _load_durable_json(child[2], []),
+                "capability_fingerprint": child[3],
+                "output_schema_fingerprint": child[4],
+                "state": child[5],
+                "result": _load_durable_json(child[6], {}),
+                "replay_decision": child[7],
+            }
+            for child in children
+        ],
     }
 
 
@@ -596,8 +732,8 @@ def claim_restartable_delegations(*, owner_pid: int, owner_started_at: int) -> L
             """SELECT delegation_id, origin_session, restart_nonce
                FROM async_delegations
                WHERE state='restart_pending' AND restart_policy=?
-                 AND restart_count < ? ORDER BY dispatched_at, delegation_id""",
-            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+                 AND restart_count < restart_budget ORDER BY dispatched_at, delegation_id""",
+            (_RESTART_POLICY,),
         ).fetchall()
     return [claim for delegation_id, session_key, restart_nonce in rows if (
         claim := claim_restartable_delegation(
@@ -619,8 +755,8 @@ def finalize_exhausted_restarts() -> int:
             """SELECT delegation_id, task_json, origin_session,
                       origin_ui_session_id, parent_session_id
                FROM async_delegations WHERE state='restart_pending'
-                 AND restart_policy=? AND restart_count >= ?""",
-            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+                 AND restart_policy=? AND restart_count >= restart_budget""",
+            (_RESTART_POLICY,),
         ).fetchall()
         for delegation_id, task_json, origin, origin_ui, parent_sid in rows:
             task = _load_durable_json(task_json, {})
@@ -640,9 +776,9 @@ def finalize_exhausted_restarts() -> int:
                 """UPDATE async_delegations SET state='error', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, restart_nonce=''
                    WHERE delegation_id=? AND state='restart_pending'
-                     AND restart_count >= ?""",
+                     AND restart_count >= restart_budget""",
                 (now, now, json.dumps(event), json.dumps(event["result"]),
-                 delegation_id, _MAX_RESTART_ATTEMPTS),
+                 delegation_id),
             ).rowcount
             if changed:
                 _record_parent_terminal_in_tx(
@@ -665,8 +801,8 @@ def restore_restartable_delegations(target_queue) -> int:
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, restart_nonce FROM async_delegations
                WHERE state='restart_pending' AND restart_policy=?
-                 AND restart_count < ? ORDER BY dispatched_at, delegation_id""",
-            (_RESTART_POLICY, _MAX_RESTART_ATTEMPTS),
+                 AND restart_count < restart_budget ORDER BY dispatched_at, delegation_id""",
+            (_RESTART_POLICY,),
         ).fetchall()
     for delegation_id, session_key, origin_ui, parent_sid, restart_nonce in rows:
         target_queue.put(TrustedRestartEvent({
@@ -686,7 +822,7 @@ def release_restart_claim(delegation_id: str, reason: str) -> bool:
         return False
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT restart_count FROM async_delegations
+            """SELECT restart_count, restart_budget FROM async_delegations
                WHERE delegation_id=? AND state='restarting'""",
             (delegation_id,),
         ).fetchone()
@@ -705,7 +841,7 @@ def release_restart_claim(delegation_id: str, reason: str) -> bool:
         ).rowcount
         # At the cap the row is deliberately returned to restart_pending but
         # False tells the gateway to finalize+enqueue exhaustion immediately.
-        return bool(changed and int(row[0]) < _MAX_RESTART_ATTEMPTS)
+        return bool(changed and int(row[0]) < int(row[1]))
 
 
 def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
@@ -858,6 +994,20 @@ def _interrupt_pending_restarts(
                 ),
             ).rowcount
             if changed:
+                child_cancel = {
+                    "status": "cancelled",
+                    "summary": None,
+                    "error": error,
+                    "replay_decision": "explicit_cancel",
+                }
+                conn.execute(
+                    """UPDATE async_delegation_children
+                       SET state='cancelled', result_json=?, completed_at=?,
+                           updated_at=?, replay_decision='explicit_cancel'
+                       WHERE delegation_id=?
+                         AND state NOT IN ('completed','failed','unknown','cancelled')""",
+                    (json.dumps(child_cancel), now, now, delegation_id),
+                )
                 _record_parent_terminal_in_tx(
                     conn,
                     delegation_id=str(delegation_id),
@@ -910,7 +1060,7 @@ def recover_abandoned_delegations() -> int:
             if live:
                 continue
             restart_row = conn.execute(
-                "SELECT restart_policy, restart_count FROM async_delegations WHERE delegation_id=?",
+                "SELECT restart_policy, restart_count, restart_budget FROM async_delegations WHERE delegation_id=?",
                 (delegation_id,),
             ).fetchone()
             if (
@@ -919,7 +1069,7 @@ def recover_abandoned_delegations() -> int:
                 and task_json
                 and restart_row is not None
                 and restart_row[0] == _RESTART_POLICY
-                and int(restart_row[1] or 0) < _MAX_RESTART_ATTEMPTS
+                and int(restart_row[1] or 0) < int(restart_row[2] or 0)
             ):
                 conn.execute(
                     """UPDATE async_delegations SET state='restart_pending',
@@ -1157,6 +1307,87 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 def current_delegation_id() -> str:
     """Return the worker-bound delegation id; empty outside a retained child."""
     return _CURRENT_DELEGATION_ID.get()
+
+
+def commit_child_terminal(
+    child_index: int,
+    result: Dict[str, Any],
+    *,
+    delegation_id: str = "",
+    replay_decision: str = "executed",
+    execution_generation: Optional[int] = None,
+) -> bool:
+    """CAS one child terminal result before aggregate completion is published."""
+    delegation_id = delegation_id or current_delegation_id()
+    if not delegation_id:
+        return False
+    status = str(result.get("status") or "completed")
+    state = {
+        "error": "failed",
+        "interrupted": "failed",
+        "unknown": "unknown",
+        "blocked_unknown_effect": "unknown",
+        "cancelled": "cancelled",
+    }.get(status, "completed")
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT execution_generation FROM async_delegations
+               WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        current_generation = int(row[0] or 0)
+        expected_generation = (
+            int(execution_generation)
+            if execution_generation is not None
+            else int(_CURRENT_EXECUTION_GENERATION.get())
+        )
+        if expected_generation < 0:
+            expected_generation = current_generation
+        if expected_generation != current_generation:
+            return False
+        changed = conn.execute(
+            """UPDATE async_delegation_children
+               SET state=?, result_json=?, completed_at=?, updated_at=?,
+                   replay_decision=?
+               WHERE delegation_id=? AND child_index=?
+                 AND execution_generation=?
+                 AND state NOT IN ('completed','failed','unknown','cancelled')""",
+            (
+                state,
+                json.dumps(result),
+                now,
+                now,
+                replay_decision,
+                delegation_id,
+                int(child_index),
+                expected_generation,
+            ),
+        ).rowcount
+        return changed == 1
+
+
+def durable_child_results(delegation_id: str) -> List[Dict[str, Any]]:
+    """Return committed child outcomes in original task order."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT child_index, state, result_json, replay_decision
+               FROM async_delegation_children WHERE delegation_id=?
+               ORDER BY child_index""",
+            (delegation_id,),
+        ).fetchall()
+    results: List[Dict[str, Any]] = []
+    for index, state, payload, replay_decision in rows:
+        result = _load_durable_json(payload, {})
+        if not result:
+            continue
+        result.setdefault("task_index", int(index))
+        result.setdefault("status", "unknown" if state == "unknown" else state)
+        result.setdefault("replay_decision", replay_decision or "reuse_terminal")
+        results.append(result)
+    return results
 
 
 def record_current_delegation_checkpoint(
@@ -2294,6 +2525,8 @@ def dispatch_async_delegation(
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
+    if root_turn_id and not restart_policy:
+        restart_policy = _RESTART_POLICY
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -2325,6 +2558,11 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
+        if delegation_id in _records:
+            return {
+                "status": "rejected",
+                "error": "Delegation identity already exists",
+            }
         running = sum(
             1 for r in _records.values()
             if r.get("status") in ("running", "stalling")
@@ -2371,8 +2609,10 @@ def dispatch_async_delegation(
         result: Dict[str, Any] = {}
         status = "error"
         context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
+        generation_token = _CURRENT_EXECUTION_GENERATION.set(0)
         try:
             result = runner() or {}
+            commit_child_terminal(0, result, delegation_id=delegation_id)
             _mark_runner_returned(delegation_id)
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
@@ -2389,6 +2629,7 @@ def dispatch_async_delegation(
             try:
                 _finalize(delegation_id, result, status)
             finally:
+                _CURRENT_EXECUTION_GENERATION.reset(generation_token)
                 _CURRENT_DELEGATION_ID.reset(context_token)
 
     try:
@@ -2561,8 +2802,12 @@ def dispatch_async_delegation_batch(
     progress_fn: Optional[Callable[[], tuple]] = None,
     child_session_ids: Optional[List[str]] = None,
     child_capability_names: Optional[List[List[str]]] = None,
+    task_specs: Optional[List[Dict[str, Any]]] = None,
+    output_schemas: Optional[List[Optional[Dict[str, Any]]]] = None,
+    output_schema_fingerprints: Optional[List[str]] = None,
     restart_policy: str = "",
     resume_claim: bool = False,
+    execution_generation: int = 0,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -2587,6 +2832,8 @@ def dispatch_async_delegation_batch(
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
+    if root_turn_id and not restart_policy:
+        restart_policy = _RESTART_POLICY
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -2595,6 +2842,9 @@ def dispatch_async_delegation_batch(
         "delegation_id": delegation_id,
         "goal": combined_goal,
         "goals": list(goals),
+        "tasks": list(task_specs or []),
+        "output_schemas": list(output_schemas or []),
+        "output_schema_fingerprints": list(output_schema_fingerprints or []),
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
@@ -2610,6 +2860,7 @@ def dispatch_async_delegation_batch(
         ],
         "restart_policy": restart_policy,
         "resume_claim": resume_claim,
+        "execution_generation": int(execution_generation),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -2621,6 +2872,11 @@ def dispatch_async_delegation_batch(
         "_interrupted_at": None,
     }
     with _records_lock:
+        if delegation_id in _records:
+            return {
+                "status": "rejected",
+                "error": "Delegation identity already exists",
+            }
         running = sum(
             1 for r in _records.values()
             if r.get("status") in ("running", "stalling")
@@ -2666,8 +2922,17 @@ def dispatch_async_delegation_batch(
         combined: Dict[str, Any] = {}
         status = "error"
         context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
+        generation_token = _CURRENT_EXECUTION_GENERATION.set(
+            int(record.get("execution_generation", 0))
+        )
         try:
             combined = runner() or {}
+            for child_result in combined.get("results") or []:
+                commit_child_terminal(
+                    int(child_result.get("task_index", -1)),
+                    child_result,
+                    delegation_id=delegation_id,
+                )
             _mark_runner_returned(delegation_id)
             # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
@@ -2690,6 +2955,7 @@ def dispatch_async_delegation_batch(
             try:
                 _finalize_batch(delegation_id, combined, status)
             finally:
+                _CURRENT_EXECUTION_GENERATION.reset(generation_token)
                 _CURRENT_DELEGATION_ID.reset(context_token)
 
     try:
@@ -2752,6 +3018,24 @@ def _push_batch_completion_event(
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
+    delegation_id = str(event_record.get("delegation_id") or "")
+    with _DB_LOCK, _transaction() as conn:
+        child_rows = conn.execute(
+            """SELECT state, result_json FROM async_delegation_children
+               WHERE delegation_id=? ORDER BY child_index""",
+            (delegation_id,),
+        ).fetchall()
+    if child_rows:
+        terminal_states = {"completed", "failed", "unknown", "cancelled"}
+        if any(row[0] not in terminal_states or not row[1] for row in child_rows):
+            logger.error(
+                "Async delegation batch %s reached aggregate finalization before "
+                "all child outcomes were durable",
+                delegation_id,
+            )
+            return False
+        combined = dict(combined)
+        combined["results"] = durable_child_results(delegation_id)
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
