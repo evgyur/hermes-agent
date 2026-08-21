@@ -965,6 +965,75 @@ def complete_continuation_after_delivery(
     return changed == 1
 
 
+def supersede_terminal_session_barriers_after_delivery(
+    *,
+    origin_session: str,
+    knowledge_cutoff: Optional[float] = None,
+) -> int:
+    """Park stale terminal-child continuations after a newer ordinary reply.
+
+    Ordinary user input is parked while a parent barrier is active, so a
+    successfully delivered ordinary final in the same session is authoritative
+    evidence that a raced/interrupted continuation was already absorbed by a
+    later turn. Preserve the barrier as an audit tombstone, but never inject its
+    already-terminal child outcome again.
+
+    Every required child must have been terminal before response generation
+    began. Children completing during generation and accepted parent
+    continuations remain owned by their original lifecycle.
+    """
+
+    session = str(origin_session or "").strip()
+    if not session:
+        return 0
+    cutoff = time.time() if knowledge_cutoff is None else float(knowledge_cutoff)
+    current = time.time()
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT b.barrier_id
+               FROM parent_task_barriers AS b
+               WHERE b.origin_session=?
+                 AND b.state IN ('open','ready','resuming')
+                 AND b.initial_persisted=1
+                 AND COALESCE(b.delivery_obligation_id, '')=''
+                 AND EXISTS (
+                     SELECT 1 FROM parent_task_children AS required_child
+                     WHERE required_child.barrier_id=b.barrier_id
+                       AND required_child.required=1
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM parent_task_children AS pending_child
+                     WHERE pending_child.barrier_id=b.barrier_id
+                       AND pending_child.required=1
+                       AND (
+                           pending_child.state NOT IN (
+                               'completed','failed','error','timeout','stalled',
+                               'interrupted','cancelled','unknown'
+                           )
+                           OR pending_child.terminal_at IS NULL
+                           OR pending_child.terminal_at>?
+                       )
+                 )""",
+            (session, cutoff),
+        ).fetchall()
+        ids = [str(row["barrier_id"]) for row in rows]
+        superseded = 0
+        for barrier_id in ids:
+            superseded += conn.execute(
+                """UPDATE parent_task_barriers
+                   SET state='cancelled',
+                       continuation_status='superseded_by_session_delivery',
+                       continuation_claim='', continuation_owner='',
+                       continuation_lease_until=NULL, next_attempt_at=NULL,
+                       updated_at=?, closed_at=?
+                   WHERE barrier_id=?
+                     AND state IN ('open','ready','resuming')
+                     AND COALESCE(delivery_obligation_id, '')=''""",
+                (current, current, barrier_id),
+            ).rowcount
+    return superseded
+
+
 def cancel_session_barriers(
     *, origin_session: str = "", parent_session_id: str = ""
 ) -> int:

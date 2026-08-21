@@ -88,6 +88,160 @@ def _admit_pair():
     return first
 
 
+def test_ordinary_session_delivery_parks_only_unbound_terminal_barriers(
+    monkeypatch, tmp_path
+):
+    _use_db(monkeypatch, tmp_path)
+    ready = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent-ready",
+        root_turn_id="turn-ready",
+        task_id="child-ready",
+    )
+    running = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent-running",
+        root_turn_id="turn-running",
+        task_id="child-running",
+    )
+    other = barrier.admit_required_child(
+        origin_session="other-origin",
+        parent_session_id="parent-other",
+        root_turn_id="turn-other",
+        task_id="child-other",
+    )
+    for parent, turn in (
+        ("parent-ready", "turn-ready"),
+        ("parent-running", "turn-running"),
+        ("parent-other", "turn-other"),
+    ):
+        barrier.finalization_policy(parent_session_id=parent, root_turn_id=turn)
+    for task_id in ("child-ready", "child-other"):
+        _put_result(task_id, {"summary": "done"})
+        barrier.record_child_terminal(
+            task_id=task_id, state="completed", result={"summary": "done"}
+        )
+
+    assert (
+        barrier.supersede_terminal_session_barriers_after_delivery(
+            origin_session="origin"
+        )
+        == 1
+    )
+    ready_snapshot = barrier.barrier_snapshot(ready)
+    running_snapshot = barrier.barrier_snapshot(running)
+    other_snapshot = barrier.barrier_snapshot(other)
+    assert ready_snapshot is not None
+    assert running_snapshot is not None
+    assert other_snapshot is not None
+    assert ready_snapshot["barrier"]["state"] == "cancelled"
+    assert (
+        ready_snapshot["barrier"]["continuation_status"]
+        == "superseded_by_session_delivery"
+    )
+    assert running_snapshot["barrier"]["state"] == "open"
+    assert other_snapshot["barrier"]["state"] == "ready"
+    assert barrier.claim_next_ready_continuation(owner="gateway") is not None
+
+
+def test_ordinary_session_delivery_never_supersedes_bound_delivery(
+    monkeypatch, tmp_path
+):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(
+        task_id="child", state="completed", result={"summary": "done"}
+    )
+    claim = barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    _accept(claim)
+    assert barrier.bind_delivery_obligation(
+        barrier_id,
+        claim["continuation_claim"],
+        obligation_id="delivery-bound",
+    )
+
+    assert (
+        barrier.supersede_terminal_session_barriers_after_delivery(
+            origin_session="origin"
+        )
+        == 0
+    )
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "continuing"
+    assert snapshot["barrier"]["continuation_status"] == "accepted"
+
+
+def test_ordinary_session_delivery_never_supersedes_live_accepted_continuation(
+    monkeypatch, tmp_path
+):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(parent_session_id="parent", root_turn_id="turn")
+    _put_result("child", {"summary": "done"})
+    barrier.record_child_terminal(task_id="child", state="completed", result={})
+    claim = barrier.claim_next_ready_continuation(owner="gateway")
+    assert claim is not None
+    _accept(claim)
+
+    assert (
+        barrier.supersede_terminal_session_barriers_after_delivery(
+            origin_session="origin",
+            knowledge_cutoff=10**10,
+        )
+        == 0
+    )
+    assert barrier.bind_delivery_obligation(
+        barrier_id,
+        claim["continuation_claim"],
+        obligation_id="delivery-live",
+    )
+
+
+def test_ordinary_delivery_requires_every_child_terminal_before_knowledge_cutoff(
+    monkeypatch, tmp_path
+):
+    _use_db(monkeypatch, tmp_path)
+    barrier_id = _admit_pair()
+    barrier.finalization_policy(
+        parent_session_id="parent-session", root_turn_id="root-turn"
+    )
+    for task_id in ("child-a", "child-b"):
+        _put_result(task_id, {"summary": task_id})
+        barrier.record_child_terminal(task_id=task_id, state="completed", result={})
+    with barrier._transaction() as conn:
+        conn.execute(
+            "UPDATE parent_task_children SET terminal_at=100 WHERE task_id='child-a'"
+        )
+        conn.execute(
+            "UPDATE parent_task_children SET terminal_at=300 WHERE task_id='child-b'"
+        )
+
+    assert (
+        barrier.supersede_terminal_session_barriers_after_delivery(
+            origin_session="agent:main:telegram:group:1:topic:2",
+            knowledge_cutoff=200,
+        )
+        == 0
+    )
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "ready"
+
+
 def test_barrier_withholds_until_all_required_children_are_terminal(monkeypatch, tmp_path):
     _use_db(monkeypatch, tmp_path)
     barrier_id = _admit_pair()

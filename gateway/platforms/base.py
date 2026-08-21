@@ -6308,6 +6308,10 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # Causal cutoff for parent-barrier supersession. A normal final can
+        # absorb only child outcomes that were terminal before this response
+        # began generating; later child completions remain independently due.
+        _ordinary_delivery_knowledge_cutoff = time.time()
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6906,6 +6910,31 @@ class BasePlatformAdapter(ABC):
                             "Parent-task delivery succeeded but barrier closure "
                             "is pending durable-ledger recovery"
                         )
+            elif processing_ok and delivery_attempted:
+                # A normal final cannot legitimately race a ready parent
+                # continuation: ordinary inbound is parked behind active
+                # barriers.  If it nevertheless happens (for example, a
+                # mid-turn steer absorbs the child result after an interrupted
+                # continuation), retain the terminal barrier as a tombstone and
+                # suppress later synthetic replay instead of sending another
+                # user-facing "already done" reply.  This bookkeeping is
+                # best-effort after delivery: a ledger fault must not turn a
+                # successful user reply into a second error message.
+                try:
+                    from tools.parent_task_barrier import (
+                        supersede_terminal_session_barriers_after_delivery,
+                    )
+
+                    await asyncio.to_thread(
+                        supersede_terminal_session_barriers_after_delivery,
+                        origin_session=session_key,
+                        knowledge_cutoff=_ordinary_delivery_knowledge_cutoff,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not supersede terminal parent barriers after "
+                        "ordinary session delivery"
+                    )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
