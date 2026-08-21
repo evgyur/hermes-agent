@@ -307,6 +307,12 @@ def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
     assert result["suppress_delivery"] is True
     assert result["defer_goal_evaluation"] is True
     assert result["parent_task_barrier_id"] == "barrier-1"
+    assert result["delivery_control"] == {
+        "disposition": "DEFER",
+        "barrier_id": "barrier-1",
+        "defer_goal_evaluation": True,
+        "outcome_id": "",
+    }
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1]["content"] == ""
     assert "Initial parent answer must stay hidden" not in str(
@@ -353,6 +359,7 @@ def test_parent_barrier_lookup_failure_suppresses_delivery(monkeypatch):
 
     assert result["suppress_delivery"] is True
     assert result["defer_goal_evaluation"] is True
+    assert result["delivery_control"]["disposition"] == "DEFER"
     assert "state db unavailable" in result["error"]
     assert agent.persisted_messages is not None
     assert all(

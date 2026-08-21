@@ -1,12 +1,18 @@
+import hashlib
 import sqlite3
 import time
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from tools import async_delegation as ad
 from tools import parent_task_barrier as barrier
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 @pytest.fixture(autouse=True)
@@ -329,4 +335,380 @@ def test_gateway_runtime_does_not_invent_delivery_controls_for_normal_turn():
         {"final_response": "ordinary final", "completed": True},
     )
 
-    assert payload == {"final_response": "ordinary final", "completed": True}
+    assert payload["final_response"] == "ordinary final"
+    assert payload["completed"] is True
+    assert payload["delivery_control"]["disposition"] == "SEND"
+    assert payload["suppress_delivery"] is False
+    assert payload["response_already_delivered"] is False
+
+
+def test_contradictory_typed_and_legacy_delivery_controls_fail_closed(caplog):
+    from agent.turn_result import normalize_delivery_control
+
+    control = normalize_delivery_control(
+        {
+            "delivery_control": {
+                "disposition": "SEND",
+                "barrier_id": "",
+                "defer_goal_evaluation": False,
+                "outcome_id": "outcome-1",
+            },
+            "suppress_delivery": True,
+        },
+        logger=__import__("logging").getLogger("delivery-control-test"),
+    )
+
+    assert control.disposition.value == "DEFER"
+    assert control.defer_goal_evaluation is True
+    assert "contradictory typed/legacy delivery controls" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "legacy_fields",
+    [
+        {"defer_goal_evaluation": True},
+        {"delivery_suppressed": True},
+    ],
+)
+def test_any_legacy_defer_signal_conflicting_with_typed_send_fails_closed(
+    caplog, legacy_fields
+):
+    from agent.turn_result import normalize_delivery_control
+
+    control = normalize_delivery_control(
+        {
+            "delivery_control": {
+                "disposition": "SEND",
+                "barrier_id": "",
+                "defer_goal_evaluation": False,
+                "outcome_id": "",
+            },
+            **legacy_fields,
+        },
+        logger=__import__("logging").getLogger("delivery-control-test"),
+    )
+
+    assert control.disposition.value == "DEFER"
+    assert control.defer_goal_evaluation is True
+    assert "contradictory typed/legacy delivery controls" in caplog.text
+
+
+def test_matching_legacy_identity_is_preserved_when_typed_control_omits_it():
+    from agent.turn_result import normalize_delivery_control
+
+    control = normalize_delivery_control(
+        {
+            "delivery_control": {
+                "disposition": "DEFER",
+                "barrier_id": "",
+                "defer_goal_evaluation": True,
+                "outcome_id": "",
+            },
+            "suppress_delivery": True,
+            "parent_task_barrier_id": "barrier-legacy",
+            "outcome_id": "outcome-legacy",
+        }
+    )
+
+    assert control.disposition.value == "DEFER"
+    assert control.barrier_id == "barrier-legacy"
+    assert control.outcome_id == "outcome-legacy"
+
+
+class _CaptureParentBarrierAdapter(BasePlatformAdapter):
+    """Exercise the real post-handler delivery pipeline without network I/O."""
+
+    def __init__(self):
+        super().__init__(
+            PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM
+        )
+        self.sent = []
+        self.documents = []
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="unexpected-send")
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        return None
+
+    async def send_document(
+        self,
+        chat_id,
+        file_path,
+        caption=None,
+        file_name=None,
+        reply_to=None,
+        metadata=None,
+        human_delay=0.0,
+        **kwargs,
+    ) -> SendResult:
+        self.documents.append(
+            {
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "sha256": hashlib.sha256(Path(file_path).read_bytes()).hexdigest(),
+            }
+        )
+        return SendResult(success=True, message_id=f"doc-{len(self.documents)}")
+
+    async def _keep_typing(
+        self, chat_id: str, interval: float = 2, metadata=None, stop_event=None
+    ) -> None:
+        if stop_event is not None:
+            await stop_event.wait()
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "legacy-defer-media",
+        "legacy-defer-local",
+        "legacy-defer-empty-metadata",
+        "typed-already",
+        "typed-send",
+    ],
+)
+async def test_delivery_disposition_controls_outer_platform_enqueue(
+    monkeypatch, tmp_path, case
+):
+    """Only SEND may enqueue; withheld text and local files never escape."""
+    import gateway.run as gateway_run
+
+    attachment = tmp_path / "PLAN.md"
+    attachment.write_text("provisional plan", encoding="utf-8")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="12345",
+    )
+    event = MessageEvent(text="continue", source=source, message_id="msg-42")
+    session_key = build_session_key(source)
+
+    adapter = _CaptureParentBarrierAdapter()
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda source: True
+    runner._set_session_env = lambda context: []
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._cache_session_source = lambda session_key, source: None
+    runner._is_session_run_current = lambda session_key, generation: True
+    runner._reply_anchor_for_event = lambda event: None
+    runner._get_guild_id = lambda event: None
+    runner._should_send_voice_reply = lambda *_a, **_kw: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=session_key,
+        session_id="sess-parent-barrier",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+
+    final_response = {
+        "legacy-defer-media": f"provisional plan\n\nMEDIA:{attachment}",
+        "legacy-defer-local": f"provisional plan at {attachment}",
+        "legacy-defer-empty-metadata": "",
+        "typed-already": f"provisional plan\n\nMEDIA:{attachment}",
+        "typed-send": "ordinary final",
+    }[case]
+    legacy_defer = {
+        "suppress_delivery": True,
+        "delivery_suppressed": True,
+        "defer_goal_evaluation": True,
+        "parent_task_barrier_id": "barrier-1",
+    }
+    delivery_fields = {
+        "legacy-defer-media": legacy_defer,
+        "legacy-defer-local": legacy_defer,
+        "legacy-defer-empty-metadata": legacy_defer,
+        "typed-already": {
+            "delivery_control": {
+                "disposition": "ALREADY_DELIVERED",
+                "barrier_id": "",
+                "defer_goal_evaluation": False,
+                "outcome_id": "outcome-1",
+            }
+        },
+        "typed-send": {
+            "delivery_control": {
+                "disposition": "SEND",
+                "barrier_id": "",
+                "defer_goal_evaluation": False,
+                "outcome_id": "outcome-2",
+            }
+        },
+    }[case]
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": final_response,
+            "messages": (
+                [
+                    {"role": "user", "content": "continue"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "img-1",
+                                "function": {
+                                    "name": "image_generate",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "img-1",
+                        "content": (
+                            '{"success": true, "image": "'
+                            + str(attachment)
+                            + '"}'
+                        ),
+                    },
+                ]
+                if case == "legacy-defer-empty-metadata"
+                else [
+                    {"role": "user", "content": "continue"},
+                    {"role": "assistant", "content": final_response},
+                ]
+            ),
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+            "completed": case == "typed-send",
+            **delivery_fields,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv(gateway_run._home_target_env_var("telegram"), "-1001")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+
+    adapter.set_message_handler(runner._handle_message)
+
+    await adapter._process_message_background(event, session_key)
+
+    if case == "typed-send":
+        assert [item["content"] for item in adapter.sent] == ["ordinary final"]
+    else:
+        assert adapter.sent == []
+        assert adapter.documents == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_parent_callback_delivers_text_and_artifact_once_on_replay(
+    tmp_path,
+):
+    artifact = tmp_path / "review.txt"
+    artifact.write_text("reviewed artifact", encoding="utf-8")
+    expected_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    barrier_id = barrier.admit_required_child(
+        origin_session="agent:main:telegram:group:-1001",
+        parent_session_id="parent-session",
+        root_turn_id="root-turn",
+        task_id="child",
+    )
+    barrier.finalization_policy(
+        parent_session_id="parent-session", root_turn_id="root-turn"
+    )
+    barrier.record_child_terminal(
+        task_id="child", state="completed", result={"summary": "reviewed"}
+    )
+    conn = sqlite3.connect(barrier._db_path())
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegations(
+               delegation_id TEXT PRIMARY KEY, result_json TEXT
+           )"""
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO async_delegations VALUES (?, ?)",
+        ("child", '{"summary":"reviewed"}'),
+    )
+    conn.commit()
+    conn.close()
+    claim = barrier.claim_next_ready_continuation(owner="gateway-test")
+    assert claim is not None
+    assert barrier.accept_continuation(
+        barrier_id,
+        claim["continuation_claim"],
+        accepted_turn_id="turn-1",
+        owner_pid=1,
+    )
+
+    delivery = barrier.TrustedParentTaskDelivery(
+        f"Reviewed final.\n\nMEDIA:{artifact}",
+        barrier_id=barrier_id,
+        continuation_claim=claim["continuation_claim"],
+        result={
+            "final_response": f"Reviewed final.\n\nMEDIA:{artifact}",
+            "delivery_control": {
+                "disposition": "SEND",
+                "barrier_id": barrier_id,
+                "defer_goal_evaluation": False,
+                "outcome_id": "outcome-reviewed",
+            },
+        },
+    )
+
+    adapter = _CaptureParentBarrierAdapter()
+
+    async def _handler(_event):
+        return delivery
+
+    adapter.set_message_handler(_handler)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="12345",
+    )
+    event = MessageEvent(text="callback", source=source, message_id="callback-1")
+    session_key = build_session_key(source)
+
+    await adapter._process_message_background(event, session_key)
+    await adapter._process_message_background(event, session_key)
+
+    assert [item["content"] for item in adapter.sent] == ["Reviewed final."]
+    assert [item["sha256"] for item in adapter.documents] == [expected_hash]

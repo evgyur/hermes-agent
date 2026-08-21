@@ -64,6 +64,11 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from agent.turn_result import (
+    DeliveryDisposition,
+    normalize_delivery_control,
+    normalize_gateway_turn_result,
+)
 from gateway import goal_launch
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -3111,34 +3116,11 @@ def _parent_task_stream_allowed(agent: Any, *, run_still_current: bool) -> bool:
     )
 
 
-_GATEWAY_AGENT_DELIVERY_CONTROL_KEYS = (
-    "suppress_delivery",
-    "delivery_suppressed",
-    "defer_goal_evaluation",
-    "parent_task_barrier_id",
-    "turn_exit_reason",
-    "response_already_delivered",
-    "outcome_id",
-    "completed",
-)
-
-
 def _merge_gateway_agent_delivery_controls(
     payload: Dict[str, Any], agent_result: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Preserve finalizer delivery authority across the gateway runtime boundary.
-
-    ``turn_finalizer`` can mark a required-child parent turn as withheld.  The
-    gateway runtime still normalizes token/media/session fields after the agent
-    returns, but that normalization must not discard the suppression and barrier
-    identity before ``_handle_message_with_agent`` decides whether any text or
-    local-file attachment may reach the platform.
-    """
-    merged = dict(payload)
-    for key in _GATEWAY_AGENT_DELIVERY_CONTROL_KEYS:
-        if key in agent_result:
-            merged[key] = agent_result[key]
-    return merged
+    """Compatibility wrapper around the sole gateway delivery normalizer."""
+    return normalize_gateway_turn_result(payload, agent_result, logger=logger)
 
 
 def _queued_first_response_delivery_policy(
@@ -6007,11 +5989,12 @@ class TurnRunner:
                 pass
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
+        _delivery_control = normalize_delivery_control(result, logger=logger)
 
         if getattr(agent, "_parent_task_prebuffering", False):
             agent._parent_task_prebuffering = False
-            _publish_parent_buffer = not bool(
-                result.get("suppress_delivery") or result.get("delivery_suppressed")
+            _publish_parent_buffer = (
+                _delivery_control.disposition == DeliveryDisposition.SEND
             )
             if _publish_parent_buffer:
                 agent._parent_task_barrier_stream_suppressed = False
@@ -6148,6 +6131,33 @@ class TurnRunner:
         _effective_history_offset = (
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
+
+        # Delivery ownership is evaluated before empty-response recovery and
+        # before MEDIA/local-file discovery. A deferred or already-delivered
+        # turn may carry provisional text or artifacts in its internal result,
+        # but neither is eligible for platform enqueue.
+        if _delivery_control.disposition != DeliveryDisposition.SEND:
+            return _merge_gateway_agent_delivery_controls({
+                "final_response": final_response or "",
+                "messages": result.get("messages", []),
+                "api_calls": result.get("api_calls", 0),
+                "failed": result.get("failed", False),
+                "failure_reason": result.get("failure_reason"),
+                "partial": result.get("partial", False),
+                "completed": result.get("completed"),
+                "interrupted": result.get("interrupted", False),
+                "interrupt_message": result.get("interrupt_message"),
+                "error": result.get("error"),
+                "tools": ctx.tools_holder[0] or [],
+                "history_offset": _effective_history_offset,
+                "compacted_in_place": _compacted_in_place,
+                "session_id": effective_session_id,
+                "last_prompt_tokens": _last_prompt_toks,
+                "input_tokens": _input_toks,
+                "output_tokens": _output_toks,
+                "model": _resolved_model,
+                "context_length": _context_length,
+            }, result)
 
         if not final_response:
             final_response = _normalize_empty_agent_response(
@@ -19809,8 +19819,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 _intentional_silence = False
-            if agent_result.get("suppress_delivery"):
-                if _parent_continuation is not None:
+            _delivery_control = normalize_delivery_control(agent_result, logger=logger)
+            if _delivery_control.disposition != DeliveryDisposition.SEND:
+                if (
+                    _delivery_control.disposition == DeliveryDisposition.DEFER
+                    and _parent_continuation is not None
+                ):
                     _nested_barrier = str(
                         agent_result.get("parent_task_barrier_id") or ""
                     )

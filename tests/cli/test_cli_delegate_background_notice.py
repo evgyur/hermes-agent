@@ -60,6 +60,18 @@ def test_synchronous_delegate_result_prints_no_notice(monkeypatch):
     assert not any("resume" in p.lower() for p in printed)
 
 
+def test_wait_true_suppresses_background_resume_notice(monkeypatch):
+    cli_obj = _make_cli()
+    printed = _capture(monkeypatch)
+
+    result = json.dumps({"status": "dispatched", "mode": "background", "count": 1})
+    cli_obj._on_tool_complete(
+        "tc-wait", "delegate_task", {"goal": "x", "wait": True}, result
+    )
+
+    assert not any("resume" in p.lower() for p in printed)
+
+
 def test_non_delegate_tool_prints_no_notice(monkeypatch):
     cli_obj = _make_cli()
     printed = _capture(monkeypatch)

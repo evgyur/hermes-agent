@@ -12352,7 +12352,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parsed = json.loads(function_result) if isinstance(function_result, str) else (function_result or {})
             except Exception:
                 parsed = {}
-            if isinstance(parsed, dict) and parsed.get("status") == "dispatched" and parsed.get("mode") == "background":
+            if (
+                function_args.get("wait") is not True
+                and isinstance(parsed, dict)
+                and parsed.get("status") == "dispatched"
+                and parsed.get("mode") == "background"
+            ):
                 n = parsed.get("count") or 1
                 noun, tail = ("task", "it finishes") if n == 1 else (f"{n} tasks", "they finish")
                 try:

@@ -27,6 +27,7 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_result import DeliveryDisposition, TurnDeliveryControl
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -902,6 +903,19 @@ def finalize_turn(
                 "parent task barrier finalization failed: "
                 + str(_parent_task_policy.get("error") or "unknown error")
             )
+    _delivery_deferred = _parent_task_policy.get("action") in {"withhold", "error"}
+    result["delivery_control"] = TurnDeliveryControl(
+        disposition=(
+            DeliveryDisposition.DEFER
+            if _delivery_deferred
+            else DeliveryDisposition.SEND
+        ),
+        barrier_id=str(_parent_task_policy.get("barrier_id") or ""),
+        defer_goal_evaluation=bool(
+            _delivery_deferred or _parent_task_policy.get("defer_goal_evaluation")
+        ),
+        outcome_id=str(result.get("outcome_id") or ""),
+    ).to_dict()
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

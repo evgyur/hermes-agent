@@ -4,7 +4,8 @@ Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. Top-level model calls run in the background; orchestrator children
+modes. Top-level model calls run in the background when ``wait`` is omitted or
+false; ``wait=true`` returns the ordered aggregate inline. Orchestrator children
 wait for their own workers so they can synthesize the results.
 
 Each child gets:
@@ -4485,10 +4486,12 @@ def _build_top_level_description() -> str:
         "terminal session, and toolset, and only its final summary returns to "
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
+        "Runs in the background by default: dispatch returns immediately with "
+        "live transcript paths, and the completed result (one consolidated "
+        "message for a batch) re-enters the conversation on its own. Set "
+        "wait=true when your final answer depends on the workers. Workers still "
+        "run concurrently, but the ordered aggregate returns inline before the "
+        "parent continues.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4674,16 +4677,14 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
-            "background": {
+            "wait": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
+                    "Wait for every worker and return the ordered aggregate in "
+                    "the current turn before the parent continues. Use this "
+                    "when the final answer depends on delegated findings. "
+                    "Defaults to false (background execution). Nested "
+                    "orchestrator delegations wait automatically."
                 ),
             },
         },
@@ -4699,18 +4700,17 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
+    Top-level delegations default to background execution. ``wait=true``
+    selects the existing synchronous aggregate path so every worker result is
+    available before the parent continues. Delegations from an orchestrator
+    subagent (depth > 0) always wait for their workers. The live path is
+    ``run_agent._dispatch_delegate_task``; this helper mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    keep the historical synchronous default and ``background`` argument.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    wait_requested = args.get("wait") is True
+    return not (is_subagent or wait_requested)
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
