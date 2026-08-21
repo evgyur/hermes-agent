@@ -163,3 +163,30 @@ def test_host_protocol_preserves_frozen_v1_frame_limit():
             "launch",
             {"goal": "x" * host_protocol.V1_MAX_FRAME},
         )
+
+
+def test_watcher_reloads_bridge_when_route_config_changes(tmp_path, monkeypatch):
+    config = tmp_path / "continuum-v2-bridge.json"
+    constructions: list[int] = []
+    ticks = 0
+
+    class FakeBridge:
+        def __init__(self, *_args):
+            constructions.append(len(constructions) + 1)
+
+        def tick(self, *, limit):
+            nonlocal ticks
+            assert limit == 32
+            ticks += 1
+            if ticks == 1:
+                config.write_text("{}", encoding="utf-8")
+            return 0
+
+    monkeypatch.setattr(tool, "_ADAPTIVE_CONFIG", config)
+    monkeypatch.setattr(tool, "Bridge", FakeBridge)
+    monkeypatch.setattr(tool.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(tool, "_RUNNER", lambda: object() if ticks < 2 else None)
+
+    tool._watch()
+
+    assert constructions == [1, 2]

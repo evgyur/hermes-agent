@@ -23,6 +23,7 @@ from tools.registry import registry
 log = logging.getLogger(__name__)
 _SOCKET = Path("/run/continuumd/control.sock")
 _DB = Path.home() / ".hermes" / "state" / "continuum-card-bridge.sqlite3"
+_ADAPTIVE_CONFIG = Path.home() / ".hermes" / "continuum-v2-bridge.json"
 _RUNNER: weakref.ReferenceType[Any] | None = None
 _LOOP: asyncio.AbstractEventLoop | None = None
 _WATCHER: threading.Thread | None = None
@@ -130,12 +131,25 @@ def _call(method: str, params: dict[str, Any]) -> dict[str, Any]:
     return daemon_call(_SOCKET, method, params)
 
 
+def _bridge_config_fingerprint() -> tuple[int, int, int] | None:
+    try:
+        stat = _ADAPTIVE_CONFIG.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 def _watch() -> None:
-    bridge = Bridge(_DB, _call, _GatewayAdapter())
+    bridge: Any | None = None
+    fingerprint: tuple[int, int, int] | None | object = object()
     while True:
         try:
             if _RUNNER is None or _RUNNER() is None:
                 return
+            current = _bridge_config_fingerprint()
+            if bridge is None or current != fingerprint:
+                bridge = Bridge(_DB, _call, _GatewayAdapter())
+                fingerprint = current
             count = bridge.tick(limit=32)
         except Exception:
             log.exception("Continuum card watcher tick failed")
