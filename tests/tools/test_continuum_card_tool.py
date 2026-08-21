@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +61,10 @@ async def test_tool_uses_trusted_session_origin_and_complete_plan(monkeypatch):
             )
             return {"task_id": "con_test", "message_id": "42", "card": "card"}
 
+        def control(self, origin, request):
+            captured.update(control_origin=json.loads(origin), control=request)
+            return {"root_id": request["root_id"], "state": "running"}
+
     monkeypatch.setattr(tool, "Bridge", FakeBridge)
     result = json.loads(
         tool._handle(
@@ -77,6 +84,11 @@ async def test_tool_uses_trusted_session_origin_and_complete_plan(monkeypatch):
         "Execute",
         "Verify",
     ]
+    controlled = json.loads(
+        tool._handle({"control": {"operation": "status", "root_id": "root-control"}})
+    )
+    assert controlled == {"root_id": "root-control", "state": "running"}
+    assert captured["control_origin"]["user_id"] == "617744661"
     definition = tool.registry.get_entry("continuum_card_launch")
     assert definition is not None
     assert definition.check_fn is tool._check_requirements
@@ -109,3 +121,33 @@ def test_bridge_is_exposed_to_telegram_but_not_other_messaging_bundles():
     assert "continuum_card_launch" in resolve_toolset("hermes-telegram")
     assert "continuum_card_launch" not in resolve_toolset("hermes-discord")
     assert "continuum_card_launch" not in resolve_toolset("hermes-whatsapp")
+
+
+def test_card_tool_imports_without_continuum_execution_package():
+    root = Path(__file__).resolve().parents[2]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.abc
+import sys
+
+class RejectContinuum(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'hermes_continuum' or fullname.startswith('hermes_continuum.'):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, RejectContinuum())
+from tools import continuum_card_tool as tool
+assert tool.Bridge.__module__ == 'tools.continuum_host_bridge'
+assert tool.daemon_call.__module__ == 'tools.continuum_host_bridge_protocol'
+""",
+        ],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr

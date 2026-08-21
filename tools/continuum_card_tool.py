@@ -16,8 +16,8 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from hermes_continuum.card_bridge import Bridge
-from hermes_continuum.kernel.client import call as daemon_call
+from tools.continuum_host_bridge import AdaptiveBridge as Bridge
+from tools.continuum_host_bridge_protocol import call_v1 as daemon_call
 from tools.registry import registry
 
 log = logging.getLogger(__name__)
@@ -171,21 +171,23 @@ def _handle(args: dict[str, Any], **_: Any) -> str:
     from gateway.session_context import get_session_env
     from gateway.platforms.base import BasePlatformAdapter
 
-    if set(args) - {"goal", "context", "idempotency_key", "plan"}:
+    if set(args) - {"goal", "context", "idempotency_key", "plan", "control"}:
         raise ValueError("unsupported argument")
     goal = args.get("goal")
     context = args.get("context", "")
     idem = args.get("idempotency_key")
     labels = args.get("plan")
-    if not isinstance(goal, str) or not goal.strip():
+    if (control := args.get("control")) is not None and (set(args) != {"control"} or not isinstance(control, dict)):
+        raise ValueError("control must be one object")
+    if control is None and (not isinstance(goal, str) or not goal.strip()):
         raise ValueError("goal is required")
-    if not isinstance(context, str):
+    if control is None and not isinstance(context, str):
         raise ValueError("context must be text")
-    if not isinstance(idem, str) or len(idem) < 12:
+    if control is None and (not isinstance(idem, str) or len(idem) < 12):
         raise ValueError("stable idempotency_key is required")
-    if not isinstance(labels, list) or not labels or len(labels) > 64:
+    if control is None and (not isinstance(labels, list) or not labels or len(labels) > 64):
         raise ValueError("complete plan is required")
-    if any(not isinstance(label, str) or not label.strip() for label in labels):
+    if control is None and any(not isinstance(label, str) or not label.strip() for label in labels):
         raise ValueError("plan labels must be non-empty strings")
 
     runner = _runner()
@@ -199,8 +201,11 @@ def _handle(args: dict[str, Any], **_: Any) -> str:
         raise RuntimeError("current provider cannot edit a task card")
 
     origin = _origin_json(source, session_key)
-    plan = [{"id": str(index), "label": label.strip()} for index, label in enumerate(labels, 1)]
     bridge = Bridge(_DB, _call, _GatewayAdapter())
+    if control is not None:
+        return json.dumps(bridge.control(origin, control), ensure_ascii=False, separators=(",", ":"))
+    assert isinstance(goal, str) and isinstance(context, str) and isinstance(idem, str) and isinstance(labels, list)
+    plan = [{"id": str(index), "label": label.strip()} for index, label in enumerate(labels, 1)]
     result = bridge.launch(origin, goal.strip(), context, idem, plan)
     _ensure_watcher()
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
@@ -218,6 +223,7 @@ registry.register(
                 "goal": {"type": "string"},
                 "context": {"type": "string"},
                 "idempotency_key": {"type": "string"},
+                "control": {"type": "object"},
                 "plan": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -225,7 +231,7 @@ registry.register(
                     "maxItems": 64,
                 },
             },
-            "required": ["goal", "idempotency_key", "plan"],
+            "anyOf": [{"required": ["goal", "idempotency_key", "plan"]}, {"required": ["control"]}],
             "additionalProperties": False,
         },
     },

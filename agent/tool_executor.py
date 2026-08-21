@@ -400,6 +400,14 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def _qualified_tool_block(agent, function_name: str) -> str | None:
+    """Fail closed when a session-bound exact tool allowlist excludes a call."""
+    allowed = getattr(agent, "qualified_tool_allowlist", None)
+    if allowed is None or function_name in allowed:
+        return None
+    return f"'{function_name}' is not authorized for this session."
+
+
 @dataclass
 class _ManagedToolResult:
     result: Any
@@ -888,6 +896,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        if _ts_scope_block is None:
+            _ts_scope_block = _qualified_tool_block(agent, function_name)
 
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
