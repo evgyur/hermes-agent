@@ -294,3 +294,39 @@ def test_goal_outcome_defers_standing_goal_judge_for_provisional_turn():
 
     assert outcomes[0]["delivery_suppressed"] is True
     assert outcomes[0]["defer_goal_evaluation"] is True
+
+
+def test_gateway_runtime_preserves_parent_barrier_delivery_controls():
+    from gateway.run import _merge_gateway_agent_delivery_controls
+
+    provisional = {
+        "final_response": "provisional with /tmp/PLAN.md",
+        "suppress_delivery": True,
+        "delivery_suppressed": True,
+        "defer_goal_evaluation": True,
+        "parent_task_barrier_id": "barrier-1",
+        "turn_exit_reason": "text_response(finish_reason=stop)",
+        "completed": False,
+    }
+
+    payload = _merge_gateway_agent_delivery_controls(
+        {"final_response": provisional["final_response"]}, provisional
+    )
+
+    assert payload["suppress_delivery"] is True
+    assert payload["delivery_suppressed"] is True
+    assert payload["defer_goal_evaluation"] is True
+    assert payload["parent_task_barrier_id"] == "barrier-1"
+    assert payload["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert payload["completed"] is False
+
+
+def test_gateway_runtime_does_not_invent_delivery_controls_for_normal_turn():
+    from gateway.run import _merge_gateway_agent_delivery_controls
+
+    payload = _merge_gateway_agent_delivery_controls(
+        {"final_response": "ordinary final"},
+        {"final_response": "ordinary final", "completed": True},
+    )
+
+    assert payload == {"final_response": "ordinary final", "completed": True}

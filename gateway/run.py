@@ -3111,6 +3111,36 @@ def _parent_task_stream_allowed(agent: Any, *, run_still_current: bool) -> bool:
     )
 
 
+_GATEWAY_AGENT_DELIVERY_CONTROL_KEYS = (
+    "suppress_delivery",
+    "delivery_suppressed",
+    "defer_goal_evaluation",
+    "parent_task_barrier_id",
+    "turn_exit_reason",
+    "response_already_delivered",
+    "outcome_id",
+    "completed",
+)
+
+
+def _merge_gateway_agent_delivery_controls(
+    payload: Dict[str, Any], agent_result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Preserve finalizer delivery authority across the gateway runtime boundary.
+
+    ``turn_finalizer`` can mark a required-child parent turn as withheld.  The
+    gateway runtime still normalizes token/media/session fields after the agent
+    returns, but that normalization must not discard the suppression and barrier
+    identity before ``_handle_message_with_agent`` decides whether any text or
+    local-file attachment may reach the platform.
+    """
+    merged = dict(payload)
+    for key in _GATEWAY_AGENT_DELIVERY_CONTROL_KEYS:
+        if key in agent_result:
+            merged[key] = agent_result[key]
+    return merged
+
+
 def _queued_first_response_delivery_policy(
     *, final_text_delivered: bool, failed: bool,
 ) -> tuple[bool, bool]:
@@ -6126,7 +6156,7 @@ class TurnRunner:
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
-            return {
+            return _merge_gateway_agent_delivery_controls({
                 "final_response": final_response,
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
@@ -6154,7 +6184,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
-            }
+            }, result)
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
         # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
@@ -6202,7 +6232,7 @@ class TurnRunner:
         # _attach_session_title_callback), because the titler now fires from
         # inside the turn prologue rather than from here.
 
-        return {
+        return _merge_gateway_agent_delivery_controls({
             "final_response": final_response,
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
@@ -6239,7 +6269,7 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
-        }
+        }, result)
 
 
 
