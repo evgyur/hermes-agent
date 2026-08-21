@@ -395,12 +395,19 @@ class AdaptiveBridge:
             "list": set(),
             "status": {"root_id", "after_event", "event_limit"},
             "result": {"root_id"},
-            "send": {"root_id", "agent_id", "message", "mode", "idempotency_key"},
+            "send": {
+                "root_id",
+                "agent_id",
+                "message",
+                "mode",
+                "idempotency_key",
+                "correlation_id",
+            },
             "stop": {"root_id"},
             "tree": {"root_id"},
-            "children": {"root_id"},
-            "schedules": {"root_id"},
-            "heartbeats": {"root_id"},
+            "children": {"root_id", "agent_id"},
+            "schedules": {"root_id", "agent_id"},
+            "heartbeats": {"root_id", "agent_id"},
         }
         if not isinstance(operation, str) or operation not in allowed:
             raise ValueError("unsupported Continuum control operation")
@@ -419,13 +426,16 @@ class AdaptiveBridge:
             params["after_event"] = request.get("after_event", 0)
             params["event_limit"] = request.get("event_limit", 100)
         if operation == "send":
-            for key in ("message", "idempotency_key"):
+            for key in ("agent_id", "message", "idempotency_key", "correlation_id"):
                 if not isinstance(request.get(key), str) or not request[key]:
                     raise ValueError(f"{key} is required")
                 params[key] = request[key]
             params["mode"] = request.get("mode", "follow_up")
-            if "agent_id" in request:
-                params["agent_id"] = request["agent_id"]
+        if operation in {"children", "schedules", "heartbeats"}:
+            agent_id = request.get("agent_id")
+            if not isinstance(agent_id, str) or not agent_id:
+                raise ValueError("agent_id is required")
+            params["agent_id"] = agent_id
         return self._v2_call(operation, params)
 
 
