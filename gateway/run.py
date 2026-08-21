@@ -18487,6 +18487,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (staged below, consumed in run_sync → build_turn_context).
         turn_sidecar_notes: List[str] = []
 
+        # Profile-scoped, exact-topic continuity.  This is deliberately a
+        # per-turn sidecar (not a system-prompt mutation), and the loader reads
+        # only bounded integrity-checked handoffs — never raw Telegram exports.
+        try:
+            from gateway.topic_handoffs import build_topic_handoff_note
+
+            _topic_handoff_note = build_topic_handoff_note(source)
+            if _topic_handoff_note:
+                turn_sidecar_notes.append(_topic_handoff_note)
+        except Exception as e:
+            logger.warning("[Gateway] Topic handoff load failed closed: %s", e)
+
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
