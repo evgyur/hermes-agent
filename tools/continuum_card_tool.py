@@ -16,8 +16,8 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from hermes_continuum.v2_card_bridge import AdaptiveBridge as Bridge
-from hermes_continuum.kernel.client import call as daemon_call
+from tools.continuum_host_bridge import AdaptiveBridge as Bridge
+from tools.continuum_host_bridge_protocol import call_v1 as daemon_call
 from tools.registry import registry
 
 log = logging.getLogger(__name__)

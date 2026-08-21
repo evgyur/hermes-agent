@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -118,3 +121,33 @@ def test_bridge_is_exposed_to_telegram_but_not_other_messaging_bundles():
     assert "continuum_card_launch" in resolve_toolset("hermes-telegram")
     assert "continuum_card_launch" not in resolve_toolset("hermes-discord")
     assert "continuum_card_launch" not in resolve_toolset("hermes-whatsapp")
+
+
+def test_card_tool_imports_without_continuum_execution_package():
+    root = Path(__file__).resolve().parents[2]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.abc
+import sys
+
+class RejectContinuum(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'hermes_continuum' or fullname.startswith('hermes_continuum.'):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, RejectContinuum())
+from tools import continuum_card_tool as tool
+assert tool.Bridge.__module__ == 'tools.continuum_host_bridge'
+assert tool.daemon_call.__module__ == 'tools.continuum_host_bridge_protocol'
+""",
+        ],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
