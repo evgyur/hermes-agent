@@ -178,15 +178,17 @@ def normalize_gateway_turn_result(
             normalized[key] = source[key]
     normalized[DELIVERY_CONTROL_KEY] = control.to_dict()
 
-    # Compatibility fields remain available to old consumers during migration.
-    normalized["suppress_delivery"] = (
-        control.disposition == DeliveryDisposition.DEFER
-    )
-    normalized["delivery_suppressed"] = normalized["suppress_delivery"]
-    normalized["response_already_delivered"] = (
-        control.disposition == DeliveryDisposition.ALREADY_DELIVERED
-    )
-    normalized["defer_goal_evaluation"] = control.defer_goal_evaluation
+    # Compatibility fields remain available to old consumers during migration,
+    # but absence is meaningful: downstream provenance code uses ``get(key,
+    # fallback)`` to mark earlier queued outcomes as already delivered.  Never
+    # materialize false controls or overwrite caller-supplied provenance.
+    if control.disposition == DeliveryDisposition.DEFER:
+        normalized["suppress_delivery"] = True
+        normalized["delivery_suppressed"] = True
+    elif control.disposition == DeliveryDisposition.ALREADY_DELIVERED:
+        normalized["response_already_delivered"] = True
+    if control.defer_goal_evaluation:
+        normalized["defer_goal_evaluation"] = True
     if control.barrier_id:
         normalized["parent_task_barrier_id"] = control.barrier_id
     if control.outcome_id:

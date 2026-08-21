@@ -66,6 +66,7 @@ from agent.turn_context import (
 )
 from agent.turn_result import (
     DeliveryDisposition,
+    TurnDeliveryControl,
     normalize_delivery_control,
     normalize_gateway_turn_result,
 )
@@ -1703,6 +1704,41 @@ def _collect_auto_append_media_tags(
             has_voice_directive = True
 
     return media_tags, has_voice_directive
+
+
+def _prepare_gateway_delivery_text(
+    result: Dict[str, Any],
+    final_response: Optional[str],
+    *,
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+) -> tuple[str, TurnDeliveryControl]:
+    """Apply one delivery gate before any automatic attachment enrichment."""
+
+    response = str(final_response or "")
+    control = normalize_delivery_control(result, logger=logger)
+    if control.disposition != DeliveryDisposition.SEND or "MEDIA:" in response:
+        return response, control
+
+    media_tags, has_voice_directive = _collect_auto_append_media_tags(
+        result.get("messages", []),
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+    )
+    if not media_tags:
+        return response, control
+
+    seen: set[str] = set()
+    unique_tags: List[str] = []
+    for tag in media_tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        unique_tags.append(tag)
+    if has_voice_directive:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    separator = "\n" if response else ""
+    return response + separator + "\n".join(unique_tags), control
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
@@ -3886,7 +3922,8 @@ def _goal_turn_outcome(
     messages = result.get("messages")
     message_count = len(messages) if isinstance(messages, list) else None
     offset = result.get("history_offset")
-    identity = str(result.get("outcome_id") or "")
+    control = normalize_delivery_control(result, logger=logger)
+    identity = str(control.outcome_id or result.get("outcome_id") or "")
     if not identity:
         payload = json.dumps(
             {
@@ -3906,12 +3943,14 @@ def _goal_turn_outcome(
         "turn_exit_reason": reason,
         "final_response": response,
         "response_already_delivered": bool(
-            result.get("response_already_delivered", response_already_delivered)
+            control.disposition == DeliveryDisposition.ALREADY_DELIVERED
+            or result.get("response_already_delivered", response_already_delivered)
         ),
-        "delivery_suppressed": bool(result.get("delivery_suppressed"))
-        or bool(result.get("suppress_delivery"))
-        or response.strip() in silence_markers,
-        "defer_goal_evaluation": bool(result.get("defer_goal_evaluation")),
+        "delivery_suppressed": (
+            control.disposition == DeliveryDisposition.DEFER
+            or response.strip() in silence_markers
+        ),
+        "defer_goal_evaluation": control.defer_goal_evaluation,
     }
 
 
@@ -6136,6 +6175,12 @@ class TurnRunner:
         # before MEDIA/local-file discovery. A deferred or already-delivered
         # turn may carry provisional text or artifacts in its internal result,
         # but neither is eligible for platform enqueue.
+        final_response, _delivery_control = _prepare_gateway_delivery_text(
+            result,
+            final_response,
+            history_offset=len(agent_history),
+            history_media_paths=_history_media_paths,
+        )
         if _delivery_control.disposition != DeliveryDisposition.SEND:
             return _merge_gateway_agent_delivery_controls({
                 "final_response": final_response or "",
@@ -6195,44 +6240,6 @@ class TurnRunner:
                 "model": _resolved_model,
                 "context_length": _context_length,
             }, result)
-
-        # Scan tool results for MEDIA:<path> tags that need to be delivered
-        # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-        # in its JSON response, but the model's final text reply usually
-        # doesn't include them.  We collect unique tags from tool results and
-        # append any that aren't already present in the final response, so the
-        # adapter's extract_media() can find and deliver the files exactly once.
-        #
-        # Scope the scan to THIS turn's tool results only. ``agent_history``
-        # was passed into run_conversation as ``conversation_history``, so the
-        # agent's returned ``messages`` list is ``agent_history`` followed by
-        # the messages produced this turn. Slicing at ``len(agent_history)``
-        # isolates the current turn precisely, so a stale MEDIA: path emitted
-        # by a tool several turns earlier (still present in the full message
-        # list) can never leak onto a later text-only reply. (Fixes #34608)
-        #
-        # Path-based deduplication against _history_media_paths (collected
-        # before run_conversation) is retained as a secondary guard. It is
-        # also the sole guard on the fallback branch taken when mid-run
-        # context compression shrinks the message list below the original
-        # history length, preserving the compression-safe behaviour of #160.
-        if "MEDIA:" not in final_response:
-            media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                result.get("messages", []),
-                history_offset=len(agent_history),
-                history_media_paths=_history_media_paths,
-            )
-
-            if media_tags:
-                seen = set()
-                unique_tags = []
-                for tag in media_tags:
-                    if tag not in seen:
-                        seen.add(tag)
-                        unique_tags.append(tag)
-                if has_voice_directive:
-                    unique_tags.insert(0, "[[audio_as_voice]]")
-                final_response = final_response + "\n" + "\n".join(unique_tags)
 
         # Auto-titling runs at TURN START (agent/turn_context.py) from the
         # user's message alone, so it no longer waits on final_response — a
@@ -19706,6 +19713,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _parent_continuation = getattr(
                 event, "_hermes_parent_task_continuation", None
             )
+            _delivery_control = normalize_delivery_control(
+                agent_result if isinstance(agent_result, dict) else {}, logger=logger
+            )
             _parent_delivery_result = None
             if _parent_continuation is not None:
                 try:
@@ -19720,17 +19730,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "untrusted parent-task continuation marker"
                         )
                     if isinstance(agent_result, dict):
-                        _parent_delivery_result = {
-                            "final_response": str(
-                                agent_result.get("final_response") or ""
-                            ),
-                            "turn_exit_reason": str(
-                                agent_result.get("turn_exit_reason") or ""
-                            ),
-                            "suppress_delivery": bool(
-                                agent_result.get("suppress_delivery")
-                            ),
-                        }
+                        _parent_delivery_result = normalize_gateway_turn_result(
+                            {
+                                "final_response": str(
+                                    agent_result.get("final_response") or ""
+                                ),
+                                "turn_exit_reason": str(
+                                    agent_result.get("turn_exit_reason") or ""
+                                ),
+                            },
+                            agent_result,
+                            logger=logger,
+                        )
                     else:
                         _parent_delivery_result = {
                             "final_response": str(agent_result or "")
@@ -19819,15 +19830,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 _intentional_silence = False
-            _delivery_control = normalize_delivery_control(agent_result, logger=logger)
             if _delivery_control.disposition != DeliveryDisposition.SEND:
                 if (
                     _delivery_control.disposition == DeliveryDisposition.DEFER
                     and _parent_continuation is not None
                 ):
-                    _nested_barrier = str(
-                        agent_result.get("parent_task_barrier_id") or ""
-                    )
+                    _nested_barrier = str(_delivery_control.barrier_id or "")
                     _current_barrier = str(
                         _parent_continuation.get("barrier_id") or ""
                     )

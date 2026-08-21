@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 import time
 from datetime import datetime
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway import run as gateway_run
 from tools import async_delegation as ad
 from tools import parent_task_barrier as barrier
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -338,8 +340,98 @@ def test_gateway_runtime_does_not_invent_delivery_controls_for_normal_turn():
     assert payload["final_response"] == "ordinary final"
     assert payload["completed"] is True
     assert payload["delivery_control"]["disposition"] == "SEND"
-    assert payload["suppress_delivery"] is False
-    assert payload["response_already_delivered"] is False
+    assert "suppress_delivery" not in payload
+    assert "delivery_suppressed" not in payload
+    assert "response_already_delivered" not in payload
+    assert "defer_goal_evaluation" not in payload
+
+
+def test_ordinary_normalization_preserves_queued_delivery_fallback():
+    payload = gateway_run._merge_gateway_agent_delivery_controls(
+        {"final_response": "first final"},
+        {
+            "final_response": "first final",
+            "turn_exit_reason": "completed",
+            "completed": True,
+        },
+    )
+
+    outcome = gateway_run._goal_turn_outcome(
+        payload, response_already_delivered=True
+    )
+
+    assert outcome is not None
+    assert outcome["response_already_delivered"] is True
+
+
+def _image_generate_result(disposition: str, attachment: Path) -> dict:
+    return {
+        "delivery_control": {
+            "disposition": disposition,
+            "barrier_id": "nested-barrier" if disposition == "DEFER" else "",
+            "defer_goal_evaluation": disposition == "DEFER",
+            "outcome_id": "outcome-image",
+        },
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "image-call",
+                        "function": {"name": "image_generate", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "image-call",
+                "content": json.dumps(
+                    {"success": True, "image": str(attachment)}
+                ),
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("disposition", "final_response"),
+    [("DEFER", "provisional final"), ("DEFER", ""), ("ALREADY_DELIVERED", "done")],
+)
+def test_delivery_gate_precedes_automatic_attachment_enrichment(
+    tmp_path, disposition, final_response
+):
+    attachment = tmp_path / "provisional.png"
+    attachment.write_bytes(b"not-deliverable-yet")
+
+    response, control = gateway_run._prepare_gateway_delivery_text(
+        _image_generate_result(disposition, attachment), final_response
+    )
+
+    assert control.disposition.value == disposition
+    assert response == final_response
+    assert "MEDIA:" not in response
+
+
+def test_send_enriches_terminal_artifact_exactly_once_and_leaves_plain_text_unchanged(
+    tmp_path,
+):
+    attachment = tmp_path / "terminal.png"
+    attachment.write_bytes(b"terminal-artifact")
+    result = _image_generate_result("SEND", attachment)
+
+    enriched, control = gateway_run._prepare_gateway_delivery_text(
+        result, "terminal final"
+    )
+    replayed, _ = gateway_run._prepare_gateway_delivery_text(result, enriched)
+    plain, _ = gateway_run._prepare_gateway_delivery_text(
+        {"final_response": "ordinary", "messages": []}, "ordinary"
+    )
+
+    assert control.disposition.value == "SEND"
+    assert enriched.count(f"MEDIA:{attachment}") == 1
+    assert replayed == enriched
+    assert plain == "ordinary"
 
 
 def test_contradictory_typed_and_legacy_delivery_controls_fail_closed(caplog):

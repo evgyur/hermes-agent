@@ -12353,8 +12353,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 parsed = {}
             if (
-                function_args.get("wait") is not True
-                and isinstance(parsed, dict)
+                isinstance(parsed, dict)
                 and parsed.get("status") == "dispatched"
                 and parsed.get("mode") == "background"
             ):
