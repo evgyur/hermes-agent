@@ -338,7 +338,7 @@ class AdaptiveBridge:
                 method,
                 params,
                 client_id="client:gateway-card-bridge-v2",
-                capabilities=[METHOD_CAPABILITY[method]],
+                capabilities=["continuum.v2", METHOD_CAPABILITY[method]],
             )
             result = response["result"]
             if not isinstance(result, dict):

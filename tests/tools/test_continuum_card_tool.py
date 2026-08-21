@@ -13,6 +13,7 @@ import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource
 from tools import continuum_card_tool as tool
+from tools import continuum_host_bridge_protocol as host_protocol
 
 
 class EditableAdapter:
@@ -151,3 +152,14 @@ assert tool.daemon_call.__module__ == 'tools.continuum_host_bridge_protocol'
         text=True,
     )
     assert probe.returncode == 0, probe.stderr
+
+
+def test_host_protocol_preserves_frozen_v1_frame_limit():
+    assert host_protocol.V1_MAX_FRAME == 65_536
+    assert host_protocol.V2_MAX_FRAME == 131_072
+    with pytest.raises(ValueError, match="request exceeds protocol frame"):
+        host_protocol.call_v1(
+            Path("/unreachable.sock"),
+            "launch",
+            {"goal": "x" * host_protocol.V1_MAX_FRAME},
+        )

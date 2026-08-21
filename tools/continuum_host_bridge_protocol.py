@@ -9,7 +9,8 @@ from typing import Any, Final
 
 V1_VERSION: Final = 1
 V2_VERSION: Final = 2
-MAX_FRAME: Final = 131_072
+V1_MAX_FRAME: Final = 65_536
+V2_MAX_FRAME: Final = 131_072
 METHOD_CAPABILITY: Final = {
     "create": "continuum.launch",
     "bind_card": "continuum.card",
@@ -32,21 +33,27 @@ class V2ProtocolError(RuntimeError):
         self.diagnostic = diagnostic
 
 
-def _exchange(socket_path: Path, request: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+def _exchange(
+    socket_path: Path,
+    request: dict[str, Any],
+    *,
+    timeout: float,
+    max_frame: int,
+) -> dict[str, Any]:
     encoded = (json.dumps(request, separators=(",", ":"), sort_keys=True) + "\n").encode()
-    if len(encoded) > MAX_FRAME:
+    if len(encoded) > max_frame:
         raise ValueError("request exceeds protocol frame")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(timeout)
         client.connect(str(socket_path))
         client.sendall(encoded)
         data = bytearray()
-        while b"\n" not in data and len(data) <= MAX_FRAME:
-            chunk = client.recv(min(4096, MAX_FRAME + 1 - len(data)))
+        while b"\n" not in data and len(data) <= max_frame:
+            chunk = client.recv(min(4096, max_frame + 1 - len(data)))
             if not chunk:
                 break
             data.extend(chunk)
-    if len(data) > MAX_FRAME or b"\n" not in data:
+    if len(data) > max_frame or b"\n" not in data:
         raise RuntimeError("invalid daemon response")
     frame, trailing = bytes(data).split(b"\n", 1)
     if trailing:
@@ -68,6 +75,7 @@ def call_v1(
         socket_path,
         {"version": V1_VERSION, "request_id": request_id, "method": method, "params": params},
         timeout=timeout,
+        max_frame=V1_MAX_FRAME,
     )
     if (
         value.get("version") != V1_VERSION
@@ -99,7 +107,9 @@ def call_v2(
     }
     if event_cursor is not None:
         request["event_cursor"] = event_cursor
-    value = _exchange(socket_path, request, timeout=timeout)
+    value = _exchange(
+        socket_path, request, timeout=timeout, max_frame=V2_MAX_FRAME
+    )
     if (
         value.get("version") != V2_VERSION
         or value.get("command_id") != request["command_id"]
