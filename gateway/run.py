@@ -12176,21 +12176,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(event, "_hermes_deferred_spool_replay", False)
                 or getattr(event, "_hermes_deferred_spool_path", None)
             )
-            if is_spool_replay:
-                if bool(getattr(event, "_hermes_startup_claim_release_pending", False)):
-                    try:
-                        released = await asyncio.to_thread(
-                            self._release_deferred_event_dispatch_claim,
-                            event,
-                        )
-                    except Exception:
-                        logger.warning("Startup claim release retry failed", exc_info=True)
-                        queue.append(event)
-                        continue
-                    if not released:
-                        queue.append(event)
-                        continue
-                    setattr(event, "_hermes_startup_claim_release_pending", False)
+            if not (
+                getattr(event, "_hermes_gateway_ledger_id", None) is not None
+                or getattr(event, "_hermes_gateway_ledger_ids", None)
+            ):
+                ledger_id = await asyncio.to_thread(
+                    self._record_gateway_ledger_received,
+                    event,
+                    session_key=self._session_key_for_source(source),
+                    reason="startup-replay-admitted",
+                )
+                if ledger_id is None and is_spool_replay:
+                    logger.error("Preserving restored event with no durable ledger identity")
+                    queue.append(event)
+                    continue
+            has_ledger_identity = bool(
+                getattr(event, "_hermes_gateway_ledger_id", None) is not None
+                or getattr(event, "_hermes_gateway_ledger_ids", None)
+            )
+            claimed = False
+            if has_ledger_identity and bool(
+                getattr(event, "_hermes_startup_claim_release_pending", False)
+            ):
+                try:
+                    released = await asyncio.to_thread(
+                        self._release_deferred_event_dispatch_claim,
+                        event,
+                    )
+                except Exception:
+                    logger.warning("Startup claim release retry failed", exc_info=True)
+                    queue.append(event)
+                    continue
+                if not released:
+                    queue.append(event)
+                    continue
+                setattr(event, "_hermes_startup_claim_release_pending", False)
+            if has_ledger_identity:
                 try:
                     claimed = await asyncio.to_thread(
                         self._claim_deferred_event_for_dispatch,
@@ -12201,18 +12222,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     queue.append(event)
                     continue
                 if not claimed:
+                    if is_spool_replay:
+                        try:
+                            from gateway.deferred_event_spool import remove_deferred_event
+
+                            remove_deferred_event(event)
+                        except Exception:
+                            logger.debug(
+                                "Could not clear non-claimable replay spool", exc_info=True
+                            )
                     continue
-            else:
-                await asyncio.to_thread(
-                    self._record_gateway_ledger_received,
-                    event,
-                    session_key=self._session_key_for_source(source),
-                    reason="startup-replay-admitted",
-                )
             try:
                 await adapter.handle_message(event)
             except Exception:
-                if is_spool_replay:
+                released = not claimed
+                if claimed:
                     try:
                         released = await asyncio.to_thread(
                             self._release_deferred_event_dispatch_claim,
@@ -12221,11 +12245,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         released = False
                         logger.warning("Startup handoff claim release failed", exc_info=True)
-                    if released:
-                        queue.append(event)
-                    else:
-                        setattr(event, "_hermes_startup_claim_release_pending", True)
-                        queue.append(event)
+                if not released:
+                    setattr(event, "_hermes_startup_claim_release_pending", True)
+                queue.append(event)
                 logger.warning("Startup adapter handoff failed", exc_info=True)
                 continue
             if is_spool_replay:
