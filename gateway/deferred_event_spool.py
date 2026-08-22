@@ -330,13 +330,21 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                 logger.warning("Deferred-event spool has no ledger row; preserving %s", path)
                 continue
             statuses = [str(row.get("status") or "").lower() for row in ledgers]
-            if any(row.get("dispatch_started_at") is not None for row in ledgers) or any(
-                status in {"in_progress", "completed", "drained", "failed"}
-                for status in statuses
-            ):
+            startup_claim_only = bool(ledgers) and all(
+                row.get("status") == "in_progress"
+                and row.get("reason") == "startup-replay-claimed"
+                for row in ledgers
+            )
+            if (
+                any(row.get("dispatch_started_at") is not None for row in ledgers)
+                or any(
+                    status in {"in_progress", "completed", "drained", "failed"}
+                    for status in statuses
+                )
+            ) and not startup_claim_only:
                 path.unlink(missing_ok=True)
                 continue
-            if any(status not in {"received", "requeued"} for status in statuses):
+            if any(status not in {"received", "requeued"} for status in statuses) and not startup_claim_only:
                 logger.warning(
                     "Deferred-event spool has unknown ledger statuses %r; preserving %s",
                     statuses,
@@ -345,6 +353,8 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                 continue
             setattr(event, "_hermes_deferred_spool_id", path.stem)
             setattr(event, "_hermes_deferred_spool_path", str(path))
+            if startup_claim_only:
+                setattr(event, "_hermes_startup_claim_release_pending", True)
             restored_ids = [int(row["id"]) for row in ledgers if row.get("id") is not None]
             ledger_id = restored_ids[0] if restored_ids else None
             if restored_ids:

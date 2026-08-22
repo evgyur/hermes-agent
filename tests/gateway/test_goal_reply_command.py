@@ -243,6 +243,38 @@ async def test_busy_supergoal_callback_commits_durable_kickoff_before_success(
 
 
 @pytest.mark.asyncio
+async def test_goal_replacement_fails_closed_if_old_durable_obligation_cannot_terminalize(
+    hermes_home, runner
+):
+    first = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal first durable owner",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="first-goal",
+        )
+    )
+    assert first.startswith("⊙ Goal set")
+    key = runner.session.session_key
+    old = runner.adapter._pending_messages[key]
+    ledger_create_calls = runner.runner._record_gateway_ledger_received.call_count
+    runner.runner._update_gateway_ledger.return_value = False
+
+    response = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal replacement must not duplicate",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="replacement-goal",
+        )
+    )
+
+    assert "could not start" in response.lower()
+    assert runner.adapter._pending_messages[key] is old
+    assert runner.runner._record_gateway_ledger_received.call_count == ledger_create_calls
+
+
+@pytest.mark.asyncio
 async def test_goal_resume_replaces_stale_continuations_without_duplication(hermes_home, runner):
     """Repeated resume is idempotent for queued synthetic continuation turns."""
     from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GoalManager

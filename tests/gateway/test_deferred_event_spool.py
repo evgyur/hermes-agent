@@ -234,6 +234,32 @@ async def test_busy_startup_handoff_keeps_replay_owner_until_real_dispatch(
     assert len(load_replayable_deferred_events(ledger_db)) == 1
 
 
+@pytest.mark.asyncio
+async def test_busy_startup_claim_release_failure_remains_restart_recoverable(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    event = _event("busy-release-failure")
+    ledger_id = _record(runner, event, "busy-key")
+    assert runner._set_gateway_ledger_deferred(event)
+    runner._startup_restore_queue = [event]
+    runner._release_deferred_event_dispatch_claim = lambda _event: False
+
+    class BusyAdapter:
+        async def handle_message(self, queued):
+            queued._hermes_adapter_handoff = "queued"
+
+    runner._adapter_for_source = lambda source: BusyAdapter()
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 0
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row["status"] == "in_progress"
+    assert row["reason"] == "startup-replay-claimed"
+    replayable = load_replayable_deferred_events(ledger_db)
+    assert len(replayable) == 1
+    assert replayable[0].event._hermes_startup_claim_release_pending is True
+
+
 def test_started_dispatch_is_never_replayed(monkeypatch, tmp_path, ledger_db):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     event = _event()

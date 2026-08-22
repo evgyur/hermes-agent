@@ -219,7 +219,8 @@ async def test_handle_message_wires_iteration_boundary_to_goal_resume(ledger_db)
     kwargs = runner._post_turn_goal_continuation.await_args.kwargs
     wired = kwargs["turn_outcomes"]
     assert len(wired) == 2
-    assert wired[0] == outcomes[0]
+    assert {k: wired[0][k] for k in outcomes[0]} == outcomes[0]
+    assert wired[0]["defer_goal_evaluation"] is False
     assert wired[1]["turn_exit_reason"] == outcomes[1]["turn_exit_reason"]
     assert wired[1]["final_response"] == ""
     assert wired[1]["delivery_suppressed"] is True
@@ -252,6 +253,8 @@ def test_internal_goal_and_startup_recovery_origins_are_distinguishable(ledger_d
     runner = _runner_with_ledger(ledger_db)
     goal_text = "[Continuing toward your standing goal]\nGoal: SECRET full private task body"
     goal_event = _event(text=goal_text, message_id=None)
+    goal_event.internal = True
+    goal_event.metadata = {"durable_internal_goal": True}
     startup_event = _event(text="", message_id=None, internal=True)
 
     goal_id = runner._record_gateway_ledger_received(goal_event, session_key="sk-goal")

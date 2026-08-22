@@ -8828,18 +8828,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         preserving normal /queue and user follow-up events.
         """
         removed = 0
+        failed = False
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
-                pending_slot.pop(session_key, None)
-                self._update_gateway_ledger(
+                if self._update_gateway_ledger(
                     pending_event,
                     "drained",
                     session_key=session_key,
                     reason="goal-kickoff-superseded",
-                )
-                removed += 1
+                ):
+                    pending_slot.pop(session_key, None)
+                    removed += 1
+                else:
+                    failed = True
 
         queue_state = self._session_state(session_key).conversation
         overflow = queue_state.queued_events
@@ -8847,13 +8850,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             kept = []
             for queued_event in overflow:
                 if self._is_goal_continuation_event(queued_event):
-                    self._update_gateway_ledger(
+                    if self._update_gateway_ledger(
                         queued_event,
                         "drained",
                         session_key=session_key,
                         reason="goal-kickoff-superseded",
-                    )
-                    removed += 1
+                    ):
+                        removed += 1
+                    else:
+                        kept.append(queued_event)
+                        failed = True
                 else:
                     kept.append(queued_event)
             # If removing synthetic entries leaves the adapter head empty,
@@ -8866,7 +8872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 pending_slot[session_key] = kept.pop(0)
             queue_state.queued_events = kept
-        return removed
+        return -1 if failed else removed
 
     def _enqueue_goal_continuation_once(
         self,
@@ -8889,7 +8895,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or not str(prompt or "").strip()
         ):
             return False
-        self._clear_goal_pending_continuations(session_key, adapter)
+        if self._clear_goal_pending_continuations(session_key, adapter) < 0:
+            return False
         continuation = MessageEvent(
             text=str(prompt),
             message_type=MessageType.TEXT,
@@ -22114,6 +22121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key = self._session_key_for_source(event.source)
                 except Exception:
                     session_key = None
+            self._mark_goal_callback_started_session(session_key)
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
