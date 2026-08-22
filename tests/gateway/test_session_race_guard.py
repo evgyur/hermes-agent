@@ -24,6 +24,7 @@ from gateway.platforms.base import (
 )
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from hermes_state import SessionDB
 
 
 class _FakeAdapter:
@@ -84,6 +85,10 @@ def _make_runner():
         get_or_create_session=AsyncMock(side_effect=_entry),
     )
     runner.delivery_router = MagicMock()
+    # Most race tests isolate session ownership from durable ledger behavior.
+    runner._record_gateway_ledger_received = MagicMock(return_value=None)
+    runner._update_gateway_ledger = MagicMock(return_value=True)
+    runner._ensure_preledger_ingress = MagicMock(return_value=True)
     return runner
 
 
@@ -172,6 +177,59 @@ async def test_goal_pause_failure_releases_claim_and_blocks_agent():
     assert "couldn't safely pause" in result
     assert session_key not in runner._running_agents
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_goal_storage_outage_retains_preledger_turn_for_retry():
+    runner = _make_runner()
+    event = _make_event(text="retain me")
+    session_key = build_session_key(event.source)
+    setattr(event, "_hermes_preledger_ingress", True)
+    setattr(event, "_hermes_deferred_spool_path", "/private/ingress.json")
+    runner._queue_preledger_retry = MagicMock()
+    runner._pause_active_goal_for_user_turn = AsyncMock(
+        side_effect=RuntimeError("state store unavailable")
+    )
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
+
+    result = await runner._handle_message(event)
+
+    assert isinstance(result, str)
+    assert "saved durably" in result
+    assert "don't resend" in result
+    assert session_key not in runner._running_agents
+    assert getattr(event, "_hermes_deferred_retry_pending") is True
+    runner._queue_preledger_retry.assert_called_once_with(event)
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_turn_never_enters_durable_ledger(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        runner = _make_runner()
+        runner._session_db = db
+        runner._record_gateway_ledger_received = (
+            GatewayRunner._record_gateway_ledger_received.__get__(runner)
+        )
+        runner._finalize_gateway_ledger_after_handler = (
+            GatewayRunner._finalize_gateway_ledger_after_handler.__get__(runner)
+        )
+        runner._is_user_authorized = lambda source: False
+        event = _make_event(text="private unauthorized body")
+        event.source.chat_type = "group"
+        event.message_id = "unauthorized"
+        event.source.message_id = "unauthorized"
+
+        assert await runner._handle_message(event) is None
+        assert db.find_gateway_message_ledger(
+            platform="telegram",
+            chat_id="12345",
+            thread_id=None,
+            message_id="unauthorized",
+        ) is None
+    finally:
+        db.close()
 
 
 # ------------------------------------------------------------------

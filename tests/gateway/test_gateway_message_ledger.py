@@ -462,6 +462,7 @@ async def test_handler_wrapper_terminalizes_command_style_early_return(ledger_db
     runner = _runner_with_ledger(ledger_db)
     runner._handle_message_impl = AsyncMock(return_value="command handled")
     event = _event(text="/model", message_id="command-early-return")
+    runner._record_gateway_ledger_received(event, reason="authorized-test-entry")
 
     assert await runner._handle_message(event) == "command handled"
 
@@ -504,6 +505,7 @@ async def test_busy_handler_records_and_preserves_deferred_event(ledger_db):
 async def test_handler_wrapper_preserves_deferred_then_terminalizes_replay(ledger_db):
     runner = _runner_with_ledger(ledger_db)
     event = _event(text="queued follow-up", message_id="queued-follow-up")
+    runner._record_gateway_ledger_received(event, reason="authorized-test-entry")
 
     async def queue_once(queued_event):
         runner._set_gateway_ledger_deferred(queued_event)
@@ -537,6 +539,7 @@ async def test_handler_wrapper_preserves_deferred_then_terminalizes_replay(ledge
 async def test_handler_wrapper_marks_pre_agent_exception_failed(ledger_db):
     runner = _runner_with_ledger(ledger_db)
     event = _event(text="boom", message_id="pre-agent-error")
+    runner._record_gateway_ledger_received(event, reason="authorized-test-entry")
 
     async def fail_before_agent(_event):
         raise RuntimeError("boom")
@@ -553,3 +556,18 @@ async def test_handler_wrapper_marks_pre_agent_exception_failed(ledger_db):
     assert row["status"] == "failed"
     assert row["reason"] == "handler-error"
     assert row["metadata"] == {"handler_error": "RuntimeError"}
+
+
+def test_retry_pending_event_is_not_terminalized_by_wrapper_fallback(ledger_db):
+    runner = _runner_with_ledger(ledger_db)
+    event = _event(text="retry later", message_id="retry-pending")
+    ledger_id = runner._record_gateway_ledger_received(
+        event, reason="authorized-test-entry"
+    )
+    setattr(event, "_hermes_deferred_retry_pending", True)
+
+    runner._finalize_gateway_ledger_after_handler(event, "saved durably")
+
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row["status"] == "received"
+    assert row["dispatch_started_at"] is None

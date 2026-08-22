@@ -35,6 +35,7 @@ class DeferredSpoolEntry:
     event: MessageEvent
     session_key: str
     ledger_id: Optional[int] = None
+    sequence: int = 0
 
 
 def _spool_dir() -> Path:
@@ -189,6 +190,47 @@ def persist_deferred_event(event: MessageEvent, *, session_key: str) -> Optional
     return path
 
 
+def persist_preledger_event(event: MessageEvent, *, session_key: str) -> Optional[Path]:
+    """Persist authorized real-user ingress before SQLite ledger admission."""
+    from utils import atomic_json_write
+
+    _maybe_sweep_expired()
+    source = getattr(event, "source", None)
+    ledger_ids = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+    primary_id = getattr(event, "_hermes_gateway_ledger_id", None)
+    if primary_id is not None:
+        ledger_ids.append(primary_id)
+    if (
+        bool(getattr(event, "internal", False))
+        or bool(getattr(source, "role_authorized", False))
+        or bool(getattr(source, "delivered_via_upstream_relay", False))
+        or bool(getattr(source, "is_bot", False))
+        or ledger_ids
+    ):
+        return None
+    created_ns = int(getattr(event, "_hermes_preledger_created_ns", 0) or time.time_ns())
+    setattr(event, "_hermes_preledger_created_ns", created_ns)
+    spool_id = f"ingress-{_identity(event)}"
+    path = _spool_dir() / f"{spool_id}.json"
+    atomic_json_write(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "phase": "preledger",
+            "session_key": str(session_key or ""),
+            "ledger_ids": [],
+            "sequence": created_ns,
+            "created_ns": created_ns,
+            "event": _serialize_event(event),
+        },
+        mode=0o600,
+    )
+    setattr(event, "_hermes_deferred_spool_id", spool_id)
+    setattr(event, "_hermes_deferred_spool_path", str(path))
+    setattr(event, "_hermes_preledger_ingress", True)
+    return path
+
+
 def remove_deferred_event(event: MessageEvent) -> bool:
     """Remove every physical spool represented by a merged event."""
     raw_path = getattr(event, "_hermes_deferred_spool_path", None)
@@ -217,6 +259,16 @@ def remove_deferred_event(event: MessageEvent) -> bool:
             continue
         except OSError:
             logger.warning("Could not remove deferred-event spool file %s", path, exc_info=True)
+    if removed:
+        for attr in (
+            "_hermes_deferred_spool_path",
+            "_hermes_preledger_ingress",
+            "_hermes_preledger_created_ns",
+        ):
+            try:
+                delattr(event, attr)
+            except (AttributeError, TypeError):
+                pass
     return removed
 
 
@@ -245,6 +297,7 @@ def discard_deferred_events_for_session(
     *,
     reason: str,
     max_ledger_id: Optional[int] = None,
+    max_created_ns: Optional[int] = None,
 ) -> int:
     """Terminalize and remove queued events cancelled by a session reset."""
     if not session_key:
@@ -256,6 +309,13 @@ def discard_deferred_events_for_session(
             if str(payload.get("session_key") or "") != str(session_key):
                 continue
             ledger_ids = [int(value) for value in payload.get("ledger_ids") or []]
+            if payload.get("phase") == "preledger":
+                created_ns = int(payload.get("created_ns") or payload.get("sequence") or 0)
+                if max_created_ns is not None and created_ns >= int(max_created_ns):
+                    continue
+                path.unlink(missing_ok=True)
+                removed += 1
+                continue
             if max_ledger_id is None or any(
                 value >= int(max_ledger_id) for value in ledger_ids
             ):
@@ -295,7 +355,13 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
             if payload.get("schema_version") != SCHEMA_VERSION:
                 raise ValueError("unsupported deferred-event schema")
             event = _deserialize_event(payload.get("event") or {})
-            if event.internal:
+            source = event.source
+            if (
+                event.internal
+                or bool(getattr(source, "role_authorized", False))
+                or bool(getattr(source, "delivered_via_upstream_relay", False))
+                or bool(getattr(source, "is_bot", False))
+            ):
                 for ledger_id in [
                     int(value) for value in payload.get("ledger_ids") or []
                 ]:
@@ -306,8 +372,28 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                     )
                 path.unlink(missing_ok=True)
                 continue
-            source = event.source
             ledger_ids = [int(value) for value in payload.get("ledger_ids") or []]
+            sequence = int(payload.get("sequence") or 0)
+            if payload.get("phase") == "preledger":
+                if ledger_ids:
+                    raise ValueError("preledger spool unexpectedly contains ledger ids")
+                setattr(event, "_hermes_deferred_spool_id", path.stem)
+                setattr(event, "_hermes_deferred_spool_path", str(path))
+                setattr(event, "_hermes_preledger_ingress", True)
+                setattr(
+                    event,
+                    "_hermes_preledger_created_ns",
+                    int(payload.get("created_ns") or sequence),
+                )
+                replayable.append(
+                    DeferredSpoolEntry(
+                        path=path,
+                        event=event,
+                        session_key=str(payload.get("session_key") or ""),
+                        sequence=sequence,
+                    )
+                )
+                continue
             ledgers = [db.get_gateway_message_ledger(value) for value in ledger_ids]
             if not ledger_ids:
                 primary = db.find_gateway_message_ledger(
@@ -349,12 +435,13 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                         payload.get("session_key") or ledgers[0].get("session_key") or ""
                     ),
                     ledger_id=ledger_id,
+                    sequence=sequence or int(ledger_id or 0),
                 )
             )
         except Exception:
             logger.warning("Could not load deferred-event spool file %s", path, exc_info=True)
 
     def _order(entry: DeferredSpoolEntry) -> tuple[int, str]:
-        return int(entry.ledger_id or 0), str(entry.path)
+        return int(entry.sequence or entry.ledger_id or 0), str(entry.path)
 
     return sorted(replayable, key=_order)

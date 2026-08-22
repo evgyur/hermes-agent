@@ -8724,6 +8724,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queueing, and pre-agent failures) so they cannot remain indefinitely
         ``received`` or ``in_progress``.
         """
+        if bool(getattr(event, "_hermes_deferred_retry_pending", False)):
+            return
         session_db = getattr(self, "_session_db", None)
         db = vars(session_db).get("_db", session_db) if session_db is not None else None
         ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
@@ -8786,6 +8788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         reason: str,
         max_ledger_id: Optional[int] = None,
+        max_created_ns: Optional[int] = None,
     ) -> int:
         session_db = getattr(self, "_session_db", None)
         db = vars(session_db).get("_db", session_db) if session_db is not None else None
@@ -8799,6 +8802,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 reason=reason,
                 max_ledger_id=max_ledger_id,
+                max_created_ns=max_created_ns,
             )
         except Exception:
             logger.warning(
@@ -12098,6 +12102,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _ensure_preledger_ingress(self, event: MessageEvent, session_key: str) -> bool:
+        """Durably retain authorized ordinary ingress when SQLite admission failed."""
+        if (
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        ):
+            return True
+        if bool(getattr(event, "_hermes_preledger_ingress", False)):
+            return bool(getattr(event, "_hermes_deferred_spool_path", None))
+        try:
+            from gateway.deferred_event_spool import persist_preledger_event
+
+            return persist_preledger_event(event, session_key=session_key) is not None
+        except Exception:
+            logger.critical(
+                "preledger_ingress_persist_failed route=%s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _queue_preledger_retry(self, event: MessageEvent) -> None:
+        """Retry a durably journaled event until SQLite can admit it."""
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = []
+            self._startup_restore_queue = queue
+        path = getattr(event, "_hermes_deferred_spool_path", None)
+        if not any(
+            queued is event
+            or (
+                path
+                and getattr(queued, "_hermes_deferred_spool_path", None) == path
+            )
+            for queued in queue
+        ):
+            queue.append(event)
+        retry = getattr(self, "_preledger_retry_task", None)
+        if retry is None or retry.done():
+            retry = asyncio.create_task(self._retry_startup_restore_queue())
+            self._preledger_retry_task = retry
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(retry)
+                retry.add_done_callback(background_tasks.discard)
+
     def _claim_deferred_event_for_dispatch(self, event: MessageEvent) -> bool:
         """Atomically claim every physical ingress row represented by a spool event."""
         session_db = getattr(self, "_session_db", None)
@@ -12191,10 +12241,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
+            try:
+                delattr(event, "_hermes_deferred_retry_pending")
+            except AttributeError:
+                pass
             is_spool_replay = bool(
                 getattr(event, "_hermes_deferred_spool_replay", False)
                 or getattr(event, "_hermes_deferred_spool_path", None)
             )
+            if is_spool_replay and not bool(getattr(event, "internal", False)):
+                # Authorization is mutable and the on-disk journal is not an
+                # authority. Re-check before creating any ledger/snippet row.
+                try:
+                    authorized = bool(self._is_user_authorized(source))
+                except Exception:
+                    authorized = False
+                    logger.warning(
+                        "Could not authorize restored ingress; preserving for retry",
+                        exc_info=True,
+                    )
+                    if event not in queue:
+                        queue.append(event)
+                    continue
+                if not authorized:
+                    try:
+                        from gateway.deferred_event_spool import remove_deferred_event
+
+                        remove_deferred_event(event)
+                    except Exception:
+                        logger.warning(
+                            "Could not remove unauthorized restored ingress",
+                            exc_info=True,
+                        )
+                    logger.warning("Dropped unauthorized restored ingress before ledger admission")
+                    continue
             if not (
                 getattr(event, "_hermes_gateway_ledger_id", None) is not None
                 or getattr(event, "_hermes_gateway_ledger_ids", None)
@@ -12254,6 +12334,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.handle_message(event)
             except Exception:
+                if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
+                    # Agent execution may have crossed a side-effect boundary.
+                    # Preserve the terminal ledger evidence and never replay.
+                    if is_spool_replay:
+                        try:
+                            from gateway.deferred_event_spool import remove_deferred_event
+
+                            remove_deferred_event(event)
+                        except Exception:
+                            logger.warning(
+                                "Could not clear ambiguous startup replay spool",
+                                exc_info=True,
+                            )
+                    logger.error(
+                        "Startup replay failed after agent dispatch began; not retrying",
+                        exc_info=True,
+                    )
+                    continue
                 released = not claimed
                 if claimed:
                     try:
@@ -12266,8 +12364,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Startup handoff claim release failed", exc_info=True)
                 if not released:
                     setattr(event, "_hermes_startup_claim_release_pending", True)
-                queue.append(event)
+                if event not in queue:
+                    queue.append(event)
                 logger.warning("Startup adapter handoff failed", exc_info=True)
+                continue
+            if bool(getattr(event, "_hermes_deferred_retry_pending", False)):
+                released = not claimed
+                if claimed:
+                    try:
+                        released = await asyncio.to_thread(
+                            self._release_deferred_event_dispatch_claim,
+                            event,
+                        )
+                    except Exception:
+                        released = False
+                        logger.warning(
+                            "Deferred retry claim release failed",
+                            exc_info=True,
+                        )
+                if not released:
+                    setattr(event, "_hermes_startup_claim_release_pending", True)
+                if event not in queue:
+                    queue.append(event)
                 continue
             if is_spool_replay:
                 try:
@@ -16698,19 +16816,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             setattr(event, "_hermes_gateway_ledger_deferred", False)
         except Exception:
             pass
-        await asyncio.to_thread(
-            self._record_gateway_ledger_received,
-            event,
-            reason="handle-message-entry",
-        )
         try:
             result = await self._handle_message_impl(event)
         except BaseException as exc:
-            await asyncio.to_thread(
-                self._finalize_gateway_ledger_after_handler,
-                event,
-                error=exc,
-            )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)) and bool(
+                getattr(event, "_hermes_deferred_spool_path", None)
+            ):
+                self._queue_preledger_retry(event)
+            predispatch_replay_failure = bool(
+                getattr(event, "_hermes_startup_restore_replay", False)
+            ) and not bool(getattr(event, "_hermes_agent_dispatch_started", False))
+            if not predispatch_replay_failure:
+                await asyncio.to_thread(
+                    self._finalize_gateway_ledger_after_handler,
+                    event,
+                    error=exc,
+                )
             raise
         await asyncio.to_thread(
             self._finalize_gateway_ledger_after_handler,
@@ -16904,6 +17025,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # Persist lifecycle evidence only after authorization. Startup replay
+        # already owns an atomic in-progress claim; do not demote or rewrite it.
+        _startup_claim_owned = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        ) and bool(
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        )
+        if not _startup_claim_owned:
+            await asyncio.to_thread(
+                self._record_gateway_ledger_received,
+                event,
+                reason="authorized-handle-message-entry",
+            )
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
@@ -16984,13 +17120,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
-        await asyncio.to_thread(
-            self._update_gateway_ledger,
-            event,
-            "received",
-            session_key=_quick_key,
-            reason="session-key-resolved",
-        )
+        if not _startup_claim_owned:
+            await asyncio.to_thread(
+                self._update_gateway_ledger,
+                event,
+                "received",
+                session_key=_quick_key,
+                reason="session-key-resolved",
+            )
+        # The SQLite ledger normally owns ingress. If it was unavailable, retain
+        # only an already-authorized ordinary user turn in the private journal
+        # before touching /goal state or any agent-dispatch boundary.
+        _ordinary_preledger_turn = False
+        if not is_internal and not getattr(event, "_hermes_startup_restore_replay", False):
+            try:
+                _ordinary_preledger_turn = event.get_command() is None
+            except Exception:
+                _ordinary_preledger_turn = True
+        if _ordinary_preledger_turn and not (
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        ):
+            if not self._ensure_preledger_ingress(event, _quick_key):
+                return (
+                    "⚠️ I couldn't durably accept this message because storage is "
+                    "unavailable. It was not executed; please retry later."
+                )
         if self._is_goal_continuation_event(event):
             try:
                 goal_entry = await self.async_session_store.get_or_create_session(source)
@@ -18247,6 +18402,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
                 exc,
             )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)):
+                setattr(event, "_hermes_deferred_retry_pending", True)
+                self._queue_preledger_retry(event)
+                return (
+                    "⏳ Storage is temporarily unavailable. This message was "
+                    "saved durably and will retry automatically; don't resend it."
+                )
             return (
                 "⏸ I couldn't safely pause the older standing goal, so this "
                 "message was not run under stale scope. Please retry or use "
@@ -18302,11 +18464,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason="active-session-claimed",
                 metadata={"run_generation": _run_generation},
             )
+            if _ledger_dispatch_claimed:
+                try:
+                    from gateway.deferred_event_spool import remove_deferred_event
 
-        if _ledger_ids and not _ledger_dispatch_claimed:
+                    remove_deferred_event(event)
+                except Exception:
+                    logger.warning("Could not clear admitted preledger event", exc_info=True)
+
+        if (_ledger_ids or bool(getattr(event, "_hermes_preledger_ingress", False))) and not _ledger_dispatch_claimed:
             logger.warning(
                 "Skipped duplicate/non-claimable live ingress before agent dispatch"
             )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)):
+                setattr(event, "_hermes_deferred_retry_pending", True)
+                self._queue_preledger_retry(event)
             self._release_running_agent_state(
                 _quick_key,
                 run_generation=_run_generation,
@@ -18315,6 +18487,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             try:
+                setattr(event, "_hermes_agent_dispatch_started", True)
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )
