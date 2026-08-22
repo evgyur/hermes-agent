@@ -11793,6 +11793,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _decision("alert_only", "active-goal-in-shared-chat", goal_status=goal_status)
             if self.adapters.get(source.platform) is None:
                 return _decision("alert_only", "adapter-not-ready", goal_status=goal_status)
+            if any(
+                status in {"received", "requeued", "in_progress"}
+                for status in ledger_statuses
+            ):
+                return _decision(
+                    "skip",
+                    "durable-inbound-owner-pending",
+                    goal_status=goal_status,
+                )
             marker = (
                 getattr(entry, "last_resume_marked_at", None)
                 or getattr(entry, "updated_at", None)
@@ -12396,6 +12405,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     continue
             try:
+                startup_ack = asyncio.Event()
+                setattr(event, "_hermes_startup_dispatch_ack", startup_ack)
                 await adapter.handle_message(event)
             except Exception:
                 if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
@@ -12452,6 +12463,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     queue.append(event)
                 continue
             handoff = getattr(event, "_hermes_adapter_handoff", None)
+            if handoff == "scheduled":
+                # BasePlatformAdapter has only created a task. Keep the spool
+                # until that task either reaches actual agent dispatch or
+                # terminally handles the event without dispatching an agent.
+                await startup_ack.wait()
+                if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
+                    handoff = "started"
+                elif bool(getattr(event, "_hermes_background_processing_completed", False)):
+                    handoff = "completed"
             if handoff is None:
                 # Legacy/custom adapters historically signal acceptance by a
                 # normal return. BasePlatformAdapter always emits the explicit
@@ -12480,7 +12500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # requeued ledger and spool remain the crash-recovery owner.
                 drained += 1
                 continue
-            if handoff != "started":
+            if handoff not in {"started", "completed"}:
                 if claimed:
                     try:
                         await asyncio.to_thread(self._release_deferred_event_dispatch_claim, event)
@@ -18591,6 +18611,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             try:
                 setattr(event, "_hermes_agent_dispatch_started", True)
+                startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
+                if startup_ack is not None:
+                    startup_ack.set()
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )

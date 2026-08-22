@@ -5965,7 +5965,14 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-        setattr(event, "_hermes_adapter_handoff", "started")
+            startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
+            if startup_ack is not None:
+                def _signal_terminal_handoff(_task) -> None:
+                    setattr(event, "_hermes_background_processing_completed", True)
+                    startup_ack.set()
+
+                task.add_done_callback(_signal_terminal_handoff)
+        setattr(event, "_hermes_adapter_handoff", "scheduled")
         return True
 
     def ensure_pending_session_processing(self, session_key: str) -> bool:

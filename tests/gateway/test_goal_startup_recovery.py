@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -197,6 +197,21 @@ def test_active_goal_without_resume_pending_uses_goalmanager_classifier(hermes_h
     assert decision.reason == "active-goal-startup-recovery"
     assert decision.prompt.startswith("[Continuing toward your standing goal]\nGoal:")
     assert "recover from a lost queued continuation" in decision.prompt
+
+
+def test_active_goal_with_durable_requeued_owner_does_not_synthesize_second_recovery(
+    hermes_home,
+):
+    runner, _adapter = make_restart_runner()
+    entry = _goal_entry(session_id="durable-owner-sid", resume_pending=False)
+    runner.session_store._entries = {entry.session_key: entry}
+    GoalManager(session_id=entry.session_id).set("continue exactly once after restart")
+    runner._startup_goal_ledger_statuses = MagicMock(return_value=("requeued",))
+
+    decision = runner._classify_startup_goal_recovery(entry)
+
+    assert decision.status == "skip"
+    assert decision.reason == "durable-inbound-owner-pending"
 
 
 @pytest.mark.asyncio
