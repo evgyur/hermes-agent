@@ -38,6 +38,7 @@ def _goal_continuation_event(source, goal="finish the task"):
         message_type=MessageType.TEXT,
         source=source,
         internal=True,
+        metadata={"durable_internal_goal": True},
     )
 
 
@@ -92,6 +93,7 @@ def test_clear_goal_pending_continuations_removes_slot_and_overflow_only():
     adapter = FakeAdapter()
     adapter._pending_messages = {}
     runner._queued_events = {}
+    runner._update_gateway_ledger = lambda *_args, **_kwargs: True
 
     source = SessionSource(
         platform=Platform.DISCORD,

@@ -42,6 +42,13 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
     adapter._pending_messages = {}
     runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
+    runner._record_gateway_ledger_received = MagicMock(
+        side_effect=lambda kickoff, **_kwargs: (
+            setattr(kickoff, "_hermes_gateway_ledger_id", 1) or 1
+        )
+    )
+    runner._set_gateway_ledger_deferred = MagicMock(return_value=True)
+    runner._update_gateway_ledger = MagicMock(return_value=True)
 
     event = MessageEvent(
         text="/goal ship the benchmark",

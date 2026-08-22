@@ -60,6 +60,9 @@ class _RecordingAdapter:
 
         return _R()
 
+    def ensure_pending_session_processing(self, session_key: str) -> bool:
+        return session_key in self._pending_messages
+
 
 def _make_runner_with_adapter(session_id: str = None):
     from gateway.run import GatewayRunner
@@ -73,6 +76,13 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._queued_events = {}
+    runner._record_gateway_ledger_received = MagicMock(
+        side_effect=lambda event, **_kwargs: (
+            setattr(event, "_hermes_gateway_ledger_id", 1) or 1
+        )
+    )
+    runner._set_gateway_ledger_deferred = MagicMock(return_value=True)
+    runner._update_gateway_ledger = MagicMock(return_value=True)
 
     src = _make_source()
     # Default to a unique session_id so xdist parallel runs on the same worker
