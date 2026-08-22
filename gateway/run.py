@@ -8829,8 +8829,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
         source: Any,
         prompt: str,
-        message_id: Any = None,
-        channel_prompt: Any = None,
     ) -> bool:
         """Replace stale synthetic goal turns with one canonical continuation.
 
@@ -8850,8 +8848,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=str(prompt),
             message_type=MessageType.TEXT,
             source=source,
-            message_id=message_id,
-            channel_prompt=channel_prompt,
+            # A synthetic continuation is a distinct inbound lifecycle.  Reusing
+            # the slash command's platform message id aliases the command ledger
+            # row, so the drain is rejected as a duplicate and the goal remains
+            # active with turns_used=0 until a real user message pauses it.
+            message_id=None,
+            channel_prompt=None,
             internal=True,
         )
         self._enqueue_fifo(session_key, continuation, adapter)
@@ -22034,8 +22036,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter=adapter,
                 source=event.source,
                 prompt=prompt,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
             )
             if not queued:
                 mgr.pause(reason="resume continuation enqueue failed")
@@ -22082,20 +22082,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
             except Exception as exc:
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
-        if adapter and _quick_key and not defer_kickoff:
+        kickoff_accepted = defer_kickoff
+        if not defer_kickoff:
             try:
                 kickoff_text = mgr.next_continuation_prompt() or state.goal
-                kickoff_event = MessageEvent(
-                    text=kickoff_text,
-                    message_type=MessageType.TEXT,
+                kickoff_accepted = self._enqueue_goal_continuation_once(
+                    session_key=_quick_key,
+                    adapter=adapter,
                     source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    internal=True,
+                    prompt=kickoff_text,
                 )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
+                kickoff_accepted = False
+        if not kickoff_accepted:
+            mgr.pause(reason="goal kickoff handoff failed")
+            logger.error("goal start: no runnable kickoff owner for session %s", _quick_key)
+            return "⚠ Goal could not start: kickoff handoff failed; goal remains paused."
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
 
