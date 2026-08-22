@@ -816,10 +816,25 @@ def test_active_barrier_inspection_is_select_only(monkeypatch, tmp_path):
     assert barrier.has_active_barrier(origin_session="origin") is True
     normalized = [statement.strip().upper() for statement in statements]
     assert normalized
-    assert all(
+    assert all(statement.startswith("SELECT") for statement in normalized)
+    assert any(
         statement.startswith("SELECT 1 FROM PARENT_TASK_BARRIERS")
         for statement in normalized
     )
+
+
+def test_active_barrier_absent_startup_storage_is_inactive(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sqlite3.connect(tmp_path / "state.db").close()
+
+    assert barrier.has_active_barrier(origin_session="origin") is False
+
+
+def test_cancel_absent_startup_storage_is_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sqlite3.connect(tmp_path / "state.db").close()
+
+    assert barrier.cancel_session_barriers(parent_session_id="parent") == 0
 
 
 def test_concurrent_active_barrier_reads_do_not_change_schema_or_mode(

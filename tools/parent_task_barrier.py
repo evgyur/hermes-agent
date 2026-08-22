@@ -227,6 +227,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _storage_initialized(conn: sqlite3.Connection) -> bool:
+    """Check startup-owned barrier storage without mutating the database."""
+
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='parent_task_barriers' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
 def _normalize_terminal_state(state: str) -> str:
     normalized = str(state or "unknown").strip().lower()
     return normalized if normalized in _TERMINAL_CHILD_STATES else "unknown"
@@ -574,6 +586,8 @@ def has_active_barrier(*, origin_session: str, parent_session_id: str = "") -> b
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        if not _storage_initialized(conn):
+            return False
         row = conn.execute(
             """SELECT 1 FROM parent_task_barriers
                WHERE state NOT IN ('closed','cancelled','failed') AND ("""
@@ -1088,6 +1102,8 @@ def cancel_session_barriers(
         return 0
     now = time.time()
     with _transaction() as conn:
+        if not _storage_initialized(conn):
+            return 0
         rows = conn.execute(
             "SELECT barrier_id FROM parent_task_barriers "
             "WHERE state NOT IN ('closed','cancelled','failed') AND ("
