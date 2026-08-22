@@ -301,11 +301,10 @@ class TestTelegramClarifyCallback:
         adapter = _make_adapter()
         handled = []
 
-        async def _handler(event):
+        async def _handle_ingress(event):
             handled.append(event)
-            return "ok"
 
-        adapter._message_handler = _handler
+        adapter.handle_message = AsyncMock(side_effect=_handle_ingress)
         query = AsyncMock()
         query.data = "cl:gone:0"
         query.message = MagicMock()
@@ -336,6 +335,7 @@ class TestTelegramClarifyCallback:
         query.answer.assert_called_once()
         assert "Starting" in query.answer.call_args[1]["text"]
         assert len(handled) == 1
+        adapter.handle_message.assert_awaited_once()
         assert handled[0].text == "/goal Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
         assert handled[0].source.chat_id == "12345"
 
@@ -496,6 +496,74 @@ class TestTelegramClarifyCallback:
             entry = cm._entries.get("cidSGRun")
         assert entry is not None
         assert entry.response == "Start now"
+
+    @pytest.mark.asyncio
+    async def test_deferred_goal_kickoff_failure_pauses_active_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="777",
+            chat_id="12345",
+            user_name="Tester User",
+            chat_type="dm",
+        )
+        bound = _make_goal_runner(adapter, source)
+        GoalManager(bound.session.session_id).set("Run the deferred goal.")
+        adapter._pending_messages = None
+
+        accepted = await bound.runner._finish_deferred_goal_kickoff(
+            session_entry=bound.session,
+            source=source,
+        )
+
+        state = GoalManager(bound.session.session_id).state
+        assert accepted is False
+        assert state is not None
+        assert state.status == "paused"
+        assert state.paused_reason == "deferred goal kickoff handoff failed"
+
+    @pytest.mark.asyncio
+    async def test_terminal_callback_finalizer_consumes_marker_and_pauses_on_failure(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="777",
+            chat_id="12345",
+            user_name="Tester User",
+            chat_type="dm",
+        )
+        bound = _make_goal_runner(adapter, source)
+        async_store = AsyncMock()
+        async_store._store = bound.runner.session_store
+        async_store.get_or_create_session.side_effect = RuntimeError("async store unavailable")
+        bound.runner._async_session_store = async_store
+        bound.runner.session_store.get_or_create_session.side_effect = RuntimeError(
+            "sync store unavailable"
+        )
+        GoalManager(bound.session.session_id).set("Run after the empty owner turn.")
+        bound.runner._mark_goal_callback_started_session(
+            bound.session_key,
+            bound.session.session_id,
+        )
+        adapter._pending_messages = None
+
+        accepted = await bound.runner._finish_unconsumed_goal_callback(
+            session_key=bound.session_key,
+            source=source,
+        )
+
+        state = GoalManager(bound.session.session_id).state
+        assert accepted is False
+        assert bound.runner._consume_goal_callback_started_session(bound.session_key) is False
+        assert state is not None
+        assert state.status == "paused"
+        assert state.paused_reason == "deferred goal kickoff handoff failed"
 
     @pytest.mark.asyncio
     async def test_live_supergoal_start_button_uses_clarify_owner_session(self, hermes_home):

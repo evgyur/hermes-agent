@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 import uuid
 
 import pytest
@@ -107,6 +107,61 @@ async def test_bare_goal_reply_uses_replied_to_text_as_goal(hermes_home, runner)
     assert queued.internal is True
     assert queued.message_id is None
     assert queued.channel_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_busy_bare_goal_reply_is_rejected_without_false_goal_set(
+    hermes_home, runner
+):
+    """A replied-to /goal during an active turn must not claim that the
+    goal started when its kickoff cannot own the session."""
+    runner.runner._handle_goal_command = AsyncMock()
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-busy-reply",
+        reply_to_message_id="plan-busy",
+        reply_to_text="Implement the approved plan end to end.",
+    )
+
+    response = await runner.runner._busy_goal_command(
+        event,
+        runner.session.session_key,
+        runner.source,
+    )
+
+    assert "was not started" in response
+    assert "Goal set" not in response
+    runner.runner._handle_goal_command.assert_not_awaited()
+    assert runner.adapter._pending_messages == {}
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(runner.session.session_id).state is None
+
+
+@pytest.mark.asyncio
+async def test_busy_bare_goal_without_reply_remains_status_control(
+    hermes_home, runner
+):
+    runner.runner._handle_goal_command = AsyncMock(return_value="No active goal")
+    event = MessageEvent(
+        text="/goal",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="cmd-busy-status",
+    )
+
+    response = await runner.runner._busy_goal_command(
+        event,
+        runner.session.session_key,
+        runner.source,
+    )
+
+    assert response == "No active goal"
+    runner.runner._handle_goal_command.assert_awaited_once_with(event)
+    assert runner.adapter._pending_messages == {}
 
 
 @pytest.mark.asyncio

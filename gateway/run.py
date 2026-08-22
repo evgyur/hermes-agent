@@ -8736,6 +8736,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queueing, and pre-agent failures) so they cannot remain indefinitely
         ``received`` or ``in_progress``.
         """
+        if bool(getattr(event, "_hermes_deferred_retry_pending", False)):
+            return
         session_db = getattr(self, "_session_db", None)
         db = vars(session_db).get("_db", session_db) if session_db is not None else None
         ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
@@ -8798,6 +8800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         reason: str,
         max_ledger_id: Optional[int] = None,
+        max_created_ns: Optional[int] = None,
     ) -> int:
         session_db = getattr(self, "_session_db", None)
         db = vars(session_db).get("_db", session_db) if session_db is not None else None
@@ -8811,6 +8814,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 reason=reason,
                 max_ledger_id=max_ledger_id,
+                max_created_ns=max_created_ns,
             )
         except Exception:
             logger.warning(
@@ -9424,7 +9428,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _SERVICE_TIER_UNSET if clear else service_tier
         )
 
-    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+    def _mark_goal_callback_started_session(
+        self,
+        session_key: Optional[str],
+        session_id: Optional[str] = None,
+    ) -> None:
         """Suppress one post-turn judge pass after a callback starts /goal."""
         if not session_key:
             return
@@ -9433,6 +9441,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sessions = set()
             self._goal_callback_started_sessions = sessions
         sessions.add(session_key)
+        if session_id:
+            session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+            if session_ids is None:
+                session_ids = {}
+                self._goal_callback_started_session_ids = session_ids
+            session_ids[session_key] = str(session_id)
 
     def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
         """Return True once for sessions started by a clarify callback."""
@@ -9442,6 +9456,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions or session_key not in sessions:
             return False
         sessions.discard(session_key)
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        if isinstance(session_ids, dict):
+            session_ids.pop(session_key, None)
         return True
 
     @staticmethod
@@ -12149,6 +12166,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _ensure_preledger_ingress(self, event: MessageEvent, session_key: str) -> bool:
+        """Durably retain authorized ordinary ingress when SQLite admission failed."""
+        if (
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        ):
+            return True
+        if bool(getattr(event, "_hermes_preledger_ingress", False)):
+            return bool(getattr(event, "_hermes_deferred_spool_path", None))
+        try:
+            from gateway.deferred_event_spool import persist_preledger_event
+
+            return persist_preledger_event(event, session_key=session_key) is not None
+        except Exception:
+            logger.critical(
+                "preledger_ingress_persist_failed route=%s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _queue_preledger_retry(self, event: MessageEvent) -> None:
+        """Retry a durably journaled event until SQLite can admit it."""
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = []
+            self._startup_restore_queue = queue
+        path = getattr(event, "_hermes_deferred_spool_path", None)
+        if not any(
+            queued is event
+            or (
+                path
+                and getattr(queued, "_hermes_deferred_spool_path", None) == path
+            )
+            for queued in queue
+        ):
+            queue.append(event)
+        retry = getattr(self, "_preledger_retry_task", None)
+        if retry is None or retry.done():
+            retry = asyncio.create_task(self._retry_startup_restore_queue())
+            self._preledger_retry_task = retry
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(retry)
+                retry.add_done_callback(background_tasks.discard)
+
     def _claim_deferred_event_for_dispatch(self, event: MessageEvent) -> bool:
         """Atomically claim every physical ingress row represented by a spool event."""
         session_db = getattr(self, "_session_db", None)
@@ -12242,10 +12305,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
+            try:
+                delattr(event, "_hermes_deferred_retry_pending")
+            except AttributeError:
+                pass
             is_spool_replay = bool(
                 getattr(event, "_hermes_deferred_spool_replay", False)
                 or getattr(event, "_hermes_deferred_spool_path", None)
             )
+            if is_spool_replay and not bool(getattr(event, "internal", False)):
+                # Authorization is mutable and the on-disk journal is not an
+                # authority. Re-check before creating any ledger/snippet row.
+                try:
+                    authorized = bool(self._is_user_authorized(source))
+                except Exception:
+                    authorized = False
+                    logger.warning(
+                        "Could not authorize restored ingress; preserving for retry",
+                        exc_info=True,
+                    )
+                    if event not in queue:
+                        queue.append(event)
+                    continue
+                if not authorized:
+                    try:
+                        from gateway.deferred_event_spool import remove_deferred_event
+
+                        remove_deferred_event(event)
+                    except Exception:
+                        logger.warning(
+                            "Could not remove unauthorized restored ingress",
+                            exc_info=True,
+                        )
+                    logger.warning("Dropped unauthorized restored ingress before ledger admission")
+                    continue
             if not (
                 getattr(event, "_hermes_gateway_ledger_id", None) is not None
                 or getattr(event, "_hermes_gateway_ledger_ids", None)
@@ -12305,6 +12398,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.handle_message(event)
             except Exception:
+                if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
+                    # Agent execution may have crossed a side-effect boundary.
+                    # Preserve the terminal ledger evidence and never replay.
+                    if is_spool_replay:
+                        try:
+                            from gateway.deferred_event_spool import remove_deferred_event
+
+                            remove_deferred_event(event)
+                        except Exception:
+                            logger.warning(
+                                "Could not clear ambiguous startup replay spool",
+                                exc_info=True,
+                            )
+                    logger.error(
+                        "Startup replay failed after agent dispatch began; not retrying",
+                        exc_info=True,
+                    )
+                    continue
                 released = not claimed
                 if claimed:
                     try:
@@ -12317,8 +12428,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Startup handoff claim release failed", exc_info=True)
                 if not released:
                     setattr(event, "_hermes_startup_claim_release_pending", True)
-                queue.append(event)
+                if event not in queue:
+                    queue.append(event)
                 logger.warning("Startup adapter handoff failed", exc_info=True)
+                continue
+            if bool(getattr(event, "_hermes_deferred_retry_pending", False)):
+                released = not claimed
+                if claimed:
+                    try:
+                        released = await asyncio.to_thread(
+                            self._release_deferred_event_dispatch_claim,
+                            event,
+                        )
+                    except Exception:
+                        released = False
+                        logger.warning(
+                            "Deferred retry claim release failed",
+                            exc_info=True,
+                        )
+                if not released:
+                    setattr(event, "_hermes_startup_claim_release_pending", True)
+                if event not in queue:
+                    queue.append(event)
                 continue
             handoff = getattr(event, "_hermes_adapter_handoff", None)
             if handoff is None:
@@ -12355,7 +12486,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await asyncio.to_thread(self._release_deferred_event_dispatch_claim, event)
                     except Exception:
                         logger.warning("Unknown startup handoff claim release failed", exc_info=True)
-                queue.append(event)
+                if event not in queue:
+                    queue.append(event)
                 logger.error("Startup adapter returned without accepting the event")
                 continue
             if is_spool_replay:
@@ -16761,18 +16893,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # "wait or /stop" message as /model so we don't race a second
         # continuation prompt against the current turn.
         _goal_arg = (event.get_command_args() or "").strip().lower()
+        _reply_goal = (getattr(event, "reply_to_text", None) or "").strip()
         _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
         # Exact-match control verbs (unchanged semantics), plus the
         # wait/unwait barrier verbs which take a pid argument and the
         # gate management verb (inspection/mutation of the gate list only —
         # gates run at turn boundary, so editing them mid-run is safe).
         _is_control = (
-            not _goal_arg
+            (not _goal_arg and not _reply_goal)
             or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
             or _goal_verb in {"wait", "gate"}
         )
         if _is_control:
             return await self._handle_goal_command(event)
+        if not _goal_arg and _reply_goal:
+            return (
+                "Agent is still finishing the current turn — replied-to /goal "
+                "was not started. Wait for completion or use /stop, then retry."
+            )
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
@@ -16781,19 +16919,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             setattr(event, "_hermes_gateway_ledger_deferred", False)
         except Exception:
             pass
-        await asyncio.to_thread(
-            self._record_gateway_ledger_received,
-            event,
-            reason="handle-message-entry",
-        )
         try:
             result = await self._handle_message_impl(event)
         except BaseException as exc:
-            await asyncio.to_thread(
-                self._finalize_gateway_ledger_after_handler,
-                event,
-                error=exc,
-            )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)) and bool(
+                getattr(event, "_hermes_deferred_spool_path", None)
+            ):
+                self._queue_preledger_retry(event)
+            predispatch_replay_failure = bool(
+                getattr(event, "_hermes_startup_restore_replay", False)
+            ) and not bool(getattr(event, "_hermes_agent_dispatch_started", False))
+            if not predispatch_replay_failure:
+                await asyncio.to_thread(
+                    self._finalize_gateway_ledger_after_handler,
+                    event,
+                    error=exc,
+                )
             raise
         await asyncio.to_thread(
             self._finalize_gateway_ledger_after_handler,
@@ -16987,6 +17128,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # Persist lifecycle evidence only after authorization. Startup replay
+        # already owns an atomic in-progress claim; do not demote or rewrite it.
+        _startup_claim_owned = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        ) and bool(
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        )
+        if not _startup_claim_owned:
+            await asyncio.to_thread(
+                self._record_gateway_ledger_received,
+                event,
+                reason="authorized-handle-message-entry",
+            )
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
@@ -17067,13 +17223,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
-        await asyncio.to_thread(
-            self._update_gateway_ledger,
-            event,
-            "received",
-            session_key=_quick_key,
-            reason="session-key-resolved",
-        )
+        if not _startup_claim_owned:
+            await asyncio.to_thread(
+                self._update_gateway_ledger,
+                event,
+                "received",
+                session_key=_quick_key,
+                reason="session-key-resolved",
+            )
+        # The SQLite ledger normally owns ingress. If it was unavailable, retain
+        # only an already-authorized ordinary user turn in the private journal
+        # before touching /goal state or any agent-dispatch boundary.
+        _ordinary_preledger_turn = False
+        if not is_internal and not getattr(event, "_hermes_startup_restore_replay", False):
+            try:
+                _ordinary_preledger_turn = event.get_command() is None
+            except Exception:
+                _ordinary_preledger_turn = True
+        if _ordinary_preledger_turn and not (
+            getattr(event, "_hermes_gateway_ledger_id", None) is not None
+            or getattr(event, "_hermes_gateway_ledger_ids", None)
+        ):
+            if not self._ensure_preledger_ingress(event, _quick_key):
+                return (
+                    "⚠️ I couldn't durably accept this message because storage is "
+                    "unavailable. It was not executed; please retry later."
+                )
         if self._is_goal_continuation_event(event):
             try:
                 goal_entry = await self.async_session_store.get_or_create_session(source)
@@ -18330,6 +18505,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
                 exc,
             )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)):
+                setattr(event, "_hermes_deferred_retry_pending", True)
+                self._queue_preledger_retry(event)
+                return (
+                    "⏳ Storage is temporarily unavailable. This message was "
+                    "saved durably and will retry automatically; don't resend it."
+                )
             return (
                 "⏸ I couldn't safely pause the older standing goal, so this "
                 "message was not run under stale scope. Please retry or use "
@@ -18385,11 +18567,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason="active-session-claimed",
                 metadata={"run_generation": _run_generation},
             )
+            if _ledger_dispatch_claimed:
+                try:
+                    from gateway.deferred_event_spool import remove_deferred_event
 
-        if _ledger_ids and not _ledger_dispatch_claimed:
+                    remove_deferred_event(event)
+                except Exception:
+                    logger.warning("Could not clear admitted preledger event", exc_info=True)
+
+        if (_ledger_ids or bool(getattr(event, "_hermes_preledger_ingress", False))) and not _ledger_dispatch_claimed:
             logger.warning(
                 "Skipped duplicate/non-claimable live ingress before agent dispatch"
             )
+            if bool(getattr(event, "_hermes_preledger_ingress", False)):
+                setattr(event, "_hermes_deferred_retry_pending", True)
+                self._queue_preledger_retry(event)
             self._release_running_agent_state(
                 _quick_key,
                 run_generation=_run_generation,
@@ -18398,6 +18590,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             try:
+                setattr(event, "_hermes_agent_dispatch_started", True)
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )
@@ -18462,7 +18655,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
                                 session_key_for_goal,
                             )
-                            await self._enqueue_goal_kickoff_prompt(
+                            await self._finish_deferred_goal_kickoff(
                                 session_entry=session_entry,
                                 source=source,
                             )
@@ -18503,6 +18696,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             raise
         finally:
+            # A clarify callback can start a goal while this owner turn is
+            # blocked.  Empty/provider-failed turns bypass the normal post-turn
+            # result branch above, so finalize any still-owned callback here
+            # before releasing the owner.  The helper verifies that the
+            # synthetic kickoff is actually staged and pauses on failure.
+            try:
+                await self._finish_unconsumed_goal_callback(
+                    session_key=_quick_key,
+                    source=source,
+                )
+            except Exception:
+                logger.error(
+                    "goal callback: terminal kickoff finalization failed for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -22076,6 +22285,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal kickoff enqueue failed: %s", exc)
             return False
 
+    async def _finish_deferred_goal_kickoff(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        """Queue a callback-started goal after its owner turn, or pause it."""
+        accepted = await self._enqueue_goal_kickoff_prompt(
+            session_entry=session_entry,
+            source=source,
+        )
+        if accepted:
+            return True
+        sid = getattr(session_entry, "session_id", None) or ""
+        if sid:
+            try:
+                from hermes_cli.goals import GoalManager
+
+                GoalManager(
+                    session_id=sid,
+                    default_max_turns=self._goal_max_turns_from_config(),
+                ).pause(reason="deferred goal kickoff handoff failed")
+            except Exception as exc:
+                logger.error("goal callback: failed to pause unowned goal %s: %s", sid, exc)
+        logger.error("goal callback: no runnable deferred kickoff owner for session %s", sid)
+        return False
+
+    async def _finish_unconsumed_goal_callback(
+        self,
+        *,
+        session_key: str,
+        source: Any,
+    ) -> bool:
+        """Finalize a callback marker missed by the normal post-turn branch."""
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        callback_session_id = (
+            str(session_ids.get(session_key) or "")
+            if isinstance(session_ids, dict)
+            else ""
+        )
+        if not self._consume_goal_callback_started_session(session_key):
+            return False
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+        except Exception:
+            session_entry = None
+        if session_entry is None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
+        if session_entry is None:
+            if not callback_session_id:
+                logger.error(
+                    "goal callback: could not resolve session for terminal kickoff %s",
+                    session_key,
+                )
+                return False
+            from types import SimpleNamespace
+
+            session_entry = SimpleNamespace(
+                session_id=callback_session_id,
+                session_key=session_key,
+            )
+        return await self._finish_deferred_goal_kickoff(
+            session_entry=session_entry,
+            source=source,
+        )
+
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
         """Start `/goal` from an inline-button callback without replaying a slash command.
 
@@ -22121,7 +22399,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key = self._session_key_for_source(event.source)
                 except Exception:
                     session_key = None
-            self._mark_goal_callback_started_session(session_key)
+            self._mark_goal_callback_started_session(
+                session_key,
+                getattr(session_entry, "session_id", None),
+            )
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)

@@ -5920,13 +5920,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                             except Exception:
                                 pass
-                            handler = getattr(self, "_message_handler", None)
-                            if callable(handler):
-                                maybe_result = handler(event)
-                                if asyncio.iscoroutine(maybe_result):
-                                    await maybe_result
-                            else:
-                                await self.handle_message(event)
+                            # Re-enter through the adapter lifecycle, not the
+                            # bound runner callback directly.  The adapter owns
+                            # the session guard and post-command pending drain;
+                            # bypassing it can acknowledge /goal while leaving
+                            # its synthetic kickoff stranded in the pending slot.
+                            await self.handle_message(event)
                             return
                     await query.answer(text="This prompt has already been resolved.")
                     return

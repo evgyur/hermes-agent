@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,9 +9,11 @@ from gateway.deferred_event_spool import (
     discard_deferred_events_for_session,
     load_replayable_deferred_events,
     persist_deferred_event,
+    persist_preledger_event,
 )
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, ParentBarrierDeferralError
+from gateway.slash_commands import GatewaySlashCommandsMixin
 from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_source
 
@@ -48,6 +51,7 @@ def _runner(db) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner._session_db = db
     runner._session_key_for_source = lambda source: "agent:main:telegram:group:chat-1:topic-1"
+    runner._is_user_authorized = lambda source: True
     return runner
 
 
@@ -141,6 +145,133 @@ def test_deferred_event_is_private_and_round_trips(monkeypatch, tmp_path, ledger
     assert restored.channel_prompt == "current channel policy"
     assert restored.channel_context == "current channel context"
     assert restored.metadata == {"safe": True}
+
+
+@pytest.mark.asyncio
+async def test_preledger_event_is_admitted_once_after_storage_recovers(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    event = _event("preledger")
+    path = persist_preledger_event(event, session_key="sk")
+    assert path is not None
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+    runner = _runner(ledger_db)
+    runner._startup_restore_queue = [load_replayable_deferred_events(ledger_db)[0].event]
+    seen = []
+
+    class Adapter:
+        async def handle_message(self, queued):
+            seen.append(queued.message_id)
+
+    runner._adapter_for_source = lambda source: Adapter()
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 1
+    assert seen == ["preledger"]
+    assert not path.exists()
+    row = ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+        message_id="preledger",
+    )
+    assert row["status"] == "in_progress"
+    assert row["dispatch_started_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_preledger_replay_is_dropped_before_ledger(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    event = _event("unauthorized-preledger")
+    path = persist_preledger_event(event, session_key="sk")
+    runner = _runner(ledger_db)
+    runner._is_user_authorized = lambda source: False
+    restored = load_replayable_deferred_events(ledger_db)[0].event
+    runner._startup_restore_queue = [restored]
+
+    class Adapter:
+        async def handle_message(self, queued):
+            raise AssertionError("unauthorized event reached adapter")
+
+    runner._adapter_for_source = lambda source: Adapter()
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 0
+    assert runner._startup_restore_queue == []
+    assert path is not None and not path.exists()
+    assert ledger_db.find_gateway_message_ledger(
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+        message_id="unauthorized-preledger",
+    ) is None
+
+
+def test_preledger_reset_cutoff_preserves_newer_ingress(monkeypatch, tmp_path, ledger_db):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    before = _event("preledger-before")
+    after = _event("preledger-after")
+    before_path = persist_preledger_event(before, session_key="sk")
+    cutoff = int(getattr(before, "_hermes_preledger_created_ns")) + 1
+    setattr(after, "_hermes_preledger_created_ns", cutoff + 1)
+    after_path = persist_preledger_event(after, session_key="sk")
+
+    assert discard_deferred_events_for_session(
+        ledger_db,
+        "sk",
+        reason="session-reset",
+        max_created_ns=cutoff,
+    ) == 1
+    assert before_path is not None and not before_path.exists()
+    assert after_path is not None and after_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_preserves_preledger_ingress(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    queued = _event("queued-before-failed-reset")
+    path = persist_preledger_event(queued, session_key="sk")
+    assert path is not None
+
+    class ResetRunner(GatewaySlashCommandsMixin):
+        pass
+
+    class BrokenResetStore:
+        async def reset_session(self, session_key):
+            raise RuntimeError("sqlite reset outage")
+
+    runner = ResetRunner()
+    runner._session_key_for_source = lambda source: "sk"
+    runner._invalidate_session_run_generation = lambda *args, **kwargs: None
+    runner._release_running_agent_state = lambda *args, **kwargs: None
+    runner.session_store = SimpleNamespace(_entries={})
+    runner._agent_cache_lock = None
+    runner._evict_cached_agent = lambda *args, **kwargs: None
+    runner._queued_events = {}
+    runner._session_db = ledger_db
+    runner.async_session_store = BrokenResetStore()
+    runner._discard_deferred_event_spool = lambda session_key, **kwargs: (
+        discard_deferred_events_for_session(ledger_db, session_key, **kwargs)
+    )
+
+    with pytest.raises(RuntimeError, match="sqlite reset outage"):
+        await runner._handle_reset_command(_event("reset-command"))
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    "trust_attr",
+    ["role_authorized", "delivered_via_upstream_relay", "is_bot"],
+)
+def test_preledger_transport_trust_is_never_persisted(
+    monkeypatch, tmp_path, trust_attr
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    event = _event(f"preledger-trusted-{trust_attr}")
+    setattr(event.source, trust_attr, True)
+    assert persist_preledger_event(event, session_key="sk") is None
 
 
 @pytest.mark.asyncio
@@ -466,6 +597,34 @@ async def test_failed_adapter_handoff_releases_claim_and_keeps_spool(
     assert row["status"] == "requeued"
     assert row["dispatch_started_at"] is None
     assert list((tmp_path / "hermes-home" / "deferred_events").glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_failure_after_agent_dispatch_is_never_replayed(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    event = _event("ambiguous-agent-failure")
+    ledger_id = _record(runner, event, "sk")
+    runner._set_gateway_ledger_deferred(event)
+    runner._startup_restore_queue = [event]
+
+    class Adapter:
+        async def handle_message(self, queued):
+            setattr(queued, "_hermes_agent_dispatch_started", True)
+            ledger_db.update_gateway_message_ledger(
+                ledger_id,
+                status="failed",
+                reason="handler-error",
+            )
+            raise RuntimeError("ambiguous provider/tool outcome")
+
+    runner._adapter_for_source = lambda source: Adapter()
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 0
+    assert runner._startup_restore_queue == []
+    assert ledger_db.get_gateway_message_ledger(ledger_id)["status"] == "failed"
+    assert not list((tmp_path / "hermes-home" / "deferred_events").glob("*.json"))
 
 
 @pytest.mark.asyncio

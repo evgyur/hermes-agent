@@ -359,3 +359,26 @@ async def test_direct_idle_goal_handler_starts_adapter_owned_turn(hermes_home):
         assert adapter.sent == ["direct goal turn started"]
     finally:
         ledger_db.close()
+
+
+def test_clear_goal_continuations_preserves_real_user_prefix_collision():
+    from gateway.run import GatewayRunner
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner._queued_events = {}
+    adapter = _DrainProbeAdapter()
+    real_user_event = MessageEvent(
+        text=CONTINUATION_TEXT,
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="real-user-prefix",
+        internal=False,
+    )
+    adapter._pending_messages[key] = real_user_event
+
+    removed = runner._clear_goal_pending_continuations(key, adapter)
+
+    assert removed == 0
+    assert adapter._pending_messages[key] is real_user_event
