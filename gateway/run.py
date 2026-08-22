@@ -16653,18 +16653,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # "wait or /stop" message as /model so we don't race a second
         # continuation prompt against the current turn.
         _goal_arg = (event.get_command_args() or "").strip().lower()
+        _reply_goal = (getattr(event, "reply_to_text", None) or "").strip()
         _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
         # Exact-match control verbs (unchanged semantics), plus the
         # wait/unwait barrier verbs which take a pid argument and the
         # gate management verb (inspection/mutation of the gate list only —
         # gates run at turn boundary, so editing them mid-run is safe).
         _is_control = (
-            not _goal_arg
+            (not _goal_arg and not _reply_goal)
             or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
             or _goal_verb in {"wait", "gate"}
         )
         if _is_control:
             return await self._handle_goal_command(event)
+        if not _goal_arg and _reply_goal:
+            return (
+                "Agent is still finishing the current turn — replied-to /goal "
+                "was not started. Wait for completion or use /stop, then retry."
+            )
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
