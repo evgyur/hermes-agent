@@ -10172,6 +10172,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def claim_gateway_message_ledger_for_dispatch(
+        self,
+        ledger_ids: list[int],
+        *,
+        reason: str = "startup-replay-claimed",
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Atomically claim undispatched rows before startup replay.
+
+        Every represented physical ingress row must still be queued and must
+        have no dispatch receipt.  A partial, terminal, or already-claimed set
+        fails closed so startup replay cannot duplicate an unknown outcome.
+        """
+        ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ids:
+            return False
+        now = float(timestamp or time.time())
+        reason_s = str(reason or "startup-replay-claimed")[:500]
+        placeholders = ",".join("?" for _ in ids)
+
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT id, status, dispatch_started_at FROM gateway_message_ledger "
+                f"WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+            if len(rows) != len(ids):
+                return False
+            if any(
+                str(row["status"] if isinstance(row, sqlite3.Row) else row[1])
+                not in {"received", "requeued"}
+                or (row["dispatch_started_at"] if isinstance(row, sqlite3.Row) else row[2])
+                is not None
+                for row in rows
+            ):
+                return False
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_message_ledger
+                SET status = 'in_progress',
+                    dispatch_started_at = ?,
+                    updated_at = ?,
+                    reason = ?
+                WHERE id IN ({placeholders})
+                  AND status IN ('received', 'requeued')
+                  AND dispatch_started_at IS NULL
+                """,
+                (now, now, reason_s, *ids),
+            )
+            return int(cursor.rowcount or 0) == len(ids)
+
+        return bool(self._execute_write(_do))
+
+    def release_gateway_message_ledger_dispatch_claim(
+        self,
+        ledger_ids: list[int],
+        *,
+        reason: str = "startup-replay-handoff-failed",
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Return a definitively unaccepted startup claim to the replay queue."""
+        ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ids:
+            return False
+        now = float(timestamp or time.time())
+        reason_s = str(reason or "startup-replay-handoff-failed")[:500]
+        placeholders = ",".join("?" for _ in ids)
+
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT id, status, reason FROM gateway_message_ledger "
+                f"WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+            if len(rows) != len(ids) or any(
+                str(row["status"] if isinstance(row, sqlite3.Row) else row[1])
+                != "in_progress"
+                or str(row["reason"] if isinstance(row, sqlite3.Row) else row[2])
+                != "startup-replay-claimed"
+                for row in rows
+            ):
+                return False
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_message_ledger
+                SET status = 'requeued',
+                    dispatch_started_at = NULL,
+                    updated_at = ?,
+                    reason = ?
+                WHERE id IN ({placeholders})
+                  AND status = 'in_progress'
+                  AND reason = 'startup-replay-claimed'
+                """,
+                (now, reason_s, *ids),
+            )
+            return int(cursor.rowcount or 0) == len(ids)
+
+        return bool(self._execute_write(_do))
+
     def mark_gateway_session_messages_drained(
         self,
         session_key: str,
