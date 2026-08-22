@@ -377,13 +377,17 @@ def sweep_failed_for_runtime(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, resume_task_id,
+                      continuation_generation, continuation_claim_owner,
+                      continuation_claim_token
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""",
             (platform,),
         ).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at,
+             resume_task_id, continuation_generation,
+             continuation_claim_owner, continuation_claim_token) in rows:
             # Ownership is authoritative before every terminalization or claim.
             # A stale/over-cap row owned by another live process is still that
             # process's row and must not be abandoned by this gateway.
@@ -417,6 +421,10 @@ def sweep_failed_for_runtime(
                     # duplicate, so the marker labels the at-least-once retry.
                     "needs_marker": True,
                     "attempts": attempts + 1,
+                    "resume_task_id": resume_task_id,
+                    "continuation_generation": continuation_generation,
+                    "continuation_claim_owner": continuation_claim_owner,
+                    "continuation_claim_token": continuation_claim_token,
                 })
     return claimed
 

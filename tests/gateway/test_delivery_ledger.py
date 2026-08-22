@@ -558,6 +558,36 @@ class TestRuntimeFailedRedelivery:
         )
 
     @pytest.mark.asyncio
+    async def test_runtime_redelivery_completes_exact_durable_generation(self):
+        from gateway.config import Platform
+
+        _record(
+            resume_task_id="resume-task-1",
+            continuation_generation=3,
+            continuation_claim_owner="gateway:owner",
+            continuation_claim_token="claim-token",
+        )
+        dl.mark_failed("ob-1", "send_path_degraded")
+        runner = self._runner(self._adapter(success=True))
+        durable_store = MagicMock()
+        durable_store.complete = AsyncMock(return_value=True)
+        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
+
+        assert await runner._redeliver_failed_obligations_for_platform(
+            Platform.SLACK
+        ) == 1
+
+        claim = durable_store.complete.await_args.args[0]
+        assert claim.continuation_id == "resume-task-1"
+        assert claim.generation == 3
+        assert claim.owner == "gateway:owner"
+        assert claim.claim_token == "claim-token"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            expected_resume_task_id="resume-task-1",
+        )
+
+    @pytest.mark.asyncio
     async def test_absent_adapter_does_not_spend_attempt(self):
         from gateway.config import Platform
 
