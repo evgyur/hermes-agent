@@ -23,6 +23,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -87,6 +88,108 @@ logger = logging.getLogger(__name__)
 
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
+
+DURABLE_CONTINUATION_STATES = frozenset(
+    {
+        "pending",
+        "claimed",
+        "waiting_unknown_effect",
+        "completed",
+        "cancelled",
+        "superseded",
+        "failed_terminal",
+    }
+)
+DURABLE_CONTINUATION_NONTERMINAL_STATES = frozenset(
+    {"pending", "claimed", "waiting_unknown_effect"}
+)
+DURABLE_CONTINUATION_TERMINAL_STATES = frozenset(
+    {"completed", "cancelled", "superseded", "failed_terminal"}
+)
+_DURABLE_CONTINUATION_OUTCOME_STATES = frozenset(
+    {"completed", "failed_terminal"}
+)
+_DURABLE_CONTINUATION_FORBIDDEN_DESCRIPTOR_KEYS = frozenset(
+    {
+        "arguments",
+        "content",
+        "messages",
+        "payload",
+        "prompt",
+        "raw",
+        "raw_content",
+        "raw_payload",
+        "raw_prompt",
+        "prompt_text",
+        "tool_args",
+        "tool_arguments",
+        "tool_input",
+        "tool_output",
+        "tool_payload",
+        "transcript",
+    }
+)
+_DURABLE_CONTINUATION_MAX_DESCRIPTOR_BYTES = 32 * 1024
+
+
+def _normalize_continuation_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _normalize_continuation_digest(value: Any, field: str) -> str:
+    value = _normalize_continuation_text(value, field)
+    if len(value) > 512:
+        raise ValueError(f"{field} is too long")
+    return value
+
+
+def _normalize_continuation_descriptor(value: Optional[Dict[str, Any]]) -> str:
+    """Canonicalize redacted metadata while refusing raw prompt/tool fields."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("continuation descriptor must be a JSON object")
+
+    def _validate(item: Any, path: str) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"continuation descriptor key at {path} must be text")
+                if key.strip().lower() in _DURABLE_CONTINUATION_FORBIDDEN_DESCRIPTOR_KEYS:
+                    raise ValueError(
+                        f"raw continuation field {key!r} is forbidden; store a digest or redacted descriptor"
+                    )
+                _validate(child, f"{path}.{key}")
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                _validate(child, f"{path}[{index}]")
+        elif item is not None and not isinstance(item, (str, int, float, bool)):
+            raise ValueError(f"continuation descriptor value at {path} is not JSON-safe")
+
+    _validate(value, "descriptor")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("continuation descriptor is not valid JSON") from exc
+    if len(encoded.encode("utf-8")) > _DURABLE_CONTINUATION_MAX_DESCRIPTOR_BYTES:
+        raise ValueError("continuation descriptor is too large")
+    return encoded
+
+
+def _durable_continuation_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    record = dict(row)
+    record["descriptor"] = json.loads(record["descriptor_json"])
+    outcome_json = record.get("outcome_descriptor_json")
+    record["outcome_descriptor"] = json.loads(outcome_json) if outcome_json else None
+    return record
 
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
@@ -2031,6 +2134,33 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS durable_continuations (
+    continuation_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    session_id TEXT,
+    origin_turn_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'claimed', 'waiting_unknown_effect', 'completed',
+        'cancelled', 'superseded', 'failed_terminal'
+    )),
+    input_digest TEXT NOT NULL,
+    descriptor_json TEXT NOT NULL DEFAULT '{}',
+    claim_token TEXT,
+    claim_owner TEXT,
+    lease_expires_at REAL,
+    effect_fence TEXT,
+    effect_started_at REAL,
+    outcome_digest TEXT,
+    outcome_descriptor_json TEXT,
+    superseded_by_continuation_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE (session_key, origin_turn_id, kind, generation)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -2045,6 +2175,13 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_continuations_one_active
+    ON durable_continuations(session_key, kind)
+    WHERE state IN ('pending', 'claimed', 'waiting_unknown_effect');
+CREATE INDEX IF NOT EXISTS idx_durable_continuations_state_lease
+    ON durable_continuations(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_durable_continuations_session
+    ON durable_continuations(session_key, kind, generation DESC);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -10172,6 +10309,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def claim_gateway_message_ledger_for_dispatch(
+        self,
+        ledger_ids: list[int],
+        *,
+        reason: str = "startup-replay-claimed",
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Atomically claim undispatched rows before startup replay.
+
+        Every represented physical ingress row must still be queued and must
+        have no dispatch receipt.  A partial, terminal, or already-claimed set
+        fails closed so startup replay cannot duplicate an unknown outcome.
+        """
+        ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ids:
+            return False
+        now = float(timestamp or time.time())
+        reason_s = str(reason or "startup-replay-claimed")[:500]
+        placeholders = ",".join("?" for _ in ids)
+
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT id, status, dispatch_started_at FROM gateway_message_ledger "
+                f"WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+            if len(rows) != len(ids):
+                return False
+            if any(
+                str(row["status"] if isinstance(row, sqlite3.Row) else row[1])
+                not in {"received", "requeued"}
+                or (row["dispatch_started_at"] if isinstance(row, sqlite3.Row) else row[2])
+                is not None
+                for row in rows
+            ):
+                return False
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_message_ledger
+                SET status = 'in_progress',
+                    dispatch_started_at = ?,
+                    updated_at = ?,
+                    reason = ?
+                WHERE id IN ({placeholders})
+                  AND status IN ('received', 'requeued')
+                  AND dispatch_started_at IS NULL
+                """,
+                (now, now, reason_s, *ids),
+            )
+            return int(cursor.rowcount or 0) == len(ids)
+
+        return bool(self._execute_write(_do))
+
+    def release_gateway_message_ledger_dispatch_claim(
+        self,
+        ledger_ids: list[int],
+        *,
+        reason: str = "startup-replay-handoff-failed",
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Return a definitively unaccepted startup claim to the replay queue."""
+        ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ids:
+            return False
+        now = float(timestamp or time.time())
+        reason_s = str(reason or "startup-replay-handoff-failed")[:500]
+        placeholders = ",".join("?" for _ in ids)
+
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT id, status, reason FROM gateway_message_ledger "
+                f"WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+            if len(rows) != len(ids) or any(
+                str(row["status"] if isinstance(row, sqlite3.Row) else row[1])
+                != "in_progress"
+                or str(row["reason"] if isinstance(row, sqlite3.Row) else row[2])
+                != "startup-replay-claimed"
+                for row in rows
+            ):
+                return False
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_message_ledger
+                SET status = 'requeued',
+                    dispatch_started_at = NULL,
+                    updated_at = ?,
+                    reason = ?
+                WHERE id IN ({placeholders})
+                  AND status = 'in_progress'
+                  AND reason = 'startup-replay-claimed'
+                """,
+                (now, reason_s, *ids),
+            )
+            return int(cursor.rowcount or 0) == len(ids)
+
+        return bool(self._execute_write(_do))
+
     def mark_gateway_session_messages_drained(
         self,
         session_key: str,
@@ -11091,6 +11327,568 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result["error"] = str(exc)
 
         return result
+
+    # ── Durable restart-safe continuations ─────────────────────────────────
+
+    def create_durable_continuation(
+        self,
+        *,
+        session_key: str,
+        origin_turn_id: str,
+        kind: str,
+        generation: int,
+        input_digest: str,
+        descriptor: Optional[Dict[str, Any]] = None,
+        continuation_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        supersede_existing: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Idempotently persist one logical continuation generation.
+
+        The logical identity is ``(session_key, origin_turn_id, kind,
+        generation)``. Retrying creation returns the existing immutable row.
+        A newer generation may replace the current non-terminal generation only
+        when ``supersede_existing`` is explicit; supersession and insertion then
+        occur in the same ``BEGIN IMMEDIATE`` transaction.
+        """
+        session_key = _normalize_continuation_text(session_key, "session_key")
+        origin_turn_id = _normalize_continuation_text(origin_turn_id, "origin_turn_id")
+        kind = _normalize_continuation_text(kind, "kind")
+        input_digest = _normalize_continuation_digest(input_digest, "input_digest")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("generation must be a non-negative integer")
+        if session_id is not None:
+            session_id = _normalize_continuation_text(session_id, "session_id")
+        if continuation_id is None:
+            continuation_id = "cont_" + secrets.token_hex(16)
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        descriptor_json = _normalize_continuation_descriptor(descriptor)
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM durable_continuations "
+                "WHERE session_key = ? AND origin_turn_id = ? "
+                "AND kind = ? AND generation = ?",
+                (session_key, origin_turn_id, kind, generation),
+            ).fetchone()
+            if existing is not None:
+                immutable_matches = (
+                    existing["session_id"] == session_id
+                    and existing["input_digest"] == input_digest
+                    and existing["descriptor_json"] == descriptor_json
+                )
+                if not immutable_matches:
+                    raise ValueError(
+                        "durable continuation logical identity already exists "
+                        "with different immutable data"
+                    )
+                return _durable_continuation_dict(existing)
+
+            id_collision = conn.execute(
+                "SELECT 1 FROM durable_continuations WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            if id_collision is not None:
+                raise ValueError("continuation_id already belongs to another generation")
+
+            active = conn.execute(
+                "SELECT * FROM durable_continuations "
+                "WHERE session_key = ? AND kind = ? "
+                "AND state IN ('pending', 'claimed', 'waiting_unknown_effect')",
+                (session_key, kind),
+            ).fetchone()
+            if active is not None:
+                if not supersede_existing:
+                    raise ValueError(
+                        "a non-terminal durable continuation already exists "
+                        "for this session_key and kind"
+                    )
+                if generation <= int(active["generation"]):
+                    raise ValueError(
+                        "a replacement durable continuation must use a newer generation"
+                    )
+                supersede_descriptor = _normalize_continuation_descriptor(
+                    {
+                        "reason": "replaced_by_new_generation",
+                        "superseded_by_continuation_id": continuation_id,
+                    }
+                )
+                updated = conn.execute(
+                    "UPDATE durable_continuations SET "
+                    "state = 'superseded', claim_token = NULL, claim_owner = NULL, "
+                    "lease_expires_at = NULL, outcome_descriptor_json = ?, "
+                    "superseded_by_continuation_id = ?, updated_at = ?, completed_at = ? "
+                    "WHERE continuation_id = ? AND generation = ? AND state = ?",
+                    (
+                        supersede_descriptor,
+                        continuation_id,
+                        timestamp,
+                        timestamp,
+                        active["continuation_id"],
+                        active["generation"],
+                        active["state"],
+                    ),
+                )
+                if updated.rowcount != 1:  # Defensive CAS; BEGIN IMMEDIATE serializes writers.
+                    raise RuntimeError("active durable continuation changed during supersession")
+
+            conn.execute(
+                "INSERT INTO durable_continuations ("
+                "continuation_id, session_key, session_id, origin_turn_id, kind, "
+                "generation, state, input_digest, descriptor_json, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (
+                    continuation_id,
+                    session_key,
+                    session_id,
+                    origin_turn_id,
+                    kind,
+                    generation,
+                    input_digest,
+                    descriptor_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM durable_continuations WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            return _durable_continuation_dict(row)
+
+        return self._execute_write(_do)
+
+    def get_durable_continuation(
+        self, continuation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        with self._read_ctx() as conn:
+            assert conn is not None
+            row = conn.execute(
+                "SELECT * FROM durable_continuations WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+        return _durable_continuation_dict(row) if row is not None else None
+
+    def list_durable_continuations(
+        self,
+        *,
+        session_key: Optional[str] = None,
+        kind: Optional[str] = None,
+        states: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if session_key is not None:
+            clauses.append("session_key = ?")
+            params.append(_normalize_continuation_text(session_key, "session_key"))
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(_normalize_continuation_text(kind, "kind"))
+        if states is not None:
+            state_values = list(states)
+            if not state_values:
+                return []
+            invalid = set(state_values) - DURABLE_CONTINUATION_STATES
+            if invalid:
+                raise ValueError(f"invalid durable continuation states: {sorted(invalid)}")
+            clauses.append("state IN ({})".format(",".join("?" for _ in state_values)))
+            params.extend(state_values)
+        sql = "SELECT * FROM durable_continuations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at ASC, continuation_id ASC"
+        with self._read_ctx() as conn:
+            assert conn is not None
+            rows = conn.execute(sql, params).fetchall()
+        return [_durable_continuation_dict(row) for row in rows]
+
+    def claim_durable_continuation(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        owner: str,
+        lease_seconds: float,
+        claim_token: Optional[str] = None,
+        expected_state: str = "pending",
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """CAS ``pending`` to ``claimed`` and return the exact lease token."""
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        owner = _normalize_continuation_text(owner, "owner")
+        if expected_state != "pending":
+            raise ValueError("durable continuations may only be claimed from pending")
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            raise ValueError("generation must be an integer")
+        duration = float(lease_seconds)
+        if not (0 < duration <= 7 * 24 * 60 * 60):
+            raise ValueError("lease_seconds must be positive and at most seven days")
+        if claim_token is None:
+            claim_token = secrets.token_urlsafe(24)
+        claim_token = _normalize_continuation_text(claim_token, "claim_token")
+        timestamp = time.time() if now is None else float(now)
+        lease_expires_at = timestamp + duration
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET state = 'claimed', "
+                "claim_token = ?, claim_owner = ?, lease_expires_at = ?, updated_at = ? "
+                "WHERE continuation_id = ? AND generation = ? AND state = ?",
+                (
+                    claim_token,
+                    owner,
+                    lease_expires_at,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    expected_state,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM durable_continuations WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            return _durable_continuation_dict(row)
+
+        return self._execute_write(_do)
+
+    def renew_durable_continuation_claim(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        claim_token: str,
+        owner: str,
+        lease_seconds: float,
+        now: Optional[float] = None,
+    ) -> bool:
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        claim_token = _normalize_continuation_text(claim_token, "claim_token")
+        owner = _normalize_continuation_text(owner, "owner")
+        duration = float(lease_seconds)
+        if not (0 < duration <= 7 * 24 * 60 * 60):
+            raise ValueError("lease_seconds must be positive and at most seven days")
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET lease_expires_at = ?, updated_at = ? "
+                "WHERE continuation_id = ? AND generation = ? AND state = 'claimed' "
+                "AND claim_token = ? AND claim_owner = ? AND lease_expires_at > ?",
+                (
+                    timestamp + duration,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    claim_token,
+                    owner,
+                    timestamp,
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def mark_durable_continuation_effect_started(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        claim_token: str,
+        owner: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Durably fence a claim before an external or irreversible effect."""
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        claim_token = _normalize_continuation_text(claim_token, "claim_token")
+        owner = _normalize_continuation_text(owner, "owner")
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET effect_fence = ?, "
+                "effect_started_at = COALESCE(effect_started_at, ?), updated_at = ? "
+                "WHERE continuation_id = ? AND generation = ? AND state = 'claimed' "
+                "AND claim_token = ? AND claim_owner = ? AND lease_expires_at > ? "
+                "AND (effect_fence IS NULL OR effect_fence = ?)",
+                (
+                    claim_token,
+                    timestamp,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    claim_token,
+                    owner,
+                    timestamp,
+                    claim_token,
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def mark_durable_continuation_effect_unknown(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        claim_token: str,
+        owner: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Fail closed after an effect may have started; never auto-replay it."""
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        claim_token = _normalize_continuation_text(claim_token, "claim_token")
+        owner = _normalize_continuation_text(owner, "owner")
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET state = 'waiting_unknown_effect', "
+                "effect_fence = COALESCE(effect_fence, ?), "
+                "effect_started_at = COALESCE(effect_started_at, ?), "
+                "claim_token = NULL, claim_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE continuation_id = ? AND generation = ? "
+                "AND state = 'claimed' AND claim_token = ? AND claim_owner = ? "
+                "AND lease_expires_at > ?",
+                (
+                    claim_token,
+                    timestamp,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    claim_token,
+                    owner,
+                    timestamp,
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def reap_expired_durable_continuation_claims(
+        self, *, now: Optional[float] = None
+    ) -> Dict[str, int]:
+        """Retry safe claims; quarantine fenced claims as unknown-effect work."""
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            safe = conn.execute(
+                "UPDATE durable_continuations SET state = 'pending', "
+                "claim_token = NULL, claim_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE state = 'claimed' "
+                "AND lease_expires_at <= ? AND effect_fence IS NULL",
+                (timestamp, timestamp),
+            ).rowcount
+            unknown = conn.execute(
+                "UPDATE durable_continuations SET state = 'waiting_unknown_effect', "
+                "claim_token = NULL, claim_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE state = 'claimed' "
+                "AND lease_expires_at <= ? AND effect_fence IS NOT NULL",
+                (timestamp, timestamp),
+            ).rowcount
+            return {"pending": safe, "waiting_unknown_effect": unknown}
+
+        return self._execute_write(_do)
+
+    def terminalize_durable_continuation(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        claim_token: str,
+        owner: str,
+        state: str,
+        outcome_digest: str,
+        outcome_descriptor: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Atomically persist an outcome and terminalize the currently owned claim."""
+        if state not in _DURABLE_CONTINUATION_OUTCOME_STATES:
+            raise ValueError("claimed outcome state must be completed or failed_terminal")
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        claim_token = _normalize_continuation_text(claim_token, "claim_token")
+        owner = _normalize_continuation_text(owner, "owner")
+        outcome_digest = _normalize_continuation_digest(
+            outcome_digest, "outcome_digest"
+        )
+        outcome_json = _normalize_continuation_descriptor(outcome_descriptor)
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET state = ?, outcome_digest = ?, "
+                "outcome_descriptor_json = ?, claim_token = NULL, claim_owner = NULL, "
+                "lease_expires_at = NULL, updated_at = ?, completed_at = ? "
+                "WHERE continuation_id = ? AND generation = ? AND state = 'claimed' "
+                "AND claim_token = ? AND claim_owner = ? AND lease_expires_at > ?",
+                (
+                    state,
+                    outcome_digest,
+                    outcome_json,
+                    timestamp,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    claim_token,
+                    owner,
+                    timestamp,
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def resolve_durable_continuation_unknown_effect(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        state: str,
+        outcome_digest: str,
+        outcome_descriptor: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Explicitly reconcile a quarantined unknown effect to a terminal receipt."""
+        if state not in _DURABLE_CONTINUATION_OUTCOME_STATES:
+            raise ValueError("reconciled outcome state must be completed or failed_terminal")
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        outcome_digest = _normalize_continuation_digest(
+            outcome_digest, "outcome_digest"
+        )
+        outcome_json = _normalize_continuation_descriptor(outcome_descriptor)
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE durable_continuations SET state = ?, outcome_digest = ?, "
+                "outcome_descriptor_json = ?, updated_at = ?, completed_at = ? "
+                "WHERE continuation_id = ? AND generation = ? "
+                "AND state = 'waiting_unknown_effect'",
+                (
+                    state,
+                    outcome_digest,
+                    outcome_json,
+                    timestamp,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def cancel_durable_continuation(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        descriptor: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Deterministically cancel any non-terminal generation; idempotent."""
+        return self._control_terminalize_durable_continuation(
+            continuation_id,
+            generation,
+            state="cancelled",
+            descriptor=descriptor,
+            now=now,
+        )
+
+    def supersede_durable_continuation(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        superseded_by_continuation_id: str,
+        descriptor: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Deterministically supersede any non-terminal generation; idempotent."""
+        superseded_by_continuation_id = _normalize_continuation_text(
+            superseded_by_continuation_id, "superseded_by_continuation_id"
+        )
+        return self._control_terminalize_durable_continuation(
+            continuation_id,
+            generation,
+            state="superseded",
+            descriptor=descriptor,
+            superseded_by_continuation_id=superseded_by_continuation_id,
+            now=now,
+        )
+
+    def _control_terminalize_durable_continuation(
+        self,
+        continuation_id: str,
+        generation: int,
+        *,
+        state: str,
+        descriptor: Optional[Dict[str, Any]],
+        superseded_by_continuation_id: Optional[str] = None,
+        now: Optional[float],
+    ) -> bool:
+        continuation_id = _normalize_continuation_text(
+            continuation_id, "continuation_id"
+        )
+        descriptor_json = _normalize_continuation_descriptor(descriptor)
+        timestamp = time.time() if now is None else float(now)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT state, superseded_by_continuation_id "
+                "FROM durable_continuations WHERE continuation_id = ? AND generation = ?",
+                (continuation_id, generation),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == state:
+                if state != "superseded":
+                    return True
+                return row["superseded_by_continuation_id"] == superseded_by_continuation_id
+            if row["state"] not in DURABLE_CONTINUATION_NONTERMINAL_STATES:
+                return False
+            updated = conn.execute(
+                "UPDATE durable_continuations SET state = ?, claim_token = NULL, "
+                "claim_owner = NULL, lease_expires_at = NULL, "
+                "outcome_descriptor_json = ?, superseded_by_continuation_id = ?, "
+                "updated_at = ?, completed_at = ? WHERE continuation_id = ? "
+                "AND generation = ? AND state = ?",
+                (
+                    state,
+                    descriptor_json,
+                    superseded_by_continuation_id,
+                    timestamp,
+                    timestamp,
+                    continuation_id,
+                    generation,
+                    row["state"],
+                ),
+            )
+            return updated.rowcount == 1
+
+        return self._execute_write(_do)
 
     # ── Handoff (cross-platform session transfer) ──────────────────────────
     #

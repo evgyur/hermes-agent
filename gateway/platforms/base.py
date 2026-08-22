@@ -2403,6 +2403,14 @@ class MessageType(Enum):
     COMMAND = "command"  # /command style
 
 
+class EventOrigin(str, Enum):
+    """Typed provenance for real and synthetic gateway events."""
+
+    REAL_INBOUND = "real_inbound"
+    STARTUP_CONTINUATION = "startup_continuation"
+    SYNTHETIC_INTERNAL = "synthetic_internal"
+
+
 class ProcessingOutcome(Enum):
     """Result classification for message-processing lifecycle hooks."""
 
@@ -2503,6 +2511,18 @@ class MessageEvent:
     # is deliberately broader (background completions, handoffs, kickoffs), so
     # recovery guidance must not use it as a synthetic-resume discriminator.
     startup_resume: bool = False
+
+    # Top-level typed provenance.  Keep ``startup_resume`` as a compatibility
+    # field while recovery arbitration migrates to this non-ambiguous value.
+    event_origin: EventOrigin = EventOrigin.REAL_INBOUND
+
+    # Exact durable-continuation identity. These are top-level typed fields so
+    # provenance cannot be lost in free-form platform metadata or merged with a
+    # different queued event.
+    continuation_id: Optional[str] = None
+    continuation_generation: Optional[int] = None
+    continuation_claim_owner: Optional[str] = None
+    continuation_claim_token: Optional[str] = None
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -2853,6 +2873,33 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # Restart-recovery wakes have exact provenance and must never be folded
+        # into a real inbound turn. Real user input wins: replacing/dropping the
+        # synthetic wake is safe because resume_pending remains durable and the
+        # real turn registers a fresh post-delivery continuation.
+        existing_recovery = (
+            getattr(existing, "event_origin", EventOrigin.REAL_INBOUND)
+            == EventOrigin.STARTUP_CONTINUATION
+        )
+        incoming_recovery = (
+            getattr(event, "event_origin", EventOrigin.REAL_INBOUND)
+            == EventOrigin.STARTUP_CONTINUATION
+        )
+        if existing_recovery != incoming_recovery:
+            if existing_recovery:
+                pending_messages[session_key] = event
+            return
+        if existing_recovery and (
+            getattr(existing, "continuation_id", None),
+            getattr(existing, "continuation_generation", None),
+        ) != (
+            getattr(event, "continuation_id", None),
+            getattr(event, "continuation_generation", None),
+        ):
+            # Distinct durable generations are never merge-compatible. Keep the
+            # event already owning the queue slot; SessionDB arbitration decides
+            # which exact generation may execute.
+            return
         _merge_gateway_ledger_ids(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -6315,14 +6362,21 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        main_delivery_attempted = False
+        main_delivery_succeeded = False
 
-        def _record_delivery(result):
+        def _record_delivery(result, *, main: bool = False):
             nonlocal delivery_attempted, delivery_succeeded
+            nonlocal main_delivery_attempted, main_delivery_succeeded
             if result is None:
                 return
             delivery_attempted = True
-            if getattr(result, "success", False):
+            succeeded = bool(getattr(result, "success", False))
+            if succeeded:
                 delivery_succeeded = True
+            if main:
+                main_delivery_attempted = True
+                main_delivery_succeeded = succeeded
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6660,6 +6714,18 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    resume_task_id=getattr(
+                                        event, "continuation_id", None
+                                    ) or getattr(event, "_hermes_resume_task_id", None),
+                                    continuation_generation=getattr(
+                                        event, "continuation_generation", None
+                                    ),
+                                    continuation_claim_owner=getattr(
+                                        event, "continuation_claim_owner", None
+                                    ),
+                                    continuation_claim_token=getattr(
+                                        event, "continuation_claim_token", None
+                                    ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -6681,7 +6747,7 @@ class BasePlatformAdapter(ABC):
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
-                    _record_delivery(result)
+                    _record_delivery(result, main=True)
                     if _obligation_id is not None and not _is_parent_task_delivery:
                         try:
                             from gateway.delivery_ledger import (
@@ -6870,6 +6936,11 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            setattr(
+                event,
+                "_hermes_delivery_succeeded",
+                bool(main_delivery_attempted and main_delivery_succeeded),
+            )
             if _is_parent_task_delivery:
                 if _parent_obligation_id is not None:
                     from gateway.delivery_ledger import (

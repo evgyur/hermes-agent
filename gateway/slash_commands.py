@@ -236,6 +236,15 @@ class GatewaySlashCommandsMixin:
         _qe = getattr(self, "_queued_events", None)
         if _qe is not None:
             _qe.pop(session_key, None)
+        discard_spool = getattr(self, "_discard_deferred_event_spool", None)
+        if callable(discard_spool):
+            reset_ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+            if reset_ledger_id is not None:
+                discard_spool(
+                    session_key,
+                    reason="session-reset",
+                    max_ledger_id=int(reset_ledger_id),
+                )
 
         # The old conversation's in-flight async delegations end WITH it
         # (#55578): after the reset rotates the session id, their completions

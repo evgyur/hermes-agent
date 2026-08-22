@@ -356,6 +356,51 @@ def test_runner_reconciles_ledger_at_recorded_startup_boundary(ledger_db):
     assert row["reason"] == "gateway-startup-reconciliation"
 
 
+def test_dispatch_claim_is_atomic_and_single_owner(ledger_db):
+    first = ledger_db.record_gateway_message_received(
+        platform="telegram", chat_id="chat-1", message_id="claim-1"
+    )
+    second = ledger_db.record_gateway_message_received(
+        platform="telegram", chat_id="chat-1", message_id="claim-2"
+    )
+
+    assert ledger_db.claim_gateway_message_ledger_for_dispatch([first, second])
+    assert not ledger_db.claim_gateway_message_ledger_for_dispatch([first, second])
+    for ledger_id in (first, second):
+        row = ledger_db.get_gateway_message_ledger(ledger_id)
+        assert row["status"] == "in_progress"
+        assert row["dispatch_started_at"] is not None
+
+
+def test_dispatch_claim_fails_closed_without_partially_claiming(ledger_db):
+    queued = ledger_db.record_gateway_message_received(
+        platform="telegram", chat_id="chat-1", message_id="queued"
+    )
+    completed = ledger_db.record_gateway_message_received(
+        platform="telegram", chat_id="chat-1", message_id="completed"
+    )
+    ledger_db.update_gateway_message_ledger(completed, status="completed")
+
+    assert not ledger_db.claim_gateway_message_ledger_for_dispatch([queued, completed])
+    assert ledger_db.get_gateway_message_ledger(queued)["status"] == "received"
+    assert ledger_db.get_gateway_message_ledger(completed)["status"] == "completed"
+
+
+def test_startup_claim_release_only_requeues_its_own_unaccepted_claim(ledger_db):
+    queued = ledger_db.record_gateway_message_received(
+        platform="telegram", chat_id="chat-1", message_id="release-me"
+    )
+    assert ledger_db.claim_gateway_message_ledger_for_dispatch([queued])
+    assert ledger_db.release_gateway_message_ledger_dispatch_claim([queued])
+    row = ledger_db.get_gateway_message_ledger(queued)
+    assert row["status"] == "requeued"
+    assert row["dispatch_started_at"] is None
+
+    ledger_db.update_gateway_message_ledger(queued, status="in_progress", reason="live-claim")
+    assert not ledger_db.release_gateway_message_ledger_dispatch_claim([queued])
+    assert ledger_db.get_gateway_message_ledger(queued)["status"] == "in_progress"
+
+
 @pytest.mark.asyncio
 async def test_startup_replay_is_owned_before_adapter_background_race(ledger_db):
     event = _event(text="replayed", message_id="startup-race")
@@ -386,9 +431,9 @@ async def test_startup_replay_is_owned_before_adapter_background_race(ledger_db)
     assert reconciled == [0]
     row = ledger_db.get_gateway_message_ledger(ledger_id)
     assert row is not None
-    assert row["status"] == "received"
-    assert row["reason"] == "startup-replay-admitted"
-    assert row["updated_at"] > 200.0
+    assert row["status"] == "in_progress"
+    assert row["reason"] == "startup-replay-claimed"
+    assert row["dispatch_started_at"] is not None
 
 
 def test_ledger_writes_are_best_effort_and_do_not_crash_gateway():

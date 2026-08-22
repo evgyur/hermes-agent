@@ -37,6 +37,10 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        resume_task_id=kw.get("resume_task_id"),
+        continuation_generation=kw.get("continuation_generation"),
+        continuation_claim_owner=kw.get("continuation_claim_owner"),
+        continuation_claim_token=kw.get("continuation_claim_token"),
     )
 
 
@@ -197,7 +201,7 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
-        _record()  # pending
+        _record(resume_task_id="resume-task-1")  # pending
         _orphan("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -210,8 +214,110 @@ class TestGatewayRedeliverySweep:
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1",
+            expected_resume_task_id="resume-task-1",
         )
+
+    @pytest.mark.asyncio
+    async def test_failed_redelivery_keeps_exact_resume_obligation(self):
+        _record(resume_task_id="resume-task-1")
+        _orphan("ob-1")
+        runner = self._runner(self._adapter(success=False))
+
+        assert await runner._redeliver_pending_obligations() == 0
+
+        runner._async_session_store.clear_resume_pending.assert_not_awaited()
+        assert runner._delivery_owed_resume_session_keys == {
+            "agent:main:slack:channel:C1"
+        }
+
+    @pytest.mark.asyncio
+    async def test_exact_durable_generation_must_complete_before_marker_clear(self):
+        _record(
+            resume_task_id="resume-task-1",
+            continuation_generation=3,
+            continuation_claim_owner="gateway:owner",
+            continuation_claim_token="claim-token",
+        )
+        _orphan("ob-1")
+        runner = self._runner(self._adapter(success=True))
+        durable_store = MagicMock()
+        durable_store.complete = AsyncMock(return_value=True)
+        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
+
+        assert await runner._redeliver_pending_obligations() == 1
+
+        claim = durable_store.complete.await_args.args[0]
+        assert claim.continuation_id == "resume-task-1"
+        assert claim.generation == 3
+        assert claim.owner == "gateway:owner"
+        assert claim.claim_token == "claim-token"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_real_store_delivery_recovery_terminalizes_exact_claim(self, tmp_path):
+        from gateway.durable_continuation import GatewayContinuationStore
+        from hermes_state import SessionDB
+
+        state_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            state_db.create_durable_continuation(
+                continuation_id="resume-task-real",
+                session_key="agent:main:slack:channel:C1",
+                session_id="session-1",
+                origin_turn_id="turn-1",
+                kind="gateway_restart_resume",
+                generation=1,
+                input_digest="sha256:input",
+                descriptor={"source": "test"},
+            )
+            claimed = state_db.claim_durable_continuation(
+                "resume-task-real",
+                1,
+                owner="gateway:real",
+                claim_token="real-token",
+                lease_seconds=90,
+            )
+            assert claimed is not None
+            _record(
+                resume_task_id="resume-task-real",
+                continuation_generation=1,
+                continuation_claim_owner="gateway:real",
+                continuation_claim_token="real-token",
+            )
+            _orphan("ob-1")
+            runner = self._runner(self._adapter(success=True))
+            store = GatewayContinuationStore(state_db, owner="gateway:real")
+            runner._gateway_continuation_store = MagicMock(return_value=store)
+
+            assert await runner._redeliver_pending_obligations() == 1
+
+            record = state_db.get_durable_continuation("resume-task-real")
+            assert record["state"] == "completed"
+            runner._async_session_store.clear_resume_pending.assert_awaited_once()
+        finally:
+            state_db.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_durable_delivery_never_clears_newer_marker(self):
+        _record(
+            resume_task_id="old-task",
+            continuation_generation=1,
+            continuation_claim_owner="dead-owner",
+            continuation_claim_token="stale-token",
+        )
+        _orphan("ob-1")
+        runner = self._runner(self._adapter(success=True))
+        durable_store = MagicMock()
+        durable_store.complete = AsyncMock(return_value=False)
+        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
+
+        assert await runner._redeliver_pending_obligations() == 1
+
+        runner._async_session_store.clear_resume_pending.assert_not_awaited()
+        assert runner._delivery_owed_resume_session_keys == {
+            "agent:main:slack:channel:C1"
+        }
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):

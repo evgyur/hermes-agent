@@ -165,7 +165,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -388,6 +388,33 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS durable_continuations (
+    continuation_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    session_id TEXT,
+    origin_turn_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'claimed', 'waiting_unknown_effect', 'completed',
+        'cancelled', 'superseded', 'failed_terminal'
+    )),
+    input_digest TEXT NOT NULL,
+    descriptor_json TEXT NOT NULL DEFAULT '{}',
+    claim_token TEXT,
+    claim_owner TEXT,
+    lease_expires_at REAL,
+    effect_fence TEXT,
+    effect_started_at REAL,
+    outcome_digest TEXT,
+    outcome_descriptor_json TEXT,
+    superseded_by_continuation_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    UNIQUE (session_key, origin_turn_id, kind, generation)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -411,6 +438,13 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_continuations_one_active
+    ON durable_continuations(session_key, kind)
+    WHERE state IN ('pending', 'claimed', 'waiting_unknown_effect');
+CREATE INDEX IF NOT EXISTS idx_durable_continuations_state_lease
+    ON durable_continuations(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_durable_continuations_session
+    ON durable_continuations(session_key, kind, generation DESC);
 """
 
 

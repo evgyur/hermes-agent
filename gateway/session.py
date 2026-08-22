@@ -862,6 +862,11 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    # Stable logical identity for this interrupted parent obligation. It is
+    # generated once (or inherited from the exact active-turn token) and stays
+    # unchanged across status replies and gateway generations until terminal
+    # proof, explicit cancellation, or supersession clears the obligation.
+    resume_task_id: Optional[str] = None
 
     # Durable ownership marker for the agent turn currently executing on this
     # routing entry.  A normal unwind clears it with compare-and-swap semantics;
@@ -901,6 +906,7 @@ class SessionEntry:
             "suspended": self.suspended,
             "resume_pending": self.resume_pending,
             "resume_reason": self.resume_reason,
+            "resume_task_id": self.resume_task_id,
             "last_resume_marked_at": (
                 self.last_resume_marked_at.isoformat()
                 if self.last_resume_marked_at
@@ -1002,6 +1008,7 @@ class SessionEntry:
             suspended=data.get("suspended", False),
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
+            resume_task_id=data.get("resume_task_id"),
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
@@ -2862,7 +2869,12 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             if session_key in self._entries:
-                self._entries[session_key].suspended = True
+                entry = self._entries[session_key]
+                entry.suspended = True
+                entry.resume_pending = False
+                entry.resume_reason = None
+                entry.last_resume_marked_at = None
+                entry.resume_task_id = None
                 self._save()
                 return True
         return False
@@ -2969,9 +2981,12 @@ class SessionStore:
                         # generic crash reason; preserve it and its freshness.
                         if entry.last_resume_marked_at is None:
                             entry.last_resume_marked_at = now
+                        if not entry.resume_task_id:
+                            entry.resume_task_id = entry.active_turn_token
                     else:
                         entry.resume_pending = True
                         entry.resume_reason = "restart_interrupted"
+                        entry.resume_task_id = entry.active_turn_token
                         # Freshness starts when recovery is discovered, not
                         # when a potentially hours-long turn began.
                         entry.last_resume_marked_at = now
@@ -3027,12 +3042,19 @@ class SessionStore:
                     return False
                 entry.resume_pending = True
                 entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
+                if not entry.resume_task_id:
+                    entry.last_resume_marked_at = _now()
+                    entry.resume_task_id = uuid.uuid4().hex
                 self._save()
                 return True
         return False
 
-    def clear_resume_pending(self, session_key: str) -> bool:
+    def clear_resume_pending(
+        self,
+        session_key: str,
+        *,
+        expected_resume_task_id: Optional[str] = None,
+    ) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
 
         Called from the gateway after ``run_conversation()`` returns a
@@ -3046,9 +3068,15 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
+            if (
+                expected_resume_task_id is not None
+                and entry.resume_task_id != expected_resume_task_id
+            ):
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.resume_task_id = None
             self._save()
             return True
 
@@ -3133,6 +3161,7 @@ class SessionStore:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
+                    entry.resume_task_id = uuid.uuid4().hex
                     count += 1
             if count:
                 self._save()
