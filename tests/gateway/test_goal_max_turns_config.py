@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -36,7 +38,9 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
-    runner.adapters = {}
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
 
     event = MessageEvent(

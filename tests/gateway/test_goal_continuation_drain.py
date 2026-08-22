@@ -206,3 +206,96 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+
+
+@pytest.mark.asyncio
+async def test_idle_goal_command_drains_distinct_kickoff_without_user_nudge(hermes_home):
+    """Regression: the kickoff must not alias the slash-command ledger identity."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    session_entry = SessionEntry(
+        session_key=key,
+        session_id=f"goal-idle-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+
+    platform_ids: set[str] = set()
+    agent_turns: list[MessageEvent] = []
+
+    async def handler(event):
+        # Mirror gateway ledger dedup: two lifecycles cannot share one platform
+        # message id.  The historical bug reused cmd-idle-goal and rejected the
+        # synthetic drain before an agent turn could start.
+        if event.message_id:
+            if event.message_id in platform_ids:
+                return None
+            platform_ids.add(event.message_id)
+        if event.get_command() == "goal":
+            return await runner._handle_goal_command(event)
+        agent_turns.append(event)
+        return "goal work started"
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(
+        MessageEvent(
+            text="/goal finish this without another message",
+            message_type=MessageType.TEXT,
+            source=src,
+            message_id="cmd-idle-goal",
+        )
+    )
+    for _ in range(60):
+        if agent_turns and len(adapter.sent) >= 2:
+            break
+        await asyncio.sleep(0.05)
+
+    assert len(agent_turns) == 1
+    assert agent_turns[0].internal is True
+    assert agent_turns[0].message_id is None
+    assert agent_turns[0].text.startswith("[Continuing toward your standing goal]")
+    assert adapter.sent[0].startswith("⊙ Goal set")
+    assert adapter.sent[1] == "goal work started"
+
+
+def test_clear_goal_continuations_preserves_real_user_prefix_collision():
+    from gateway.run import GatewayRunner
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner._queued_events = {}
+    adapter = _DrainProbeAdapter()
+    real_user_event = MessageEvent(
+        text=CONTINUATION_TEXT,
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="real-user-prefix",
+        internal=False,
+    )
+    adapter._pending_messages[key] = real_user_event
+
+    removed = runner._clear_goal_pending_continuations(key, adapter)
+
+    assert removed == 0
+    assert adapter._pending_messages[key] is real_user_event

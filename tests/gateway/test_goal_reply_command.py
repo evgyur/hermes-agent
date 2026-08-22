@@ -94,6 +94,8 @@ async def test_bare_goal_reply_uses_replied_to_text_as_goal(hermes_home, runner)
     assert state.goal in queued.text
     assert queued.source == runner.source
     assert queued.internal is True
+    assert queued.message_id is None
+    assert queued.channel_prompt is None
 
 
 @pytest.mark.asyncio
@@ -213,6 +215,31 @@ async def test_goal_resume_queues_immediate_canonical_continuation(hermes_home, 
     assert queued.text.startswith("[Continuing toward your standing goal]\nGoal: ")
     assert state.goal in queued.text
     assert queued.internal is True
+    assert queued.message_id is None
+    assert queued.channel_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_new_goal_fails_closed_when_kickoff_has_no_adapter(hermes_home, runner):
+    """Never acknowledge runnable work when no adapter owns the first turn."""
+    from hermes_cli.goals import GoalManager
+
+    runner.runner.adapters.pop(runner.source.platform)
+    response = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal start only if runnable",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="cmd-set-no-adapter",
+        )
+    )
+
+    state = GoalManager(runner.session.session_id).state
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "goal kickoff handoff failed"
+    assert "Goal set" not in response
+    assert "could not start" in response.lower()
 
 
 @pytest.mark.asyncio

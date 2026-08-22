@@ -7488,14 +7488,11 @@ class AIAgent:
         hygiene may retry after the anti-thrash breaker trips, but it still
         honors provider failure cooldowns and remains an automatic attempt.
         """
-        from agent.conversation_compression import compress_context
-        return compress_context(
-            self, messages, system_message,
-            approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-            force=force,
-            bypass_ineffective_guard=bypass_ineffective_guard,
-            defer_context_engine_notification=defer_context_engine_notification,
-            commit_fence=commit_fence,
+        from agent.conversation_compression import (
+            CompressionCommitFence,
+            compress_context,
+            resolve_context_compression_timeouts,
+            run_compress_context_with_progress_timeout,
         )
         from agent.portal_tags import (
             get_conversation_context,
@@ -7526,17 +7523,19 @@ class AIAgent:
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize fence publication so a waiter cannot replace the fence of
-        # the attempt currently generating/committing a summary.
+        # Serialize the WHOLE attempt, not just fence publication. Otherwise a
+        # second attempt can replace the active fence while the first is still
+        # summarising, so hard_interrupt() cancels only the newer attempt and
+        # the older one can still commit after the surfaced stop.
         fence_registration_lock = vars(self).setdefault(
             "_compression_commit_fence_lock", threading.RLock()
         )
-        with fence_registration_lock:
-            missing_fence = object()
-            previous_fence = vars(self).get(
-                "_active_compression_commit_fence", missing_fence
-            )
-            self._active_compression_commit_fence = active_fence
+        fence_registration_lock.acquire()
+        missing_fence = object()
+        previous_fence = vars(self).get(
+            "_active_compression_commit_fence", missing_fence
+        )
+        self._active_compression_commit_fence = active_fence
         try:
             def _run(fence=None, target_messages=None):
                 return compress_context(
@@ -7546,6 +7545,7 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
+                    bypass_ineffective_guard=bypass_ineffective_guard,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -7705,11 +7705,11 @@ class AIAgent:
                 )
             return result
         finally:
-            with fence_registration_lock:
-                if previous_fence is missing_fence:
-                    vars(self).pop("_active_compression_commit_fence", None)
-                else:
-                    self._active_compression_commit_fence = previous_fence
+            if previous_fence is missing_fence:
+                vars(self).pop("_active_compression_commit_fence", None)
+            else:
+                self._active_compression_commit_fence = previous_fence
+            fence_registration_lock.release()
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:

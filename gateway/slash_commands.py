@@ -2586,8 +2586,6 @@ class GatewaySlashCommandsMixin:
                 adapter=adapter,
                 source=event.source,
                 prompt=prompt,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
             )
             if not queued:
                 mgr.pause(reason="resume continuation enqueue failed")
@@ -2702,18 +2700,21 @@ class GatewaySlashCommandsMixin:
         # starts making progress. The post-turn hook takes over after.
         adapter = self.adapters.get(event.source.platform) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
-        if adapter and _quick_key:
-            try:
-                kickoff_event = MessageEvent(
-                    text=state.goal,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
-            except Exception as exc:
-                logger.debug("goal kickoff enqueue failed: %s", exc)
+        try:
+            kickoff_text = mgr.next_continuation_prompt() or state.goal
+            kickoff_accepted = self._enqueue_goal_continuation_once(
+                session_key=_quick_key,
+                adapter=adapter,
+                source=event.source,
+                prompt=kickoff_text,
+            )
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
+            kickoff_accepted = False
+        if not kickoff_accepted:
+            mgr.pause(reason="goal kickoff handoff failed")
+            logger.error("goal start: no runnable kickoff owner for session %s", _quick_key)
+            return "⚠ Goal could not start: kickoff handoff failed; goal remains paused."
 
         base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
         if state.has_contract():

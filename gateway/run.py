@@ -8439,6 +8439,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         must distinguish them from real user /queue messages before removing or
         suppressing them.
         """
+        if hasattr(event_or_text, "internal") and not bool(
+            getattr(event_or_text, "internal", False)
+        ):
+            return False
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
@@ -8847,8 +8851,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
         source: Any,
         prompt: str,
-        message_id: Any = None,
-        channel_prompt: Any = None,
     ) -> bool:
         """Replace stale synthetic goal turns with one canonical continuation.
 
@@ -8868,8 +8870,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=str(prompt),
             message_type=MessageType.TEXT,
             source=source,
-            message_id=message_id,
-            channel_prompt=channel_prompt,
+            # A synthetic continuation is a distinct inbound lifecycle.  Reusing
+            # the slash command's platform message id aliases the command ledger
+            # row, so the drain is rejected as a duplicate and the goal remains
+            # active with turns_used=0 until a real user message pauses it.
+            message_id=None,
+            channel_prompt=None,
             internal=True,
         )
         self._enqueue_fifo(session_key, continuation, adapter)
@@ -9354,7 +9360,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _SERVICE_TIER_UNSET if clear else service_tier
         )
 
-    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+    def _mark_goal_callback_started_session(
+        self,
+        session_key: Optional[str],
+        session_id: Optional[str] = None,
+    ) -> None:
         """Suppress one post-turn judge pass after a callback starts /goal."""
         if not session_key:
             return
@@ -9363,6 +9373,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sessions = set()
             self._goal_callback_started_sessions = sessions
         sessions.add(session_key)
+        if session_id:
+            session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+            if session_ids is None:
+                session_ids = {}
+                self._goal_callback_started_session_ids = session_ids
+            session_ids[session_key] = str(session_id)
 
     def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
         """Return True once for sessions started by a clarify callback."""
@@ -9372,6 +9388,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions or session_key not in sessions:
             return False
         sessions.discard(session_key)
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        if isinstance(session_ids, dict):
+            session_ids.pop(session_key, None)
         return True
 
     @staticmethod
@@ -18360,7 +18379,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
                                 session_key_for_goal,
                             )
-                            await self._enqueue_goal_kickoff_prompt(
+                            await self._finish_deferred_goal_kickoff(
                                 session_entry=session_entry,
                                 source=source,
                             )
@@ -18401,6 +18420,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             raise
         finally:
+            # A clarify callback can start a goal while this owner turn is
+            # blocked.  Empty/provider-failed turns bypass the normal post-turn
+            # result branch above, so finalize any still-owned callback here
+            # before releasing the owner.  The helper verifies that the
+            # synthetic kickoff is actually staged and pauses on failure.
+            try:
+                await self._finish_unconsumed_goal_callback(
+                    session_key=_quick_key,
+                    source=source,
+                )
+            except Exception:
+                logger.error(
+                    "goal callback: terminal kickoff finalization failed for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -21962,20 +21997,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             adapter = self.adapters.get(source.platform)
             session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
-            if not adapter or not session_key:
-                return False
-            kickoff_event = MessageEvent(
-                text=prompt,
-                message_type=MessageType.TEXT,
+            return self._enqueue_goal_continuation_once(
+                session_key=session_key,
+                adapter=adapter,
                 source=source,
-                message_id=None,
-                channel_prompt=None,
+                prompt=prompt,
             )
-            self._enqueue_fifo(session_key, kickoff_event, adapter)
-            return True
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
             return False
+
+    async def _finish_deferred_goal_kickoff(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        """Queue a callback-started goal after its owner turn, or pause it."""
+        accepted = await self._enqueue_goal_kickoff_prompt(
+            session_entry=session_entry,
+            source=source,
+        )
+        if accepted:
+            return True
+        sid = getattr(session_entry, "session_id", None) or ""
+        if sid:
+            try:
+                from hermes_cli.goals import GoalManager
+
+                GoalManager(
+                    session_id=sid,
+                    default_max_turns=self._goal_max_turns_from_config(),
+                ).pause(reason="deferred goal kickoff handoff failed")
+            except Exception as exc:
+                logger.error("goal callback: failed to pause unowned goal %s: %s", sid, exc)
+        logger.error("goal callback: no runnable deferred kickoff owner for session %s", sid)
+        return False
+
+    async def _finish_unconsumed_goal_callback(
+        self,
+        *,
+        session_key: str,
+        source: Any,
+    ) -> bool:
+        """Finalize a callback marker missed by the normal post-turn branch."""
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        callback_session_id = (
+            str(session_ids.get(session_key) or "")
+            if isinstance(session_ids, dict)
+            else ""
+        )
+        if not self._consume_goal_callback_started_session(session_key):
+            return False
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+        except Exception:
+            session_entry = None
+        if session_entry is None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
+        if session_entry is None:
+            if not callback_session_id:
+                logger.error(
+                    "goal callback: could not resolve session for terminal kickoff %s",
+                    session_key,
+                )
+                return False
+            from types import SimpleNamespace
+
+            session_entry = SimpleNamespace(
+                session_id=callback_session_id,
+                session_key=session_key,
+            )
+        return await self._finish_deferred_goal_kickoff(
+            session_entry=session_entry,
+            source=source,
+        )
 
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
         """Start `/goal` from an inline-button callback without replaying a slash command.
@@ -22028,7 +22127,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     session_key = None
             if defer_kickoff:
-                self._mark_goal_callback_started_session(session_key)
+                self._mark_goal_callback_started_session(
+                    session_key,
+                    getattr(session_entry, "session_id", None),
+                )
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
@@ -22101,8 +22203,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter=adapter,
                 source=event.source,
                 prompt=prompt,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
             )
             if not queued:
                 mgr.pause(reason="resume continuation enqueue failed")
@@ -22149,20 +22249,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
             except Exception as exc:
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
-        if adapter and _quick_key and not defer_kickoff:
+        kickoff_accepted = defer_kickoff
+        if not defer_kickoff:
             try:
                 kickoff_text = mgr.next_continuation_prompt() or state.goal
-                kickoff_event = MessageEvent(
-                    text=kickoff_text,
-                    message_type=MessageType.TEXT,
+                kickoff_accepted = self._enqueue_goal_continuation_once(
+                    session_key=_quick_key,
+                    adapter=adapter,
                     source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    internal=True,
+                    prompt=kickoff_text,
                 )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
+                kickoff_accepted = False
+        if not kickoff_accepted:
+            mgr.pause(reason="goal kickoff handoff failed")
+            logger.error("goal start: no runnable kickoff owner for session %s", _quick_key)
+            return "⚠ Goal could not start: kickoff handoff failed; goal remains paused."
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
 
