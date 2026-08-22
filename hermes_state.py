@@ -10526,6 +10526,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 results.append(parsed)
         return results
 
+    def list_unresolved_gateway_message_ledger_statuses(
+        self, session_key: str
+    ) -> List[str]:
+        """Return every unresolved durable owner for one session, without truncation."""
+        if not session_key or self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT status FROM gateway_message_ledger
+                WHERE session_key = ?
+                  AND status IN ('received', 'requeued', 'in_progress')
+                ORDER BY id
+                """,
+                (session_key,),
+            ).fetchall()
+        return [str(row["status"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
+
     # ── Meta key/value (for scheduler bookkeeping) ──
 
     def get_meta(self, key: str) -> Optional[str]:

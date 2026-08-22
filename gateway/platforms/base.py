@@ -5968,7 +5968,8 @@ class BasePlatformAdapter(ABC):
             startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
             if startup_ack is not None:
                 def _signal_terminal_handoff(_task) -> None:
-                    setattr(event, "_hermes_background_processing_completed", True)
+                    if not _task.cancelled() and _task.exception() is None:
+                        setattr(event, "_hermes_background_processing_completed", True)
                     startup_ack.set()
 
                 task.add_done_callback(_signal_terminal_handoff)

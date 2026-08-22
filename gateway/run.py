@@ -11591,10 +11591,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if raw_store is None:
             return ()
         try:
+            list_unresolved = getattr(
+                raw_store,
+                "list_unresolved_gateway_message_ledger_statuses",
+                None,
+            )
+            if callable(list_unresolved):
+                return tuple(str(status).strip() for status in list_unresolved(session_key))
             list_ledger = getattr(raw_store, "list_gateway_message_ledger_for_session", None)
             if not callable(list_ledger):
                 return ()
-            rows = list_ledger(session_key, limit=8)
+            rows = list_ledger(session_key, limit=200)
         except Exception:
             return ()
         return tuple(
