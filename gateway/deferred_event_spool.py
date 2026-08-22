@@ -164,8 +164,14 @@ def persist_deferred_event(event: MessageEvent, *, session_key: str) -> Optional
         )
     )
     source = getattr(event, "source", None)
+    metadata = getattr(event, "metadata", None)
+    durable_internal_goal = bool(
+        getattr(event, "internal", False)
+        and isinstance(metadata, dict)
+        and metadata.get("durable_internal_goal") is True
+    )
     if (
-        bool(getattr(event, "internal", False))
+        (bool(getattr(event, "internal", False)) and not durable_internal_goal)
         or bool(getattr(source, "role_authorized", False))
         or bool(getattr(source, "delivered_via_upstream_relay", False))
         or bool(getattr(source, "is_bot", False))
@@ -295,10 +301,15 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
             if payload.get("schema_version") != SCHEMA_VERSION:
                 raise ValueError("unsupported deferred-event schema")
             event = _deserialize_event(payload.get("event") or {})
-            if event.internal:
-                for ledger_id in [
-                    int(value) for value in payload.get("ledger_ids") or []
-                ]:
+            ledger_ids = [int(value) for value in payload.get("ledger_ids") or []]
+            ledgers = [db.get_gateway_message_ledger(value) for value in ledger_ids]
+            if event.internal and not (
+                bool((event.metadata or {}).get("durable_internal_goal"))
+                and ledger_ids
+                and all(row is not None for row in ledgers)
+                and all(row.get("origin_type") == "internal_goal" for row in ledgers)
+            ):
+                for ledger_id in ledger_ids:
                     db.update_gateway_message_ledger(
                         ledger_id,
                         status="drained",
@@ -307,8 +318,6 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                 path.unlink(missing_ok=True)
                 continue
             source = event.source
-            ledger_ids = [int(value) for value in payload.get("ledger_ids") or []]
-            ledgers = [db.get_gateway_message_ledger(value) for value in ledger_ids]
             if not ledger_ids:
                 primary = db.find_gateway_message_ledger(
                     platform=getattr(source.platform, "value", source.platform),

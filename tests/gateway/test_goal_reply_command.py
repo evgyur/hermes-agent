@@ -34,6 +34,9 @@ class RecordingAdapter:
     def __init__(self) -> None:
         self._pending_messages: dict[str, MessageEvent] = {}
 
+    def ensure_pending_session_processing(self, session_key: str) -> bool:
+        return session_key in self._pending_messages
+
 
 @pytest.fixture()
 def runner():
@@ -60,6 +63,14 @@ def runner():
     )
     r.adapters = {Platform.TELEGRAM: RecordingAdapter()}
     r._queued_events = {}
+    def record_goal_ledger(event, **_kwargs):
+        event._hermes_gateway_ledger_id = 1
+        event._hermes_gateway_ledger_ids = [1]
+        return 1
+
+    r._record_gateway_ledger_received = MagicMock(side_effect=record_goal_ledger)
+    r._set_gateway_ledger_deferred = MagicMock(return_value=True)
+    r._update_gateway_ledger = MagicMock(return_value=True)
     r.session_store = MagicMock()
     r.session_store.get_or_create_session.return_value = session_entry
     r.session_store._generate_session_key.return_value = session_entry.session_key
@@ -185,6 +196,28 @@ async def test_new_goal_fails_closed_when_kickoff_has_no_adapter(hermes_home, ru
     assert state.paused_reason == "goal kickoff handoff failed"
     assert "Goal set" not in response
     assert "could not start" in response.lower()
+
+
+@pytest.mark.asyncio
+async def test_new_goal_fails_closed_when_durable_kickoff_write_fails(hermes_home, runner):
+    from hermes_cli.goals import GoalManager
+
+    runner.runner._record_gateway_ledger_received.side_effect = None
+    runner.runner._record_gateway_ledger_received.return_value = None
+    response = await runner.runner._handle_goal_command(
+        MessageEvent(
+            text="/goal durable or paused",
+            message_type=MessageType.TEXT,
+            source=runner.source,
+            message_id="cmd-set-ledger-failure",
+        )
+    )
+
+    state = GoalManager(runner.session.session_id).state
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "goal kickoff handoff failed"
+    assert "Goal set" not in response
 
 
 @pytest.mark.asyncio

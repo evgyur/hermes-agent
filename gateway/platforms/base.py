@@ -5967,6 +5967,31 @@ class BasePlatformAdapter(ABC):
             task.add_done_callback(self._expected_cancelled_tasks.discard)
         return True
 
+    def ensure_pending_session_processing(self, session_key: str) -> bool:
+        """Bind a pending event to this adapter's session owner.
+
+        Queue producers call this after their durable handoff commits.  An
+        active frame already owns the eventual drain; an idle adapter must
+        atomically consume the pending slot and start ordinary processing so a
+        second user message is never needed merely to wake the queue.
+        """
+        if session_key not in self._pending_messages:
+            return False
+        if session_key in self._active_sessions:
+            task = self._session_tasks.get(session_key)
+            if task is None or not task.done():
+                return True
+            # Preserve the pending event while healing a dead owner.  The
+            # generic stale-lock helper intentionally discards pending input,
+            # which is wrong after a durable queue handoff.
+            self._active_sessions.pop(session_key, None)
+            self._session_tasks.pop(session_key, None)
+        event = self._pending_messages.pop(session_key)
+        if self._start_session_processing(event, session_key):
+            return True
+        self._pending_messages[session_key] = event
+        return False
+
     async def cancel_session_processing(
         self,
         session_key: str,

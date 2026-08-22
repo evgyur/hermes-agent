@@ -8377,20 +8377,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(
+        self,
+        session_key: str,
+        queued_event: "MessageEvent",
+        adapter: Any,
+        *,
+        persist_deferred: bool = True,
+    ) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
-            return
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
-        self._set_gateway_ledger_deferred(queued_event)
+        if persist_deferred:
+            self._set_gateway_ledger_deferred(queued_event)
+        return True
 
     def _promote_queued_event(
         self,
@@ -8873,19 +8882,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=None,
             channel_prompt=None,
             internal=True,
+            metadata={"durable_internal_goal": True},
         )
-        self._enqueue_fifo(session_key, continuation, adapter)
+        ledger_id = self._record_gateway_ledger_received(
+            continuation,
+            session_key=session_key,
+            reason="goal-kickoff-created",
+        )
+        if ledger_id is None or not self._set_gateway_ledger_deferred(continuation):
+            if ledger_id is not None:
+                self._update_gateway_ledger(
+                    continuation,
+                    "failed",
+                    session_key=session_key,
+                    reason="goal-kickoff-durable-handoff-failed",
+                )
+            return False
+        if not self._enqueue_fifo(
+            session_key,
+            continuation,
+            adapter,
+            persist_deferred=False,
+        ):
+            self._update_gateway_ledger(
+                continuation,
+                "failed",
+                session_key=session_key,
+                reason="goal-kickoff-memory-handoff-failed",
+            )
+            return False
+        ensure_processing = getattr(adapter, "ensure_pending_session_processing", None)
+        if callable(ensure_processing) and ensure_processing(session_key):
+            return True
         pending_messages = getattr(adapter, "_pending_messages", None)
-        pending = (
-            pending_messages.get(session_key)
-            if isinstance(pending_messages, dict)
-            else None
+        if isinstance(pending_messages, dict) and pending_messages.get(session_key) is continuation:
+            pending_messages.pop(session_key, None)
+        queue_state = self._session_state(session_key).conversation
+        queue_state.queued_events = [
+            queued for queued in queue_state.queued_events if queued is not continuation
+        ]
+        self._update_gateway_ledger(
+            continuation,
+            "failed",
+            session_key=session_key,
+            reason="goal-kickoff-owner-unavailable",
         )
-        queue_state = self._peek_session_state(session_key)
-        overflow = queue_state.conversation.queued_events if queue_state else []
-        return pending is continuation or any(
-            item is continuation for item in overflow
-        )
+        return False
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
@@ -22205,16 +22247,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
 
                     kickoff_text = CONTINUATION_PROMPT_TEMPLATE.format(goal=state.goal)
-                kickoff_event = MessageEvent(
-                    text=kickoff_text,
-                    message_type=MessageType.TEXT,
+                return self._enqueue_goal_continuation_once(
+                    session_key=quick_key,
+                    adapter=adapter,
                     source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                    internal=True,
+                    prompt=kickoff_text,
                 )
-                self._enqueue_fifo(quick_key, kickoff_event, adapter)
-                return True
         except Exception as exc:
             logger.warning("supergoal auto-dispatch: kickoff enqueue failed: %s", exc)
         return False

@@ -259,6 +259,25 @@ def test_internal_continuation_is_not_spooled(monkeypatch, tmp_path):
     assert persist_deferred_event(event, session_key="sk") is None
 
 
+def test_durable_internal_goal_is_spooled_and_replayable(monkeypatch, tmp_path, ledger_db):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    event = _event("unused-platform-id")
+    event.message_id = None
+    event.internal = True
+    event.metadata = {"durable_internal_goal": True}
+    ledger_id = _record(runner, event, "sk-goal")
+
+    assert runner._set_gateway_ledger_deferred(event)
+    entries = load_replayable_deferred_events(ledger_db)
+
+    assert len(entries) == 1
+    assert entries[0].ledger_id == ledger_id
+    assert entries[0].session_key == runner._session_key_for_source(event.source)
+    assert entries[0].event.internal is True
+    assert entries[0].event.metadata == {"durable_internal_goal": True}
+
+
 @pytest.mark.parametrize(
     "trust_attr",
     ["role_authorized", "delivered_via_upstream_relay", "is_bot"],

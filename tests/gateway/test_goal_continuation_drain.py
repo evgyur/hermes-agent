@@ -178,6 +178,14 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
 
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
+    adapter._active_sessions[adapter_key] = asyncio.Event()
+    runner._record_gateway_ledger_received = MagicMock(
+        side_effect=lambda event, **_kwargs: (
+            setattr(event, "_hermes_gateway_ledger_id", 1) or 1
+        )
+    )
+    runner._set_gateway_ledger_deferred = MagicMock(return_value=True)
+    runner._update_gateway_ledger = MagicMock(return_value=True)
 
     GoalManager(session_entry.session_id).set("ship it")
     with (
@@ -239,6 +247,13 @@ async def test_idle_goal_command_drains_distinct_kickoff_without_user_nudge(herm
     runner.session_store._generate_session_key.return_value = key
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
+    runner._record_gateway_ledger_received = MagicMock(
+        side_effect=lambda event, **_kwargs: (
+            setattr(event, "_hermes_gateway_ledger_id", 1) or 1
+        )
+    )
+    runner._set_gateway_ledger_deferred = MagicMock(return_value=True)
+    runner._update_gateway_ledger = MagicMock(return_value=True)
 
     platform_ids: set[str] = set()
     agent_turns: list[MessageEvent] = []
@@ -276,3 +291,71 @@ async def test_idle_goal_command_drains_distinct_kickoff_without_user_nudge(herm
     assert agent_turns[0].text.startswith("[Continuing toward your standing goal]")
     assert adapter.sent[0].startswith("⊙ Goal set")
     assert adapter.sent[1] == "goal work started"
+
+
+@pytest.mark.asyncio
+async def test_direct_idle_goal_handler_starts_adapter_owned_turn(hermes_home):
+    """A handler invoked with an idle adapter must wake its own pending event."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_state import SessionDB
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    session_entry = SessionEntry(
+        session_key=key,
+        session_id=f"goal-direct-idle-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = key
+    ledger_db = SessionDB(hermes_home / "state.db")
+    runner._session_db = ledger_db
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    agent_turns: list[MessageEvent] = []
+
+    async def handler(event):
+        agent_turns.append(event)
+        return "direct goal turn started"
+
+    adapter.set_message_handler(handler)
+    try:
+        response = await runner._handle_goal_command(
+            MessageEvent(
+                text="/goal start from idle direct handler",
+                message_type=MessageType.TEXT,
+                source=src,
+                message_id="direct-command",
+            )
+        )
+        assert response.startswith("⊙ Goal set")
+        for _ in range(60):
+            if agent_turns and adapter.sent:
+                break
+            await asyncio.sleep(0.05)
+        assert len(agent_turns) == 1
+        assert agent_turns[0].internal is True
+        assert agent_turns[0].message_id is None
+        ledger_id = agent_turns[0]._hermes_gateway_ledger_id
+        row = ledger_db.get_gateway_message_ledger(ledger_id)
+        assert row is not None
+        assert row["origin_type"] == "internal_goal"
+        assert row["status"] == "requeued"
+        assert adapter.sent == ["direct goal turn started"]
+    finally:
+        ledger_db.close()
