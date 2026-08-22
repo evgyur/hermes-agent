@@ -5965,6 +5965,7 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+        setattr(event, "_hermes_adapter_handoff", "started")
         return True
 
     def ensure_pending_session_processing(self, session_key: str) -> bool:
@@ -6186,6 +6187,7 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            setattr(event, "_hermes_adapter_handoff", "queued")
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:

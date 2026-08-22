@@ -84,11 +84,7 @@ def _read_connection() -> Iterator[Optional[sqlite3.Connection]]:
     if not path.is_file():
         yield None
         return
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    except sqlite3.OperationalError:
-        yield None
-        return
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         if not _storage_initialized(conn):

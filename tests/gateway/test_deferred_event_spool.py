@@ -203,6 +203,37 @@ async def test_duplicate_startup_delivery_is_claimed_once(monkeypatch, tmp_path,
     assert seen == ["duplicate"]
 
 
+@pytest.mark.asyncio
+async def test_busy_startup_handoff_keeps_replay_owner_until_real_dispatch(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    event = _event("busy-replay")
+    ledger_id = _record(runner, event, "busy-key")
+    assert runner._set_gateway_ledger_deferred(event)
+    runner._startup_restore_queue = [event]
+
+    class BusyAdapter:
+        def __init__(self):
+            self.pending = []
+
+        async def handle_message(self, queued):
+            self.pending.append(queued)
+            queued._hermes_adapter_handoff = "queued"
+
+    adapter = BusyAdapter()
+    runner._adapter_for_source = lambda source: adapter
+
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 1
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row["status"] == "requeued"
+    assert row["dispatch_started_at"] is None
+    assert len(adapter.pending) == 1
+    assert len(list((tmp_path / "hermes-home" / "deferred_events").glob("*.json"))) == 1
+    assert len(load_replayable_deferred_events(ledger_db)) == 1
+
+
 def test_started_dispatch_is_never_replayed(monkeypatch, tmp_path, ledger_db):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     event = _event()

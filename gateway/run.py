@@ -8448,7 +8448,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         must distinguish them from real user /queue messages before removing or
         suppressing them.
         """
-        text = getattr(event_or_text, "text", event_or_text) or ""
+        metadata = getattr(event_or_text, "metadata", None)
+        if not (
+            getattr(event_or_text, "internal", False)
+            and isinstance(metadata, dict)
+            and metadata.get("durable_internal_goal") is True
+        ):
+            return False
+        text = getattr(event_or_text, "text", "") or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
     def _gateway_ledger_origin_type(self, event: MessageEvent) -> str:
@@ -8826,6 +8833,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
                 pending_slot.pop(session_key, None)
+                self._update_gateway_ledger(
+                    pending_event,
+                    "drained",
+                    session_key=session_key,
+                    reason="goal-kickoff-superseded",
+                )
                 removed += 1
 
         queue_state = self._session_state(session_key).conversation
@@ -8834,6 +8847,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             kept = []
             for queued_event in overflow:
                 if self._is_goal_continuation_event(queued_event):
+                    self._update_gateway_ledger(
+                        queued_event,
+                        "drained",
+                        session_key=session_key,
+                        reason="goal-kickoff-superseded",
+                    )
                     removed += 1
                 else:
                     kept.append(queued_event)
@@ -12293,6 +12312,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     setattr(event, "_hermes_startup_claim_release_pending", True)
                 queue.append(event)
                 logger.warning("Startup adapter handoff failed", exc_info=True)
+                continue
+            handoff = getattr(event, "_hermes_adapter_handoff", None)
+            if handoff is None:
+                # Legacy/custom adapters historically signal acceptance by a
+                # normal return. BasePlatformAdapter always emits the explicit
+                # started/queued marker used for crash-safe busy handoffs.
+                handoff = "started"
+            if handoff == "queued":
+                released = not claimed
+                if claimed:
+                    try:
+                        released = await asyncio.to_thread(
+                            self._release_deferred_event_dispatch_claim,
+                            event,
+                        )
+                    except Exception:
+                        released = False
+                        logger.warning("Queued startup handoff claim release failed", exc_info=True)
+                if not released:
+                    setattr(event, "_hermes_startup_claim_release_pending", True)
+                    logger.critical(
+                        "Queued startup event is in incident hold until its premature claim releases"
+                    )
+                    continue
+                setattr(event, "_hermes_startup_restore_replay", False)
+                setattr(event, "_hermes_startup_claim_release_pending", False)
+                # The adapter owns this event in RAM, while its unchanged
+                # requeued ledger and spool remain the crash-recovery owner.
+                drained += 1
+                continue
+            if handoff != "started":
+                if claimed:
+                    try:
+                        await asyncio.to_thread(self._release_deferred_event_dispatch_claim, event)
+                    except Exception:
+                        logger.warning("Unknown startup handoff claim release failed", exc_info=True)
+                queue.append(event)
+                logger.error("Startup adapter returned without accepting the event")
                 continue
             if is_spool_replay:
                 try:
@@ -22002,15 +22059,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
             if not adapter or not session_key:
                 return False
-            kickoff_event = MessageEvent(
-                text=prompt,
-                message_type=MessageType.TEXT,
+            return self._enqueue_goal_continuation_once(
+                session_key=session_key,
+                adapter=adapter,
                 source=source,
-                message_id=None,
-                channel_prompt=None,
+                prompt=prompt,
             )
-            self._enqueue_fifo(session_key, kickoff_event, adapter)
-            return True
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
             return False
@@ -22037,11 +22091,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 callback_session_key = self._session_key_for_source(event.source)
             except Exception:
                 callback_session_key = None
-        running_agents = getattr(self, "_running_agents", {}) or {}
-        defer_kickoff = bool(callback_session_key and callback_session_key in running_agents)
-        if defer_kickoff:
-            setattr(event, "_defer_goal_kickoff_until_post_turn", True)
-
         try:
             response = await self._handle_goal_command(event)
         except Exception as exc:
@@ -22065,8 +22114,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key = self._session_key_for_source(event.source)
                 except Exception:
                     session_key = None
-            if defer_kickoff:
-                self._mark_goal_callback_started_session(session_key)
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)
@@ -22174,7 +22221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _quick_key = getattr(session_entry, "session_key", None) or (
             self._session_key_for_source(event.source) if event.source else None
         )
-        defer_kickoff = bool(getattr(event, "_defer_goal_kickoff_until_post_turn", False))
+
         if _quick_key and self._is_supergoal_dispatch(args, from_reply=goal_from_reply):
             try:
                 from hermes_constants import parse_reasoning_effort
@@ -22185,19 +22232,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("/goal Supergoal dispatch: session reasoning override set to xhigh")
             except Exception as exc:
                 logger.debug("/goal Supergoal high reasoning override failed: %s", exc)
-        kickoff_accepted = defer_kickoff
-        if not defer_kickoff:
-            try:
-                kickoff_text = mgr.next_continuation_prompt() or state.goal
-                kickoff_accepted = self._enqueue_goal_continuation_once(
-                    session_key=_quick_key,
-                    adapter=adapter,
-                    source=event.source,
-                    prompt=kickoff_text,
-                )
-            except Exception as exc:
-                logger.debug("goal kickoff enqueue failed: %s", exc)
-                kickoff_accepted = False
+        try:
+            kickoff_text = mgr.next_continuation_prompt() or state.goal
+            kickoff_accepted = self._enqueue_goal_continuation_once(
+                session_key=_quick_key,
+                adapter=adapter,
+                source=event.source,
+                prompt=kickoff_text,
+            )
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
+            kickoff_accepted = False
         if not kickoff_accepted:
             mgr.pause(reason="goal kickoff handoff failed")
             logger.error("goal start: no runnable kickoff owner for session %s", _quick_key)

@@ -89,6 +89,15 @@ def test_barrier_readbacks_tolerate_absent_storage(monkeypatch, tmp_path):
     assert barrier.barrier_snapshot("missing") is None
 
 
+def test_barrier_read_open_error_propagates_fail_closed(monkeypatch):
+    def broken_connect(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(barrier.sqlite3, "connect", broken_connect)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        barrier.has_active_barrier(origin_session="must-defer")
+
+
 @pytest.mark.asyncio
 async def test_barrier_initializer_failure_prevents_gateway_intake():
     from gateway.run import GatewayRunner

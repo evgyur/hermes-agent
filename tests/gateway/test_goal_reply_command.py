@@ -221,6 +221,28 @@ async def test_new_goal_fails_closed_when_durable_kickoff_write_fails(hermes_hom
 
 
 @pytest.mark.asyncio
+async def test_busy_supergoal_callback_commits_durable_kickoff_before_success(
+    hermes_home, runner
+):
+    key = runner.session.session_key
+    runner.runner._running_agents = {key: object()}
+    event = MessageEvent(
+        text="/goal callback must survive parent failure",
+        message_type=MessageType.TEXT,
+        source=runner.source,
+        message_id="callback-goal",
+    )
+    event._session_key_override = key
+
+    assert await runner.runner._start_goal_from_callback_event(event) is True
+    queued = runner.adapter._pending_messages[key]
+    assert queued.internal is True
+    assert queued.metadata == {"durable_internal_goal": True}
+    runner.runner._record_gateway_ledger_received.assert_called()
+    runner.runner._set_gateway_ledger_deferred.assert_called()
+
+
+@pytest.mark.asyncio
 async def test_goal_resume_replaces_stale_continuations_without_duplication(hermes_home, runner):
     """Repeated resume is idempotent for queued synthetic continuation turns."""
     from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GoalManager
@@ -233,6 +255,7 @@ async def test_goal_resume_replaces_stale_continuations_without_duplication(herm
         message_type=MessageType.TEXT,
         source=runner.source,
         internal=True,
+        metadata={"durable_internal_goal": True},
     )
     runner.adapter._pending_messages[runner.session.session_key] = stale
     event = MessageEvent(
@@ -271,6 +294,7 @@ async def test_goal_resume_preserves_real_fifo_events(hermes_home, runner):
         message_type=MessageType.TEXT,
         source=runner.source,
         internal=True,
+        metadata={"durable_internal_goal": True},
     )
     second_user = MessageEvent(
         text="second real user message",
@@ -317,6 +341,7 @@ async def test_goal_resume_promotes_real_user_behind_stale_head(hermes_home, run
         message_type=MessageType.TEXT,
         source=runner.source,
         internal=True,
+        metadata={"durable_internal_goal": True},
     )
     real_user = MessageEvent(
         text="accepted real user turn",
