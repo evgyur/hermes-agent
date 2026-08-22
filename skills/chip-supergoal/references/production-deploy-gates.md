@@ -33,6 +33,24 @@ A deploy phase is not just “run the deploy script after tests pass.” It must
    - For internal endpoints, smoke both unauthorized and authorized behavior, then clean smoke data.
    - For multi-hop flows, prove the real chain end-to-end or block with the exact external dependency that prevents it.
 
+## Hermes state rail: non-interference contract
+
+For a Hermes self-rollout, the state-database rail protects activation; it
+does not own or throttle the SuperGoal execution loop. Planning, coding,
+testing, committing, pushing, candidate staging, and read-only preflight must
+continue normally. Do not pause or shorten the plan merely because the rail is
+installed.
+
+Invoke the bounded read-only database check only immediately before quiescing
+`hermes-gateway.service` and immediately after restart, before rollout success
+is declared. A healthy check (SQLite header, bounded `PRAGMA quick_check`, and
+foreign keys) adds only a few seconds at activation. Refuse the activation only
+if the canonical state database cannot be certified; preserve the completed
+candidate and report the database blocker rather than presenting the plan as
+failed. A post-restart failure enters the reviewed rollback/stop path. The
+forensic watcher is passive and must never stop/restart Hermes, repair the
+database, or interrupt the current task.
+
 ## Phase-spec additions
 
 For production phases, add acceptance criteria like:
