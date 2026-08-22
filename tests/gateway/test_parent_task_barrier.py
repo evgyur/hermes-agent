@@ -63,6 +63,32 @@ def _seed_required_completion():
     return barrier_id, event
 
 
+def test_barrier_readbacks_never_enter_writer_transaction(monkeypatch):
+    barrier_id, event = _seed_required_completion()
+
+    def reject_writer_transaction():
+        raise AssertionError("readback entered BEGIN IMMEDIATE writer path")
+
+    monkeypatch.setattr(barrier, "_transaction", reject_writer_transaction)
+
+    assert barrier.barrier_for_child(event["delegation_id"]) == barrier_id
+    assert barrier.has_active_barrier(
+        origin_session=event["session_key"],
+        parent_session_id=event["parent_session_id"],
+    )
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["barrier_id"] == barrier_id
+
+
+def test_barrier_readbacks_tolerate_absent_storage(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "not-initialized"))
+
+    assert barrier.barrier_for_child("missing") is None
+    assert barrier.has_active_barrier(origin_session="missing") is False
+    assert barrier.barrier_snapshot("missing") is None
+
+
 @pytest.mark.asyncio
 async def test_barrier_initializer_failure_prevents_gateway_intake():
     from gateway.run import GatewayRunner

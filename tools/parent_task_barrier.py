@@ -76,6 +76,29 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _read_connection() -> Iterator[Optional[sqlite3.Connection]]:
+    """Open initialized barrier storage without creating files or write locks."""
+
+    path = _db_path()
+    if not path.is_file():
+        yield None
+        return
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    except sqlite3.OperationalError:
+        yield None
+        return
+    conn.row_factory = sqlite3.Row
+    try:
+        if not _storage_initialized(conn):
+            yield None
+            return
+        yield conn
+    finally:
+        conn.close()
+
+
 def initialize_storage() -> None:
     """Create or migrate barrier tables before gateway adapter intake.
 
@@ -561,7 +584,9 @@ def mark_initial_persisted(barrier_id: str) -> bool:
 
 
 def barrier_for_child(task_id: str) -> Optional[str]:
-    with _transaction() as conn:
+    with _read_connection() as conn:
+        if conn is None:
+            return None
         row = conn.execute(
             "SELECT barrier_id FROM parent_task_children WHERE task_id=?",
             (str(task_id),),
@@ -582,11 +607,8 @@ def has_active_barrier(*, origin_session: str, parent_session_id: str = "") -> b
     if parent:
         clauses.append("parent_session_id=?")
         params.append(parent)
-    path = _db_path()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        if not _storage_initialized(conn):
+    with _read_connection() as conn:
+        if conn is None:
             return False
         row = conn.execute(
             """SELECT 1 FROM parent_task_barriers
@@ -595,8 +617,6 @@ def has_active_barrier(*, origin_session: str, parent_session_id: str = "") -> b
             + ") LIMIT 1",
             params,
         ).fetchone()
-    finally:
-        conn.close()
     return row is not None
 
 
@@ -1134,7 +1154,9 @@ def cancel_session_barriers(
 def barrier_snapshot(barrier_id: str) -> Optional[Dict[str, Any]]:
     """Readback helper for tests, diagnostics, and release evidence."""
 
-    with _transaction() as conn:
+    with _read_connection() as conn:
+        if conn is None:
+            return None
         barrier = conn.execute(
             "SELECT * FROM parent_task_barriers WHERE barrier_id=?",
             (str(barrier_id),),
