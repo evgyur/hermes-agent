@@ -8435,6 +8435,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         must distinguish them from real user /queue messages before removing or
         suppressing them.
         """
+        if hasattr(event_or_text, "internal") and not bool(
+            getattr(event_or_text, "internal", False)
+        ):
+            return False
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
@@ -18332,6 +18336,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             raise
         finally:
+            # A clarify callback can start a goal while this owner turn is
+            # blocked.  Empty/provider-failed turns bypass the normal post-turn
+            # result branch above, so finalize any still-owned callback here
+            # before releasing the owner.  The helper verifies that the
+            # synthetic kickoff is actually staged and pauses on failure.
+            try:
+                await self._finish_unconsumed_goal_callback(
+                    session_key=_quick_key,
+                    source=source,
+                )
+            except Exception:
+                logger.error(
+                    "goal callback: terminal kickoff finalization failed for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -21933,6 +21953,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.error("goal callback: failed to pause unowned goal %s: %s", sid, exc)
         logger.error("goal callback: no runnable deferred kickoff owner for session %s", sid)
         return False
+
+    async def _finish_unconsumed_goal_callback(
+        self,
+        *,
+        session_key: str,
+        source: Any,
+    ) -> bool:
+        """Finalize a callback marker missed by the normal post-turn branch."""
+        if not self._consume_goal_callback_started_session(session_key):
+            return False
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+        except Exception:
+            session_entry = None
+        if session_entry is None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
+        if session_entry is None:
+            logger.error(
+                "goal callback: could not resolve session for terminal kickoff %s",
+                session_key,
+            )
+            return False
+        return await self._finish_deferred_goal_kickoff(
+            session_entry=session_entry,
+            source=source,
+        )
 
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
         """Start `/goal` from an inline-button callback without replaying a slash command.
