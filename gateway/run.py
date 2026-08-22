@@ -2022,6 +2022,10 @@ class MultiplexConfigError(RuntimeError):
     """
 
 
+class ParentBarrierDeferralError(RuntimeError):
+    """Barrier inspection failed and the event was not durably deferred."""
+
+
 class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
@@ -25636,6 +25640,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "parent_barrier_event_not_deferred route=%s ledger_id=%s",
                     session_key,
                     ledger_id,
+                )
+                raise ParentBarrierDeferralError(
+                    "barrier inspection failed and event deferral was unavailable"
                 )
             return True
 

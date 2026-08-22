@@ -490,6 +490,22 @@ def finalization_policy(
     turn = str(root_turn_id or "").strip()
     if not parent or not turn:
         return {"action": "deliver"}
+    # Non-gateway entry points can finalize ordinary turns against a fresh
+    # state.db before gateway startup. No barrier can have been admitted
+    # without its table, so this exact first-run state means no barrier.
+    # Other read and transaction failures still propagate fail-closed.
+    path = _db_path()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        schema_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='parent_task_barriers'"
+        ).fetchone()
+    finally:
+        conn.close()
+    if schema_exists is None:
+        return {"action": "deliver"}
     now = time.time()
     with _transaction() as conn:
         row = conn.execute(

@@ -10,7 +10,7 @@ from gateway.deferred_event_spool import (
     persist_deferred_event,
 )
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, ParentBarrierDeferralError
 from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_source
 
@@ -91,6 +91,27 @@ async def test_barrier_inspection_failure_defers_only_affected_route(
     assert affected_row["dispatch_started_at"] is None
     assert unrelated_row["status"] == "received"
     assert unrelated_row["dispatch_started_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_barrier_failure_without_ledger_is_not_reported_deferred(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    event = _event("missing-ledger")
+
+    async def broken_inspection(**_kwargs):
+        raise __import__("sqlite3").OperationalError("disk I/O error")
+
+    runner._park_user_event_for_parent_barrier = broken_inspection
+    with pytest.raises(ParentBarrierDeferralError):
+        await runner._park_user_event_or_defer_on_inspection_failure(
+            event=event,
+            session_key="agent:main:telegram:group:chat-1:topic-1",
+            parent_session_id="parent",
+        )
+    assert not list((tmp_path / "hermes-home" / "deferred_events").glob("*.json"))
 
 
 def test_deferred_event_is_private_and_round_trips(monkeypatch, tmp_path, ledger_db):
