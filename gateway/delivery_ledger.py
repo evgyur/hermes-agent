@@ -294,7 +294,7 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                       state='attempting', updated_at=?
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )

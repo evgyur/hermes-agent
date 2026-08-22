@@ -123,6 +123,33 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
+    def test_startup_claim_is_not_reclaimed_by_runtime_reconnect(self):
+        _record()
+        dl.mark_failed("ob-1", "send_path_degraded")
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        assert _row("ob-1")["state"] == "attempting"
+        assert dl.sweep_failed_for_runtime("slack") == []
+
+    def test_startup_claim_at_attempt_cap_is_not_abandoned_while_in_flight(self):
+        _record()
+        dl.mark_failed("ob-1", "send_path_degraded")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS - 1, "ob-1"),
+            )
+        _orphan("ob-1")
+
+        assert dl.sweep_recoverable(deliverable_platforms={"slack"})
+        assert dl.sweep_failed_for_runtime("slack") == []
+        row = _row("ob-1")
+        assert row["state"] == "attempting"
+        assert row["attempts"] == dl.MAX_ATTEMPTS
+
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
