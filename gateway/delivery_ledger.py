@@ -107,9 +107,29 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            resume_task_id TEXT,
+            continuation_generation INTEGER,
+            continuation_claim_owner TEXT,
+            continuation_claim_token TEXT
         )"""
     )
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    if "resume_task_id" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN resume_task_id TEXT"
+        )
+    for name, sql_type in (
+        ("continuation_generation", "INTEGER"),
+        ("continuation_claim_owner", "TEXT"),
+        ("continuation_claim_token", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
+            )
 
 
 @contextmanager
@@ -193,6 +213,10 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    resume_task_id: Optional[str] = None,
+    continuation_generation: Optional[int] = None,
+    continuation_claim_owner: Optional[str] = None,
+    continuation_claim_token: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -202,11 +226,14 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, resume_task_id,
+                continuation_generation, continuation_claim_owner,
+                continuation_claim_token)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, resume_task_id, continuation_generation,
+             continuation_claim_owner, continuation_claim_token),
         )
     _prune()
 
@@ -265,12 +292,16 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, resume_task_id,
+                      continuation_generation, continuation_claim_owner,
+                      continuation_claim_token
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at,
+             resume_task_id, continuation_generation,
+             continuation_claim_owner, continuation_claim_token) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -306,6 +337,10 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "resume_task_id": resume_task_id,
+                    "continuation_generation": continuation_generation,
+                    "continuation_claim_owner": continuation_claim_owner,
+                    "continuation_claim_token": continuation_claim_token,
                 })
     return claimed
 

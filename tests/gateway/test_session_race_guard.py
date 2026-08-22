@@ -16,7 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
+from gateway.platforms.base import (
+    EventOrigin,
+    MessageEvent,
+    MessageType,
+    merge_pending_message_event,
+)
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
@@ -215,6 +220,39 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+
+
+def test_recovery_and_real_inbound_never_merge_or_inherit_provenance():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    recovery = MessageEvent(
+        text="continue interrupted work",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        startup_resume=True,
+        event_origin=EventOrigin.STARTUP_CONTINUATION,
+    )
+    inbound = MessageEvent(
+        text="?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    pending = {session_key: inbound}
+    merge_pending_message_event(pending, session_key, recovery, merge_text=True)
+    assert pending[session_key] is inbound
+    assert pending[session_key].startup_resume is False
+
+    pending = {session_key: recovery}
+    merge_pending_message_event(pending, session_key, inbound, merge_text=True)
+    assert pending[session_key] is inbound
+    assert pending[session_key].internal is False
 
 
 @pytest.mark.asyncio

@@ -35,11 +35,14 @@ import pytest
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
+    GatewayRunner,
     _AGENT_PENDING_SENTINEL,
+    StartupGoalRecoveryDecision,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _should_clear_resume_obligation_after_turn,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -70,6 +73,92 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+
+
+def test_real_inbound_success_does_not_clear_interrupted_parent_obligation():
+    result = {"final_response": "status: still running", "completed": True}
+
+    assert _should_clear_resume_obligation_after_turn(
+        result, startup_resume=False
+    ) is False
+    assert _should_clear_resume_obligation_after_turn(
+        result, startup_resume=True
+    ) is True
+    assert _should_clear_resume_obligation_after_turn(
+        {"interrupted": True}, startup_resume=True
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_priority_reply_queues_distinct_synthetic_continuation():
+    runner, _ = make_restart_runner()
+    source = make_restart_source()
+    entry = MagicMock(resume_pending=True)
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock()
+    decision = StartupGoalRecoveryDecision(
+        status="auto_resume",
+        session_key="telegram:123",
+        session_id="sid",
+        reason="generic-resume-pending",
+        prompt="continue exact prior task",
+    )
+    runner._classify_startup_goal_recovery = MagicMock(return_value=decision)
+
+    queued = await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+
+    assert queued is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.startup_resume is True
+    assert event.text == "continue exact prior task"
+    assert event.source is source
+    assert event._hermes_resume_task_id is entry.resume_task_id
+
+
+@pytest.mark.asyncio
+async def test_priority_reply_does_not_queue_after_explicit_marker_clear():
+    runner, _ = make_restart_runner()
+    source = make_restart_source()
+    entry = MagicMock(resume_pending=False)
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock()
+
+    queued = await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+
+    assert queued is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_priority_reply_unknown_effect_alerts_without_replay():
+    runner, _ = make_restart_runner()
+    source = make_restart_source()
+    entry = MagicMock(resume_pending=True)
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock()
+    decision = StartupGoalRecoveryDecision(
+        status="alert_only",
+        session_key="telegram:123",
+        session_id="sid",
+        reason="ambiguous-tool-outcome: terminal call missing result",
+    )
+    runner._classify_startup_goal_recovery = MagicMock(return_value=decision)
+    runner._schedule_startup_goal_recovery_alert = MagicMock()
+
+    queued = await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+
+    assert queued is False
+    adapter.handle_message.assert_not_awaited()
+    runner._schedule_startup_goal_recovery_alert.assert_called_once_with(
+        decision, source
+    )
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
@@ -222,6 +311,13 @@ class TestMarkResumePending:
         assert refreshed.resume_pending is True
         assert refreshed.resume_reason == "restart_timeout"
         assert refreshed.last_resume_marked_at is not None
+        assert refreshed.resume_task_id
+
+        task_id = refreshed.resume_task_id
+        boundary = refreshed.last_resume_marked_at
+        assert store.mark_resume_pending(entry.session_key) is True
+        assert store._entries[entry.session_key].resume_task_id == task_id
+        assert store._entries[entry.session_key].last_resume_marked_at == boundary
 
     def test_custom_reason_persists(self, tmp_path):
         store = _make_store(tmp_path)
@@ -233,6 +329,31 @@ class TestMarkResumePending:
 
 
 class TestClearResumePending:
+
+    def test_terminal_clear_removes_stable_task_identity(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        assert store._entries[entry.session_key].resume_task_id
+
+        assert store.clear_resume_pending(entry.session_key) is True
+        refreshed = store._entries[entry.session_key]
+        assert refreshed.resume_pending is False
+        assert refreshed.resume_task_id is None
+
+    def test_stale_recovery_generation_cannot_clear_new_obligation(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        current_task_id = store._entries[entry.session_key].resume_task_id
+
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_resume_task_id="stale-task-id",
+        ) is False
+        refreshed = store._entries[entry.session_key]
+        assert refreshed.resume_pending is True
+        assert refreshed.resume_task_id == current_task_id
 
     def test_returns_false_when_not_pending(self, tmp_path):
         store = _make_store(tmp_path)
@@ -347,7 +468,11 @@ class TestResumePendingSystemNote:
         )
         assert "NEW message" in real_event_note
         assert "ask what they would like to do next" not in real_event_note
-        assert "CONTINUE the interrupted task" not in real_event_note
+        assert "does not cancel or supersede" in real_event_note
+        assert "separate continuation turn" in real_event_note
+        assert "skip any unfinished work" not in real_event_note
+        assert "UNKNOWN" in real_event_note
+        assert "durable provider/runtime receipts" in real_event_note
 
 
     def test_resume_pending_fires_without_tool_tail(self):
@@ -652,6 +777,36 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_real_inbound_cutoff_wins_before_synthetic_resume():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-1",
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._startup_restore_priority_session_keys = {pending_entry.session_key}
+    adapter.handle_message = AsyncMock()
+
+    with patch.dict("os.environ", {"HERMES_GATEWAY_STARTUP_AUTO_RESUME": "1"}):
+        scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_awaited()
+    assert pending_entry.resume_pending is True
 
 
 @pytest.mark.asyncio
@@ -1441,5 +1596,38 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
+
+
+@pytest.mark.asyncio
+async def test_failed_continuation_stops_heartbeat_and_quarantines_claim():
+    runner = object.__new__(GatewayRunner)
+    store = MagicMock()
+    store.mark_unknown_effect = AsyncMock(return_value=True)
+    runner._gateway_continuation_store = MagicMock(return_value=store)
+
+    heartbeat_block = asyncio.Event()
+    heartbeat = asyncio.create_task(heartbeat_block.wait())
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="failed-continuation"),
+        internal=True,
+        startup_resume=True,
+    )
+    event.continuation_id = "continuation-1"
+    event.continuation_generation = 2
+    event.continuation_claim_owner = "gateway:owner"
+    event.continuation_claim_token = "token-1"
+    event._hermes_continuation_heartbeat = heartbeat
+
+    await runner._abort_durable_resume_attempt(event)
+    await asyncio.sleep(0)
+
+    assert heartbeat.cancelled()
+    assert event._hermes_continuation_heartbeat is None
+    claim = store.mark_unknown_effect.await_args.args[0]
+    assert claim.continuation_id == "continuation-1"
+    assert claim.generation == 2
+    assert claim.claim_token == "token-1"
 
 

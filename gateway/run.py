@@ -1145,12 +1145,17 @@ def build_resume_recovery_note(
     )
     if not startup_resume:
         resume_guidance = (
-            "Address the user's NEW message below FIRST and focus "
-            "on what the user is asking now."
+            "Address the user's NEW message below FIRST. This priority does "
+            "not cancel or supersede the interrupted task. Keep this turn "
+            "focused on the new message; after its reply is delivered, the "
+            "gateway will schedule a separate continuation turn unless the "
+            "user explicitly cancelled or superseded the task."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-execute old tool calls. Calls with persisted results "
+            "are complete. Calls without recorded results have an UNKNOWN "
+            "outcome and must be reconciled from durable provider/runtime "
+            "receipts before any retry."
         )
     else:
         resume_guidance = (
@@ -2493,6 +2498,7 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    EventOrigin,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
@@ -3895,6 +3901,24 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _should_clear_resume_obligation_after_turn(
+    agent_result: dict,
+    *,
+    startup_resume: bool,
+) -> bool:
+    """Clear an interrupted parent only from its exact recovery turn.
+
+    A real inbound message is deliberately given response priority. Its own
+    successful turn is not proof that the pre-restart parent task terminalized,
+    so it must not consume ``resume_pending``. Synthetic startup provenance is
+    exact and is the only ordinary turn allowed to close that durable marker.
+    Explicit cancel/supersede paths clear it independently and deterministically.
+    """
+    return bool(startup_resume) and _should_clear_resume_pending_after_turn(
+        agent_result
+    )
 
 
 def _goal_turn_outcome(
@@ -11374,7 +11398,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 calls.append((str(call_id), str(name or "unknown-tool")))
         return calls
 
-    def _unresolved_startup_tool_call_risk(self, session_id: str) -> Optional[str]:
+    def _unresolved_startup_tool_call_risk(
+        self,
+        session_id: str,
+        *,
+        interrupted_at: Any = None,
+    ) -> Optional[str]:
         """Describe a tool dispatch whose durable outcome is ambiguous.
 
         The assistant tool-call row is flushed before execution, while the
@@ -11408,6 +11437,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "tool history unavailable"
         if not isinstance(messages, (list, tuple)):
             return "tool history unavailable"
+
+        # A priority status turn is appended after the interruption marker. It
+        # must not become a completion checkpoint for the older parent task and
+        # hide an unmatched effectful call. Keep rows without usable timestamps
+        # in the scan (fail closed); discard only rows proven newer than the
+        # exact persisted interruption boundary.
+        cutoff = _coerce_gateway_timestamp(interrupted_at)
+        if cutoff is not None:
+            messages = [
+                msg
+                for msg in messages
+                if _coerce_gateway_timestamp(msg.get("timestamp")) is None
+                or _coerce_gateway_timestamp(msg.get("timestamp")) <= cutoff
+            ]
 
         checkpoint_idx = -1
         for idx, msg in enumerate(messages):
@@ -11654,7 +11697,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
                 return _decision("alert_only", "active-goal-recovery-stale", goal_status=goal_status)
 
-            ambiguous_outcome = self._unresolved_startup_tool_call_risk(session_id)
+            ambiguous_outcome = self._unresolved_startup_tool_call_risk(
+                session_id,
+                interrupted_at=getattr(entry, "last_resume_marked_at", None),
+            )
             if ambiguous_outcome:
                 return _decision(
                     "alert_only",
@@ -11710,7 +11756,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return _decision("skip", "resume-pending-stale")
         if session_key in getattr(self, "_running_agents", {}):
             return _decision("skip", "agent-already-running")
-        ambiguous_outcome = self._unresolved_startup_tool_call_risk(session_id)
+        ambiguous_outcome = self._unresolved_startup_tool_call_risk(
+            session_id,
+            interrupted_at=getattr(entry, "last_resume_marked_at", None),
+        )
         if ambiguous_outcome:
             return _decision(
                 "alert_only",
@@ -11718,11 +11767,216 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return _decision("auto_resume", "generic-resume-pending")
 
+    def _gateway_continuation_store(self):
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None
+        # Tests and degraded startup paths intentionally install a transcript-
+        # only DB stub.  Preserve the legacy resume marker in that mode rather
+        # than treating an unavailable optional durability facade as a claim
+        # conflict.  A real SessionDB always exposes the full API below.
+        sync_db = vars(session_db).get("_db", session_db)
+        required = (
+            "create_durable_continuation",
+            "claim_durable_continuation",
+            "reap_expired_durable_continuation_claims",
+            "terminalize_durable_continuation",
+        )
+        if not all(callable(getattr(sync_db, name, None)) for name in required):
+            return None
+        store = getattr(self, "_gateway_continuation_store_instance", None)
+        if store is None:
+            from gateway.durable_continuation import GatewayContinuationStore
+
+            store = GatewayContinuationStore(session_db)
+            self._gateway_continuation_store_instance = store
+        return store
+
+    async def _prepare_durable_resume_event(
+        self, event: MessageEvent, entry: Any
+    ) -> bool:
+        """Claim the exact SessionDB continuation before launching a wake."""
+        store = self._gateway_continuation_store()
+        if store is None:
+            event._hermes_resume_task_id = getattr(entry, "resume_task_id", None)
+            return True
+        try:
+            decision = await store.claim_entry(entry)
+        except Exception:
+            logger.exception(
+                "durable restart continuation claim failed for %s",
+                getattr(entry, "session_key", "unknown"),
+            )
+            return False
+        if decision.status == "terminal":
+            await self._async_session_store.clear_resume_pending(
+                entry.session_key,
+                expected_resume_task_id=getattr(entry, "resume_task_id", None),
+            )
+            return False
+        if not decision.acquired:
+            logger.warning(
+                "restart continuation withheld for %s: durable state=%s",
+                getattr(entry, "session_key", "unknown"),
+                decision.status,
+            )
+            return False
+        claim = decision.claim
+        event.continuation_id = claim.continuation_id
+        event.continuation_generation = claim.generation
+        event.continuation_claim_owner = claim.owner
+        event.continuation_claim_token = claim.claim_token
+        event._hermes_resume_task_id = claim.continuation_id
+        return True
+
+    def _continuation_claim_from_event(self, event: MessageEvent):
+        continuation_id = getattr(event, "continuation_id", None)
+        generation = getattr(event, "continuation_generation", None)
+        owner = getattr(event, "continuation_claim_owner", None)
+        token = getattr(event, "continuation_claim_token", None)
+        if not all((continuation_id, generation is not None, owner, token)):
+            return None
+        from gateway.durable_continuation import ContinuationClaim
+
+        return ContinuationClaim(
+            continuation_id=str(continuation_id),
+            generation=int(generation),
+            owner=str(owner),
+            claim_token=str(token),
+        )
+
+    async def _begin_durable_resume_effect(self, event: MessageEvent) -> bool:
+        """Fence the model/tool turn and renew its short ownership lease."""
+        claim = self._continuation_claim_from_event(event)
+        store = self._gateway_continuation_store()
+        if claim is None or store is None:
+            return True
+        if not await store.mark_effect_started(claim):
+            return False
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(max(1.0, store.lease_seconds / 3.0))
+                if not await store.renew(claim):
+                    return
+
+        event._hermes_continuation_heartbeat = asyncio.create_task(_heartbeat())
+        return True
+
+    @staticmethod
+    def _stop_durable_resume_heartbeat(event: MessageEvent) -> None:
+        task = getattr(event, "_hermes_continuation_heartbeat", None)
+        if task is not None and not task.done():
+            task.cancel()
+        event._hermes_continuation_heartbeat = None
+
+    async def _abort_durable_resume_attempt(self, event: MessageEvent) -> None:
+        """Stop renewal and quarantine a fenced continuation after an exception."""
+        self._stop_durable_resume_heartbeat(event)
+        claim = self._continuation_claim_from_event(event)
+        store = self._gateway_continuation_store()
+        if claim is None or store is None:
+            return
+        try:
+            await store.mark_unknown_effect(claim)
+        except Exception:
+            logger.exception(
+                "Could not quarantine failed durable continuation %s",
+                claim.continuation_id,
+            )
+
+    async def _finalize_durable_resume_turn(
+        self,
+        event: MessageEvent,
+        source: Any,
+        session_key: str,
+        agent_result: Any,
+        response: str,
+        *,
+        response_already_delivered: bool,
+        delivery_suppressed: bool,
+        run_generation: int,
+    ) -> bool:
+        """Bind exact-generation completion to transcript/delivery durability."""
+        claim = self._continuation_claim_from_event(event)
+        store = self._gateway_continuation_store()
+        if claim is None or store is None:
+            if not response or response_already_delivered or delivery_suppressed:
+                self._stop_durable_resume_heartbeat(event)
+                return await self._async_session_store.clear_resume_pending(
+                    session_key,
+                    expected_resume_task_id=getattr(
+                        event, "_hermes_resume_task_id", None
+                    ),
+                )
+            adapter = self._adapter_for_source(source)
+            register_callback = getattr(
+                adapter, "register_post_delivery_callback", None
+            )
+            if not callable(register_callback):
+                return False
+
+            async def _legacy_after_delivery() -> None:
+                if not bool(getattr(event, "_hermes_delivery_succeeded", False)):
+                    return
+                await self._async_session_store.clear_resume_pending(
+                    session_key,
+                    expected_resume_task_id=getattr(
+                        event, "_hermes_resume_task_id", None
+                    ),
+                )
+
+            register_callback(
+                session_key,
+                _legacy_after_delivery,
+                generation=run_generation,
+            )
+            return True
+        if not await store.owns_claim(claim):
+            self._stop_durable_resume_heartbeat(event)
+            return False
+
+        async def _complete(*, delivered: bool) -> bool:
+            try:
+                completed = await store.complete(
+                    claim, agent_result, delivered=delivered
+                )
+                if not completed:
+                    return False
+                return await self._async_session_store.clear_resume_pending(
+                    session_key,
+                    expected_resume_task_id=claim.continuation_id,
+                )
+            finally:
+                self._stop_durable_resume_heartbeat(event)
+
+        if not response or response_already_delivered or delivery_suppressed:
+            return await _complete(delivered=response_already_delivered)
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not hasattr(adapter, "register_post_delivery_callback"):
+            self._stop_durable_resume_heartbeat(event)
+            return False
+
+        async def _after_delivery() -> None:
+            if not bool(getattr(event, "_hermes_delivery_succeeded", False)):
+                self._stop_durable_resume_heartbeat(event)
+                return
+            await _complete(delivered=True)
+
+        adapter.register_post_delivery_callback(
+            session_key,
+            _after_delivery,
+            generation=run_generation,
+        )
+        return True
+
     async def _run_startup_resume_event(
         self,
         adapter: BasePlatformAdapter,
         event: MessageEvent,
         session_key: str,
+        entry: Any,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn.
 
@@ -11734,6 +11988,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            if not await self._prepare_durable_resume_event(event, entry):
+                return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -11747,6 +12003,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pre_state = self._peek_session_state(session_key)
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
+
+    async def _continue_resume_pending_after_priority_reply(
+        self,
+        entry: Any,
+        source: SessionSource,
+        adapter: BasePlatformAdapter,
+    ) -> bool:
+        """Queue one recovery wake after a real inbound reply was delivered.
+
+        ``resume_pending`` is re-read from the shared entry so explicit
+        cancellation/supersession that happened meanwhile wins.  Returning a
+        bool makes the arbitration boundary directly testable.
+        """
+        if not bool(getattr(entry, "resume_pending", False)):
+            return False
+        decision = self._classify_startup_goal_recovery(
+            entry,
+            platform=source.platform,
+        )
+        if decision.status != "auto_resume":
+            if decision.status == "alert_only":
+                self._schedule_startup_goal_recovery_alert(decision, source)
+            return False
+        continuation_event = MessageEvent(
+            text=decision.prompt or "",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            startup_resume=True,
+            event_origin=EventOrigin.STARTUP_CONTINUATION,
+        )
+        setattr(
+            continuation_event,
+            "_hermes_resume_task_id",
+            getattr(entry, "resume_task_id", None),
+        )
+        if not await self._prepare_durable_resume_event(continuation_event, entry):
+            return False
+        await adapter.handle_message(continuation_event)
+        return True
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
@@ -11927,6 +12223,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     remove_deferred_event(event)
                 except Exception:
                     logger.warning("Could not clear accepted replay spool", exc_info=True)
+            # Control commands return before the normal agent-turn callback
+            # registration. Do not exclude those sessions from the synthetic
+            # pass: adapter serialization still ensures the command reply wins.
+            if not str(getattr(event, "text", "") or "").lstrip().startswith("/"):
+                priority_keys = getattr(
+                    self, "_startup_restore_priority_session_keys", None
+                )
+                if priority_keys is None:
+                    priority_keys = set()
+                    self._startup_restore_priority_session_keys = priority_keys
+                priority_keys.add(self._session_key_for_source(source))
             drained += 1
 
         if queue and schedule_retry:
@@ -12100,6 +12407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovered-reply marker so a possible duplicate is labeled, never
         silent. Returns the number of redeliveries attempted.
         """
+        self._delivery_owed_resume_session_keys = set()
         try:
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
@@ -12128,6 +12436,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         redelivered = 0
         for row in claimed:
+            session_key = row.get("session_key") or ""
+            resume_task_id = row.get("resume_task_id")
+            if session_key:
+                self._delivery_owed_resume_session_keys.add(session_key)
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -12162,6 +12474,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if session_key and resume_task_id:
+                        generation = row.get("continuation_generation")
+                        claim_owner = row.get("continuation_claim_owner")
+                        claim_token = row.get("continuation_claim_token")
+                        cleared = False
+                        if generation is not None and claim_owner and claim_token:
+                            store = self._gateway_continuation_store()
+                            if store is not None:
+                                from gateway.durable_continuation import ContinuationClaim
+
+                                claim = ContinuationClaim(
+                                    continuation_id=str(resume_task_id),
+                                    generation=int(generation),
+                                    owner=str(claim_owner),
+                                    claim_token=str(claim_token),
+                                )
+                                cleared = await store.complete(
+                                    claim,
+                                    {"final_response": str(row.get("content") or "")},
+                                    delivered=True,
+                                )
+                                if cleared:
+                                    cleared = await self.async_session_store.clear_resume_pending(
+                                        session_key,
+                                        expected_resume_task_id=resume_task_id,
+                                    )
+                        else:
+                            # Compatibility for obligations created before the
+                            # durable continuation columns existed.
+                            cleared = await self.async_session_store.clear_resume_pending(
+                                session_key,
+                                expected_resume_task_id=resume_task_id,
+                            )
+                        if cleared:
+                            self._delivery_owed_resume_session_keys.discard(
+                                session_key
+                            )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
@@ -12177,18 +12526,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
-
-            # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
-            session_key = row.get("session_key") or ""
-            if session_key:
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception:
-                    logger.debug(
-                        "clear_resume_pending failed for %s", session_key,
-                        exc_info=True,
-                    )
         return redelivered
 
     def _mark_active_goal_resume_pending(self, entry: Any) -> None:
@@ -12316,6 +12653,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            if entry.session_key in getattr(
+                self, "_delivery_owed_resume_session_keys", set()
+            ):
+                # Immutable final text is still owed; never regenerate the
+                # parent while its exact outbox record remains nonterminal.
+                continue
+            if entry.session_key in getattr(
+                self, "_startup_restore_priority_session_keys", set()
+            ):
+                # A real event was already admitted for this session at the
+                # startup cutoff. Its delivered turn owns the follow-up wake.
+                continue
             decision = self._classify_startup_goal_recovery(
                 entry,
                 platform=platform,
@@ -12356,9 +12705,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
                 startup_resume=True,
+                event_origin=EventOrigin.STARTUP_CONTINUATION,
+            )
+            setattr(
+                event,
+                "_hermes_resume_task_id",
+                getattr(entry, "resume_task_id", None),
             )
             task = asyncio.create_task(
-                self._run_startup_resume_event(adapter, event, entry.session_key)
+                self._run_startup_resume_event(
+                    adapter, event, entry.session_key, entry
+                )
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -13279,8 +13636,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        # Real inbound received before this explicit cutoff wins the first turn.
+        # Those sessions are excluded from the synthetic startup pass; their
+        # successful delivery registers a separate continuation afterward.
+        await self._drain_startup_restore_queue()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        self._startup_restore_priority_session_keys = set()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -20002,6 +20364,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Parent-task continuation claim was not current at turn start"
                     )
                     return
+            if bool(event.startup_resume):
+                if not await self._begin_durable_resume_effect(event):
+                    logger.warning(
+                        "Stale durable continuation refused before agent start: %s",
+                        getattr(event, "continuation_id", None),
+                    )
+                    return
+
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -20210,22 +20580,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compression session_id swap, both of which happen later.  See
             # the call site after the `update_session(...)` write.
 
-            # Successful turn — clear any stuck-loop counter for this session.
-            # This ensures the counter only accumulates across CONSECUTIVE
-            # restarts where the session was active (never completed).
-            #
-            # Also clear the resume_pending flag (set by drain-timeout
-            # shutdown) — the turn ran to completion, so recovery
-            # succeeded and subsequent messages should no longer receive
-            # the restart-interruption system note.
-            if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
+            # A real message gets its reply first, then a distinct synthetic
+            # recovery turn. Registering here is durable-safe: the callback runs
+            # after platform delivery while the adapter's per-session guard is
+            # still held, so handle_message() queues the continuation behind the
+            # reply. A crash before this callback leaves resume_pending set for
+            # the next startup scan.
+            if (
+                session_key
+                and not bool(event.startup_resume)
+                and bool(getattr(session_entry, "resume_pending", False))
+                and _should_clear_resume_pending_after_turn(agent_result)
+            ):
+                _resume_adapter = self._adapter_for_source(source)
+                if _resume_adapter is not None:
+
+                    async def _continue_interrupted_parent_after_reply() -> None:
+                        if not bool(
+                            getattr(event, "_hermes_delivery_succeeded", False)
+                        ):
+                            return
+                        # If a real follow-up was already handed to a fresh
+                        # per-session task, let that turn answer and register
+                        # the next continuation instead of overtaking it.
+                        current_session_task = getattr(
+                            _resume_adapter, "_session_tasks", {}
+                        ).get(session_key)
+                        if (
+                            current_session_task is not None
+                            and current_session_task is not asyncio.current_task()
+                        ):
+                            return
+                        await self._continue_resume_pending_after_priority_reply(
+                            session_entry,
+                            source=source,
+                            adapter=_resume_adapter,
+                        )
+
+                    _resume_adapter.register_post_delivery_callback(
+                        session_key,
+                        _continue_interrupted_parent_after_reply,
+                        generation=run_generation,
                     )
 
             # Normalize empty responses: surface errors, partial failures, and
@@ -20692,6 +21087,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # The exact synthetic continuation owns the recovery marker until
+            # a durable terminal boundary. Visible text registers a
+            # generation-aware post-delivery callback; streaming/already-sent
+            # and intentional no-send paths complete only after transcript
+            # persistence above. A real inbound turn never reaches this path.
+            if session_key and _should_clear_resume_obligation_after_turn(
+                agent_result,
+                startup_resume=bool(event.startup_resume),
+            ):
+                _continuation_finalized = await self._finalize_durable_resume_turn(
+                    event,
+                    source,
+                    session_key,
+                    agent_result,
+                    response,
+                    response_already_delivered=bool(
+                        agent_result.get("already_sent")
+                    ),
+                    delivery_suppressed=bool(_intentional_silence),
+                    run_generation=run_generation,
+                )
+                if _continuation_finalized:
+                    self._clear_restart_failure_count(session_key)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -20761,6 +21180,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            # A failed synthetic continuation must not retain a live renewal
+            # task forever. Stop renewal and quarantine the fenced claim as an
+            # unknown effect immediately, rather than replaying or abandoning it.
+            await self._abort_durable_resume_attempt(event)
             _failed_parent_continuation = locals().get(
                 "_parent_continuation_start"
             )

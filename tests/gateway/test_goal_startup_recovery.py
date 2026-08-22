@@ -473,6 +473,41 @@ class _UnavailableToolHistoryDB:
         raise RuntimeError("history unavailable")
 
 
+class _RiskyTailThenStatusReplyDB:
+    def __init__(self, cutoff: float):
+        self.cutoff = cutoff
+
+    def get_messages(self, _session_id):
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "timestamp": self.cutoff - 1,
+                "tool_calls": [{
+                    "id": "call-risky",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "assistant",
+                "content": "status: still running",
+                "timestamp": self.cutoff + 1,
+            },
+        ]
+
+
+def test_priority_status_reply_cannot_hide_unknown_parent_effect(hermes_home):
+    runner, _adapter = make_restart_runner()
+    cutoff = datetime.now()
+    runner._session_db = _RiskyTailThenStatusReplyDB(cutoff.timestamp())
+
+    risk = runner._unresolved_startup_tool_call_risk(
+        "sid", interrupted_at=cutoff
+    )
+
+    assert risk == "unresolved tool call(s): terminal"
+
+
 def test_startup_goal_recovery_unwraps_async_session_db(hermes_home):
     runner, _adapter = make_restart_runner()
     entry = _goal_entry(session_id="async-db-goal-sid")

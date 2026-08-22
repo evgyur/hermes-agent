@@ -1199,6 +1199,10 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         runner2, _adapter2, event2 = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
+        # This is a new inbound turn after restart, not a redelivery of the
+        # first message. Give it a distinct durable ingress identity so the
+        # gateway ledger correctly allows the cooldown assertion to run.
+        event2.message_id = "restart-followup-2"
         assert await runner2._handle_message(event2) == "ok"
         assert ShouldNotRunAgent.instances == 0, (
             "REGRESSION (#74136): a fresh GatewayRunner on the same state DB "
