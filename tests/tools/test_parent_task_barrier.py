@@ -26,6 +26,7 @@ def _use_db(monkeypatch, tmp_path):
     )
     conn.commit()
     conn.close()
+    barrier.initialize_storage()
     return path
 
 
@@ -689,6 +690,7 @@ def test_transcript_and_initial_persisted_commit_atomically(monkeypatch, tmp_pat
 
     path = tmp_path / "state.db"
     monkeypatch.setattr(barrier, "_db_path", lambda: path)
+    barrier.initialize_storage()
     barrier_id = barrier.admit_required_child(
         origin_session="origin",
         parent_session_id="parent",
@@ -742,6 +744,7 @@ def test_schema_migrates_legacy_database_without_rewriting_legacy_rows(
     conn.commit()
     conn.close()
 
+    barrier.initialize_storage()
     barrier_id = barrier.admit_required_child(
         origin_session="origin",
         parent_session_id="parent",
@@ -783,12 +786,76 @@ def test_schema_version_five_advances_to_six(monkeypatch, tmp_path):
         conn.execute(
             "UPDATE parent_task_barrier_meta SET schema_version=5 WHERE singleton=1"
         )
+    barrier.initialize_storage()
     assert barrier.barrier_snapshot(barrier_id) is not None
     conn = sqlite3.connect(barrier._db_path())
     assert conn.execute(
         "SELECT schema_version FROM parent_task_barrier_meta WHERE singleton=1"
     ).fetchone()[0] == 6
     conn.close()
+
+
+def test_active_barrier_inspection_is_select_only(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    real_connect = sqlite3.connect
+    statements = []
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(barrier.sqlite3, "connect", traced_connect)
+    assert barrier.has_active_barrier(origin_session="origin") is True
+    assert barrier.has_active_barrier(origin_session="origin") is True
+    normalized = [statement.strip().upper() for statement in statements]
+    assert normalized
+    assert all(
+        statement.startswith("SELECT 1 FROM PARENT_TASK_BARRIERS")
+        for statement in normalized
+    )
+
+
+def test_concurrent_active_barrier_reads_do_not_change_schema_or_mode(
+    monkeypatch, tmp_path
+):
+    path = _use_db(monkeypatch, tmp_path)
+    barrier.admit_required_child(
+        origin_session="origin",
+        parent_session_id="parent",
+        root_turn_id="turn",
+        task_id="child",
+    )
+    conn = sqlite3.connect(path)
+    before_schema = conn.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    before_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    conn.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: barrier.has_active_barrier(origin_session="origin"),
+                range(32),
+            )
+        )
+
+    conn = sqlite3.connect(path)
+    after_schema = conn.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    after_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    conn.close()
+    assert all(results)
+    assert after_schema == before_schema
+    assert after_mode == before_mode
 
 
 def test_explicit_session_cancellation_terminalizes_open_barrier(monkeypatch, tmp_path):

@@ -8512,6 +8512,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if primary_id is not None:
             ledger_ids.append(primary_id)
         ledger_ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+
+        def _finish(ok: bool) -> bool:
+            if ok and status == "in_progress" and ledger_ids:
+                try:
+                    rows = [db.get_gateway_message_ledger(value) for value in ledger_ids]
+                    ok = bool(rows) and all(
+                        isinstance(row, dict)
+                        and row.get("status") == "in_progress"
+                        and row.get("dispatch_started_at") is not None
+                        for row in rows
+                    )
+                except Exception:
+                    ok = False
+            if ok and status in {"in_progress", "completed", "drained", "failed"}:
+                try:
+                    from gateway.deferred_event_spool import remove_deferred_event
+
+                    remove_deferred_event(event)
+                except Exception:
+                    logger.warning(
+                        "Could not clear deferred-event spool after ledger %s",
+                        status,
+                        exc_info=True,
+                    )
+            return ok
+
         try:
             if ledger_ids:
                 results = [
@@ -8525,7 +8551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     for ledger_id in ledger_ids
                 ]
-                return bool(results) and all(results)
+                return _finish(bool(results) and all(results))
 
             ok = db.update_gateway_message_ledger(
                 platform=getattr(
@@ -8558,7 +8584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reason=reason,
                         metadata=metadata,
                     )
-            return bool(ok)
+            return _finish(bool(ok))
         except Exception as exc:
             logger.debug("gateway message ledger update failed: %s", exc, exc_info=True)
             return False
@@ -8613,13 +8639,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata={"completed": True},
             )
 
-    def _set_gateway_ledger_deferred(self, event: MessageEvent) -> None:
-        """Mark an inbound event as durably queued for a later handler pass."""
+    def _set_gateway_ledger_deferred(self, event: MessageEvent) -> bool:
+        """Durably spool one not-yet-dispatched event, then mark it replayable."""
+        try:
+            from gateway.deferred_event_spool import persist_deferred_event
+
+            source = getattr(event, "source", None)
+            session_key = self._session_key_for_source(source) if source is not None else ""
+            path = persist_deferred_event(event, session_key=session_key)
+        except Exception:
+            logger.critical(
+                "deferred_event_persist_failed route=%s ledger_id=%s",
+                (
+                    self._session_key_for_source(getattr(event, "source"))
+                    if getattr(event, "source", None) is not None
+                    else ""
+                ),
+                getattr(event, "_hermes_gateway_ledger_id", None),
+                exc_info=True,
+            )
+            return False
+        if path is None:
+            logger.critical(
+                "deferred_event_persist_rejected route=%s ledger_id=%s",
+                session_key,
+                getattr(event, "_hermes_gateway_ledger_id", None),
+            )
+            return False
         try:
             setattr(event, "_hermes_gateway_ledger_deferred", True)
         except Exception:
             pass
-        self._update_gateway_ledger(
+        return self._update_gateway_ledger(
             event,
             "requeued",
             reason="handler-deferred",
@@ -11700,42 +11751,201 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
+    def _claim_deferred_event_for_dispatch(self, event: MessageEvent) -> bool:
+        """Atomically claim every physical ingress row represented by a spool event."""
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        execute_write = getattr(db, "_execute_write", None)
+        ledger_ids = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+        primary_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        if primary_id is not None:
+            ledger_ids.append(primary_id)
+        ledger_ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ledger_ids or not callable(execute_write):
+            return False
+        placeholders = ",".join("?" for _ in ledger_ids)
+        now = time.time()
+
+        def _claim(conn):
+            rows = conn.execute(
+                f"SELECT id, status, dispatch_started_at FROM gateway_message_ledger "
+                f"WHERE id IN ({placeholders})",
+                tuple(ledger_ids),
+            ).fetchall()
+            if len(rows) != len(ledger_ids) or any(
+                str(row["status"]) not in {"received", "requeued"}
+                or row["dispatch_started_at"] is not None
+                for row in rows
+            ):
+                return False
+            cursor = conn.execute(
+                f"""UPDATE gateway_message_ledger
+                    SET status='in_progress', dispatch_started_at=?, updated_at=?,
+                        reason='startup-replay-claimed'
+                    WHERE id IN ({placeholders})
+                      AND status IN ('received','requeued')
+                      AND dispatch_started_at IS NULL""",
+                (now, now, *ledger_ids),
+            )
+            return int(cursor.rowcount or 0) == len(ledger_ids)
+
+        return bool(execute_write(_claim))
+
+    def _release_deferred_event_dispatch_claim(self, event: MessageEvent) -> bool:
+        """Release a claim only when adapter handoff definitively raised."""
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        execute_write = getattr(db, "_execute_write", None)
+        ledger_ids = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
+        primary_id = getattr(event, "_hermes_gateway_ledger_id", None)
+        if primary_id is not None:
+            ledger_ids.append(primary_id)
+        ledger_ids = list(dict.fromkeys(int(value) for value in ledger_ids if value is not None))
+        if not ledger_ids or not callable(execute_write):
+            return False
+        placeholders = ",".join("?" for _ in ledger_ids)
+        now = time.time()
+
+        def _release(conn):
+            cursor = conn.execute(
+                f"""UPDATE gateway_message_ledger
+                    SET status='requeued', dispatch_started_at=NULL, updated_at=?,
+                        reason='startup-replay-handoff-failed'
+                    WHERE id IN ({placeholders})
+                      AND status='in_progress'
+                      AND reason='startup-replay-claimed'""",
+                (now, *ledger_ids),
+            )
+            return int(cursor.rowcount or 0) == len(ledger_ids)
+
+        return bool(execute_write(_release))
+
+    async def _drain_startup_restore_queue(self, *, schedule_retry: bool = True) -> int:
+        """Replay queued ingress without crossing an ambiguous dispatch boundary."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             return 0
-        while queue:
+        remaining = len(queue)
+        while queue and remaining > 0:
+            remaining -= 1
             event = queue.pop(0)
             source = getattr(event, "source", None)
             adapter = self._adapter_for_source(source)
             if adapter is None:
-                logger.debug(
-                    "Dropping startup-restore queued message: adapter unavailable for %s",
+                logger.warning(
+                    "Deferring startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
+                queue.append(event)
                 continue
             assert source is not None
-            # Mark this replay so _handle_message does not queue it again while
-            # the restore gate remains closed for any fresh inbound arrivals.
             try:
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
-            # Persist current-process ownership before adapter.handle_message can
-            # return after merely spawning its background task.  Reconciliation
-            # runs immediately after this drain and must not win the race against
-            # the replay's later runner callback.
-            await asyncio.to_thread(
-                self._record_gateway_ledger_received,
-                event,
-                session_key=self._session_key_for_source(source),
-                reason="startup-replay-admitted",
+            is_spool_replay = bool(
+                getattr(event, "_hermes_deferred_spool_replay", False)
+                or getattr(event, "_hermes_deferred_spool_path", None)
             )
-            await adapter.handle_message(event)
+            if is_spool_replay:
+                if bool(getattr(event, "_hermes_startup_claim_release_pending", False)):
+                    try:
+                        released = await asyncio.to_thread(
+                            self._release_deferred_event_dispatch_claim,
+                            event,
+                        )
+                    except Exception:
+                        logger.warning("Startup claim release retry failed", exc_info=True)
+                        queue.append(event)
+                        continue
+                    if not released:
+                        queue.append(event)
+                        continue
+                    setattr(event, "_hermes_startup_claim_release_pending", False)
+                try:
+                    claimed = await asyncio.to_thread(
+                        self._claim_deferred_event_for_dispatch,
+                        event,
+                    )
+                except Exception:
+                    logger.warning("Startup durable dispatch claim failed", exc_info=True)
+                    queue.append(event)
+                    continue
+                if not claimed:
+                    continue
+            else:
+                await asyncio.to_thread(
+                    self._record_gateway_ledger_received,
+                    event,
+                    session_key=self._session_key_for_source(source),
+                    reason="startup-replay-admitted",
+                )
+            try:
+                await adapter.handle_message(event)
+            except Exception:
+                if is_spool_replay:
+                    try:
+                        released = await asyncio.to_thread(
+                            self._release_deferred_event_dispatch_claim,
+                            event,
+                        )
+                    except Exception:
+                        released = False
+                        logger.warning("Startup handoff claim release failed", exc_info=True)
+                    if released:
+                        queue.append(event)
+                    else:
+                        setattr(event, "_hermes_startup_claim_release_pending", True)
+                        queue.append(event)
+                logger.warning("Startup adapter handoff failed", exc_info=True)
+                continue
+            if is_spool_replay:
+                try:
+                    from gateway.deferred_event_spool import remove_deferred_event
+
+                    remove_deferred_event(event)
+                except Exception:
+                    logger.warning("Could not clear accepted deferred-event spool", exc_info=True)
             drained += 1
+        if queue and schedule_retry:
+            retry = asyncio.create_task(self._retry_startup_restore_queue())
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(retry)
+                retry.add_done_callback(background_tasks.discard)
         return drained
+
+    async def _retry_startup_restore_queue(self) -> None:
+        """Retry definitively unaccepted queued events until shutdown."""
+        while getattr(self, "_startup_restore_queue", None) and not bool(
+            getattr(self, "_draining", False)
+        ):
+            await asyncio.sleep(2)
+            await self._drain_startup_restore_queue(schedule_retry=False)
+
+    def _restore_spooled_deferred_events(self) -> list[MessageEvent]:
+        """Load only events whose ledger proves dispatch never started."""
+        session_db = getattr(self, "_session_db", None)
+        db = vars(session_db).get("_db", session_db) if session_db is not None else None
+        if db is None:
+            return []
+        try:
+            from gateway.deferred_event_spool import load_replayable_deferred_events
+
+            entries = load_replayable_deferred_events(db)
+        except Exception:
+            logger.warning("Deferred-event spool restore failed", exc_info=True)
+            return []
+        events = [entry.event for entry in entries]
+        for event in events:
+            setattr(event, "_hermes_deferred_spool_replay", True)
+        if events:
+            logger.warning(
+                "Restored %d deferred inbound event(s) whose dispatch never started",
+                len(events),
+            )
+        return events
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
@@ -11790,8 +12000,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
         self._startup_restore_tasks = []
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
+        drained = 0
+        try:
+            restored_events = await asyncio.to_thread(self._restore_spooled_deferred_events)
+            queue = getattr(self, "_startup_restore_queue", None)
+            if queue is None:
+                queue = []
+                self._startup_restore_queue = queue
+            queue[0:0] = restored_events
+            drained = await self._drain_startup_restore_queue()
+        finally:
+            self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
         await asyncio.to_thread(self._reconcile_previous_gateway_ledger)
@@ -11850,10 +12069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.delivery_ledger import (
-                RECOVERED_MARKER,
                 ledger_enabled,
-                mark_delivered,
-                mark_failed,
                 sweep_recoverable,
             )
 
@@ -11871,8 +12087,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
+        return await self._redeliver_claimed_rows(claimed)
+
+    async def _redeliver_claimed_rows(
+        self, claimed: List[Dict[str, Any]]
+    ) -> int:
+        """Send already-claimed ledger rows and record delivered/failed."""
         if not claimed:
             return 0
+        from gateway.delivery_ledger import (
+            RECOVERED_MARKER,
+            mark_delivered,
+            mark_failed,
+        )
 
         redelivered = 0
         for row in claimed:
@@ -11938,6 +12165,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _redeliver_failed_obligations_for_platform(self, platform) -> int:
+        """Claim and resend definitively failed rows after this platform reconnects."""
+        if self.adapters.get(platform) is None:
+            return 0
+        try:
+            from gateway.delivery_ledger import (
+                ledger_enabled,
+                sweep_failed_for_runtime,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return 0
+            claimed = await asyncio.to_thread(
+                sweep_failed_for_runtime,
+                getattr(platform, "value", str(platform)),
+            )
+        except Exception:
+            logger.debug("delivery ledger runtime sweep failed", exc_info=True)
+            return 0
+        return await self._redeliver_claimed_rows(claimed)
 
     def _mark_active_goal_resume_pending(self, entry: Any) -> None:
         if getattr(entry, "resume_pending", False):
@@ -12233,6 +12481,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         self._gateway_ledger_startup_cutoff = time.time()
         logger.info("Starting Hermes Gateway...")
+        # Barrier DDL/migrations are startup-owned.  Fail before any adapter
+        # can accept external events rather than entering a half-initialized
+        # gateway whose hot path would need to mutate schema.
+        from tools.parent_task_barrier import initialize_storage
+
+        await asyncio.to_thread(initialize_storage)
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -14106,6 +14360,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                        try:
+                            await self._redeliver_failed_obligations_for_platform(platform)
+                        except Exception:
+                            logger.debug(
+                                "failed-obligation redelivery after %s reconnect failed",
                                 platform.value,
                                 exc_info=True,
                             )
@@ -19621,15 +19883,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Explicit /stop, /new, and /reset are handled by the existing command
         # paths before this point and still cancel child + barrier ownership.
         if not bool(getattr(event, "internal", False)):
-            try:
-                parked = await self._park_user_event_for_parent_barrier(
-                    event=event,
-                    session_key=session_key,
-                    parent_session_id=str(session_entry.session_id or ""),
-                )
-            except Exception:
-                logger.exception("Could not inspect active parent-task barrier")
-                return
+            parked = await self._park_user_event_or_defer_on_inspection_failure(
+                event=event,
+                session_key=session_key,
+                parent_session_id=str(session_entry.session_id or ""),
+            )
             if parked:
                 return
 
@@ -25350,6 +25608,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 accepted.add(delegation_id)
 
         return accepted
+
+    async def _park_user_event_or_defer_on_inspection_failure(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        parent_session_id: str,
+    ) -> bool:
+        """Fail closed by durably preserving only this pre-dispatch event."""
+        try:
+            return await self._park_user_event_for_parent_barrier(
+                event=event,
+                session_key=session_key,
+                parent_session_id=parent_session_id,
+            )
+        except Exception:
+            ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+            logger.exception(
+                "parent_barrier_inspection_failed route=%s ledger_id=%s",
+                session_key,
+                ledger_id,
+            )
+            deferred = await asyncio.to_thread(self._set_gateway_ledger_deferred, event)
+            if not deferred:
+                logger.critical(
+                    "parent_barrier_event_not_deferred route=%s ledger_id=%s",
+                    session_key,
+                    ledger_id,
+                )
+            return True
 
     async def _park_user_event_for_parent_barrier(
         self,

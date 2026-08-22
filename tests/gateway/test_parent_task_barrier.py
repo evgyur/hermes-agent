@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -21,6 +21,7 @@ from gateway.session import SessionEntry, SessionSource, build_session_key
 def _isolated_state(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ad._reset_for_tests()
+    barrier.initialize_storage()
     yield
     ad._reset_for_tests()
 
@@ -60,6 +61,21 @@ def _seed_required_completion():
     }
     assert ad._persist_completion(event, {"summary": "evidence"})
     return barrier_id, event
+
+
+@pytest.mark.asyncio
+async def test_barrier_initializer_failure_prevents_gateway_intake():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._create_adapter = MagicMock()
+    with patch(
+        "tools.parent_task_barrier.initialize_storage",
+        side_effect=sqlite3.OperationalError("disk I/O error"),
+    ):
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            await runner.start()
+    runner._create_adapter.assert_not_called()
 
 
 @pytest.mark.asyncio

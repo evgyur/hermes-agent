@@ -70,11 +70,29 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def initialize_storage() -> None:
+    """Create or migrate barrier tables before gateway adapter intake.
+
+    Schema ownership is deliberately explicit: ordinary barrier transactions
+    never run DDL or journal-mode setters, and hot-path inspection uses a
+    separate read-only connection.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_schema(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @contextmanager
@@ -82,7 +100,6 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        _ensure_schema(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -537,7 +554,10 @@ def has_active_barrier(*, origin_session: str, parent_session_id: str = "") -> b
     if parent:
         clauses.append("parent_session_id=?")
         params.append(parent)
-    with _transaction() as conn:
+    path = _db_path()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
         row = conn.execute(
             """SELECT 1 FROM parent_task_barriers
                WHERE state NOT IN ('closed','cancelled','failed') AND ("""
@@ -545,6 +565,8 @@ def has_active_barrier(*, origin_session: str, parent_session_id: str = "") -> b
             + ") LIMIT 1",
             params,
         ).fetchone()
+    finally:
+        conn.close()
     return row is not None
 
 

@@ -2,7 +2,17 @@ import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
+
+
+@pytest.fixture(autouse=True)
+def _initialized_parent_barrier_storage(monkeypatch, tmp_path):
+    from tools import parent_task_barrier
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent_task_barrier.initialize_storage()
 
 
 class FakeAgent:
