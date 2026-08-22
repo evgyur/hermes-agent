@@ -9342,7 +9342,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _SERVICE_TIER_UNSET if clear else service_tier
         )
 
-    def _mark_goal_callback_started_session(self, session_key: Optional[str]) -> None:
+    def _mark_goal_callback_started_session(
+        self,
+        session_key: Optional[str],
+        session_id: Optional[str] = None,
+    ) -> None:
         """Suppress one post-turn judge pass after a callback starts /goal."""
         if not session_key:
             return
@@ -9351,6 +9355,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sessions = set()
             self._goal_callback_started_sessions = sessions
         sessions.add(session_key)
+        if session_id:
+            session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+            if session_ids is None:
+                session_ids = {}
+                self._goal_callback_started_session_ids = session_ids
+            session_ids[session_key] = str(session_id)
 
     def _consume_goal_callback_started_session(self, session_key: Optional[str]) -> bool:
         """Return True once for sessions started by a clarify callback."""
@@ -9360,6 +9370,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions or session_key not in sessions:
             return False
         sessions.discard(session_key)
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        if isinstance(session_ids, dict):
+            session_ids.pop(session_key, None)
         return True
 
     @staticmethod
@@ -21961,6 +21974,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Any,
     ) -> bool:
         """Finalize a callback marker missed by the normal post-turn branch."""
+        session_ids = getattr(self, "_goal_callback_started_session_ids", None)
+        callback_session_id = (
+            str(session_ids.get(session_key) or "")
+            if isinstance(session_ids, dict)
+            else ""
+        )
         if not self._consume_goal_callback_started_session(session_key):
             return False
         try:
@@ -21973,11 +21992,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 session_entry = None
         if session_entry is None:
-            logger.error(
-                "goal callback: could not resolve session for terminal kickoff %s",
-                session_key,
+            if not callback_session_id:
+                logger.error(
+                    "goal callback: could not resolve session for terminal kickoff %s",
+                    session_key,
+                )
+                return False
+            from types import SimpleNamespace
+
+            session_entry = SimpleNamespace(
+                session_id=callback_session_id,
+                session_key=session_key,
             )
-            return False
         return await self._finish_deferred_goal_kickoff(
             session_entry=session_entry,
             source=source,
@@ -22034,7 +22060,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     session_key = None
             if defer_kickoff:
-                self._mark_goal_callback_started_session(session_key)
+                self._mark_goal_callback_started_session(
+                    session_key,
+                    getattr(session_entry, "session_id", None),
+                )
             logger.info("Supergoal callback: started official /goal from button press")
         else:
             logger.warning("Supergoal callback: /goal start returned without active state: %s", response)

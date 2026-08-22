@@ -541,10 +541,16 @@ class TestTelegramClarifyCallback:
         bound = _make_goal_runner(adapter, source)
         async_store = AsyncMock()
         async_store._store = bound.runner.session_store
-        async_store.get_or_create_session.return_value = bound.session
+        async_store.get_or_create_session.side_effect = RuntimeError("async store unavailable")
         bound.runner._async_session_store = async_store
+        bound.runner.session_store.get_or_create_session.side_effect = RuntimeError(
+            "sync store unavailable"
+        )
         GoalManager(bound.session.session_id).set("Run after the empty owner turn.")
-        bound.runner._mark_goal_callback_started_session(bound.session_key)
+        bound.runner._mark_goal_callback_started_session(
+            bound.session_key,
+            bound.session.session_id,
+        )
         adapter._pending_messages = None
 
         accepted = await bound.runner._finish_unconsumed_goal_callback(
