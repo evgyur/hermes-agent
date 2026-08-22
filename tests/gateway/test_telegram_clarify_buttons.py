@@ -498,6 +498,33 @@ class TestTelegramClarifyCallback:
         assert entry.response == "Start now"
 
     @pytest.mark.asyncio
+    async def test_deferred_goal_kickoff_failure_pauses_active_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="777",
+            chat_id="12345",
+            user_name="Tester User",
+            chat_type="dm",
+        )
+        bound = _make_goal_runner(adapter, source)
+        GoalManager(bound.session.session_id).set("Run the deferred goal.")
+        adapter._pending_messages = None
+
+        accepted = await bound.runner._finish_deferred_goal_kickoff(
+            session_entry=bound.session,
+            source=source,
+        )
+
+        state = GoalManager(bound.session.session_id).state
+        assert accepted is False
+        assert state is not None
+        assert state.status == "paused"
+        assert state.paused_reason == "deferred goal kickoff handoff failed"
+
+    @pytest.mark.asyncio
     async def test_live_supergoal_start_button_uses_clarify_owner_session(self, hermes_home):
         from hermes_cli.goals import GoalManager
         from tools import clarify_gateway as cm

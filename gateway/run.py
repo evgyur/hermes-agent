@@ -18291,7 +18291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Skipping post-turn goal judge for %s because /goal was started from a callback during this turn",
                                 session_key_for_goal,
                             )
-                            await self._enqueue_goal_kickoff_prompt(
+                            await self._finish_deferred_goal_kickoff(
                                 session_entry=session_entry,
                                 source=source,
                             )
@@ -21897,20 +21897,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             adapter = self.adapters.get(source.platform)
             session_key = getattr(session_entry, "session_key", None) or self._session_key_for_source(source)
-            if not adapter or not session_key:
-                return False
-            kickoff_event = MessageEvent(
-                text=prompt,
-                message_type=MessageType.TEXT,
+            return self._enqueue_goal_continuation_once(
+                session_key=session_key,
+                adapter=adapter,
                 source=source,
-                message_id=None,
-                channel_prompt=None,
+                prompt=prompt,
             )
-            self._enqueue_fifo(session_key, kickoff_event, adapter)
-            return True
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
             return False
+
+    async def _finish_deferred_goal_kickoff(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> bool:
+        """Queue a callback-started goal after its owner turn, or pause it."""
+        accepted = await self._enqueue_goal_kickoff_prompt(
+            session_entry=session_entry,
+            source=source,
+        )
+        if accepted:
+            return True
+        sid = getattr(session_entry, "session_id", None) or ""
+        if sid:
+            try:
+                from hermes_cli.goals import GoalManager
+
+                GoalManager(
+                    session_id=sid,
+                    default_max_turns=self._goal_max_turns_from_config(),
+                ).pause(reason="deferred goal kickoff handoff failed")
+            except Exception as exc:
+                logger.error("goal callback: failed to pause unowned goal %s: %s", sid, exc)
+        logger.error("goal callback: no runnable deferred kickoff owner for session %s", sid)
+        return False
 
     async def _start_goal_from_callback_event(self, event: "MessageEvent") -> bool:
         """Start `/goal` from an inline-button callback without replaying a slash command.
