@@ -317,6 +317,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
             user_id="12345",
         ),
         message_id="1",
+        internal=True,
     )
 
     # Pre-load a failure streak so we can prove the recovery gate is WIRED UP,
@@ -485,6 +486,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
             user_id="12345",
         ),
         message_id="1",
+        internal=True,
     )
 
     result = await runner._handle_message(event)
@@ -942,6 +944,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
             user_id="12345",
         ),
         message_id="1",
+        internal=True,
     )
 
     result = await runner._handle_message(event)
