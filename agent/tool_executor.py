@@ -833,7 +833,13 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
-    timeout_s = _resolve_sequential_tool_timeout()
+    from agent.deadline import within_run_budget
+
+    timeout_s = within_run_budget(
+        _resolve_sequential_tool_timeout(),
+        agent,
+        reserve_s=5.0,
+    )
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
@@ -1289,7 +1295,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # Resolved before the workers are defined so the start-order gate can clamp
     # its own bound against the batch deadline it must stay under.
-    timeout_s = _resolve_concurrent_tool_timeout()
+    from agent.deadline import within_run_budget
+
+    timeout_s = within_run_budget(
+        _resolve_concurrent_tool_timeout(),
+        agent,
+        reserve_s=5.0,
+    )
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
 
     # Touch activity before launching workers so the gateway knows

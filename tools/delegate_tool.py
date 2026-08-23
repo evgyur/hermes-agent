@@ -950,11 +950,17 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
+_SYNC_CHILD_MAX_WAIT_S = 90.0
+_SYNC_CHILD_OWNER_RESERVE_S = 5.0
+_CHILD_CANCEL_CONVERGENCE_GRACE_S = 5.0
+
+
 def _get_child_timeout() -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
-    Returns the number of seconds a single child agent is allowed to run
-    before being cut off, or ``None`` when no wall-clock cap applies.
+    Returns the number of seconds a single child agent is allowed to run.
+    Durable background children retain the configured behavior; synchronous
+    children are capped inside their parent tool/turn deadline.
 
     Default: ``None`` (no timeout). Subagents doing legitimate heavy work
     (deep code review, large research fan-outs, slow reasoning models) were
@@ -968,6 +974,8 @@ def _get_child_timeout() -> Optional[float]:
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
     """
+    configured: Optional[float] = DEFAULT_CHILD_TIMEOUT
+    configured_from_config = False
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
     if val is not None:
@@ -980,16 +988,52 @@ def _get_child_timeout() -> Optional[float]:
                 val,
             )
         else:
-            return None if parsed <= 0 else max(30.0, parsed)
+            configured = None if parsed <= 0 else max(30.0, parsed)
+            configured_from_config = True
     env_val = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
-    if env_val:
+    if not configured_from_config and env_val:
         try:
             parsed = float(env_val)
         except (TypeError, ValueError):
             pass
         else:
-            return None if parsed <= 0 else max(30.0, parsed)
-    return DEFAULT_CHILD_TIMEOUT
+            configured = None if parsed <= 0 else max(30.0, parsed)
+
+    return configured
+
+
+def _get_effective_child_timeout(
+    *,
+    parent_agent=None,
+    durable_background: bool = False,
+) -> Optional[float]:
+    """Derive a child wait from its configured cap and owner deadline."""
+    configured = _get_child_timeout()
+    if durable_background:
+        return configured
+
+    # A synchronous child is nested inside a tool call.  Its wait must remain
+    # strictly inside both the tool deadline and the foreground turn budget so
+    # the owner retains time to cancel, persist, and deliver a terminal result.
+    from agent.deadline import within_run_budget
+    from agent.tool_executor import _resolve_concurrent_tool_timeout
+
+    parent_tool_timeout = _resolve_concurrent_tool_timeout()
+    if parent_tool_timeout is not None:
+        parent_tool_timeout = max(
+            0.001,
+            parent_tool_timeout - _SYNC_CHILD_OWNER_RESERVE_S,
+        )
+    bounded = min(
+        value
+        for value in (configured, parent_tool_timeout, _SYNC_CHILD_MAX_WAIT_S)
+        if value is not None
+    )
+    return within_run_budget(
+        bounded,
+        parent_agent,
+        reserve_s=_SYNC_CHILD_OWNER_RESERVE_S,
+    ) if parent_agent is not None else bounded
 
 
 def _get_max_spawn_depth() -> int:
@@ -2452,6 +2496,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    durable_background: bool = False,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2774,7 +2819,10 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        child_timeout = _get_effective_child_timeout(
+            parent_agent=parent_agent,
+            durable_background=durable_background,
+        )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2823,6 +2871,7 @@ def _run_single_child(
             _child_context.run,
             _run_with_thread_capture,
         )
+        _defer_child_close = False
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2838,6 +2887,46 @@ def _run_single_child(
                 if not interrupted and child is not None and hasattr(child, "_interrupt_requested"):
                     child._interrupt_requested = True
             except Exception:
+                pass
+
+            # Cancellation is a lifecycle transition, not merely a signal.
+            # Give cooperative children a bounded chance to reach terminal
+            # state before the owner returns and closes their SessionDB.  A
+            # non-cooperative worker is never closed underneath: its close is
+            # attached to its own terminal future instead.
+            try:
+                _child_future.result(timeout=_CHILD_CANCEL_CONVERGENCE_GRACE_S)
+            except (FuturesTimeoutError, TimeoutError):
+                _defer_child_close = True
+
+                def _close_after_worker_converges(_future):
+                    if _subagent_id:
+                        _unregister_subagent(_subagent_id, agent=child)
+                    if child_pool is not None and leased_cred_id is not None:
+                        try:
+                            child_pool.release_lease(leased_cred_id)
+                        except Exception as exc:
+                            logger.debug("Failed deferred credential release: %s", exc)
+                    if hasattr(parent_agent, "_active_children"):
+                        try:
+                            lock = getattr(parent_agent, "_active_children_lock", None)
+                            if lock:
+                                with lock:
+                                    parent_agent._active_children.remove(child)
+                            else:
+                                parent_agent._active_children.remove(child)
+                        except (ValueError, UnboundLocalError):
+                            pass
+                    try:
+                        if hasattr(child, "close"):
+                            child.close()
+                    except Exception:
+                        logger.debug("Failed deferred child close after convergence")
+
+                _child_future.add_done_callback(_close_after_worker_converges)
+            except Exception:
+                # The worker reached a terminal exception; resource teardown is
+                # now safe and the original timeout/error remains authoritative.
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
@@ -3329,10 +3418,14 @@ def _run_single_child(
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
+        if _subagent_id and not locals().get("_defer_child_close", False):
             _unregister_subagent(_subagent_id, agent=child)
 
-        if child_pool is not None and leased_cred_id is not None:
+        if (
+            child_pool is not None
+            and leased_cred_id is not None
+            and not locals().get("_defer_child_close", False)
+        ):
             try:
                 child_pool.release_lease(leased_cred_id)
             except Exception as exc:
@@ -3349,7 +3442,10 @@ def _run_single_child(
         # Remove child from active tracking
 
         # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
+        if (
+            hasattr(parent_agent, "_active_children")
+            and not locals().get("_defer_child_close", False)
+        ):
             try:
                 lock = getattr(parent_agent, "_active_children_lock", None)
                 if lock:
@@ -3363,11 +3459,12 @@ def _run_single_child(
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) so subagent subprocesses
         # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        if not locals().get("_defer_child_close", False):
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
@@ -4000,6 +4097,7 @@ def delegate_task(
                     owner_session_id=_origin_ui_session_id or None,
                     owner_transport=_origin_owner_transport,
                     owner_session_record=_origin_owner_session_record,
+                    durable_background=background,
                 )
                 _commit_durable(result)
                 results.append(result)
@@ -4028,6 +4126,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        durable_background=background,
                     )
                     futures[future] = i
 

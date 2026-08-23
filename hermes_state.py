@@ -3645,6 +3645,10 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class SessionDBClosedError(RuntimeError):
+    """An operation reached a SessionDB after its owner closed the handle."""
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -5038,11 +5042,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn = self._conn
+                    if conn is None:
+                        raise SessionDBClosedError(
+                            "SessionDB is closed; write ownership has ended"
+                        )
+                    conn.execute("BEGIN IMMEDIATE")
                     txn_started = time.monotonic()
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                         held_s = time.monotonic() - txn_started
                         if held_s >= self._LONG_WRITE_WARN_S:
                             logger.warning(
@@ -5055,7 +5064,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise

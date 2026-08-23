@@ -1,0 +1,33 @@
+schema_version: 1
+tenant: milolika
+service: milolika-hermes-gateway.service
+host: hel1
+
+release_policy:
+  source_release: 59a840eb7165c4a2d9d169e8039cbd822df650ee
+  install_scope: seya-only
+  require_explicit_production_approval: true
+
+workspace_overlay:
+  source: tenant-overlays/seya/AGENTS.md
+  destination: /home/milolika/workspace/AGENTS.md
+  expected_sha256: c501f321cc13f5d28a838a4ae559d575949ff024cdfd2f10336efd3fe873e79c
+
+config_patch:
+  agent:
+    run_budget_seconds: 300
+  environment:
+    HERMES_AGENT_NOTIFY_INTERVAL: "75"
+
+preserve:
+  - delegation.child_timeout_seconds
+  - tool_loop_guardrails.hard_stop_enabled
+  - employee_auto_approval_policy
+  - human20_mcp_credentials
+  - employee_chipmanager_telegram_capability
+
+rollback:
+  release: 59a840eb7165c4a2d9d169e8039cbd822df650ee-seya-ready11
+  restore_workspace_overlay_backup: true
+  restore_config_backup: true
+  restart_only: milolika-hermes-gateway.service

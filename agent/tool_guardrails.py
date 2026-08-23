@@ -100,6 +100,12 @@ IDENTICAL_RESULT_STUB_MIN_CHARS = 512
 # evicts the referenced result (cheap dangling-reference mitigation).
 _RESULT_STUB_ARGS_PREVIEW_CHARS = 120
 
+_EXTERNAL_WEB_TOOLS = frozenset(
+    {"web_search", "web_extract", "browser_navigate", "browser_snapshot"}
+)
+_EXTERNAL_PROVIDER_FAILURE_LIMIT = 3
+_EXTERNAL_SIGNATURE_FAILURE_LIMIT = 2
+
 
 def is_stall_guard_repeatable(tool_name: str) -> bool:
     """Whether a tool is exempt from the identical-call loop notice."""
@@ -333,6 +339,44 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+def _external_failure_key(
+    tool_name: str,
+    args: Mapping[str, Any],
+    result: str | None,
+) -> tuple[str, str, str] | None:
+    """Normalize one external failure as capability/provider/error-class."""
+    if tool_name not in _EXTERNAL_WEB_TOOLS:
+        return None
+    capability = "search" if tool_name == "web_search" else "extract"
+    provider = str(args.get("provider") or args.get("backend") or "external_web")
+    text = str(result or "").lower()
+    if "timeout" in text or "timed out" in text:
+        error_class = "timeout"
+    elif "ungrounded" in text:
+        error_class = "ungrounded"
+    elif "malformed" in text or "invalid json" in text:
+        error_class = "malformed"
+    elif "search-only" in text or "cannot extract" in text:
+        error_class = "capability_unavailable"
+    elif "unavailable" in text or "not configured" in text:
+        error_class = "unavailable"
+    else:
+        error_class = "external_failure"
+    return capability, provider.strip().lower(), error_class
+
+
+def _rescued_provider(result: str | None) -> str:
+    """Return the configured provider named by a successful rescue payload."""
+    data = safe_json_loads(result or "")
+    if not isinstance(data, dict):
+        return ""
+    candidates = [data, data.get("data")]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("rescued_from"):
+            return str(candidate["rescued_from"]).strip().lower()
+    return ""
+
+
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
@@ -370,6 +414,9 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._external_failure_counts: dict[tuple[str, str, str], int] = {}
+        self._external_provider_totals: dict[str, int] = {}
+        self._open_external_providers: set[str] = set()
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -377,6 +424,35 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        if (
+            self.config.hard_stop_enabled
+            and tool_name in _EXTERNAL_WEB_TOOLS
+            and self._open_external_providers
+            and self._exact_failure_counts.get(signature, 0)
+            < self.config.exact_failure_block_after
+        ):
+            provider = str(
+                _coerce_args(args).get("provider")
+                or _coerce_args(args).get("backend")
+                or "external_web"
+            ).strip().lower()
+            if provider in self._open_external_providers:
+                count = self._external_provider_totals.get(provider, 0)
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="external_provider_breaker_open",
+                    message=(
+                        f"Blocked {tool_name}: external provider '{provider}' "
+                        f"is degraded after {count} failures this turn. Return "
+                        "the evidence already obtained or explain the unavailable source."
+                    ),
+                    tool_name=tool_name,
+                    count=count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -444,6 +520,20 @@ class ToolCallGuardrailController:
             failed, _ = classify_tool_failure(tool_name, result)
 
         if failed:
+            external_key = _external_failure_key(tool_name, args, result)
+            if external_key is not None:
+                capability, provider, error_class = external_key
+                external_count = self._external_failure_counts.get(external_key, 0) + 1
+                self._external_failure_counts[external_key] = external_count
+                provider_total = self._external_provider_totals.get(provider, 0) + 1
+                self._external_provider_totals[provider] = provider_total
+                if (
+                    external_count >= _EXTERNAL_SIGNATURE_FAILURE_LIMIT
+                    or provider_total >= _EXTERNAL_PROVIDER_FAILURE_LIMIT
+                    or "keyless rescue also failed" in str(result or "").lower()
+                ):
+                    self._open_external_providers.add(provider)
+
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
@@ -491,6 +581,16 @@ class ToolCallGuardrailController:
                 )
 
             return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
+
+        rescued_from = _rescued_provider(result)
+        if tool_name in _EXTERNAL_WEB_TOOLS and rescued_from:
+            # The configured provider already consumed its one rescue attempt.
+            # The model may use the rescued result, but cannot reopen the same
+            # degraded path during this turn.
+            self._external_provider_totals["external_web"] = (
+                self._external_provider_totals.get("external_web", 0) + 1
+            )
+            self._open_external_providers.update({"external_web", rescued_from})
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)

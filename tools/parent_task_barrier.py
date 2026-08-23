@@ -344,6 +344,12 @@ def admit_required_child(
             "required-child admission lacks parent identity: " + ", ".join(missing)
         )
 
+    # The gateway initializes this schema at startup. Direct durable dispatch
+    # callers (tests, cron, recovery workers) can legitimately arrive without
+    # that boot sequence, so make first admission self-initializing as well.
+    # CREATE IF NOT EXISTS keeps the transition idempotent across contenders.
+    initialize_storage()
+
     now = time.time()
     owner_pid, owner_started_at = _current_owner_stamp()
     with _transaction() as conn:
@@ -525,18 +531,9 @@ def finalization_policy(
     # state.db before gateway startup. No barrier can have been admitted
     # without its table, so this exact first-run state means no barrier.
     # Other read and transaction failures still propagate fail-closed.
-    path = _db_path()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        schema_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='parent_task_barriers'"
-        ).fetchone()
-    finally:
-        conn.close()
-    if schema_exists is None:
-        return {"action": "deliver"}
+    with _read_connection() as read_conn:
+        if read_conn is None:
+            return {"action": "deliver"}
     now = time.time()
     with _transaction() as conn:
         row = conn.execute(

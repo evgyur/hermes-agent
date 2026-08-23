@@ -201,10 +201,12 @@ def test_budget_without_started_clock_is_inert(monkeypatch, tmp_path):
 
 
 class _StubAgent:
-    def __init__(self, budget=None, started=None):
+    def __init__(self, budget=None, started=None, platform="cli"):
         self.run_budget_seconds = budget
         self._run_budget_started_at = started
+        self._run_budget_started_mono = None
         self._run_budget_wrapup_injected = False
+        self.platform = platform
 
 
 def _tool_messages():
@@ -231,6 +233,26 @@ def test_wrapup_not_injected_before_threshold():
     messages = _tool_messages()
     assert _maybe_inject_run_budget_wrapup(agent, messages) is False
     assert agent._run_budget_wrapup_injected is False
+
+
+def test_telegram_wrapup_uses_research_deadline_fraction():
+    from agent.conversation_loop import _maybe_inject_run_budget_wrapup
+
+    agent = _StubAgent(
+        budget=300,
+        started=time.time() - 181,
+        platform="telegram",
+    )
+    messages = _tool_messages()
+    assert _maybe_inject_run_budget_wrapup(agent, messages) is True
+
+
+def test_monotonic_hard_deadline_expires_at_full_budget():
+    from agent.conversation_loop import _run_budget_expired
+
+    agent = _StubAgent(budget=300, started=time.time() - 300, platform="telegram")
+    agent._run_budget_started_mono = time.monotonic() - 301
+    assert _run_budget_expired(agent) is True
 
 
 def test_wrapup_injected_once_after_threshold():

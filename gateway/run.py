@@ -76,6 +76,13 @@ from gateway import goal_launch
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
+# Explicit user-created conversation boundaries are terminal delivery fences.
+# Idle/timeout closure is deliberately excluded: background completions remain
+# routable to the chat's current live session after scale-to-zero rotation.
+_USER_BOUNDARY_END_REASONS = frozenset(
+    {"session_reset", "new_session", "user_exit", "session_switch"}
+)
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,

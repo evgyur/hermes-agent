@@ -80,6 +80,8 @@ __all__ = [
     "BoundedResult",
     "DeadlineExpired",
     "clamp_timeout",
+    "remaining_run_budget",
+    "within_run_budget",
     "resolve_timeout",
     "run_bounded_async",
     "run_bounded_sync",
@@ -163,6 +165,36 @@ def clamp_timeout(timeout: Optional[float]) -> Optional[float]:
     if value <= 0:
         return None
     return min(value, MAX_SAFE_TIMEOUT_S)
+
+
+def remaining_run_budget(agent: Any, *, reserve_s: float = 0.0) -> Optional[float]:
+    """Return monotonic seconds left in the current agent turn.
+
+    ``None`` means the turn has no configured run budget.  The optional
+    reserve keeps a nested operation strictly inside its owner so the owner
+    retains time to cancel, persist, and deliver a terminal result.
+    """
+    budget = clamp_timeout(getattr(agent, "run_budget_seconds", None))
+    started = getattr(agent, "_run_budget_started_mono", None)
+    if budget is None or not isinstance(started, (int, float)):
+        return None
+    return max(0.0, budget - (time.monotonic() - float(started)) - max(0.0, reserve_s))
+
+
+def within_run_budget(
+    timeout: Optional[float],
+    agent: Any,
+    *,
+    reserve_s: float = 0.0,
+) -> Optional[float]:
+    """Clamp a nested timeout to the remaining monotonic turn budget."""
+    configured = clamp_timeout(timeout)
+    remaining = remaining_run_budget(agent, reserve_s=reserve_s)
+    if remaining is None:
+        return configured
+    if remaining <= 0:
+        return 0.001
+    return min(configured, remaining) if configured is not None else remaining
 
 
 # ---------------------------------------------------------------------------

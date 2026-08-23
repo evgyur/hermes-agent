@@ -627,8 +627,10 @@ def build_turn_context(
     # latch resets each turn (one notice per run, not per session).
     if getattr(agent, "run_budget_seconds", None):
         agent._run_budget_started_at = time.time()
+        agent._run_budget_started_mono = time.monotonic()
     else:
         agent._run_budget_started_at = None
+        agent._run_budget_started_mono = None
     agent._run_budget_wrapup_injected = False
 
     # Log conversation turn start for debugging/observability.

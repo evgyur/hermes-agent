@@ -142,6 +142,10 @@ _STALE_CHECK_INTERVAL = 30.0  # seconds between monitor sweeps
 _STALE_IDLE_SECONDS = 450.0  # no progress, no current tool → stalled
 _STALE_IN_TOOL_SECONDS = 1200.0  # no progress while inside a tool → stalled
 _STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
+# A completion is useful across ordinary gateway restarts, but replaying a
+# week-old result can revive a stale conversation and spend a full context on
+# work whose owner has disappeared. Keep the durable result, drop only delivery.
+_MAX_COMPLETION_REPLAY_AGE_S = 7 * 24 * 60 * 60
 
 _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
@@ -368,7 +372,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
         key: record.get(key)
         for key in (
             "goal", "goals", "tasks", "output_schemas", "context", "toolsets",
-            "role", "model", "is_batch",
+            "role", "model", "is_batch", "scope_id", "user_id", "user_name",
         )
         if key in record
     }
@@ -2498,6 +2502,25 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _capture_routing_origin() -> Dict[str, str]:
+    """Snapshot scoped delivery identity before dispatch crosses threads."""
+    try:
+        from gateway.session_context import get_session_env
+
+        mapping = {
+            "scope_id": "HERMES_SESSION_SCOPE_ID",
+            "user_id": "HERMES_SESSION_USER_ID",
+            "user_name": "HERMES_SESSION_USER_NAME",
+        }
+        return {
+            key: value
+            for key, env_name in mapping.items()
+            if (value := str(get_session_env(env_name, "") or "").strip())
+        }
+    except Exception:
+        return {}
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -2591,6 +2614,7 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        **_capture_routing_origin(),
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -2828,7 +2852,16 @@ def _push_completion_event(
         if _k in result:
             evt[_k] = result[_k]
     if not _persist_completion(evt, result):
-        return False
+        # A real durable row that lost the terminal CAS already has another
+        # owner; never enqueue it twice. Missing rows are legacy/in-memory
+        # producers and may still use the shared completion queue.
+        with _DB_LOCK, _transaction() as conn:
+            row_exists = conn.execute(
+                "SELECT 1 FROM async_delegations WHERE delegation_id=?",
+                (str(record.get("delegation_id") or ""),),
+            ).fetchone() is not None
+        if row_exists:
+            return False
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -2928,6 +2961,7 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        **_capture_routing_origin(),
     }
     with _records_lock:
         if delegation_id in _records:

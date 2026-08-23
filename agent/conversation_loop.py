@@ -117,6 +117,20 @@ RUN_BUDGET_WRAPUP_NOTICE = (
     "the state you already have, completing only mandatory writes."
 )
 
+RUN_BUDGET_TERMINAL_RESPONSE = (
+    "I reached the foreground time limit and stopped safely so this chat is "
+    "not blocked. Any work already transferred to a background delegation "
+    "keeps its durable delivery owner and will return separately."
+)
+
+
+def _run_budget_expired(agent: Any) -> bool:
+    """Whether the authoritative monotonic turn budget is exhausted."""
+    from agent.deadline import remaining_run_budget
+
+    remaining = remaining_run_budget(agent)
+    return remaining is not None and remaining <= 0
+
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
@@ -139,7 +153,9 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     started = getattr(agent, "_run_budget_started_at", None)
     if not started:
         return False
-    if (time.time() - started) < 0.8 * float(budget):
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    wrap_fraction = 0.6 if platform == "telegram" else 0.8
+    if (time.time() - started) < wrap_fraction * float(budget):
         return False
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -1986,6 +2002,15 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        if _run_budget_expired(agent):
+            final_response = RUN_BUDGET_TERMINAL_RESPONSE
+            append_message(
+                messages,
+                {"role": "assistant", "content": final_response},
+            )
+            _turn_exit_reason = "foreground_run_budget_exhausted"
+            break
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
