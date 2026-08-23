@@ -48,6 +48,20 @@ def install_rentals_bundle(project_root: Path, hermes_home: Path) -> dict[str, A
     return {"source": str(source), "target": str(target), "skill_roots": installed}
 
 
+def install_employee_bundle(project_root: Path, hermes_home: Path) -> dict[str, Any]:
+    """Install capabilities that are available only to employee tenants."""
+    source = project_root / "bundles" / "employee" / "skills"
+    if not source.is_dir():
+        raise FileNotFoundError(f"Employee bundle is missing: {source}")
+    target = hermes_home / "skills"
+    target.mkdir(parents=True, exist_ok=True)
+    installed: list[str] = []
+    for skill_root in sorted(path for path in source.iterdir() if path.is_dir()):
+        shutil.copytree(skill_root, target / skill_root.name, dirs_exist_ok=True)
+        installed.append(skill_root.name)
+    return {"source": str(source), "target": str(target), "skill_roots": installed}
+
+
 def normalize_h20_base_url(value: str | None) -> str:
     base = (value or DEFAULT_H20_BASE_URL).strip().rstrip("/")
     if not base.startswith("https://") and not base.startswith("http://127.0.0.1:"):

@@ -22,6 +22,7 @@ from hermes_cli.config import get_hermes_home, get_project_root, load_config, sa
 from hermes_cli.power_variants import (
     DEFAULT_H20_BASE_URL,
     VARIANTS,
+    install_employee_bundle,
     install_rentals_bundle,
     load_employee_overlay,
     normalize_h20_base_url,
@@ -551,6 +552,10 @@ def run_install(args: Any) -> int:
         bundle = None if dry_run else install_rentals_bundle(get_project_root(), home)
         credential_names: list[str] = []
         if preset == "employee" and not dry_run:
+            employee_bundle = install_employee_bundle(get_project_root(), home)
+            bundle["skill_roots"] = sorted(
+                set(bundle.get("skill_roots", [])) | set(employee_bundle.get("skill_roots", []))
+            )
             credential_names = save_employee_credentials(customer_key, base_url)
     except Exception:
         if not dry_run:

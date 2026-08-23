@@ -11,6 +11,7 @@ import yaml
 from hermes_cli import power
 from hermes_cli.power_variants import (
     employee_env_values,
+    install_employee_bundle,
     install_rentals_bundle,
     load_employee_overlay,
     validate_h20_identity,
@@ -66,9 +67,23 @@ def test_install_rentals_bundle_copies_same_payload_for_variants(tmp_path):
     assert (tmp_path / "home" / "skills" / "sample" / "SKILL.md").exists()
 
 
-def test_powerpack_bundle_never_grants_tenant_access_to_chipcr_telegram():
+def test_rentals_bundle_never_grants_tenant_access_to_telegram_accounts():
     project = Path(__file__).resolve().parents[2]
     assert not (project / "bundles" / "rentals" / "skills" / "telegram-chip").exists()
+
+
+def test_employee_bundle_installs_chipmanager_only(tmp_path):
+    project = Path(__file__).resolve().parents[2]
+    source = project / "bundles" / "employee" / "skills" / "telegram-chip" / "SKILL.md"
+    text = source.read_text(encoding="utf-8")
+    assert "http://127.0.0.1:18083" in text
+    assert "@chipmanager" in text
+    assert "127.0.0.1:8080" not in text
+    assert "@ChipCR" not in text
+
+    receipt = install_employee_bundle(project, tmp_path / "home")
+    assert receipt["skill_roots"] == ["telegram-chip"]
+    assert (tmp_path / "home" / "skills" / "telegram-chip" / "SKILL.md").is_file()
 
 
 def test_employee_install_validates_before_config_and_never_prints_key(monkeypatch, capsys):
@@ -76,6 +91,7 @@ def test_employee_install_validates_before_config_and_never_prints_key(monkeypat
     monkeypatch.setattr(power, "validate_h20_identity", lambda *a, **k: events.append("validate") or {"customer_id": "employee-1"})
     monkeypatch.setattr(power, "apply_power_preset", lambda **k: events.append("config") or {"toolsets": []})
     monkeypatch.setattr(power, "install_rentals_bundle", lambda *a, **k: {"skill_roots": ["sample"]})
+    monkeypatch.setattr(power, "install_employee_bundle", lambda *a, **k: events.append("employee_bundle") or {"skill_roots": ["telegram-chip"]})
     monkeypatch.setattr(power, "save_employee_credentials", lambda *a, **k: events.append("credentials") or ["H20_KEYS_API_KEY"])
     monkeypatch.setattr(power, "get_project_root", lambda: Path("/project"))
     monkeypatch.setattr(power, "get_hermes_home", lambda: Path("/home/employee/.hermes"))
@@ -89,7 +105,7 @@ def test_employee_install_validates_before_config_and_never_prints_key(monkeypat
         h20_base_url="https://keys.human20.app",
     )
     assert power.run_install(args) == 0
-    assert events == ["validate", "config", "credentials"]
+    assert events == ["validate", "config", "employee_bundle", "credentials"]
     output = capsys.readouterr().out
     assert "customer-key" not in output
     assert "employee-1" in output
