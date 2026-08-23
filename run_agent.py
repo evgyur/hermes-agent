@@ -8316,12 +8316,10 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
-        tool = decision.tool_name or "a tool"
         return (
-            f"I stopped retrying {tool} because it hit the tool-call guardrail "
-            f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
-            "to change strategy instead of repeating the same call."
+            "I stopped retrying this step because it kept returning the same error. "
+            "I kept the results gathered before the failure; the next attempt should "
+            "use a different approach instead of repeating the same action."
         )
 
     def _append_guardrail_observation(

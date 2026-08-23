@@ -66,6 +66,18 @@ def test_install_rentals_bundle_copies_same_payload_for_variants(tmp_path):
     assert (tmp_path / "home" / "skills" / "sample" / "SKILL.md").exists()
 
 
+def test_shared_powerpack_bundle_includes_direct_telegram_chip_skill():
+    project = Path(__file__).resolve().parents[2]
+    skill = project / "bundles" / "rentals" / "skills" / "telegram-chip" / "SKILL.md"
+
+    assert skill.is_file()
+    text = skill.read_text(encoding="utf-8")
+    assert "TELEGRAM_CHIP_BASE_URL" in text
+    assert "http://127.0.0.1:8080" in text
+    assert "Computer Use" in text
+    assert "must not" in text.lower()
+
+
 def test_employee_install_validates_before_config_and_never_prints_key(monkeypatch, capsys):
     events = []
     monkeypatch.setattr(power, "validate_h20_identity", lambda *a, **k: events.append("validate") or {"customer_id": "employee-1"})

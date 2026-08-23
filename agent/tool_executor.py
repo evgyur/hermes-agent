@@ -56,6 +56,13 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _record_persisted_path_for_stub(agent, tool_call_id: str, result: str) -> None:
+    """Let stall guards inspect a spilled tool result without losing its path."""
+    path = extract_persisted_path(result) if isinstance(result, str) else None
+    if path:
+        agent._tool_guardrails.record_persisted_result(tool_call_id, path)
+
+
 @contextmanager
 def _scoped_deferred_tool_authority(tool_name: Optional[str]):
     """Bind exact host authority for an agent-level ``tool_call`` unwrap.
