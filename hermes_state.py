@@ -10505,6 +10505,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         parent_task_barrier_id: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -10543,7 +10544,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    turn_lease_holder=turn_lease_holder,
                     parent_task_barrier_id=parent_task_barrier_id,
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
                 )
             return inserted_total
 
