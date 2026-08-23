@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict
 
 import requests
@@ -90,7 +91,65 @@ class PerplexityWebSearchProvider(WebSearchProvider):
 
             limit = min(max(int(limit or 5), 1), 20)
             logger.info("Perplexity search: '%s' (limit=%d)", query, limit)
+            api_url = os.getenv("PERPLEXITY_API_URL", _API_URL).strip() or _API_URL
             configured_model = os.getenv("PERPLEXITY_MODEL", _DEFAULT_MODEL).strip()
+            if api_url.rstrip("/").endswith("/chat/completions"):
+                request_payload = {
+                    "model": configured_model or "pplx-sonar",
+                    "messages": [{"role": "user", "content": query}],
+                    "max_tokens": 700,
+                }
+                response = requests.post(
+                    api_url,
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                    timeout=45,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                choices = payload.get("choices") or []
+                message = choices[0].get("message", {}) if choices else {}
+                answer = str(message.get("content") or "").strip()
+                raw_results = payload.get("search_results") or message.get("search_results") or []
+                raw_citations = payload.get("citations") or message.get("citations") or []
+                if not raw_results and not raw_citations:
+                    raw_citations = re.findall(r"https?://[^\s)\]}>\"']+", answer)
+                web_results = []
+                seen_urls = set()
+                for item in list(raw_results) + list(raw_citations):
+                    if isinstance(item, str):
+                        item = {"url": item, "title": item}
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or item.get("source_url") or "").strip()
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    web_results.append({
+                        "url": url,
+                        "title": str(item.get("title") or item.get("name") or url),
+                        "description": str(item.get("snippet") or item.get("description") or answer[:500])[:500],
+                        "position": len(web_results) + 1,
+                    })
+                    if len(web_results) >= limit:
+                        break
+                if not answer or not web_results:
+                    return {
+                        "success": False,
+                        "error": "H20 Perplexity returned an ungrounded response without citations.",
+                    }
+                return {
+                    "success": True,
+                    "data": {"web": web_results},
+                    "answer": answer,
+                    "citations": [item["url"] for item in web_results],
+                    "usage": payload.get("usage", {}),
+                    "request_id": payload.get("id"),
+                    "grounded": True,
+                }
             request_payload: Dict[str, Any] = {
                 "input": query,
                 "tools": [
@@ -117,7 +176,7 @@ class PerplexityWebSearchProvider(WebSearchProvider):
                 request_payload["max_steps"] = 1
 
             response = requests.post(
-                _API_URL,
+                api_url,
                 headers={
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
