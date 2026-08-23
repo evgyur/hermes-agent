@@ -11455,21 +11455,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to queue semantics so nothing is lost.
         # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
         # to every entry in the parent's ``_active_children`` list and
-        # aborts in-flight ``delegate_task`` work. Route ``interrupt`` to
-        # generation-bound ``steer`` while children are active so the follow-up
-        # can adjust the parent plan without cancelling child work. Explicit
-        # ``/stop`` and ``/new`` still use ``_interrupt_and_clear_session``.
+        # aborts in-flight ``delegate_task`` work. Demote ``interrupt`` to
+        # ``queue`` while children are active so an unrelated follow-up cannot
+        # take over the parent plan or cancel child work. Users can still opt
+        # into an in-run correction explicitly with ``/steer``; ``/stop`` and
+        # ``/new`` continue to use ``_interrupt_and_clear_session``.
         demoted_for_subagents = (
             effective_mode == "interrupt"
             and self._agent_has_active_subagents(running_agent)
         )
         if demoted_for_subagents:
             logger.info(
-                "Routing busy_input_mode 'interrupt' to 'steer' for session %s "
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
                 "because the running agent has active subagents (#30170)",
                 session_key,
             )
-            effective_mode = "steer"
+            effective_mode = "queue"
         demoted_for_compression = (
             effective_mode == "interrupt"
             and (

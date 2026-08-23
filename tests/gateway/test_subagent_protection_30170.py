@@ -220,7 +220,7 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert "Subagent" not in content
 
     @pytest.mark.asyncio
-    async def test_delegate_teardown_steers(self):
+    async def test_delegate_teardown_queues(self):
         runner = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -231,13 +231,14 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         runner._running_agents[sk] = parent
         runner.adapters[event.source.platform] = adapter
 
-        with patch("gateway.run.merge_pending_message_event"):
-            await runner._handle_active_session_busy_message(event, sk)
+        await runner._handle_active_session_busy_message(event, sk)
 
         parent.interrupt.assert_not_called()
-        assert parent.steer.call_args.args == ("follow-up during delegate teardown",)
+        parent.steer.assert_not_called()
+        assert adapter._pending_messages[sk].text == "follow-up during delegate teardown"
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Accepted for the current run" in content
+        assert "Subagent working" in content
+        assert "queued for when it finishes" in content
 
     @pytest.mark.asyncio
     async def test_queue_mode_unchanged_with_subagents(self) -> None:
@@ -286,7 +287,7 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert parent.steer.call_args.args == ("course-correct",)
         parent.interrupt.assert_not_called()
     @pytest.mark.asyncio
-    async def test_interrupt_mode_steers_parent_without_cancelling_children(self) -> None:
+    async def test_interrupt_mode_queues_without_cancelling_children(self) -> None:
         runner = _make_runner()
         runner._busy_input_mode = "interrupt"
         runner._busy_text_mode = "interrupt"
@@ -303,9 +304,9 @@ class TestBusyHandlerDemotesInterruptForSubagents:
 
         await runner._handle_active_session_busy_message(event, sk)
 
-        assert parent.steer.call_args.args == ("change the active approach",)
+        parent.steer.assert_not_called()
         parent.interrupt.assert_not_called()
-        assert adapter._pending_messages == {}
+        assert adapter._pending_messages[sk].text == "change the active approach"
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Accepted for the current run" in content
-
+        assert "Subagent working" in content
+        assert "queued for when it finishes" in content
