@@ -15,8 +15,8 @@ telegram-chip runtime.
 - `GET /me` must return username `chipmanager`. Stop if any other identity is
   returned.
 - Never probe, connect to, or mention the personal runtime on port 8080.
-- Load this skill once per turn, then proceed directly through terminal and the
-  HTTP API; do not repeat `skill_view`.
+- After reading this file, proceed directly through terminal and the HTTP API.
+  Never call `skill_view` again in the same turn.
 
 ## Safety
 
@@ -27,33 +27,15 @@ telegram-chip runtime.
 - Fetch every sent message back by its returned message ID before claiming
   success.
 
-Use this one-shot identity probe. It deliberately prints no phone number or
-other account metadata:
+For an identity or health check, run exactly this one terminal command. The
+bundled probe deliberately prints no phone number or other account metadata:
 
 ```bash
-python3 - <<'PY'
-import json, os, urllib.request
-
-base = os.environ.get("TELEGRAM_CHIP_BASE_URL", "http://127.0.0.1:18083").rstrip("/")
-if base != "http://127.0.0.1:18083":
-    raise SystemExit("REFUSED_UNEXPECTED_TELEGRAM_RUNTIME")
-
-def get(path):
-    with urllib.request.urlopen(base + path, timeout=10) as response:
-        return json.load(response)
-
-health = get("/health")
-outer = get("/me")
-identity = json.loads(outer["data"]) if isinstance(outer.get("data"), str) else outer["data"]
-if health.get("status") != "ok" or not health.get("telegram_connected"):
-    raise SystemExit("CHIPMANAGER_HEALTH_FAILED")
-if identity.get("username") != "chipmanager":
-    raise SystemExit("CHIPMANAGER_IDENTITY_FAILED")
-print("CHIPMANAGER_HEALTH_OK")
-print("CHIPMANAGER_IDENTITY_OK username=chipmanager")
-PY
+python3 ~/.hermes/skills/telegram-chip/scripts/probe_identity.py
 ```
 
-After both OK lines, answer the user immediately; do not run another terminal call.
+After both `CHIPMANAGER_HEALTH_OK` and
+`CHIPMANAGER_IDENTITY_OK username=chipmanager`, answer the user immediately;
+do not run another terminal call.
 
 Use the exact OpenAPI method and schema for all further operations.

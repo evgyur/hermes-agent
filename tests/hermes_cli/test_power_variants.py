@@ -86,6 +86,11 @@ def test_employee_bundle_installs_chipmanager_only(tmp_path):
     receipt = install_employee_bundle(project, tmp_path / "home")
     assert receipt["skill_roots"] == ["telegram-chip"]
     assert (tmp_path / "home" / "skills" / "telegram-chip" / "SKILL.md").is_file()
+    probe = tmp_path / "home" / "skills" / "telegram-chip" / "scripts" / "probe_identity.py"
+    assert probe.is_file()
+    probe_text = probe.read_text(encoding="utf-8")
+    assert "127.0.0.1:18083" in probe_text
+    assert "127.0.0.1:8080" not in probe_text
 
 
 def test_employee_install_validates_before_config_and_never_prints_key(monkeypatch, capsys):
