@@ -51,6 +51,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.platforms.telegram import TelegramAdapter
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -78,6 +79,24 @@ def hermes_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
+def _install_goal_enqueue_fixture(runner: GatewayRunner) -> None:
+    def _enqueue(*, session_key, adapter, source, prompt):
+        pending = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending, dict):
+            return False
+        pending[session_key] = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=None,
+            internal=True,
+            metadata={"durable_internal_goal": True},
+        )
+        return True
+
+    runner._enqueue_goal_continuation_once = MagicMock(side_effect=_enqueue)
+
+
 def _make_goal_runner(adapter: TelegramAdapter, source: SessionSource):
     session_key = build_session_key(source)
     session_entry = SessionEntry(
@@ -96,6 +115,9 @@ def _make_goal_runner(adapter: TelegramAdapter, source: SessionSource):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._queued_events = {}
     runner._running_agents = {session_key: object()}
+    # Callback tests exercise callback/session ownership, not lower-level
+    # ledger SQL, while preserving the real queue/failure contract.
+    _install_goal_enqueue_fixture(runner)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store._generate_session_key.return_value = session_key
@@ -478,7 +500,9 @@ class TestTelegramClarifyCallback:
         assert state is not None
         assert state.status == "active"
         assert state.goal == "Run `.supergoal/demo` and finish with SUPERGOAL_RUN_COMPLETE."
-        assert bound.session_key not in adapter._pending_messages
+        assert bound.session_key in adapter._pending_messages
+        initial_queued = adapter._pending_messages[bound.session_key]
+        assert initial_queued.metadata.get("durable_internal_goal") is True
         assert bound.runner._session_reasoning_overrides[bound.session_key]["effort"] == "xhigh"
         assert bound.runner._consume_goal_callback_started_session(bound.session_key) is True
         assert bound.runner._consume_goal_callback_started_session(bound.session_key) is False
@@ -611,6 +635,7 @@ class TestTelegramClarifyCallback:
         )
         runner.adapters = {Platform.TELEGRAM: adapter}
         runner._queued_events = {}
+        _install_goal_enqueue_fixture(runner)
         runner.session_store = MagicMock()
         runner.session_store._entries = {key_a: session_a, key_b: session_b}
         runner.session_store._ensure_loaded = MagicMock()

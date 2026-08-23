@@ -3312,7 +3312,13 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(
+        self,
+        text: str,
+        *,
+        receipt_id: Optional[str] = None,
+        receipt_transition: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3333,6 +3339,9 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        _receipt = None
+        if receipt_id and callable(receipt_transition):
+            _receipt = (str(receipt_id), receipt_transition)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3340,13 +3349,37 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if _receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(_receipt)
+                self._pending_steer_receipts = pending
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if _receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(_receipt)
+                self._pending_steer_receipts = pending
         return True
+
+    def _mark_drained_steer_request_fenced(self) -> None:
+        """Fence the exact receipts whose trusted markers enter this request."""
+        receipts = list(getattr(self, "_drained_steer_receipts", []) or [])
+        self._fenced_steer_receipts = receipts
+        self._drained_steer_receipts = []
+        for receipt_id, transition in receipts:
+            transition(receipt_id, "REQUEST_FENCED")
+
+    def _mark_fenced_steer_provider_result(self, *, accepted: bool) -> None:
+        """Terminalize fenced receipts without replaying an ambiguous request."""
+        receipts = list(getattr(self, "_fenced_steer_receipts", []) or [])
+        self._fenced_steer_receipts = []
+        state = "CONSUMED_CURRENT" if accepted else "AMBIGUOUS_PROVIDER_REQUEST"
+        for receipt_id, transition in receipts:
+            transition(receipt_id, state)
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3470,10 +3503,18 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_pending_steer_receipts", []) or []
+            )
+            self._pending_steer_receipts = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_pending_steer_receipts", []) or []
+            )
+            self._pending_steer_receipts = []
         return text
 
     def _record_file_mutation_result(

@@ -5953,6 +5953,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = guard
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
+        setattr(event, "_hermes_adapter_processing_task", task)
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -5968,8 +5969,6 @@ class BasePlatformAdapter(ABC):
             startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
             if startup_ack is not None:
                 def _signal_terminal_handoff(_task) -> None:
-                    if not _task.cancelled() and _task.exception() is None:
-                        setattr(event, "_hermes_background_processing_completed", True)
                     startup_ack.set()
 
                 task.add_done_callback(_signal_terminal_handoff)
@@ -6452,6 +6451,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            setattr(event, "_hermes_background_handler_succeeded", True)
             _parent_delivery_response = response
             from tools.parent_task_barrier import TrustedParentTaskDelivery
 
@@ -7101,6 +7101,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            setattr(event, "_hermes_background_handler_cancelled", True)
             await _abort_parent_task_delivery(
                 locals().get("_parent_delivery_response"),
                 locals().get("_parent_obligation_id"),
@@ -7113,6 +7114,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            setattr(event, "_hermes_background_handler_failed", True)
             _aborted_parent_delivery = await _abort_parent_task_delivery(
                 locals().get("_parent_delivery_response"),
                 locals().get("_parent_obligation_id"),

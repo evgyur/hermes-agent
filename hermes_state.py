@@ -44,7 +44,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -2106,6 +2106,22 @@ CREATE TABLE IF NOT EXISTS gateway_message_ledger (
     snippet TEXT
 );
 
+CREATE TABLE IF NOT EXISTS gateway_steer_receipts (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id TEXT NOT NULL UNIQUE,
+    session_key TEXT NOT NULL,
+    session_id TEXT,
+    generation INTEGER NOT NULL,
+    ingress_ledger_id INTEGER,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    request_fenced_at REAL,
+    terminal_at REAL,
+    UNIQUE (session_key, generation, ingress_ledger_id)
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -2170,6 +2186,10 @@ CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup ON gateway_message_
 CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session ON gateway_message_ledger(session_key, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_platform ON gateway_message_ledger(platform, chat_id, thread_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status ON gateway_message_ledger(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_session
+    ON gateway_steer_receipts(session_key, sequence);
+CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_state
+    ON gateway_steer_receipts(state, sequence);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -10223,6 +10243,149 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    _GATEWAY_STEER_STATES = frozenset(
+        {
+            "ADMITTED", "OFFERED", "REQUEST_FENCED", "CONSUMED_CURRENT",
+            "QUEUED_NEXT", "AMBIGUOUS_PROVIDER_REQUEST", "CANCELLED",
+        }
+    )
+    _GATEWAY_STEER_TERMINAL_STATES = frozenset(
+        {"CONSUMED_CURRENT", "QUEUED_NEXT", "AMBIGUOUS_PROVIDER_REQUEST", "CANCELLED"}
+    )
+
+    def admit_gateway_steer_receipt(
+        self,
+        *,
+        receipt_id: str,
+        session_key: str,
+        session_id: Optional[str],
+        generation: int,
+        ingress_ledger_id: Optional[int],
+        payload_json: str,
+        timestamp: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Persist one immutable, ordered mid-turn steer identity."""
+        receipt = str(receipt_id or "").strip()
+        key = str(session_key or "").strip()
+        payload = str(payload_json or "")
+        if not receipt or not key or not payload:
+            raise ValueError("receipt_id, session_key, and payload_json are required")
+        generation_i = int(generation)
+        ledger_i = int(ingress_ledger_id) if ingress_ledger_id is not None else None
+        now = float(timestamp or time.time())
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO gateway_steer_receipts (
+                    receipt_id, session_key, session_id, generation,
+                    ingress_ledger_id, payload_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'ADMITTED', ?, ?)
+                """,
+                (receipt, key, session_id, generation_i, ledger_i, payload, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM gateway_steer_receipts WHERE receipt_id = ?", (receipt,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("steer receipt admission produced no row")
+            result = dict(row)
+            identity = (
+                str(result["session_key"]), int(result["generation"]),
+                result["ingress_ledger_id"], str(result["payload_json"]),
+            )
+            if identity != (key, generation_i, ledger_i, payload):
+                raise ValueError("steer receipt identity collision")
+            return result
+
+        return self._execute_write(_do)
+
+    def transition_gateway_steer_receipt(
+        self,
+        receipt_id: str,
+        *,
+        generation: int,
+        expected_states: Iterable[str],
+        state: str,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """CAS one receipt using its immutable generation and current state."""
+        target = str(state or "").strip().upper()
+        expected = tuple(str(value).strip().upper() for value in expected_states)
+        if target not in self._GATEWAY_STEER_STATES or not expected:
+            raise ValueError("invalid gateway steer receipt transition")
+        if any(value not in self._GATEWAY_STEER_STATES for value in expected):
+            raise ValueError("invalid expected gateway steer receipt state")
+        placeholders = ",".join("?" for _ in expected)
+        now = float(timestamp or time.time())
+        fenced_at = now if target == "REQUEST_FENCED" else None
+        terminal_at = now if target in self._GATEWAY_STEER_TERMINAL_STATES else None
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_steer_receipts
+                   SET state = ?, updated_at = ?,
+                       request_fenced_at = COALESCE(request_fenced_at, ?),
+                       terminal_at = COALESCE(terminal_at, ?)
+                 WHERE receipt_id = ? AND generation = ?
+                   AND state IN ({placeholders})
+                """,
+                (target, now, fenced_at, terminal_at, str(receipt_id), int(generation), *expected),
+            )
+            if int(cursor.rowcount or 0) == 1:
+                return True
+            row = conn.execute(
+                "SELECT generation, state FROM gateway_steer_receipts WHERE receipt_id = ?",
+                (str(receipt_id),),
+            ).fetchone()
+            return bool(
+                row is not None and int(row["generation"]) == int(generation)
+                and str(row["state"]) == target
+            )
+
+        return bool(self._execute_write(_do))
+
+    def list_gateway_steer_receipts(
+        self, session_key: Optional[str] = None, *, terminal: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_key is not None:
+            clauses.append("session_key = ?")
+            params.append(str(session_key))
+        terminal_states = tuple(sorted(self._GATEWAY_STEER_TERMINAL_STATES))
+        if terminal is not None:
+            placeholders = ",".join("?" for _ in terminal_states)
+            clauses.append(f"state {'IN' if terminal else 'NOT IN'} ({placeholders})")
+            params.extend(terminal_states)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM gateway_steer_receipts{where} ORDER BY sequence ASC",
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def reconcile_gateway_steer_receipts_after_restart(self) -> Dict[str, int]:
+        """Converge orphaned offers without guessing past the provider fence."""
+        now = time.time()
+
+        def _do(conn):
+            ambiguous = conn.execute(
+                """UPDATE gateway_steer_receipts
+                      SET state='AMBIGUOUS_PROVIDER_REQUEST', updated_at=?, terminal_at=?
+                    WHERE state='REQUEST_FENCED'""", (now, now),
+            ).rowcount
+            queued = conn.execute(
+                """UPDATE gateway_steer_receipts
+                      SET state='QUEUED_NEXT', updated_at=?, terminal_at=?
+                    WHERE state IN ('ADMITTED','OFFERED')""", (now, now),
+            ).rowcount
+            return {"ambiguous": int(ambiguous or 0), "queued_next": int(queued or 0)}
 
         return self._execute_write(_do)
 

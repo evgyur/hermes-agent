@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -59,6 +60,26 @@ def _record(runner: GatewayRunner, event: MessageEvent, session_key: str = "sk")
     ledger_id = runner._record_gateway_ledger_received(event, session_key=session_key)
     assert ledger_id is not None
     return ledger_id
+
+
+@pytest.mark.asyncio
+async def test_busy_startup_replay_preserves_its_original_ledger_identity(ledger_db):
+    """A busy startup replay must not be admitted/finalized as fresh ingress."""
+    runner = _runner(ledger_db)
+    event = _event("busy-owned-identity")
+    _record(runner, event, "busy-key")
+    event._hermes_startup_restore_replay = True
+    runner._record_gateway_ledger_received = MagicMock(
+        side_effect=AssertionError("startup replay minted a second ledger identity")
+    )
+    runner._finalize_gateway_ledger_after_handler = MagicMock(
+        side_effect=AssertionError("busy RAM handoff terminalized the replay owner")
+    )
+    runner._handle_active_session_busy_message_impl = AsyncMock(return_value=True)
+
+    assert await runner._handle_active_session_busy_message(event, "busy-key") is True
+    runner._record_gateway_ledger_received.assert_not_called()
+    runner._finalize_gateway_ledger_after_handler.assert_not_called()
 
 
 @pytest.mark.asyncio

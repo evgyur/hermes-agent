@@ -9878,10 +9878,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        persist_deferred: bool = True,
+    ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9899,14 +9905,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(getattr(event, "media_urls", None))
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
-            self._set_gateway_ledger_deferred(event)
+            if persist_deferred:
+                self._set_gateway_ledger_deferred(event)
             merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -9914,15 +9921,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            self._update_gateway_ledger(
-                event,
-                "failed",
-                session_key=session_key,
-                reason="pending-queue-cap",
-            )
-            return
+            if persist_deferred:
+                self._update_gateway_ledger(
+                    event,
+                    "failed",
+                    session_key=session_key,
+                    reason="pending-queue-cap",
+                )
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(
+            session_key,
+            event,
+            adapter,
+            persist_deferred=persist_deferred,
+        )
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9967,29 +9980,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
     ) -> bool:
         """Handle busy-session ingress with a complete ledger lifecycle."""
-        try:
-            setattr(event, "_hermes_gateway_ledger_deferred", False)
-        except Exception:
-            pass
-        await asyncio.to_thread(
-            self._record_gateway_ledger_received,
-            event,
-            session_key=session_key,
-            reason="busy-handler-entry",
+        startup_replay_owned = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+            and (
+                getattr(event, "_hermes_gateway_ledger_id", None) is not None
+                or getattr(event, "_hermes_gateway_ledger_ids", None)
+            )
         )
+        if not startup_replay_owned:
+            try:
+                setattr(event, "_hermes_gateway_ledger_deferred", False)
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                self._record_gateway_ledger_received,
+                event,
+                session_key=session_key,
+                reason="busy-handler-entry",
+            )
         try:
             handled = await self._handle_active_session_busy_message_impl(
                 event,
                 session_key,
             )
         except BaseException as exc:
-            await asyncio.to_thread(
-                self._finalize_gateway_ledger_after_handler,
-                event,
-                error=exc,
-            )
+            if not startup_replay_owned:
+                await asyncio.to_thread(
+                    self._finalize_gateway_ledger_after_handler,
+                    event,
+                    error=exc,
+                )
             raise
-        if handled:
+        if handled and not startup_replay_owned:
             await asyncio.to_thread(
                 self._finalize_gateway_ledger_after_handler,
                 event,
@@ -10165,34 +10187,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to queue semantics so nothing is lost.
         # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
         # to every entry in the parent's ``_active_children`` list and
-        # aborts in-flight ``delegate_task`` work. Demote ``interrupt``
-        # to ``queue`` when the parent is currently driving subagents so
-        # a conversational follow-up doesn't destroy minutes of subagent
-        # work. Explicit ``/stop`` and ``/new`` slash commands go through
-        # ``_interrupt_and_clear_session`` and are unaffected — the
-        # operator still has a way to force-cancel everything.
+        # aborts in-flight ``delegate_task`` work. Route ``interrupt``
+        # to generation-bound ``steer`` while children are active so the
+        # follow-up changes the parent without cancelling child work or
+        # waiting silently for another turn. Explicit ``/stop`` and ``/new``
+        # still use ``_interrupt_and_clear_session``.
         demoted_for_subagents = (
             effective_mode == "interrupt"
             and self._agent_has_active_subagents(running_agent)
         )
         if demoted_for_subagents:
             logger.info(
-                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "Routing busy_input_mode 'interrupt' to 'steer' for session %s "
                 "because the running agent has active subagents (#30170)",
                 session_key,
             )
-            effective_mode = "queue"
+            effective_mode = "steer"
         demoted_for_compression = (
             effective_mode == "interrupt"
             and await self._session_has_compression_in_flight(session_key)
         )
         if demoted_for_compression:
             logger.info(
-                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "Routing busy_input_mode 'interrupt' to 'steer' for session %s "
                 "because context compression is in flight (#56391)",
                 session_key,
             )
-            effective_mode = "queue"
+            effective_mode = "steer"
         steered = False
         redirected = False
         if effective_mode == "steer":
@@ -10220,11 +10241,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "steer")
             )
             if can_steer:
+                _steer_generation = int(
+                    getattr(self, "_session_run_generation", {}).get(session_key, 0)
+                )
+                _steer_ledger_id = getattr(event, "_hermes_gateway_ledger_id", None)
+                _steer_identity = "|".join(
+                    (
+                        session_key,
+                        str(_steer_generation),
+                        str(_steer_ledger_id or ""),
+                        str(getattr(event, "message_id", "") or ""),
+                    )
+                )
+                _steer_receipt_id = hashlib.sha256(
+                    _steer_identity.encode("utf-8", errors="surrogatepass")
+                ).hexdigest()
+                _steer_db = getattr(self, "_session_db", None)
+                _transition = None
+                if _steer_db is not None and hasattr(
+                    _steer_db, "admit_gateway_steer_receipt"
+                ):
+                    _steer_db.admit_gateway_steer_receipt(
+                        receipt_id=_steer_receipt_id,
+                        session_key=session_key,
+                        session_id=(
+                            str(getattr(running_agent, "session_id", "") or "") or None
+                        ),
+                        generation=_steer_generation,
+                        ingress_ledger_id=_steer_ledger_id,
+                        payload_json=json.dumps(
+                            {"text": steer_text}, ensure_ascii=False, sort_keys=True
+                        ),
+                    )
+
+                    def _transition(receipt_id: str, state: str) -> None:
+                        expected = {
+                            "REQUEST_FENCED": ("OFFERED",),
+                            "CONSUMED_CURRENT": ("REQUEST_FENCED",),
+                            "AMBIGUOUS_PROVIDER_REQUEST": ("REQUEST_FENCED",),
+                        }[state]
+                        _steer_db.transition_gateway_steer_receipt(
+                            receipt_id,
+                            generation=_steer_generation,
+                            expected_states=expected,
+                            state=state,
+                        )
+
+                    _steer_db.transition_gateway_steer_receipt(
+                        _steer_receipt_id,
+                        generation=_steer_generation,
+                        expected_states=("ADMITTED",),
+                        state="OFFERED",
+                    )
                 try:
-                    steered = bool(running_agent.steer(steer_text))
+                    steered = bool(
+                        running_agent.steer(
+                            steer_text,
+                            receipt_id=_steer_receipt_id,
+                            receipt_transition=_transition,
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
+                if not steered and _steer_db is not None:
+                    _steer_db.transition_gateway_steer_receipt(
+                        _steer_receipt_id,
+                        generation=_steer_generation,
+                        expected_states=("OFFERED", "ADMITTED"),
+                        state="QUEUED_NEXT",
+                    )
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -10369,8 +10455,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
             message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
+                f"⏩ Accepted for the current run{status_detail}. "
+                f"It will be applied at the next safe model boundary."
             )
         elif is_redirect_mode:
             message = (

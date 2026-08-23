@@ -244,6 +244,29 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         with patch("gateway.run.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
-        parent.steer.assert_called_once_with("course-correct")
+        assert parent.steer.call_args.args == ("course-correct",)
         parent.interrupt.assert_not_called()
+    @pytest.mark.asyncio
+    async def test_interrupt_mode_steers_parent_without_cancelling_children(self) -> None:
+        runner = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "interrupt"
+        runner._session_run_generation = {}
+        runner._session_db = None
+        runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+        adapter = _make_adapter()
+        event = _make_event(text="change the active approach")
+        sk = build_session_key(event.source)
+        parent = _make_parent_with_subagents()
+        parent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        assert parent.steer.call_args.args == ("change the active approach",)
+        parent.interrupt.assert_not_called()
+        assert adapter._pending_messages == {}
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Accepted for the current run" in content
 
