@@ -8569,7 +8569,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     ok = False
-            if ok and status in {"in_progress", "completed", "drained", "failed"}:
+            if ok and status in {"completed", "drained", "failed"}:
                 try:
                     from gateway.deferred_event_spool import remove_deferred_event
 
@@ -10289,7 +10289,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         generation=_steer_generation,
                         ingress_ledger_id=_steer_ledger_id,
                         payload_json=json.dumps(
-                            {"text": steer_text}, ensure_ascii=False, sort_keys=True
+                            {
+                                "text": steer_text,
+                                "event": __import__(
+                                    "gateway.deferred_event_spool",
+                                    fromlist=["serialize_message_event"],
+                                ).serialize_message_event(event),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
                         ),
                     )
 
@@ -12622,7 +12630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     queue.append(event)
                 logger.error("Startup adapter returned without accepting the event")
                 continue
-            if is_spool_replay:
+            if is_spool_replay and handoff == "completed":
                 try:
                     from gateway.deferred_event_spool import remove_deferred_event
 
@@ -12646,6 +12654,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(2)
             await self._drain_startup_restore_queue(schedule_retry=False)
 
+    def _reconcile_terminal_steer_receipts(self, session_key: str, generation: int) -> int:
+        db = getattr(self, "_session_db", None)
+        db = vars(db).get("_db", db) if db is not None else None
+        if db is None:
+            return 0
+        from gateway.deferred_event_spool import deserialize_message_event, persist_deferred_event
+        queued = 0
+        for row in db.list_gateway_steer_receipts(session_key, terminal=False):
+            if int(row.get("generation") or -1) != int(generation):
+                continue
+            receipt_id = str(row["receipt_id"])
+            state = str(row["state"])
+            if state == "REQUEST_FENCED":
+                db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="AMBIGUOUS_PROVIDER_REQUEST")
+                logger.critical("Steering receipt entered incident hold after provider request")
+                continue
+            if state not in {"ADMITTED", "OFFERED"}:
+                continue
+            if not self._is_session_run_current(session_key, generation):
+                db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="CANCELLED")
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                event = deserialize_message_event(payload["event"])
+            except Exception:
+                logger.critical("Steering receipt payload is malformed; incident hold", exc_info=True)
+                continue
+            ledger_id = row.get("ingress_ledger_id")
+            if ledger_id is not None:
+                setattr(event, "_hermes_gateway_ledger_id", int(ledger_id))
+                db.update_gateway_message_ledger(int(ledger_id), status="requeued", session_key=session_key, reason="steer-queued-next")
+            persist_deferred_event(event, session_key=session_key)
+            adapter = self._adapter_for_source(event.source)
+            pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending, dict):
+                continue
+            event.metadata = dict(event.metadata or {})
+            event.metadata["steer_receipt_id"] = receipt_id
+            pending[session_key] = event
+            if db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="QUEUED_NEXT"):
+                queued += 1
+        return queued
+
+    def _restore_startup_steer_events(self, db) -> list[MessageEvent]:
+        from gateway.deferred_event_spool import deserialize_message_event, persist_deferred_event
+        restored: list[MessageEvent] = []
+        for row in db.list_gateway_steer_receipts(terminal=False):
+            receipt_id = str(row["receipt_id"])
+            generation = int(row["generation"])
+            state = str(row["state"])
+            if state == "REQUEST_FENCED":
+                db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="AMBIGUOUS_PROVIDER_REQUEST")
+                logger.critical("Steering receipt is in incident hold after restart")
+                continue
+            if state not in {"ADMITTED", "OFFERED"}:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                event = deserialize_message_event(payload["event"])
+            except Exception:
+                logger.critical("Steering receipt payload is malformed; incident hold", exc_info=True)
+                continue
+            ledger_id = row.get("ingress_ledger_id")
+            if ledger_id is not None:
+                setattr(event, "_hermes_gateway_ledger_id", int(ledger_id))
+                db.update_gateway_message_ledger(int(ledger_id), status="requeued", session_key=str(row["session_key"]), reason="steer-startup-queued-next")
+            persist_deferred_event(event, session_key=str(row["session_key"]))
+            if db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="QUEUED_NEXT"):
+                restored.append(event)
+        return restored
+
     def _restore_spooled_deferred_events(self) -> list[MessageEvent]:
         """Load only events whose ledger proves dispatch never started."""
         session_db = getattr(self, "_session_db", None)
@@ -12655,11 +12734,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.deferred_event_spool import load_replayable_deferred_events
 
+            steer_events = self._restore_startup_steer_events(db)
             entries = load_replayable_deferred_events(db)
         except Exception:
             logger.warning("Deferred-event spool restore failed", exc_info=True)
             return []
-        events = [entry.event for entry in entries]
+        events = list(steer_events)
+        seen_ids = {str(getattr(item, "message_id", "") or "") for item in events}
+        for entry in entries:
+            message_id = str(getattr(entry.event, "message_id", "") or "")
+            if message_id and message_id in seen_ids:
+                continue
+            events.append(entry.event)
+            if message_id:
+                seen_ids.add(message_id)
         for event in events:
             setattr(event, "_hermes_deferred_spool_replay", True)
         if events:
@@ -18682,13 +18770,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.warning("Durable live-ingress claim failed", exc_info=True)
                 _ledger_dispatch_claimed = False
-            if _ledger_dispatch_claimed:
-                try:
-                    from gateway.deferred_event_spool import remove_deferred_event
-
-                    remove_deferred_event(event)
-                except Exception:
-                    logger.warning("Could not clear live claimed-event spool", exc_info=True)
         else:
             # Ledger writes are best effort for fresh current-process ingress.
             _ledger_dispatch_claimed = await asyncio.to_thread(
@@ -18699,13 +18780,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason="active-session-claimed",
                 metadata={"run_generation": _run_generation},
             )
-            if _ledger_dispatch_claimed:
-                try:
-                    from gateway.deferred_event_spool import remove_deferred_event
-
-                    remove_deferred_event(event)
-                except Exception:
-                    logger.warning("Could not clear admitted preledger event", exc_info=True)
 
         if (_ledger_ids or bool(getattr(event, "_hermes_preledger_ingress", False))) and not _ledger_dispatch_claimed:
             logger.warning(
@@ -18860,6 +18934,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
+            try:
+                self._reconcile_terminal_steer_receipts(
+                    _quick_key, _run_generation
+                )
+            except Exception:
+                logger.critical(
+                    "Steering terminal reconciliation failed; receipt retained",
+                    exc_info=True,
+                )
             await self._clear_durable_active_turn(event)
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a

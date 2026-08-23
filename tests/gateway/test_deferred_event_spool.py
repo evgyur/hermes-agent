@@ -189,7 +189,7 @@ async def test_preledger_event_is_admitted_once_after_storage_recovers(
     runner._adapter_for_source = lambda source: Adapter()
     assert await runner._drain_startup_restore_queue(schedule_retry=False) == 1
     assert seen == ["preledger"]
-    assert not path.exists()
+    assert path.exists()  # dispatch claim is not terminal ownership
     row = ledger_db.find_gateway_message_ledger(
         platform="telegram",
         chat_id="chat-1",
@@ -322,7 +322,7 @@ async def test_restart_replays_only_undispatched_deferred_event(
     second._startup_restore_queue[0:0] = restored
     assert await second._drain_startup_restore_queue() == 1
     assert seen == [event.text]
-    assert list(spool_path.glob("*.json")) == []
+    assert len(list(spool_path.glob("*.json"))) == 1
     row = ledger_db.find_gateway_message_ledger(
         platform="telegram",
         chat_id="chat-1",
@@ -422,6 +422,9 @@ def test_started_dispatch_is_never_replayed(monkeypatch, tmp_path, ledger_db):
     runner._update_gateway_ledger(event, "in_progress")
 
     assert load_replayable_deferred_events(ledger_db) == []
+    assert path.exists(), "dispatch claim is not terminal ownership"
+
+    assert runner._update_gateway_ledger(event, "completed")
     assert not path.exists()
 
 
@@ -457,7 +460,7 @@ def test_merged_pending_events_replay_as_physical_messages_in_ledger_order(
     assert [entry.event.text for entry in entries] == ["line one", "line two"]
     assert runner._update_gateway_ledger(pending["sk"], "in_progress")
     spool_dir = tmp_path / "hermes-home" / "deferred_events"
-    assert list(spool_dir.glob("*.json")) == []
+    assert len(list(spool_dir.glob("*.json"))) == 2
 
 
 def test_internal_continuation_is_not_spooled(monkeypatch, tmp_path):

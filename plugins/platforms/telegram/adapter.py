@@ -3568,7 +3568,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._start_polling_once(
                     app,
-                    drop_pending_updates=True,
+                    drop_pending_updates=False,
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info(
@@ -4581,10 +4581,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Never discard Bot API updates that were not first admitted
+                    # to Hermes durable ingress. This applies to cold starts and
+                    # watcher reconnects alike.
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )

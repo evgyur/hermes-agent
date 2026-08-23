@@ -5966,6 +5966,29 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+
+            def _record_processing_outcome(done_task) -> None:
+                """Publish the authoritative startup-handoff outcome."""
+                if done_task.cancelled() or bool(
+                    getattr(event, "_hermes_background_handler_cancelled", False)
+                ):
+                    outcome = "cancelled"
+                elif bool(getattr(event, "_hermes_background_handler_failed", False)):
+                    outcome = "failed"
+                else:
+                    try:
+                        failed = done_task.exception() is not None
+                    except (asyncio.CancelledError, Exception):
+                        failed = True
+                    outcome = "failed" if failed else "completed"
+                setattr(event, "_hermes_background_processing_outcome", outcome)
+                setattr(
+                    event,
+                    "_hermes_background_processing_completed",
+                    outcome == "completed",
+                )
+
+            task.add_done_callback(_record_processing_outcome)
             startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
             if startup_ack is not None:
                 def _signal_terminal_handoff(_task) -> None:

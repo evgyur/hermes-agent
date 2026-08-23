@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -654,6 +655,32 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     env = _scrub_delegated_child_kanban_env(env)
 
     return env
+
+
+_GATEWAY_TOOL_NOFILE_LIMIT = 4096
+
+
+def gateway_tool_subprocess_kwargs() -> dict[str, Any]:
+    """Descriptor and resource policy for host tools spawned by Hermes.
+
+    The nofile limit is installed in the gateway child immediately before exec,
+    leaving the long-lived gateway/admin process's own limits untouched.
+    """
+    if _IS_WINDOWS:
+        return {"close_fds": True}
+    kwargs: dict[str, Any] = {"close_fds": True, "pass_fds": ()}
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return kwargs
+
+    def _bound_gateway_child_nofile() -> None:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        bounded = min(_GATEWAY_TOOL_NOFILE_LIMIT, soft, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (bounded, bounded))
+
+    kwargs["preexec_fn"] = _bound_gateway_child_nofile
+    return kwargs
 
 
 def build_subprocess_env(
@@ -1527,7 +1554,9 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs = gateway_tool_subprocess_kwargs()
+        if _IS_WINDOWS:
+            _popen_kwargs["creationflags"] = windows_hide_flags()
 
         proc = subprocess.Popen(
             args,

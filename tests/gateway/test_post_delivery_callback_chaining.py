@@ -136,4 +136,35 @@ async def test_startup_ack_observes_swallowed_background_failure(adapter):
 
     assert event._hermes_background_handler_failed is True
     assert not getattr(event, "_hermes_background_processing_completed", False)
+    assert event._hermes_background_processing_outcome == "failed"
+
+
+@pytest.mark.asyncio
+async def test_startup_ack_records_authoritative_successful_completion(adapter):
+    event = __import__(
+        "gateway.platforms.base", fromlist=["MessageEvent"]
+    ).MessageEvent(
+        text="restore me",
+        source=__import__(
+            "gateway.session", fromlist=["SessionSource"]
+        ).SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="u",
+            chat_id="c",
+            chat_type="dm",
+        ),
+        message_id="startup-success",
+    )
+    event._hermes_startup_dispatch_ack = asyncio.Event()
+    adapter.config.typing_indicator = False
+    adapter._run_processing_hook = AsyncMock()
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter.set_message_handler(AsyncMock(return_value="done"))
+
+    assert adapter._start_session_processing(event, "s") is True
+    await asyncio.wait_for(event._hermes_startup_dispatch_ack.wait(), timeout=2)
+    await asyncio.wait_for(event._hermes_adapter_processing_task, timeout=2)
+
+    assert event._hermes_background_processing_completed is True
+    assert event._hermes_background_processing_outcome == "completed"
 

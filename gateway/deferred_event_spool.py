@@ -149,6 +149,16 @@ def _deserialize_event(data: dict[str, Any]) -> MessageEvent:
     )
 
 
+def serialize_message_event(event: MessageEvent) -> dict[str, Any]:
+    """Return the durable MessageEvent payload shared by spool and receipts."""
+    return _serialize_event(event)
+
+
+def deserialize_message_event(data: dict[str, Any]) -> MessageEvent:
+    """Rebuild a MessageEvent from the shared durable payload."""
+    return _deserialize_event(data)
+
+
 def persist_deferred_event(event: MessageEvent, *, session_key: str) -> Optional[Path]:
     """Atomically persist one not-yet-dispatched event with private permissions."""
     from utils import atomic_json_write
@@ -346,8 +356,9 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
     """Load only events proven never to have started dispatch.
 
     Ambiguous, terminal, malformed, or ledger-missing records are never replayed.
-    Terminal/claimed records are removed because the ledger now owns recovery;
-    malformed and ledger-missing records remain for operator inspection.
+    Terminal records are removed because processing is complete. Claimed but
+    non-terminal records remain as incident/recovery evidence; malformed and
+    ledger-missing records also remain for operator inspection.
     """
     replayable: list[DeferredSpoolEntry] = []
     _maybe_sweep_expired(force=True)
@@ -423,14 +434,15 @@ def load_replayable_deferred_events(db: Any) -> list[DeferredSpoolEntry]:
                 and row.get("reason") == "startup-replay-claimed"
                 for row in ledgers
             )
+            if any(status in {"completed", "drained", "failed"} for status in statuses):
+                path.unlink(missing_ok=True)
+                continue
             if (
                 any(row.get("dispatch_started_at") is not None for row in ledgers)
-                or any(
-                    status in {"in_progress", "completed", "drained", "failed"}
-                    for status in statuses
-                )
+                or any(status == "in_progress" for status in statuses)
             ) and not startup_claim_only:
-                path.unlink(missing_ok=True)
+                # A dispatch claim is not terminal ownership. Keep the spool as
+                # recovery evidence until processing closes the ledger.
                 continue
             if any(status not in {"received", "requeued"} for status in statuses) and not startup_claim_only:
                 logger.warning(
