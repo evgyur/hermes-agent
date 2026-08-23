@@ -12618,9 +12618,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except asyncio.TimeoutError:
                     outcome = await self._fence_startup_processing_task(event)
                     if outcome == "requeue":
-                        self._startup_restore_queue.insert(0, event)
-                        self._update_gateway_ledger(event, "requeued", reason="startup-handoff-timeout")
-                        logger.error("Startup handoff timed out; fenced event returned to replay")
+                        if self._release_deferred_event_dispatch_claim(event):
+                            self._startup_restore_queue.insert(0, event)
+                            logger.error("Startup handoff timed out; fenced event returned to replay")
+                        else:
+                            outcome = "ambiguous"
+                            self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
                     elif outcome == "ambiguous":
                         self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
                         logger.critical("Startup handoff timeout could not fence adapter task; incident hold")
@@ -12631,8 +12634,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except asyncio.CancelledError:
                     outcome = await self._fence_startup_processing_task(event)
                     if outcome == "requeue":
-                        self._startup_restore_queue.insert(0, event)
-                        self._update_gateway_ledger(event, "requeued", reason="startup-handoff-cancelled")
+                        if self._release_deferred_event_dispatch_claim(event):
+                            self._startup_restore_queue.insert(0, event)
+                        else:
+                            outcome = "ambiguous"
+                            self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
                     elif outcome == "ambiguous":
                         self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
                         logger.critical("Cancelled startup handoff could not fence adapter task; incident hold")

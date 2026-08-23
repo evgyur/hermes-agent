@@ -407,7 +407,8 @@ async def test_scheduled_startup_handoff_timeout_restores_replay_owner(
     assert runner._startup_restore_queue == [event]
     row = ledger_db.get_gateway_message_ledger(ledger_id)
     assert row["status"] == "requeued"
-    assert row["reason"] == "startup-handoff-timeout"
+    assert row["reason"] == "startup-replay-handoff-failed"
+    assert row["dispatch_started_at"] is None
 
 
 @pytest.mark.asyncio
