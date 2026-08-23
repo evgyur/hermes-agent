@@ -32,7 +32,7 @@ from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
-from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
