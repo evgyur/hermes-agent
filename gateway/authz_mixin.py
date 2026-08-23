@@ -420,7 +420,12 @@ class GatewayAuthorizationMixin:
             return False
         return "*" in allowed_ids or str(source.user_id or "") in allowed_ids
 
-    def _is_user_authorized(self, source: SessionSource) -> bool:
+    def _is_user_authorized(
+        self,
+        source: SessionSource,
+        *,
+        allow_adapter_delegation: bool = True,
+    ) -> bool:
         """
         Check if a user is authorized to use the bot.
         
