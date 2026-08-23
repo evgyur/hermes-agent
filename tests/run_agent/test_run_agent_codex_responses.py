@@ -1116,8 +1116,17 @@ def test_codex_backend_detection_is_narrow(monkeypatch):
     assert codex._is_codex_backend() is True
     assert copilot._is_codex_backend() is False
 
+    # Credential-pool route changes can leave the cached URL fields stale.
+    # The normalized provider identity must still keep the final Codex wire
+    # guard active so unsupported request fields are stripped.
+    setattr(codex, "_base_url_hostname", "api.openai.com")
+    setattr(codex, "_base_url_lower", "https://api.openai.com/v1")
+    assert codex._is_codex_backend() is True
+
     # Exact backend URL detection still works for an explicitly custom route.
     setattr(codex, "provider", "custom")
+    setattr(codex, "_base_url_hostname", "chatgpt.com")
+    setattr(codex, "_base_url_lower", "https://chatgpt.com/backend-api/codex")
     assert codex._is_codex_backend() is True
     setattr(codex, "api_mode", "chat_completions")
     assert codex._is_codex_backend() is False

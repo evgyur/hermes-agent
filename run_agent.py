@@ -1612,11 +1612,17 @@ class AIAgent:
 
     def _is_codex_backend(self) -> bool:
         """Return True for the ChatGPT OAuth Codex Responses backend."""
+        provider = (getattr(self, "provider", "") or "").strip().lower()
         return (
             getattr(self, "api_mode", None) == "codex_responses"
-            and getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-            and "/backend-api/codex"
-            in (getattr(self, "_base_url_lower", "") or "")
+            and (
+                provider == "openai-codex"
+                or (
+                    getattr(self, "_base_url_hostname", "") == "chatgpt.com"
+                    and "/backend-api/codex"
+                    in (getattr(self, "_base_url_lower", "") or "")
+                )
+            )
         )
 
     def _anthropic_prompt_cache_policy(
