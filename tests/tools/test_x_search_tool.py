@@ -213,7 +213,7 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
 
     _no_xai_env(monkeypatch)
 
-    def _fake_resolve():
+    def _fake_resolve(**_kwargs):
         return {
             "provider": "xai-oauth",
             "api_key": "oauth-bearer-token",
@@ -249,7 +249,7 @@ def test_x_search_returns_tool_error_when_no_credentials(monkeypatch):
 
     _no_xai_env(monkeypatch)
 
-    def _fake_resolve():
+    def _fake_resolve(**_kwargs):
         return {
             "provider": "xai",
             "api_key": "",

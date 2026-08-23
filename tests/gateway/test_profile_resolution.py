@@ -8,9 +8,9 @@ import pytest
 
 from gateway.session import SessionSource, build_session_key
 from gateway.run import GatewayRunner
-from gateway.profile_routing import ProfileRoute
+from gateway.profile_routing import ProfileRoute, ProfileRouteRejected
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 
 
 @pytest.fixture
@@ -295,7 +295,74 @@ class TestNonDiscordProfileRouting:
         ]
         telegram_source.profile = None
 
-        assert mock_runner._profile_name_for_source(telegram_source) == "tg-profile"
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", Path("/profiles/default")),
+                          ("tg-profile", Path("/profiles/tg-profile"))],
+        ):
+            assert mock_runner._profile_name_for_source(telegram_source) == "tg-profile"
+
+    def test_route_inside_allowlist_resolves(self, mock_runner, telegram_source):
+        mock_runner.config.multiplex_profile_allowlist = ["worker"]
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="worker-route",
+                platform="telegram",
+                profile="worker",
+                chat_id="route-chat",
+            )
+        ]
+        telegram_source.chat_id = "route-chat"
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", Path("/profiles/default")),
+                          ("worker", Path("/profiles/worker"))],
+        ) as enumerate_profiles:
+            assert mock_runner._profile_name_for_source(telegram_source) == "worker"
+
+        enumerate_profiles.assert_called_once_with(
+            multiplex=True, profile_allowlist=["worker"]
+        )
+
+    def test_route_outside_allowlist_rejects(self, mock_runner, telegram_source, caplog):
+        mock_runner.config.multiplex_profile_allowlist = ["worker"]
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="restricted-route",
+                platform="telegram",
+                profile="restricted",
+                chat_id="route-chat",
+            )
+        ]
+        telegram_source.chat_id = "route-chat"
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", Path("/profiles/default")),
+                          ("worker", Path("/profiles/worker"))],
+        ), caplog.at_level(logging.WARNING, logger="gateway.run"):
+            with pytest.raises(ProfileRouteRejected):
+                mock_runner._profile_name_for_source(telegram_source)
+
+        assert "target profile 'restricted' is not served" in caplog.text
+
+    def test_no_route_match_preserves_default_sentinel(self, mock_runner, telegram_source):
+        mock_runner.config.multiplex_profile_allowlist = ["worker"]
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="other-chat",
+                platform="telegram",
+                profile="worker",
+                chat_id="different-chat",
+            )
+        ]
+        telegram_source.chat_id = "route-chat"
+
+        assert mock_runner._profile_name_for_source(telegram_source) is None
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+        source = adapter.build_source(chat_id="route-chat", chat_type="group")
+        assert source.profile is None
 
     def test_telegram_no_route_returns_none(self, mock_runner, telegram_source):
         """With no matching Telegram route, resolution returns None (caller
@@ -379,9 +446,14 @@ class TestAdapterToSessionKeyIntegration:
         mock_runner.config.profile_routes = self._routes()
         adapter = _stub_adapter(Platform.DISCORD, mock_runner)
 
-        source = adapter.build_source(
-            chat_id="222", chat_type="group", guild_id="111", user_id="u1",
-        )
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", Path("/profiles/default")),
+                          ("coder", Path("/profiles/coder"))],
+        ):
+            source = adapter.build_source(
+                chat_id="222", chat_type="group", guild_id="111", user_id="u1",
+            )
         assert source.profile == "coder"
 
         key = build_session_key(source, profile=source.profile)

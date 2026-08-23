@@ -1098,6 +1098,12 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            # Routing origin persisted at dispatch (see _capture_routing_origin):
+            # restores scope_id/user_id for the reconstructed SessionSource so
+            # relay egress priming works after a restart.
+            for _k in ("scope_id", "user_id", "user_name"):
+                if task.get(_k):
+                    event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             changed = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -1130,20 +1136,48 @@ def restore_undelivered_completions(target_queue) -> int:
     leave them queued for a consumer that can positively prove ownership,
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
+
+    Staleness cap: a pending completion older than
+    ``_MAX_COMPLETION_REPLAY_AGE_S`` is terminally dropped instead of
+    replayed. Replaying a weeks-old completion re-runs its parent session as
+    a full-context turn (a July session replayed in August burned a
+    102K-token context on the staging fleet) for a result nobody is waiting
+    on anymore; the payload stays queryable on the dropped row.
     """
     recover_abandoned_delegations()
+    now = time.time()
+    restored = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, event_json, completed_at, dispatched_at
+               FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        for delegation_id, payload, completed_at, dispatched_at in rows:
+            age_basis = completed_at or dispatched_at
+            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (now, delegation_id),
+                )
+                logger.warning(
+                    "Async delegation %s: pending completion is %.1fh old "
+                    "(cap %.1fh); terminally dropping the replay (result "
+                    "remains queryable).",
+                    delegation_id, (now - age_basis) / 3600.0,
+                    _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
+                )
+                continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -2777,6 +2811,12 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # Routing origin captured at dispatch (see _capture_routing_origin):
+    # additive, lets the gateway reconstruct a full SessionSource (incl.
+    # scope_id for relay tenant egress) when its own caches are cold.
+    for _k in ("scope_id", "user_id", "user_name"):
+        if record.get(_k):
+            evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (
@@ -3112,6 +3152,10 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    # Routing origin captured at dispatch (see _capture_routing_origin).
+    for _k in ("scope_id", "user_id", "user_name"):
+        if event_record.get(_k):
+            evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (

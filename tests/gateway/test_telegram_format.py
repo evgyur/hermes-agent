@@ -6,7 +6,6 @@ or corrupt user-visible content.
 """
 
 import re
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
