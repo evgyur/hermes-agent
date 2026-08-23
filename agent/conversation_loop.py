@@ -1388,6 +1388,19 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _without_tool_definition(tools, blocked_name: str):
+    """Return request-local tool definitions without one exact function name."""
+    return [
+        tool
+        for tool in (tools or [])
+        if not (
+            isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") == blocked_name
+        )
+    ]
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -1938,6 +1951,12 @@ def run_conversation(
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
 
+    # Different support files may be loaded in one turn. After an exact repeat,
+    # however, the content is already present. Stop advertising only the read
+    # tool for the rest of this turn so action tools can make progress.
+    _seen_skill_view_calls = set()
+    _suppress_skill_view_for_turn = False
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -2482,7 +2501,11 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = (
+            _without_tool_definition(agent.tools, "skill_view")
+            if _suppress_skill_view_for_turn
+            else agent.tools
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -7424,6 +7447,21 @@ def run_conversation(
                 # execute_code (programmatic tool calling).  These are
                 # cheap RPC-style calls that shouldn't eat the budget.
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
+                for _tc in assistant_message.tool_calls:
+                    if _tc.function.name != "skill_view":
+                        continue
+                    try:
+                        _sv_args = json.loads(_tc.function.arguments or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        _sv_args = {}
+                    _sv_signature = (
+                        str(_sv_args.get("name") or ""),
+                        str(_sv_args.get("file_path") or ""),
+                    )
+                    if _sv_signature in _seen_skill_view_calls:
+                        _suppress_skill_view_for_turn = True
+                    else:
+                        _seen_skill_view_calls.add(_sv_signature)
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 

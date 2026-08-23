@@ -1,6 +1,6 @@
 ---
 name: telegram-chip
-description: Use the employee-scoped @chipmanager Telegram runtime directly on HEL1.
+description: "Run: python3 ~/.hermes/skills/telegram-chip/scripts/probe_identity.py."
 ---
 
 # Employee Telegram — chipmanager
