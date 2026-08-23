@@ -13,12 +13,16 @@ import run_agent
 
 
 @pytest.fixture(autouse=True)
-def _no_codex_backoff(monkeypatch):
+def _no_codex_backoff(monkeypatch, tmp_path):
     """Short-circuit retry backoff so Codex retry tests don't block on real
     wall-clock waits (5s jittered_backoff base delay + tight time.sleep loop)."""
     import time as _time
     monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import parent_task_barrier
+
+    parent_task_barrier.initialize_storage()
 
 
 def _patch_agent_bootstrap(monkeypatch):
@@ -1121,8 +1125,16 @@ def test_codex_backend_detection_is_narrow(monkeypatch):
     assert codex._is_codex_backend() is True
     assert copilot._is_codex_backend() is False
 
+    # Cached URL fields are only accelerators. The canonical base_url must
+    # still keep the final Codex wire guard active after route bookkeeping.
+    setattr(codex, "_base_url_hostname", "api.openai.com")
+    setattr(codex, "_base_url_lower", "https://api.openai.com/v1")
+    assert codex._is_codex_backend() is True
+
     # Exact backend URL detection still works for an explicitly custom route.
     setattr(codex, "provider", "custom")
+    setattr(codex, "_base_url_hostname", "chatgpt.com")
+    setattr(codex, "_base_url_lower", "https://chatgpt.com/backend-api/codex")
     assert codex._is_codex_backend() is True
     setattr(codex, "api_mode", "chat_completions")
     assert codex._is_codex_backend() is False
