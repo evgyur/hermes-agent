@@ -1,6 +1,30 @@
-# Hermes Power Setup MVP
+# Hermes Power Setup
 
-Status: public-safe MVP foundation.
+## Unified install variants
+
+The private Powerpack has one runtime and one curated rentals skill bundle.
+Choose only the provider bootstrap:
+
+```bash
+# Rentals / workshop / ordinary operator install (also the default alias)
+hermes power install rentals
+
+# Employee install: read a customer-scoped Human20 Keys credential from stdin
+printf '%s\n' "$H20_CUSTOMER_KEY" | \
+  hermes power install employee --employee-id EMPLOYEE_CUSTOMER_ID --h20-key-stdin
+```
+
+Both variants install the same runtime and `bundles/rentals/skills` payload.
+The employee overlay additionally configures `h20-gpt` as primary, `mmfast`
+as fallback and delegation model, Perplexity search and Groq Whisper through
+Human20 Keys. The installer validates `/v1/me` before writing config and never
+accepts the customer key as a command-line argument.
+
+Customer/key issuance remains an administrator operation in Human20 Keys. The
+Powerpack consumes an already-issued customer key; it does not write the H20
+ledger database or mint credentials locally.
+
+Status: unified private Powerpack.
 
 Hermes Power Setup is an opinionated multimodal setup layer for Hermes Agent. It is designed to be easy to deploy without importing any private operator overlay.
 
@@ -32,8 +56,9 @@ The product boundary is: publish mechanisms and convenience, not a private opera
 
 ```bash
 hermes power inventory
-hermes power install --dry-run
-hermes power install
+hermes power install rentals --dry-run
+hermes power install rentals
+hermes power install employee --employee-id EMPLOYEE_CUSTOMER_ID --h20-key-stdin
 hermes power doctor
 hermes power secret-scan
 hermes setup power

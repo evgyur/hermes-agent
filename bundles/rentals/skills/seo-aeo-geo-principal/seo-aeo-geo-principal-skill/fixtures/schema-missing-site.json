@@ -1,0 +1,66 @@
+{
+  "base": "https://fixture.test",
+  "sitemap_url_count": 5,
+  "ok_html_count": 5,
+  "non_200": [],
+  "missing_title": [],
+  "missing_description": [],
+  "missing_canonical": [],
+  "bad_h1": [],
+  "noindex": [],
+  "text_chars_median": 2600,
+  "discovery": {
+    "https://fixture.test/robots.txt": {
+      "status": 200
+    },
+    "https://fixture.test/sitemap.xml": {
+      "status": 200
+    },
+    "https://fixture.test/llms.txt": {
+      "status": 200
+    },
+    "https://fixture.test/.well-known/mcp.json": {
+      "status": 200
+    }
+  },
+  "pages": [
+    {
+      "url": "https://fixture.test/",
+      "status": 200,
+      "internal_links_unique": 18,
+      "jsonld_types": []
+    },
+    {
+      "url": "https://fixture.test/a",
+      "status": 200,
+      "internal_links_unique": 15,
+      "jsonld_types": []
+    },
+    {
+      "url": "https://fixture.test/b",
+      "status": 200,
+      "internal_links_unique": 16,
+      "jsonld_types": []
+    },
+    {
+      "url": "https://fixture.test/c",
+      "status": 200,
+      "internal_links_unique": 17,
+      "jsonld_types": []
+    },
+    {
+      "url": "https://fixture.test/d",
+      "status": 200,
+      "internal_links_unique": 19,
+      "jsonld_types": []
+    }
+  ],
+  "missing_jsonld": [
+    "https://fixture.test/0",
+    "https://fixture.test/1",
+    "https://fixture.test/2",
+    "https://fixture.test/3"
+  ],
+  "thin_pages_under_1500": [],
+  "meaningful_image_alt_debt": []
+}

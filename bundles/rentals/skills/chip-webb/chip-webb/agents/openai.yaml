@@ -1,0 +1,6 @@
+interface:
+  display_name: "Chip Webb"
+  short_description: "Production website workflow"
+  default_prompt: "Use $chip-webb to build or audit a production website with local Supabase, account flows, video hosting, deploy, rollback, and smoke verification."
+policy:
+  allow_implicit_invocation: true

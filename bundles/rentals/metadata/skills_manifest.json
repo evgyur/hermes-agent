@@ -1,0 +1,426 @@
+[
+  {
+    "slug": "superpowerss",
+    "source_content_id": "codex-github-start",
+    "label": "Superpowers",
+    "source_url": "https://human20.app/files/codex-github-start/superpowers-skills.zip",
+    "archive": "archives/superpowers-skills.zip",
+    "skill_paths": [
+      "skills/systematic-debugging/SKILL.md",
+      "skills/using-git-worktrees/SKILL.md",
+      "skills/writing-plans/SKILL.md",
+      "skills/brainstorming/SKILL.md",
+      "skills/dispatching-parallel-agents/SKILL.md",
+      "skills/receiving-code-review/SKILL.md",
+      "skills/requesting-code-review/SKILL.md",
+      "skills/test-driven-development/SKILL.md",
+      "skills/using-superpowers/SKILL.md",
+      "skills/finishing-a-development-branch/SKILL.md",
+      "skills/writing-skills/SKILL.md",
+      "skills/verification-before-completion/SKILL.md",
+      "skills/executing-plans/SKILL.md",
+      "skills/subagent-driven-development/SKILL.md"
+    ],
+    "sha256": "f2e5b9df9166e54fae55f2e8a92ca0a6957c81bb231fbf9c678ceb9bd2fc292b",
+    "bytes": 127994,
+    "kind": "zip"
+  },
+  {
+    "slug": "prompt-optimizer",
+    "source_content_id": "codex-github-start",
+    "label": "Prompt Optimizer",
+    "source_url": "https://human20.app/files/codex-github-start/prompt-optimizer-skill.zip",
+    "archive": "archives/prompt-optimizer-skill.zip",
+    "skill_paths": [
+      "po/SKILL.md"
+    ],
+    "sha256": "ef5fedeacb8648dc373e0758170c15573b085c52567033c88c81cbd601dff5d6",
+    "bytes": 9081,
+    "kind": "zip"
+  },
+  {
+    "slug": "reasoning-personas",
+    "source_content_id": "codex-github-start",
+    "label": "Reasoning Personas",
+    "source_url": "https://human20.app/files/codex-github-start/reasoning-personas-skill.zip",
+    "archive": "archives/reasoning-personas-skill.zip",
+    "skill_paths": [
+      "reasoning-personas/SKILL.md"
+    ],
+    "sha256": "aa49e3c4ce46b398e16bbd79fbe2e2491ef595558be0721b596556eb70389522",
+    "bytes": 3401,
+    "kind": "zip"
+  },
+  {
+    "slug": "perplex-direct",
+    "source_content_id": "codex-github-start",
+    "label": "Perplex",
+    "source_url": "https://human20.app/files/codex-github-start/perplex-direct-skill.zip",
+    "archive": "archives/perplex-direct-skill.zip",
+    "skill_paths": [
+      "perplex/SKILL.md"
+    ],
+    "sha256": "dc1dd71a3badfe681e62486ca12cf0fe028ff3cad25de735924768a56a3fe275",
+    "bytes": 3155,
+    "kind": "zip"
+  },
+  {
+    "slug": "deep-hermes-hel1-noscrets",
+    "source_content_id": "codex-github-start",
+    "label": "Deep",
+    "source_url": "https://human20.app/files/codex-github-start/deep-skill-hermes-hel1-noscrets.zip",
+    "archive": "archives/deep-skill-hermes-hel1-noscrets.zip",
+    "skill_paths": [
+      "deep/SKILL.md"
+    ],
+    "sha256": "57f8ab88404be2713c2b757ac8b4f086c9d0e6c1f291d69e9e8cb6e062fba63a",
+    "bytes": 15113,
+    "kind": "zip"
+  },
+  {
+    "slug": "refero-web-design",
+    "source_content_id": "lesson-2",
+    "label": "refero-web-design",
+    "source_url": "https://human20.app/files/lesson-2/refero-web-design.zip",
+    "archive": "archives/refero-web-design.zip",
+    "skill_paths": [
+      "refero-web-design/SKILL.md"
+    ],
+    "sha256": "975255854f46e58d1a13ad05a4346adbfb7ae33ab313d902dd0103eaea9889ba",
+    "bytes": 1067,
+    "kind": "zip"
+  },
+  {
+    "slug": "refero-design",
+    "source_content_id": "lesson-2",
+    "label": "refero_skill",
+    "source_url": "https://human20.app/files/lesson-2/refero-design.zip",
+    "archive": "archives/refero-design.zip",
+    "skill_paths": [
+      "refero-design/SKILL.md"
+    ],
+    "sha256": "ac173a22f36c4dc60f9c79baf72eeeecfcdc8ed7f6aa115790308778bbef59ea",
+    "bytes": 495251,
+    "kind": "zip"
+  },
+  {
+    "slug": "hallmark",
+    "source_content_id": "lesson-2",
+    "label": "hallmark",
+    "source_url": "https://human20.app/files/lesson-2/hallmark.zip",
+    "archive": "archives/hallmark.zip",
+    "skill_paths": [
+      "hallmark/SKILL.md"
+    ],
+    "sha256": "7234900707c6315263cd724ecdeb012177a76ce03d781f5a50cf658c409f0afc",
+    "bytes": 308026,
+    "kind": "zip"
+  },
+  {
+    "slug": "shaw",
+    "source_content_id": "lesson-2",
+    "label": "shaw",
+    "source_url": "https://human20.app/files/lesson-2/shaw.zip",
+    "archive": "archives/shaw.zip",
+    "skill_paths": [
+      "shaw-public-clean/SKILL.md"
+    ],
+    "sha256": "926f720bda1a93cc92c65b50188a94ba00d9c63ae32b70015dd607802e35dd52",
+    "bytes": 3032,
+    "kind": "zip"
+  },
+  {
+    "slug": "chip-webb",
+    "source_content_id": "lesson-3",
+    "label": "chip-webb — production web/VPS/Supabase skill",
+    "source_url": "https://human20.app/files/lesson-3/chip-webb-skill.zip",
+    "archive": "archives/chip-webb-skill.zip",
+    "skill_paths": [
+      "chip-webb/SKILL.md"
+    ],
+    "sha256": "71aeb884a84e26750474fd443173df298f393a081481cdac7e3192e67a61eb14",
+    "bytes": 22391,
+    "kind": "zip"
+  },
+  {
+    "slug": "create",
+    "source_content_id": "lesson-3",
+    "label": "create-skill — создание и правка навыков",
+    "source_url": "https://human20.app/files/lesson-3/create-skill.zip",
+    "archive": "archives/create-skill.zip",
+    "skill_paths": [
+      "create-skill/SKILL.md"
+    ],
+    "sha256": "0d058aed9b23bb7b1b6fba020e87148a30a721ac7226e838a9c1c512b033a5fe",
+    "bytes": 51885,
+    "kind": "zip"
+  },
+  {
+    "slug": "seo-aeo-geo-principal",
+    "source_content_id": "lesson-3",
+    "label": "seo-aeo-geo-principal — SEO/AEO/GEO аудит",
+    "source_url": "https://human20.app/files/lesson-3/seo-aeo-geo-principal-skill.zip",
+    "archive": "archives/seo-aeo-geo-principal-skill.zip",
+    "skill_paths": [
+      "seo-aeo-geo-principal-skill/SKILL.md"
+    ],
+    "sha256": "7994ebc6de9f32f8a966147ca8e0313b302118c4c83b9cdc584a8b829141f0e6",
+    "bytes": 25614,
+    "kind": "zip"
+  },
+  {
+    "slug": "summ_skill",
+    "source_content_id": "jun-lesson-5",
+    "label": "summary skill",
+    "source_url": "https://human20.app/files/jun-lesson-5/summ_skill_public.md",
+    "archive": "archives/summ_skill_public.md",
+    "skill_paths": [
+      "SKILL.md"
+    ],
+    "sha256": "c28d1500e8bea41ea9d9b79fb2e693f00de3832f22594d06c12b722a1d3a6183",
+    "bytes": 12045,
+    "kind": "md"
+  },
+  {
+    "slug": "guardianangel",
+    "source_content_id": "jun-lesson-5",
+    "label": "Guardian Angel skill",
+    "source_url": "https://human20.app/files/jun-lesson-5/guardianangel-public-clean.zip",
+    "archive": "archives/guardianangel-public-clean.zip",
+    "skill_paths": [
+      "guardianangel/SKILL.md"
+    ],
+    "sha256": "33137b291a19e9f37ceafc85302770884095cd5306463bb775795a7c2d82ac97",
+    "bytes": 9991,
+    "kind": "zip"
+  },
+  {
+    "slug": "tg-postcraft",
+    "source_content_id": "jun-lesson-5",
+    "label": "TG + Postcraft skills",
+    "source_url": "https://human20.app/files/jun-lesson-5/tg-postcraft.zip",
+    "archive": "archives/tg-postcraft.zip",
+    "skill_paths": [
+      "workshop-skills-clean/tg/SKILL.md",
+      "workshop-skills-clean/postcraft/SKILL.md"
+    ],
+    "sha256": "a7cb0800c126a055eabb7a8997bd7deaeeb847e30f457b7b544495b9c83ef982",
+    "bytes": 6353,
+    "kind": "zip"
+  },
+  {
+    "slug": "chip-marketing",
+    "source_content_id": "jun-lesson-6",
+    "label": "chip-marketing skill ZIP",
+    "source_url": "https://human20.app/files/jun-lesson-6/chip-marketing-public-validated.zip",
+    "archive": "archives/chip-marketing-public-validated.zip",
+    "skill_paths": [
+      "chip-marketing-public-clean/SKILL.md",
+      "chip-marketing-public-clean/references/pricing-alerts/SKILL.md",
+      "chip-marketing-public-clean/references/content-syndication/SKILL.md",
+      "chip-marketing-public-clean/references/hook-frameworks/SKILL.md",
+      "chip-marketing-public-clean/references/playbooks/SKILL.md"
+    ],
+    "sha256": "7f42db72fd54608af0ed2676cb53927b37a3446c21ac603eb8fdd4922b83932a",
+    "bytes": 37744,
+    "kind": "zip"
+  },
+  {
+    "slug": "bird-socialdata-validated",
+    "source_content_id": "jun-lesson-6",
+    "label": "bird + Social Data skill ZIP",
+    "source_url": "https://human20.app/files/jun-lesson-6/bird-skill-socialdata-validated.zip",
+    "archive": "archives/bird-skill-socialdata-validated.zip",
+    "skill_paths": [
+      "bird/SKILL.md"
+    ],
+    "sha256": "a77bf3c4460cbf2ad1bc86b9750848cbe0904c67ba8589f092f331087433f411",
+    "bytes": 7740,
+    "kind": "zip"
+  },
+  {
+    "slug": "restic-doctor",
+    "source_content_id": "jun-lesson-6",
+    "label": "restic-doctor skill ZIP",
+    "source_url": "https://human20.app/files/jun-lesson-6/restic-doctor.zip",
+    "archive": "archives/restic-doctor.zip",
+    "skill_paths": [
+      "restic-doctor/SKILL.md"
+    ],
+    "sha256": "b61707ba715328188eaad8dbd68d033b843d2a3a5694c95015973cbd02d99817",
+    "bytes": 5818,
+    "kind": "zip"
+  },
+  {
+    "slug": "img-chip-cover",
+    "source_content_id": "jun-lesson-6",
+    "label": "img+chip-cover skill ZIP",
+    "source_url": "https://human20.app/files/jun-lesson-6/img-chip-cover-public-validated.zip",
+    "archive": "archives/img-chip-cover-public-validated.zip",
+    "skill_paths": [
+      "image-skills-public-clean/img/SKILL.md",
+      "image-skills-public-clean/chip-cover/SKILL.md"
+    ],
+    "sha256": "ba225021af2aca1b9091266c57fdb3ff87b6ab7ffac9b08f142006e088e7be51",
+    "bytes": 17596,
+    "kind": "zip"
+  },
+  {
+    "slug": "perplex-hel1-20260622",
+    "source_content_id": "codex-github-start",
+    "label": "perplex-skill-hel1-20260622.zip",
+    "source_url": "https://human20.app/files/codex-github-start/perplex-skill-hel1-20260622.zip",
+    "archive": "archives/perplex-skill-hel1-20260622.zip",
+    "skill_paths": [
+      "perplex/SKILL.md"
+    ],
+    "sha256": "3d69b95442c1ac0f2d400cbb445f87d74679062aadd5f50d52c82d36a1040b5e",
+    "bytes": 16163,
+    "kind": "zip"
+  },
+  {
+    "slug": "design-taste-frontend",
+    "source_content_id": "lesson-2",
+    "label": "design-taste-frontend.zip",
+    "source_url": "https://human20.app/files/lesson-2/design-taste-frontend.zip",
+    "archive": "archives/design-taste-frontend.zip",
+    "skill_paths": [
+      "design-taste-frontend/SKILL.md"
+    ],
+    "sha256": "f44e7243e10f46b3c1ed89acc20c429cb40809addc63e06fce0d3f04670c9b4e",
+    "bytes": 9926,
+    "kind": "zip"
+  },
+  {
+    "slug": "image-to-code",
+    "source_content_id": "lesson-2",
+    "label": "image-to-code-skill.zip",
+    "source_url": "https://human20.app/files/lesson-2/image-to-code-skill.zip",
+    "archive": "archives/image-to-code-skill.zip",
+    "skill_paths": [
+      "image-to-code-skill/SKILL.md"
+    ],
+    "sha256": "d9f14f45be90d44292cab9ee91b0717627f83a1f0b5e9e7693d763ce59293fbf",
+    "bytes": 12887,
+    "kind": "zip"
+  },
+  {
+    "slug": "taste",
+    "source_content_id": "lesson-2",
+    "label": "taste-skill.zip",
+    "source_url": "https://human20.app/files/lesson-2/taste-skill.zip",
+    "archive": "archives/taste-skill.zip",
+    "skill_paths": [
+      "taste-skill/SKILL.md"
+    ],
+    "sha256": "86f5596ed5b6d66ce3e880d60639e13e94f579cf2616f7bcbab37de6b0f60081",
+    "bytes": 35351,
+    "kind": "zip"
+  },
+  {
+    "slug": "webd",
+    "source_content_id": "lesson-3",
+    "label": "webd.zip",
+    "source_url": "https://human20.app/files/lesson-3/webd.zip",
+    "archive": "archives/webd.zip",
+    "skill_paths": [
+      "webd/SKILL.md"
+    ],
+    "sha256": "f42ede6ded83353971cbe2051f7483911e2d6295035938831b49bed64e37d2bb",
+    "bytes": 48804,
+    "kind": "zip"
+  },
+  {
+    "slug": "tg-chip",
+    "source_content_id": "downloads",
+    "label": "tg-skill-chip.zip",
+    "source_url": "https://human20.app/downloads/tg-skill-chip.zip",
+    "archive": "archives/tg-skill-chip.zip",
+    "skill_paths": [
+      "tg-skill-clean/SKILL.md",
+      "tg-skill-clean/modules/tgdl-export/SKILL.md",
+      "tg-skill-clean/modules/ops-hardening/SKILL.md",
+      "tg-skill-clean/modules/mcp-stdio/SKILL.md",
+      "tg-skill-clean/modules/runtime-api/SKILL.md"
+    ],
+    "sha256": "93a2e8373139d920d54dbbbf4ba0c7d898a73897e6a738918ed70cf46fe81f9c",
+    "bytes": 72437,
+    "kind": "zip"
+  },
+  {
+    "slug": "codex-tg",
+    "source_content_id": "downloads",
+    "label": "codex-tg.zip",
+    "source_url": "https://human20.app/downloads/codex-tg.zip",
+    "archive": "archives/codex-tg.zip",
+    "skill_paths": [
+      "codex-tg-clean/SKILL.md",
+      "codex-tg-clean/references/openclaw-codex-app-server/.agents/skills/test-ocas-openclaw/SKILL.md",
+      "codex-tg-clean/references/openclaw-codex-app-server/.agents/skills/release/SKILL.md",
+      "codex-tg-clean/references/openclaw-codex-app-server/.agents/skills/project-manager/SKILL.md"
+    ],
+    "sha256": "9aac1c825941459cb359e286228ab94f1ec34079417819ed316eefb4b0fc3d07",
+    "bytes": 290333,
+    "kind": "zip"
+  },
+  {
+    "slug": "codex-plugin",
+    "source_content_id": "downloads",
+    "label": "codex-plugin.zip",
+    "source_url": "https://human20.app/downloads/codex-plugin.zip",
+    "archive": "archives/codex-plugin.zip",
+    "skill_paths": [
+      "codex-plugin-clean/.agents/skills/test-ocas-openclaw/SKILL.md",
+      "codex-plugin-clean/.agents/skills/release/SKILL.md",
+      "codex-plugin-clean/.agents/skills/project-manager/SKILL.md"
+    ],
+    "sha256": "a3a909487dbad6433e8df9109e453b1f186e122cc8532758a6050a21067257f5",
+    "bytes": 193619,
+    "kind": "zip"
+  },
+  {
+    "slug": "vercel-labs-agents",
+    "source_content_id": "downloads",
+    "label": "vercel-labs-agent-skills.zip",
+    "source_url": "https://human20.app/downloads/vercel-labs-agent-skills.zip",
+    "archive": "archives/vercel-labs-agent-skills.zip",
+    "skill_paths": [
+      "skills/web-design-guidelines/SKILL.md",
+      "skills/deploy-to-vercel/SKILL.md",
+      "skills/react-view-transitions/SKILL.md",
+      "skills/react-best-practices/SKILL.md",
+      "skills/vercel-cli-with-tokens/SKILL.md",
+      "skills/react-native-skills/SKILL.md",
+      "skills/composition-patterns/SKILL.md"
+    ],
+    "sha256": "4712ff19137362cda3e3d028b2fddfc7454eff7c78e3d2bda64c506549a39a04",
+    "bytes": 404194,
+    "kind": "zip"
+  },
+  {
+    "slug": "video-generation",
+    "source_content_id": "jun-lesson-6",
+    "label": "video generation skill public validated",
+    "source_url": "https://human20.app/files/jun-lesson-6/video-generation-skill-public-validated.zip",
+    "archive": "archives/video-generation-skill-public-validated.zip",
+    "skill_paths": [
+      "video-generation-skill-public-clean/SKILL.md"
+    ],
+    "sha256": "957e0f358e94761b9628c85dd046bf0d5618a1923fd894450b9f75bd37c7d6da",
+    "bytes": 6003,
+    "kind": "zip"
+  },
+  {
+    "slug": "video-use",
+    "source_content_id": "jun-lesson-6",
+    "label": "video use public validated",
+    "source_url": "https://human20.app/files/jun-lesson-6/video-use-public-validated.zip",
+    "archive": "archives/video-use-public-validated.zip",
+    "skill_paths": [
+      "video-use-public-clean/SKILL.md"
+    ],
+    "sha256": "4017bb064df479d725e6f1747d95b7018b6691878f70b46a4f341e237d6050c5",
+    "bytes": 77752,
+    "kind": "zip"
+  }
+]

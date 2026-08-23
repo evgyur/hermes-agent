@@ -1,9 +1,8 @@
 """Hermes Power Setup helpers.
 
-This module provides a small, safe foundation for an opinionated multimodal
-Hermes setup.  It intentionally ships only generic, public-safe defaults: no
-private chat ids, no token files, no operator overlays, and no tg/postcraft
-editorial pack in the default module set.
+This module provides the unified private Powerpack installer.  Rentals and
+employee installs share one runtime and one curated skill payload; employee
+installs add only customer-scoped Human20 Keys routing.
 """
 
 from __future__ import annotations
@@ -20,6 +19,15 @@ from typing import Any
 import yaml
 
 from hermes_cli.config import get_hermes_home, get_project_root, load_config, save_config
+from hermes_cli.power_variants import (
+    DEFAULT_H20_BASE_URL,
+    VARIANTS,
+    install_rentals_bundle,
+    load_employee_overlay,
+    normalize_h20_base_url,
+    save_employee_credentials,
+    validate_h20_identity,
+)
 
 
 EXCLUDED_DEFAULT_MODULES = frozenset({"tg", "postcraft"})
@@ -178,6 +186,22 @@ def _merge_dict(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
         else:
             base[key] = value
     return base
+
+
+def _snapshot_file(path: Path) -> tuple[bool, bytes, int]:
+    if not path.exists():
+        return False, b"", 0o600
+    return True, path.read_bytes(), path.stat().st_mode & 0o777
+
+
+def _restore_file(path: Path, snapshot: tuple[bool, bytes, int]) -> None:
+    existed, payload, mode = snapshot
+    if not existed:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    path.chmod(mode)
 
 
 def power_preset_defaults() -> dict[str, Any]:
@@ -472,14 +496,22 @@ def run_doctor(json_output: bool = False) -> int:
     return 1 if any(check.status == "fail" for check in checks) else 0
 
 
-def apply_power_preset(dry_run: bool = False) -> dict[str, Any]:
+def apply_power_preset(dry_run: bool = False, preset: str = "rentals") -> dict[str, Any]:
     current = load_config()
-    preset = power_preset_defaults()
+    if preset == "default":
+        preset = "rentals"
+    if preset not in VARIANTS:
+        raise ValueError(f"Unknown Powerpack variant: {preset}")
+    preset_config = power_preset_defaults()
     current_display = current.get("display", {}) if isinstance(current.get("display"), dict) else {}
     current_personality = str(current_display.get("personality", "") or "").strip().lower()
     if current_personality not in {"", "none", "default", "neutral"}:
-        preset.pop("display", None)
-    updated = _merge_dict(dict(current), preset)
+        preset_config.pop("display", None)
+    power_config = preset_config.setdefault("power", {})
+    power_config["preset"] = preset
+    if preset == "employee":
+        _merge_dict(preset_config, load_employee_overlay(get_project_root()))
+    updated = _merge_dict(dict(current), preset_config)
     if not dry_run:
         save_config(updated)
     return updated
@@ -488,25 +520,69 @@ def apply_power_preset(dry_run: bool = False) -> dict[str, Any]:
 def run_install(args: Any) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     json_output = bool(getattr(args, "json", False))
-    updated = apply_power_preset(dry_run=dry_run)
+    preset = str(getattr(args, "preset", "rentals") or "rentals")
+    if preset == "default":
+        preset = "rentals"
+    base_url = normalize_h20_base_url(getattr(args, "h20_base_url", DEFAULT_H20_BASE_URL))
+    identity: dict[str, Any] | None = None
+    customer_key = ""
+    if preset == "employee" and not dry_run:
+        expected_customer_id = str(getattr(args, "employee_id", "") or "").strip()
+        if not expected_customer_id:
+            raise ValueError("Employee install requires --employee-id")
+        customer_key = os.environ.get("H20_KEYS_API_KEY", "").strip()
+        if not customer_key and bool(getattr(args, "h20_key_stdin", False)):
+            customer_key = sys.stdin.readline().strip()
+        if not customer_key:
+            raise ValueError(
+                "Employee install requires H20_KEYS_API_KEY or --h20-key-stdin"
+            )
+        identity = validate_h20_identity(
+            customer_key,
+            base_url=base_url,
+            expected_customer_id=expected_customer_id,
+        )
+
+    home = get_hermes_home()
+    config_snapshot = _snapshot_file(home / "config.yaml")
+    env_snapshot = _snapshot_file(home / ".env")
+    try:
+        updated = apply_power_preset(dry_run=dry_run, preset=preset)
+        bundle = None if dry_run else install_rentals_bundle(get_project_root(), home)
+        credential_names: list[str] = []
+        if preset == "employee" and not dry_run:
+            credential_names = save_employee_credentials(customer_key, base_url)
+    except Exception:
+        if not dry_run:
+            _restore_file(home / "config.yaml", config_snapshot)
+            _restore_file(home / ".env", env_snapshot)
+        raise
     result = {
-        "preset": "default",
+        "preset": preset,
         "dry_run": dry_run,
         "modules": list(POWER_DEFAULT_MODULES),
         "excluded": sorted(EXCLUDED_DEFAULT_MODULES),
-        "config_path": str(get_hermes_home() / "config.yaml"),
+        "config_path": str(home / "config.yaml"),
         "toolsets": updated.get("toolsets", []),
+        "rentals_skill_roots": [] if bundle is None else bundle["skill_roots"],
+        "employee_identity": identity,
+        "credential_names": credential_names,
     }
     if json_output:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         action = "Would update" if dry_run else "Updated"
-        print(f"{action} Hermes config for Power Setup preset: default")
+        print(f"{action} Hermes config for Power Setup preset: {preset}")
         print(f"Config: {result['config_path']}")
         print("Modules:")
         for module in POWER_DEFAULT_MODULES:
             print(f"  - {module}")
         print("Excluded from default: tg, postcraft")
+        if bundle is not None:
+            print(f"Installed rentals skill roots: {len(bundle['skill_roots'])}")
+        if identity is not None:
+            print(f"Validated H20 customer: {identity['customer_id']}")
+            print("Stored credential names: " + ", ".join(credential_names))
         print("Next: hermes power doctor")
     return 0
 
@@ -607,10 +683,13 @@ def add_power_parser(subparsers: Any) -> Any:
 
     power_sub.add_parser("list", help="List default Power Setup modules")
 
-    install = power_sub.add_parser("install", help="Apply the default public-safe Power Setup config preset")
-    install.add_argument("preset", nargs="?", default="default", choices=["default"], help="Preset name")
+    install = power_sub.add_parser("install", help="Install the unified rentals or employee Powerpack variant")
+    install.add_argument("preset", nargs="?", default="rentals", choices=["default", *VARIANTS], help="Variant name (default is a compatibility alias for rentals)")
     install.add_argument("--dry-run", action="store_true", help="Show what would be changed without writing config")
     install.add_argument("--json", action="store_true", help="Emit JSON")
+    install.add_argument("--employee-id", help="Expected H20 customer id; required for employee installs")
+    install.add_argument("--h20-key-stdin", action="store_true", help="Read the H20 customer key from stdin without exposing it in argv")
+    install.add_argument("--h20-base-url", default=DEFAULT_H20_BASE_URL, help="Human20 Keys customer base URL")
 
     scan = power_sub.add_parser("secret-scan", help="Scan public Power Setup artifacts for common secret patterns")
     scan.add_argument("paths", nargs="*", help="Optional repo-relative files/directories to scan")

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Perplex Direct"
+  short_description: "Direct Perplexity Sonar search"
+  default_prompt: "Use $perplex to search the web with direct Perplexity Sonar and return cited findings."
+policy:
+  allow_implicit_invocation: true
