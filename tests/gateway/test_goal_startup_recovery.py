@@ -511,6 +511,31 @@ class _RiskyTailThenStatusReplyDB:
         ]
 
 
+class _ToolResultDuringShutdownDrainDB:
+    def __init__(self, cutoff: float):
+        self.cutoff = cutoff
+
+    def get_messages(self, _session_id):
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "timestamp": self.cutoff - 1,
+                "tool_calls": [{
+                    "id": "call-drained",
+                    "function": {"name": "delegate_task", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-drained",
+                "tool_name": "delegate_task",
+                "content": "interrupted",
+                "timestamp": self.cutoff + 1,
+            },
+        ]
+
+
 def test_priority_status_reply_cannot_hide_unknown_parent_effect(hermes_home):
     runner, _adapter = make_restart_runner()
     cutoff = datetime.now()
@@ -521,6 +546,18 @@ def test_priority_status_reply_cannot_hide_unknown_parent_effect(hermes_home):
     )
 
     assert risk == "unresolved tool call(s): terminal"
+
+
+def test_tool_result_persisted_during_shutdown_drain_resolves_parent_call(hermes_home):
+    cutoff = datetime.now()
+    runner, _adapter = make_restart_runner()
+    runner._session_db = _ToolResultDuringShutdownDrainDB(cutoff.timestamp())
+
+    risk = runner._unresolved_startup_tool_call_risk(
+        "sid", interrupted_at=cutoff
+    )
+
+    assert risk is None
 
 
 def test_startup_goal_recovery_unwraps_async_session_db(hermes_home):

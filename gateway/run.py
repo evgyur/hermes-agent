@@ -11656,23 +11656,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(messages, (list, tuple)):
             return "tool history unavailable"
 
-        # A priority status turn is appended after the interruption marker. It
-        # must not become a completion checkpoint for the older parent task and
-        # hide an unmatched effectful call. Keep rows without usable timestamps
-        # in the scan (fail closed); discard only rows proven newer than the
-        # exact persisted interruption boundary.
+        # A priority status turn appended after the interruption marker must
+        # not become a completion checkpoint for the older parent task. A tool
+        # that was already running may, however, persist its correlated result
+        # during the graceful shutdown drain. Ignore post-cutoff assistant rows
+        # while still accepting an exact result for a pre-cutoff call id.
         cutoff = _coerce_gateway_timestamp(interrupted_at)
-        if cutoff is not None:
-            messages = [
-                msg
-                for msg in messages
-                if _coerce_gateway_timestamp(msg.get("timestamp")) is None
-                or _coerce_gateway_timestamp(msg.get("timestamp")) <= cutoff
-            ]
+
+        def _is_proven_after_cutoff(msg: Dict[str, Any]) -> bool:
+            timestamp = _coerce_gateway_timestamp(msg.get("timestamp"))
+            return cutoff is not None and timestamp is not None and timestamp > cutoff
 
         checkpoint_idx = -1
         for idx, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+            if (
+                not _is_proven_after_cutoff(msg)
+                and msg.get("role") == "assistant"
+                and msg.get("content")
+                and not msg.get("tool_calls")
+            ):
                 checkpoint_idx = idx
 
         unresolved: Dict[str, str] = {}
@@ -11680,6 +11682,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for msg in messages[checkpoint_idx + 1:]:
             role = msg.get("role")
             if role == "assistant" and msg.get("tool_calls"):
+                if _is_proven_after_cutoff(msg):
+                    continue
                 for call_id, name in self._startup_tool_calls_from_message(msg):
                     if call_id:
                         unresolved[call_id] = name
