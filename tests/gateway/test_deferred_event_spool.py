@@ -387,6 +387,30 @@ async def test_busy_startup_handoff_keeps_replay_owner_until_real_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_startup_handoff_timeout_restores_replay_owner(
+    monkeypatch, tmp_path, ledger_db
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    runner = _runner(ledger_db)
+    runner._startup_event_handoff_timeout_secs = 0.01
+    event = _event("scheduled-timeout")
+    ledger_id = _record(runner, event, "busy-key")
+    assert runner._set_gateway_ledger_deferred(event)
+    runner._startup_restore_queue = [event]
+
+    class Adapter:
+        async def handle_message(self, queued):
+            queued._hermes_adapter_handoff = "scheduled"
+
+    runner._adapter_for_source = lambda source: Adapter()
+    assert await runner._drain_startup_restore_queue(schedule_retry=False) == 0
+    assert runner._startup_restore_queue == [event]
+    row = ledger_db.get_gateway_message_ledger(ledger_id)
+    assert row["status"] == "requeued"
+    assert row["reason"] == "startup-handoff-timeout"
+
+
+@pytest.mark.asyncio
 async def test_busy_startup_claim_release_failure_remains_restart_recoverable(
     monkeypatch, tmp_path, ledger_db
 ):

@@ -1483,6 +1483,8 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
+        from subprocess_limits import bounded_child_kwargs
+
         proc = subprocess.Popen(
             [_child_python, _script_path],
             cwd=_child_cwd,
@@ -1492,6 +1494,7 @@ def execute_code(
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **bounded_child_kwargs(),
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---

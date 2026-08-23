@@ -12587,7 +12587,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # BasePlatformAdapter has only created a task. Keep the spool
                 # until that task either reaches actual agent dispatch or
                 # terminally handles the event without dispatching an agent.
-                await startup_ack.wait()
+                try:
+                    await asyncio.wait_for(
+                        startup_ack.wait(),
+                        timeout=float(getattr(self, "_startup_event_handoff_timeout_secs", 30.0)),
+                    )
+                except asyncio.TimeoutError:
+                    self._startup_restore_queue.insert(0, event)
+                    self._update_gateway_ledger(event, "requeued", reason="startup-handoff-timeout")
+                    logger.error("Startup handoff timed out; event returned to durable replay")
+                    break
+                except asyncio.CancelledError:
+                    self._startup_restore_queue.insert(0, event)
+                    self._update_gateway_ledger(event, "requeued", reason="startup-handoff-cancelled")
+                    raise
                 if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
                     handoff = "started"
                 elif bool(getattr(event, "_hermes_background_processing_completed", False)):
@@ -12692,7 +12705,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             event.metadata = dict(event.metadata or {})
             event.metadata["steer_receipt_id"] = receipt_id
-            pending[session_key] = event
+            if not self._enqueue_fifo(session_key, event, adapter, persist_deferred=False):
+                continue
             if db.transition_gateway_steer_receipt(receipt_id, generation=generation, expected_states=(state,), state="QUEUED_NEXT"):
                 queued += 1
         return queued
@@ -18443,12 +18457,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
+                            from subprocess_limits import bounded_child_kwargs
                             sanitized_env = _sanitize_subprocess_env(env)
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
+                                **bounded_child_kwargs(),
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()

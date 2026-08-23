@@ -138,6 +138,8 @@ def _runner(db: SessionDB, adapter) -> GatewayRunner:
     runner._adapter_for_source = lambda _source: adapter
     runner._session_key_for_source = lambda _source: "sk"
     runner._is_session_run_current = lambda _key, generation: generation == 7
+    state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+    runner._session_state = lambda _key: state
     return runner
 
 
@@ -228,5 +230,22 @@ def test_startup_restores_unfenced_receipt_and_holds_fenced_receipt(
             "fenced": "AMBIGUOUS_PROVIDER_REQUEST",
         }
         assert "incident hold" in caplog.text
+    finally:
+        db.close()
+
+
+def test_terminal_reconcile_preserves_existing_fifo_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        head = _event("head", "first")
+        adapter = SimpleNamespace(_pending_messages={"sk": head})
+        runner = _runner(db, adapter)
+        followup = _event("followup", "second")
+        _admit(db, followup, receipt_id="fifo", generation=7)
+        assert runner._reconcile_terminal_steer_receipts("sk", 7) == 1
+        assert adapter._pending_messages["sk"].message_id == "head"
+        queued = runner._session_state("sk").conversation.queued_events
+        assert [item.message_id for item in queued] == ["followup"]
     finally:
         db.close()

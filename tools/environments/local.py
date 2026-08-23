@@ -657,30 +657,13 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     return env
 
 
-_GATEWAY_TOOL_NOFILE_LIMIT = 4096
-
-
 def gateway_tool_subprocess_kwargs() -> dict[str, Any]:
-    """Descriptor and resource policy for host tools spawned by Hermes.
+    """Descriptor and resource policy for host tools spawned by Hermes."""
+    from subprocess_limits import bounded_child_kwargs
 
-    The nofile limit is installed in the gateway child immediately before exec,
-    leaving the long-lived gateway/admin process's own limits untouched.
-    """
-    if _IS_WINDOWS:
-        return {"close_fds": True}
-    kwargs: dict[str, Any] = {"close_fds": True, "pass_fds": ()}
     if os.environ.get("_HERMES_GATEWAY") != "1":
-        return kwargs
-
-    def _bound_gateway_child_nofile() -> None:
-        import resource
-
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        bounded = min(_GATEWAY_TOOL_NOFILE_LIMIT, soft, hard)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (bounded, bounded))
-
-    kwargs["preexec_fn"] = _bound_gateway_child_nofile
-    return kwargs
+        return {"close_fds": True, "pass_fds": ()}
+    return bounded_child_kwargs()
 
 
 def build_subprocess_env(
