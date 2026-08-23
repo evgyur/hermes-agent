@@ -2145,9 +2145,9 @@ _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content is already loaded and unchanged. Do not call skill_view "
-    "again in this turn. Execute the loaded instructions now with a different "
-    "tool (for example terminal), or answer from the loaded content."
+    "Skill content is already loaded and unchanged. Execute the loaded "
+    "instructions now with the required action tool (for example terminal), "
+    "or answer from the loaded content. Re-reading cannot make progress."
 )
 
 

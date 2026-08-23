@@ -16,7 +16,7 @@ telegram-chip runtime.
   returned.
 - Never probe, connect to, or mention the personal runtime on port 8080.
 - After reading this file, proceed directly through terminal and the HTTP API.
-  Never call `skill_view` again in the same turn.
+  Read this file only once in a turn.
 
 ## Safety
 

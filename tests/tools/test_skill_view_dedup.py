@@ -50,8 +50,9 @@ class TestSkillViewDedup:
         assert r2["success"] is False
         assert r2.get("dedup") is True
         assert r2.get("content_returned") is False
-        assert "Do not call skill_view again" in r2["error"]
-        assert "different tool" in r2["error"]
+        assert "required action tool" in r2["error"]
+        assert "Re-reading cannot make progress" in r2["error"]
+        assert "skill_view" not in r2["error"]
         assert "content" not in r2
 
     def test_modified_skill_returns_full_content(self, skills_home):
