@@ -27,11 +27,33 @@ telegram-chip runtime.
 - Fetch every sent message back by its returned message ID before claiming
   success.
 
+Use this one-shot identity probe. It deliberately prints no phone number or
+other account metadata:
+
 ```bash
-base="${TELEGRAM_CHIP_BASE_URL:-http://127.0.0.1:18083}"
-curl -fsS "$base/health"
-curl -fsS "$base/me"
-curl -fsS "$base/openapi.json"
+python3 - <<'PY'
+import json, os, urllib.request
+
+base = os.environ.get("TELEGRAM_CHIP_BASE_URL", "http://127.0.0.1:18083").rstrip("/")
+if base != "http://127.0.0.1:18083":
+    raise SystemExit("REFUSED_UNEXPECTED_TELEGRAM_RUNTIME")
+
+def get(path):
+    with urllib.request.urlopen(base + path, timeout=10) as response:
+        return json.load(response)
+
+health = get("/health")
+outer = get("/me")
+identity = json.loads(outer["data"]) if isinstance(outer.get("data"), str) else outer["data"]
+if health.get("status") != "ok" or not health.get("telegram_connected"):
+    raise SystemExit("CHIPMANAGER_HEALTH_FAILED")
+if identity.get("username") != "chipmanager":
+    raise SystemExit("CHIPMANAGER_IDENTITY_FAILED")
+print("CHIPMANAGER_HEALTH_OK")
+print("CHIPMANAGER_IDENTITY_OK username=chipmanager")
+PY
 ```
+
+After both OK lines, answer the user immediately; do not run another terminal call.
 
 Use the exact OpenAPI method and schema for all further operations.

@@ -80,6 +80,8 @@ def test_employee_bundle_installs_chipmanager_only(tmp_path):
     assert "@chipmanager" in text
     assert "127.0.0.1:8080" not in text
     assert "@ChipCR" not in text
+    assert "CHIPMANAGER_IDENTITY_OK" in text
+    assert "do not run another terminal call" in text
 
     receipt = install_employee_bundle(project, tmp_path / "home")
     assert receipt["skill_roots"] == ["telegram-chip"]
