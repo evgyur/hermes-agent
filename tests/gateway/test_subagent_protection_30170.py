@@ -220,7 +220,7 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert "Subagent" not in content
 
     @pytest.mark.asyncio
-    async def test_delegate_teardown_window_is_queued_not_interrupted(self) -> None:
+    async def test_delegate_teardown_steers(self):
         runner = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -235,8 +235,9 @@ class TestBusyHandlerDemotesInterruptForSubagents:
             await runner._handle_active_session_busy_message(event, sk)
 
         parent.interrupt.assert_not_called()
+        assert parent.steer.call_args.args == ("follow-up during delegate teardown",)
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Subagent working" in content
+        assert "Accepted for the current run" in content
 
     @pytest.mark.asyncio
     async def test_queue_mode_unchanged_with_subagents(self) -> None:
