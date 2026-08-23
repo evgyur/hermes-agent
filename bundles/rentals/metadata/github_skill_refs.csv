@@ -1,0 +1,18 @@
+content_id,content_title,label,url,kind
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",refero_skill GitHub,https://github.com/referodesign/refero_skill,github
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",hallmark GitHub,https://github.com/Nutlope/hallmark,github
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",Awesome Design MD,https://github.com/VoltAgent/awesome-design-md,github
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",GPT Image Prompting Skill,https://github.com/botskiskf/gpt-image-prompting-skill,github
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",Github And Vercel Deploy,https://github.com/denis-skripnik/github-and-vercel-deploy,github
+lesson-2,"Делаем дизайн сайта с design.md, Refero, Hallmark, Taste, Open Design",Vercel Skills CLI,https://github.com/vercel-labs/skills,github
+lesson-3,"Серверы, Supabase и личные кабинеты",server-doctor-public,https://github.com/evgyur/server-doctor-public,github
+lesson-3,"Серверы, Supabase и личные кабинеты",chip-supergoal,https://github.com/evgyur/chip-supergoal,github
+lesson-3,"Серверы, Supabase и личные кабинеты",chip-legal-web-rf,https://github.com/evgyur/chip-legal-web-rf,github
+lesson-4,"Ставим Hermes на VPS: Powerpack, server-doctor, Telegram-бот и gateway",Hermes Powerpack,https://github.com/evgyur/Hermes-powerpack,github
+lesson-4,"Ставим Hermes на VPS: Powerpack, server-doctor, Telegram-бот и gateway",server-doctor-public,https://github.com/evgyur/server-doctor-public,github
+lesson-4,"Ставим Hermes на VPS: Powerpack, server-doctor, Telegram-бот и gateway",gptprof-hermes,https://github.com/evgyur/gptprof-hermes,github
+lesson-4,"Ставим Hermes на VPS: Powerpack, server-doctor, Telegram-бот и gateway",GoClaw,https://github.com/nextlevelbuilder/goclaw,github
+skill-telegram-chip,telegram-chip: Telegram как инструмент автоматизации,server-doctor-public,https://github.com/evgyur/server-doctor-public,github
+skill-telegram-chip,telegram-chip: Telegram как инструмент автоматизации,chip-docs-local,https://github.com/evgyur/chip-docs-local,github
+skill-codex-tg,"Codex в Telegram: cockpit для тредов, команд и контроля",chip-codex-tg-public,https://github.com/evgyur/chip-codex-tg-public,github
+skill-codex-tg,"Codex в Telegram: cockpit для тредов, команд и контроля",openclaw-codex-app-server,https://github.com/pwrdrvr/openclaw-codex-app-server,github

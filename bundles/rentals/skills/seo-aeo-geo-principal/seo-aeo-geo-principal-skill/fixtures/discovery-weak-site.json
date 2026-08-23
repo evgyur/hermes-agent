@@ -1,0 +1,77 @@
+{
+  "base": "https://fixture.test",
+  "sitemap_url_count": 5,
+  "ok_html_count": 5,
+  "non_200": [],
+  "missing_title": [],
+  "missing_description": [],
+  "missing_canonical": [],
+  "bad_h1": [],
+  "noindex": [],
+  "text_chars_median": 2600,
+  "discovery": {
+    "https://fixture.test/robots.txt": {
+      "status": 200
+    },
+    "https://fixture.test/sitemap.xml": {
+      "status": 200
+    },
+    "https://fixture.test/llms.txt": {
+      "status": 404
+    },
+    "https://fixture.test/.well-known/mcp.json": {
+      "status": 404
+    }
+  },
+  "pages": [
+    {
+      "url": "https://fixture.test/",
+      "status": 200,
+      "internal_links_unique": 18,
+      "jsonld_types": [
+        "Organization",
+        "Person",
+        "WebSite",
+        "AboutPage",
+        "FAQPage",
+        "LearningResource"
+      ]
+    },
+    {
+      "url": "https://fixture.test/a",
+      "status": 200,
+      "internal_links_unique": 15,
+      "jsonld_types": [
+        "BreadcrumbList",
+        "CreativeWork"
+      ]
+    },
+    {
+      "url": "https://fixture.test/b",
+      "status": 200,
+      "internal_links_unique": 16,
+      "jsonld_types": [
+        "FAQPage"
+      ]
+    },
+    {
+      "url": "https://fixture.test/c",
+      "status": 200,
+      "internal_links_unique": 17,
+      "jsonld_types": [
+        "LearningResource"
+      ]
+    },
+    {
+      "url": "https://fixture.test/d",
+      "status": 200,
+      "internal_links_unique": 19,
+      "jsonld_types": [
+        "CreativeWork"
+      ]
+    }
+  ],
+  "missing_jsonld": [],
+  "thin_pages_under_1500": [],
+  "meaningful_image_alt_debt": []
+}

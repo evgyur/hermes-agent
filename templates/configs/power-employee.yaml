@@ -1,0 +1,105 @@
+# Human20 employee overlay for `hermes power install employee`.
+# Secrets are never stored in this template. The installer accepts one
+# customer-scoped H20 key through stdin or H20_KEYS_API_KEY and validates /v1/me.
+
+model:
+  default: h20-gpt
+  provider: human20-keys
+  base_url: https://keys.human20.app/v1
+  key_env: H20_KEYS_API_KEY
+  api_mode: chat_completions
+  max_tokens: 4096
+  context_length: 256000
+
+providers:
+  human20-keys:
+    name: Human20 Keys
+    base_url: https://keys.human20.app/v1
+    key_env: H20_KEYS_API_KEY
+    api_mode: chat_completions
+    default_model: h20-gpt
+    models:
+      h20-gpt:
+        name: h20-gpt
+        display_name: H20 GPT
+        disabled: false
+      mmfast:
+        name: mmfast
+        display_name: H20 MiniMax M3
+        disabled: false
+      pplx-sonar:
+        name: pplx-sonar
+        display_name: Perplexity Sonar via H20
+        disabled: false
+      pplx-sonar-pro:
+        name: pplx-sonar-pro
+        display_name: Perplexity Sonar Pro via H20
+        disabled: false
+
+fallback_providers:
+  - provider: human20-keys
+    model: mmfast
+    base_url: https://keys.human20.app/v1
+    key_env: H20_KEYS_API_KEY
+    api_mode: chat_completions
+
+delegation:
+  provider: human20-keys
+  model: mmfast
+  base_url: https://keys.human20.app/v1
+  api_key: ${H20_KEYS_API_KEY}
+  api_mode: chat_completions
+  max_concurrent_children: 3
+  max_async_children: 3
+  max_spawn_depth: 1
+  max_iterations: 50
+  child_timeout_seconds: 600
+  orchestrator_enabled: true
+  subagent_auto_approve: false
+
+web:
+  backend: perplexity
+  search_backend: perplexity
+  extract_backend: ""
+
+stt:
+  enabled: true
+  provider: groq
+  language: ""
+  echo_transcripts: true
+  groq:
+    model: whisper-large-v3-turbo
+    language: ""
+
+agent:
+  max_turns: 200
+  stall_guards: true
+
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+  loop_caps:
+    max_subagents: 20
+    max_web_searches: 50
+
+quick_commands:
+  mmfast:
+    type: alias
+    target: /model mmfast --provider human20-keys --global
+  gptt:
+    type: alias
+    target: /model h20-gpt --provider human20-keys --global
+
+power:
+  enabled: true
+  preset: employee
+  credential_owner: human20-keys
+  tenant_isolation_required: true
