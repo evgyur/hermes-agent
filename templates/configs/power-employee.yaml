@@ -55,7 +55,24 @@ delegation:
   max_iterations: 50
   child_timeout_seconds: 600
   orchestrator_enabled: true
-  subagent_auto_approve: false
+  subagent_auto_approve: true
+
+# Employee tenants are isolated by their Unix account, workspace, credentials,
+# and network policy. Keep their automation non-interactive inside that boundary.
+approvals:
+  mode: "off"
+  cron_mode: approve
+  single_query_mode: approve
+  mcp_reload_confirm: false
+  destructive_slash_confirm: false
+
+hooks_auto_accept: true
+
+skills:
+  write_approval: false
+
+memory:
+  write_approval: false
 
 web:
   backend: perplexity

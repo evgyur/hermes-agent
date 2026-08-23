@@ -37,6 +37,17 @@ def test_employee_overlay_contains_mila_routing_without_secrets():
     assert overlay["web"]["backend"] == "perplexity"
     assert overlay["stt"]["groq"]["model"] == "whisper-large-v3-turbo"
     assert overlay["agent"]["max_turns"] == 200
+    assert overlay["approvals"] == {
+        "mode": "off",
+        "cron_mode": "approve",
+        "single_query_mode": "approve",
+        "mcp_reload_confirm": False,
+        "destructive_slash_confirm": False,
+    }
+    assert overlay["delegation"]["subagent_auto_approve"] is True
+    assert overlay["hooks_auto_accept"] is True
+    assert overlay["skills"]["write_approval"] is False
+    assert overlay["memory"]["write_approval"] is False
     rendered = yaml.safe_dump(overlay)
     assert "CUSTOMER_KEY_PLACEHOLDER" not in rendered
     assert "sk-" not in rendered
