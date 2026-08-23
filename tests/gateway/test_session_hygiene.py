@@ -1189,6 +1189,10 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert AbortingCompressAgent.instances == 1
         assert len(streak_threads) == 1
         assert streak_threads[0] != main_thread
+        assert db._conn.execute(
+            "SELECT failure_streak FROM gateway_hygiene_state WHERE session_key = ?",
+            ("agent:main:telegram:dm:12345",),
+        ).fetchone()[0] == 1
 
         # The abort must have persisted a cooldown to the DB.
         state = db.get_compression_failure_cooldown(session_id)
@@ -1232,6 +1236,10 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         )
         # The user turn itself still runs; only compression is skipped.
         assert runner2._run_agent.await_count == 1
+        assert db._conn.execute(
+            "SELECT failure_streak FROM gateway_hygiene_state WHERE session_key = ?",
+            ("agent:main:telegram:dm:12345",),
+        ).fetchone()[0] == 1
 
         # Once the first deadline expires, the next failed attempt after a
         # restart must use rung 2 (900s), not start over at 300s (#86650).
@@ -1239,6 +1247,7 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         runner3, _adapter3, event3 = _make_cooldown_runner(
             monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
         )
+        event3.message_id = "restart-followup-3"
         assert await runner3._handle_message(event3) == "ok"
         assert AbortingCompressAgent.instances == 2
         assert len(streak_threads) == 2

@@ -22974,6 +22974,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         f"{_approx_tokens:,}", f"{_new_tokens:,}",
                                     )
 
+                                    _comp = getattr(_hyg_agent, "context_compressor", None)
+                                    _hyg_aborted = _comp is not None and getattr(
+                                        _comp, "_last_compress_aborted", False
+                                    )
                                     if _new_tokens >= _warn_token_threshold:
                                         logger.warning(
                                             "Session hygiene: still ~%s tokens after "
@@ -22983,7 +22987,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # Whether persistence failed outright or an in-place
                                         # compaction was too small, do not retry the same
                                         # critical recovery on every subsequent message.
-                                        if _hyg_failure_cooldown_seconds >= 0:
+                                        if (
+                                            not _hyg_aborted
+                                            and _hyg_failure_cooldown_seconds >= 0
+                                        ):
                                             _record_hygiene_cooldown(
                                                 self,
                                                 session_entry.session_id,
@@ -23003,10 +23010,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # is "frozen" at the current size and can
                                     # /compress to retry or /reset to start
                                     # fresh.
-                                    _comp = getattr(_hyg_agent, "context_compressor", None)
-                                    _hyg_aborted = _comp is not None and getattr(
-                                        _comp, "_last_compress_aborted", False
-                                    )
                                     if not _hyg_aborted:
                                         # Recovery decision lives in the
                                         # extracted, unit-tested predicate — the

@@ -920,7 +920,12 @@ def _clear_parent_goal_if_migrated_to_child(
     return state
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str) -> bool:
+def migrate_goal_to_session(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "",
+) -> bool:
     """Move an active goal across a context-compression session split.
 
     Session compression rotates the transcript from parent -> child while the
@@ -955,7 +960,12 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str) -> bool:
     state.status = "cleared"
     state.last_reason = f"migrated to {new_session_id} after context compression"
     save_goal(old_session_id, state)
-    logger.info("GoalManager: migrated goal %s -> %s", old_session_id, new_session_id)
+    logger.info(
+        "GoalManager: migrated goal %s -> %s (%s)",
+        old_session_id,
+        new_session_id,
+        reason or "compression",
+    )
     return True
 
 
@@ -1020,44 +1030,6 @@ def clear_goal(session_id: str) -> None:
         return
     state.status = "cleared"
     save_goal(session_id, state)
-
-
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation.
-
-    Context compression rotates ``session_id`` to a fresh child session,
-    but ``load_goal`` does a flat ``goal:<session_id>`` lookup with no
-    parent-lineage walk — so an active goal silently dies at the
-    compaction boundary (#33618). Copy the goal onto the new session and
-    archive the old row as ``cleared`` so exactly one active goal row
-    exists per logical conversation (avoids the "two active goals"
-    hazard of a pure copy).
-
-    Returns True when a goal was migrated, False when there was nothing
-    to migrate or the DB was unavailable. Best-effort and never raises —
-    a failure here must not block compression.
-    """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    try:
-        state = load_goal(old_session_id)
-        if state is None or getattr(state, "status", None) == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed
-        # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug(
-            "GoalManager: migrated goal %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
-        return False
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -163,8 +163,8 @@ class TestAbortPathsResetPerAttemptState:
             compressor = _ReasonedBreakerCompressor("ineffective")
             agent.context_compressor = compressor
             messages = [
-                {"role": "user", "content": "old question"},
-                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "old question " * 200},
+                {"role": "assistant", "content": "old answer " * 200},
             ]
 
             compacted, _ = compress_context(
@@ -217,4 +217,3 @@ class TestAbortPathsResetPerAttemptState:
             conversation_history_after_compression,
         )
         from hermes_state import SessionDB
-

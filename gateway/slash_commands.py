@@ -694,6 +694,18 @@ class GatewaySlashCommandsMixin:
                 row = {}
 
         session_row = row
+        persisted_route: dict[str, Any] = {}
+        if session_db:
+            db = vars(session_db).get("_db", session_db)
+            try:
+                route = await asyncio.to_thread(
+                    db.get_dominant_session_model_route,
+                    session_entry.session_id,
+                )
+                if isinstance(route, dict):
+                    persisted_route = route
+            except Exception:
+                persisted_route = {}
         input_tokens = int(row.get("input_tokens") or 0)
         output_tokens = int(row.get("output_tokens") or 0)
         cache_read = int(row.get("cache_read_tokens") or 0)
