@@ -6316,6 +6316,44 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Re-resolve multiplex profile routing at the final adapter ingress
+        # boundary, immediately before deriving the session key.  Most events
+        # are stamped in build_source(), but restart/drain and synthetic
+        # adapter paths can bypass that constructor.  Falling through as
+        # agent:main in those paths lets the primary adapter create a second
+        # owner for a topic already bound to a routed profile.
+        source = getattr(event, "source", None)
+        runner = getattr(self, "gateway_runner", None)
+        runner_config = getattr(runner, "config", None)
+        if (
+            source is not None
+            and runner is not None
+            and getattr(runner_config, "multiplex_profiles", False)
+            and not getattr(source, "profile", None)
+            and getattr(source, "profile_route_rejected", False) is not True
+        ):
+            from gateway.profile_routing import ProfileRouteRejected
+
+            try:
+                source.profile = runner._profile_name_for_source(source)
+            except ProfileRouteRejected:
+                source.profile_route_rejected = True
+            except Exception:
+                logger.warning(
+                    "Profile resolution failed at adapter ingress for %s/%s; "
+                    "dropping instead of falling back to the default profile",
+                    getattr(source, "platform", None),
+                    getattr(source, "chat_id", None),
+                    exc_info=True,
+                )
+                source.profile_route_rejected = True
+        if getattr(source, "profile_route_rejected", False) is True:
+            logger.warning(
+                "Dropping adapter event because its multiplex profile route "
+                "could not be resolved safely"
+            )
+            return
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),

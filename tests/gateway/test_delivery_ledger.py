@@ -185,7 +185,7 @@ class TestGatewayRedeliverySweep:
         runner = object.__new__(GatewayRunner)
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
         _store = MagicMock()
-        _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending = AsyncMock(return_value=True)
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
@@ -219,17 +219,18 @@ class TestGatewayRedeliverySweep:
         )
 
     @pytest.mark.asyncio
-    async def test_failed_redelivery_keeps_exact_resume_obligation(self):
+    async def test_failed_redelivery_fences_exact_resume_before_send(self):
         _record(resume_task_id="resume-task-1")
         _orphan("ob-1")
         runner = self._runner(self._adapter(success=False))
 
         assert await runner._redeliver_pending_obligations() == 0
 
-        runner._async_session_store.clear_resume_pending.assert_not_awaited()
-        assert runner._delivery_owed_resume_session_keys == {
-            "agent:main:slack:channel:C1"
-        }
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            expected_resume_task_id="resume-task-1",
+        )
+        assert runner._delivery_owed_resume_session_keys == set()
 
     @pytest.mark.asyncio
     async def test_exact_durable_generation_must_complete_before_marker_clear(self):
@@ -311,10 +312,14 @@ class TestGatewayRedeliverySweep:
         durable_store = MagicMock()
         durable_store.complete = AsyncMock(return_value=False)
         runner._gateway_continuation_store = MagicMock(return_value=durable_store)
+        runner._async_session_store.clear_resume_pending.return_value = False
 
         assert await runner._redeliver_pending_obligations() == 1
 
-        runner._async_session_store.clear_resume_pending.assert_not_awaited()
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            expected_resume_task_id="old-task",
+        )
         assert runner._delivery_owed_resume_session_keys == {
             "agent:main:slack:channel:C1"
         }
@@ -561,7 +566,7 @@ class TestRuntimeFailedRedelivery:
         runner = object.__new__(GatewayRunner)
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
         _store = MagicMock()
-        _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending = AsyncMock(return_value=True)
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store

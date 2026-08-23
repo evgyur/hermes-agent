@@ -14443,13 +14443,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
-            return 0
+            return []
         return await self._redeliver_claimed_rows(claimed)
 
     async def _redeliver_claimed_rows(
         self, claimed: List[Dict[str, Any]]
-    ) -> int:
-        """Send already-claimed ledger rows and record delivered/failed."""
+    ) -> List[Dict[str, Any]]:
+        """Fence replay for already-claimed rows before any network send."""
         if not claimed:
             return []
 
@@ -14462,8 +14462,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not session_key:
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                resume_task_id = row.get("resume_task_id")
+                if resume_task_id:
+                    cleared = await self.async_session_store.clear_resume_pending(
+                        session_key,
+                        expected_resume_task_id=resume_task_id,
+                    )
+                else:
+                    cleared = await self.async_session_store.clear_resume_pending(
+                        session_key
+                    )
+                if not cleared:
+                    self._delivery_owed_resume_session_keys.add(session_key)
             except Exception:
+                self._delivery_owed_resume_session_keys.add(session_key)
                 logger.debug(
                     "clear_resume_pending failed for %s", session_key,
                     exc_info=True,
@@ -14489,11 +14501,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
-        from gateway.delivery_ledger import (
-            RECOVERED_MARKER,
-            mark_delivered,
-            mark_failed,
-        )
 
         owed_sessions = getattr(self, "_delivery_owed_resume_session_keys", None)
         if owed_sessions is None:
@@ -14503,8 +14510,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for row in claimed:
             session_key = row.get("session_key") or ""
             resume_task_id = row.get("resume_task_id")
-            if session_key:
-                owed_sessions.add(session_key)
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -14544,7 +14549,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         generation = row.get("continuation_generation")
                         claim_owner = row.get("continuation_claim_owner")
                         claim_token = row.get("continuation_claim_token")
-                        cleared = False
                         if generation is not None and claim_owner and claim_token:
                             store = self._gateway_continuation_store()
                             if store is not None:
@@ -14556,34 +14560,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     owner=str(claim_owner),
                                     claim_token=str(claim_token),
                                 )
-                                cleared = await store.complete(
+                                completed = await store.complete(
                                     claim,
                                     {"final_response": str(row.get("content") or "")},
                                     delivered=True,
                                 )
-                                if cleared:
-                                    cleared = await self.async_session_store.clear_resume_pending(
-                                        session_key,
-                                        expected_resume_task_id=resume_task_id,
-                                    )
-                        else:
-                            # Compatibility for obligations created before the
-                            # durable continuation columns existed.
-                            cleared = await self.async_session_store.clear_resume_pending(
-                                session_key,
-                                expected_resume_task_id=resume_task_id,
-                            )
-                        if cleared:
-                            owed_sessions.discard(session_key)
-                    elif session_key:
-                        # Legacy obligations have no durable continuation ID.
-                        # Preserve the pre-continuation contract: once their
-                        # recorded final response is delivered, do not rerun
-                        # the completed turn during resume recovery.
-                        cleared = await self.async_session_store.clear_resume_pending(
-                            session_key
-                        )
-                        if cleared:
+                                if not completed:
+                                    owed_sessions.add(session_key)
+                        if session_key not in owed_sessions:
                             owed_sessions.discard(session_key)
                     redelivered += 1
                     logger.info(
@@ -14601,6 +14585,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
         return redelivered
+
+    async def _redeliver_pending_obligations(self) -> int:
+        """Claim recoverable rows, fence replay, then redeliver their output."""
+        claimed = await self._claim_pending_obligations()
+        return await self._redeliver_claimed_obligations(claimed)
 
     async def _redeliver_failed_obligations_for_platform(self, platform) -> int:
         """Claim and resend definitively failed rows after this platform reconnects."""
@@ -14621,7 +14610,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("delivery ledger runtime sweep failed", exc_info=True)
             return 0
-        return await self._redeliver_claimed_rows(claimed)
+        claimed = await self._redeliver_claimed_rows(claimed)
+        return await self._redeliver_claimed_obligations(claimed)
 
     def _mark_active_goal_resume_pending(self, entry: Any) -> None:
         if getattr(entry, "resume_pending", False):

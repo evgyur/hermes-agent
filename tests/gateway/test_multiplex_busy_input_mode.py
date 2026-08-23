@@ -102,7 +102,7 @@ async def _load_profile_snapshot(
 @pytest.mark.parametrize(
     ("secondary_mode", "handled", "expected_action", "expected_text_mode"),
     [
-        ("queue", False, "queue", "queue"),
+        ("queue", True, "queue", "queue"),
         ("steer", True, "steer", "interrupt"),
         ("interrupt", True, "interrupt", "interrupt"),
     ],
@@ -138,7 +138,8 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
         agent.steer.assert_not_called()
         agent.interrupt.assert_not_called()
     elif expected_action == "steer":
-        agent.steer.assert_called_once_with("follow up")
+        agent.steer.assert_called_once()
+        assert agent.steer.call_args.args == ("follow up",)
         agent.interrupt.assert_not_called()
     else:
         agent.steer.assert_not_called()
@@ -267,8 +268,32 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     await adapter.handle_message(event)
 
     assert event.source.profile == "research"
-    agent.steer.assert_called_once_with("follow up")
+    agent.steer.assert_called_once()
+    assert agent.steer.call_args.args == ("follow up",)
     agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_primary_adapter_re_resolves_profile_before_busy_session_key():
+    """Restart/drain ingress cannot fall back to agent:main for a routed topic."""
+    runner = _runner(default_mode="interrupt")
+    runner._profile_name_for_source = MagicMock(return_value="research")
+    adapter = _adapter()
+    adapter.gateway_runner = runner
+    adapter.set_session_store(None)
+    busy_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(busy_handler)
+    adapter.set_message_handler(AsyncMock(return_value=None))
+
+    event = _event(profile=None)
+    routed_key = build_session_key(event.source, profile="research")
+    adapter._active_sessions[routed_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    assert event.source.profile == "research"
+    busy_handler.assert_awaited_once_with(event, routed_key)
+    adapter._message_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -286,7 +311,7 @@ async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
     agent._active_children = []
     runner._running_agents[session_key] = agent
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is False
+    assert await runner._handle_active_session_busy_message(event, session_key) is True
     assert adapter._busy_text_mode == "queue"
     agent.interrupt.assert_not_called()
 
