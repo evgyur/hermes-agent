@@ -76,6 +76,7 @@ def test_shared_powerpack_bundle_includes_direct_telegram_chip_skill():
     assert "http://127.0.0.1:8080" in text
     assert "Computer Use" in text
     assert "must not" in text.lower()
+    assert "never call `skill_view` again in the same turn" in text
 
 
 def test_employee_install_validates_before_config_and_never_prints_key(monkeypatch, capsys):

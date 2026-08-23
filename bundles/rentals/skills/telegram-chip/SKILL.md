@@ -9,6 +9,8 @@ Use the existing user-owned `telegram-chip` HTTP service directly. Computer Use,
 Telegram Desktop, browser automation, and web scraping must not be used for
 Telegram operations when this runtime is available.
 
+Load this skill exactly once per turn. After this content is returned, never call `skill_view` again in the same turn; immediately perform the requested checks through the terminal and the HTTP API.
+
 ## Runtime
 
 - Base URL: `$TELEGRAM_CHIP_BASE_URL` when set, otherwise `http://127.0.0.1:8080`.
