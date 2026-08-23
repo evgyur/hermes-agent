@@ -43,7 +43,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import ContextVar, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
