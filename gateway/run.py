@@ -12410,6 +12410,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return bool(execute_write(_release))
 
+    async def _fence_startup_processing_task(self, event: MessageEvent) -> str:
+        """Cancel and join an unacknowledged adapter task before requeueing."""
+        task = getattr(event, "_hermes_adapter_processing_task", None)
+        if task is None:
+            return "requeue"
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            return "ambiguous"
+        except Exception:
+            pass
+        if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
+            return "started"
+        if bool(getattr(event, "_hermes_background_processing_completed", False)):
+            return "completed"
+        if task.done() and task.cancelled():
+            return "requeue"
+        return "ambiguous"
+
     async def _drain_startup_restore_queue(self, *, schedule_retry: bool = True) -> int:
         """Replay queued ingress without crossing an ambiguous dispatch boundary."""
         drained = 0
@@ -12593,13 +12616,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         timeout=float(getattr(self, "_startup_event_handoff_timeout_secs", 30.0)),
                     )
                 except asyncio.TimeoutError:
-                    self._startup_restore_queue.insert(0, event)
-                    self._update_gateway_ledger(event, "requeued", reason="startup-handoff-timeout")
-                    logger.error("Startup handoff timed out; event returned to durable replay")
-                    break
+                    outcome = await self._fence_startup_processing_task(event)
+                    if outcome == "requeue":
+                        self._startup_restore_queue.insert(0, event)
+                        self._update_gateway_ledger(event, "requeued", reason="startup-handoff-timeout")
+                        logger.error("Startup handoff timed out; fenced event returned to replay")
+                    elif outcome == "ambiguous":
+                        self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
+                        logger.critical("Startup handoff timeout could not fence adapter task; incident hold")
+                    else:
+                        handoff = outcome
+                    if outcome in {"requeue", "ambiguous"}:
+                        break
                 except asyncio.CancelledError:
-                    self._startup_restore_queue.insert(0, event)
-                    self._update_gateway_ledger(event, "requeued", reason="startup-handoff-cancelled")
+                    outcome = await self._fence_startup_processing_task(event)
+                    if outcome == "requeue":
+                        self._startup_restore_queue.insert(0, event)
+                        self._update_gateway_ledger(event, "requeued", reason="startup-handoff-cancelled")
+                    elif outcome == "ambiguous":
+                        self._update_gateway_ledger(event, "in_progress", reason="startup-handoff-incident-hold")
+                        logger.critical("Cancelled startup handoff could not fence adapter task; incident hold")
                     raise
                 if bool(getattr(event, "_hermes_agent_dispatch_started", False)):
                     handoff = "started"
