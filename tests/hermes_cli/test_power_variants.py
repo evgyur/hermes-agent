@@ -91,6 +91,12 @@ def test_employee_bundle_installs_chipmanager_only(tmp_path):
     probe_text = probe.read_text(encoding="utf-8")
     assert "127.0.0.1:18083" in probe_text
     assert "127.0.0.1:8080" not in probe_text
+    sender = tmp_path / "home" / "skills" / "telegram-chip" / "scripts" / "send_and_read.py"
+    assert sender.is_file()
+    sender_text = sender.read_text(encoding="utf-8")
+    assert "127.0.0.1:18083" in sender_text
+    assert "127.0.0.1:8080" not in sender_text
+    assert "CHIPMANAGER_READBACK_OK" in sender_text
 
 
 def test_employee_install_validates_before_config_and_never_prints_key(monkeypatch, capsys):

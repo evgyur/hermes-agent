@@ -39,3 +39,10 @@ After both `CHIPMANAGER_HEALTH_OK` and
 do not run another terminal call.
 
 Use the exact OpenAPI method and schema for all further operations.
+
+For an authorized exact-target write plus mandatory readback, use the bundled
+helper instead of constructing shell HTTP payloads by hand:
+
+```bash
+python3 ~/.hermes/skills/telegram-chip/scripts/send_and_read.py --chat-id TARGET --message TEXT
+```
