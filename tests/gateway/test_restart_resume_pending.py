@@ -42,6 +42,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _prepare_resume_pending_message,
     _should_clear_resume_obligation_after_turn,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
@@ -1665,5 +1666,4 @@ async def test_failed_continuation_stops_heartbeat_and_quarantines_claim():
     assert claim.continuation_id == "continuation-1"
     assert claim.generation == 2
     assert claim.claim_token == "token-1"
-
 

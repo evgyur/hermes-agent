@@ -1401,6 +1401,38 @@ class PluginContext:
         self._subagent_lifecycle: Any = None
         self._retained_work: Any = None
 
+    def _track(
+        self,
+        kind: str,
+        key: str,
+        release: Callable[[], None],
+    ) -> PluginRegistration:
+        """Record host-owned cleanup for a successful registration."""
+        return self._manager._track_registration(
+            self.manifest, kind, key, release
+        )
+
+    def _track_replacement(
+        self,
+        kind: str,
+        key: str,
+        *,
+        slot: tuple,
+        current: Any,
+        previous: Any,
+        restore: Callable[[Any], bool],
+        finalize: Optional[Callable[[], None]] = None,
+    ) -> PluginRegistration:
+        """Track one generation in a replaceable registration slot."""
+        lease = replacement_coordinator.acquire(
+            slot,
+            current=current,
+            previous=previous,
+            restore=restore,
+            finalize=finalize,
+        )
+        return self._track(kind, key, lease.dispose)
+
     # -- host-owned LLM access ----------------------------------------------
 
     @property

@@ -1815,6 +1815,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: "Path | None" = None,
     *,
     persist_snapshot: bool = True,
     routing_policy: str = "conservative",
@@ -1843,14 +1844,14 @@ def build_skills_system_prompt(
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
     """
-    from agent.skill_routing import (
-        normalize_routing_policy,
-        protected_boundary_guidance,
-        skill_routing_guidance,
-    )
+    from agent.skill_routing import normalize_routing_policy
 
-    skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    if skills_dir_override is not None:
+        skills_dir = Path(skills_dir_override)
+        home_token = set_hermes_home_override(str(skills_dir.parent))
+    else:
+        skills_dir = get_skills_dir()
+        home_token = None
     effective_routing_policy = normalize_routing_policy(routing_policy)
     effective_protected_boundaries = tuple(
         sorted(
@@ -1860,6 +1861,11 @@ def build_skills_system_prompt(
         )
     )
 
+    try:
+        external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        from agent.skill_utils import get_project_skills_dirs
+
+        project_dirs = get_project_skills_dirs()
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
 
@@ -1870,10 +1876,13 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
+            persist_snapshot=persist_snapshot,
+            effective_routing_policy=effective_routing_policy,
+            effective_protected_boundaries=effective_protected_boundaries,
         )
     finally:
-        if _home_token is not None:
-            reset_hermes_home_override(_home_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def _build_skills_system_prompt_inner(
@@ -1883,7 +1892,13 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    *,
+    persist_snapshot: bool = True,
+    effective_routing_policy: str = "conservative",
+    effective_protected_boundaries: "tuple[str, ...]" = (),
 ) -> str:
+    from agent.skill_routing import protected_boundary_guidance, skill_routing_guidance
+
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()

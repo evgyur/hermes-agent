@@ -676,6 +676,34 @@ def _meta_key(session_id: str) -> str:
 
 
 _DB_CACHE: Dict[str, Any] = {}
+_DB_BOOTSTRAP_LOCK = threading.Lock()
+_DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
+_DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
+_DB_BOOTSTRAP_INIT_WAIT_S = 1.5
+
+
+def _bootstrap_session_db(home: str, done: threading.Event) -> None:
+    """Construct SessionDB off-loop and populate the scoped cache."""
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_state import SessionDB
+
+        token = set_hermes_home_override(home)
+        try:
+            db = SessionDB()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("GoalManager: background SessionDB() raised (%s)", exc)
+        db = None
+    with _DB_BOOTSTRAP_LOCK:
+        if db is not None and home not in _DB_CACHE:
+            _DB_CACHE[home] = db
+        _DB_BOOTSTRAP_INFLIGHT.pop(home, None)
+    done.set()
 _MIGRATABLE_GOAL_STATUSES = {"active", "paused", "blocked"}
 
 

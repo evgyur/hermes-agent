@@ -1372,7 +1372,9 @@ def _prepare_resume_pending_message(
     non-empty row never trips the sanitizer.
     """
     recovery_message = build_resume_recovery_note(
-        reason, message or "", interactive=interactive,
+        reason,
+        message or "",
+        startup_resume=not interactive and not (message or "").strip(),
     )
     persist_message = (
         message if isinstance(message, str) and message.strip() else recovery_message
@@ -11037,6 +11039,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return False
 
+    @staticmethod
+    def _agent_has_compression_in_flight(running_agent) -> bool:
+        """Return whether the live agent has published a compression marker."""
+        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+            return False
+        try:
+            agent_state = vars(running_agent)
+        except TypeError:
+            return False
+        return (
+            agent_state.get("_active_compression_commit_fence") is not None
+            or agent_state.get("_active_compression_lock_holder") is not None
+        )
+
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """Return True when a compression lock is held for this session's id.
 
@@ -11046,9 +11062,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         orphaned compression siblings (#56391). Callers demote interrupt to
         queue when this returns True.
 
-        Both blocking sources — the ``session_store`` lock + JSON load, and the
-        SQLite ``get_compression_lock_holder`` SELECT — are offloaded to a
-        worker thread so a large state.db never freezes the event loop (#5).
+        The running agent's in-memory fence is checked first because it is
+        published before the durable SQLite lock is acquired. That closes the
+        preflight race where interrupt could otherwise land between those two
+        publications. Both blocking durable sources — the ``session_store``
+        lock + JSON load, and the SQLite ``get_compression_lock_holder`` SELECT
+        — are offloaded to a worker thread so a large state.db never freezes
+        the event loop (#5).
         """
         session_store = getattr(self, "session_store", None)
         if not session_key or session_store is None:
@@ -11435,11 +11455,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to queue semantics so nothing is lost.
         # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
         # to every entry in the parent's ``_active_children`` list and
-        # aborts in-flight ``delegate_task`` work. Route ``interrupt``
-        # to generation-bound ``steer`` while children are active so the
-        # follow-up changes the parent without cancelling child work or
-        # waiting silently for another turn. Explicit ``/stop`` and ``/new``
-        # still use ``_interrupt_and_clear_session``.
+        # aborts in-flight ``delegate_task`` work. Route ``interrupt`` to
+        # generation-bound ``steer`` while children are active so the follow-up
+        # can adjust the parent plan without cancelling child work. Explicit
+        # ``/stop`` and ``/new`` still use ``_interrupt_and_clear_session``.
         demoted_for_subagents = (
             effective_mode == "interrupt"
             and self._agent_has_active_subagents(running_agent)
@@ -11453,15 +11472,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "steer"
         demoted_for_compression = (
             effective_mode == "interrupt"
-            and await self._session_has_compression_in_flight(session_key)
+            and (
+                self._agent_has_compression_in_flight(running_agent)
+                or await self._session_has_compression_in_flight(session_key)
+            )
         )
         if demoted_for_compression:
             logger.info(
-                "Routing busy_input_mode 'interrupt' to 'steer' for session %s "
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
                 "because context compression is in flight (#56391)",
                 session_key,
             )
-            effective_mode = "steer"
+            effective_mode = "queue"
         steered = False
         redirected = False
         if effective_mode == "steer":
@@ -19547,6 +19569,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        allow_gateway_control = event.allow_gateway_control
         if not _startup_claim_owned:
             await asyncio.to_thread(
                 self._update_gateway_ledger,
@@ -20020,7 +20043,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the id out from under it, forking orphaned compression
             # siblings. Demote to queue semantics so the follow-up waits
             # for the in-flight compression + rotation to land.
-            if await self._session_has_compression_in_flight(_quick_key):
+            if (
+                self._agent_has_compression_in_flight(running_agent)
+                or await self._session_has_compression_in_flight(_quick_key)
+            ):
                 logger.info(
                     "PRIORITY interrupt demoted to queue for session %s "
                     "because context compression is in flight (#56391)",
