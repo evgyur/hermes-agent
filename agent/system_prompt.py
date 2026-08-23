@@ -53,7 +53,7 @@ from agent.prompt_builder import (
 )
 from agent.runtime_cwd import resolve_context_cwd
 from agent.skill_routing import scope_ownership_guidance
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
