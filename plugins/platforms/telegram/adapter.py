@@ -2512,15 +2512,53 @@ class TelegramAdapter(BasePlatformAdapter):
             connection_id = self._telegram_supplied_business_connection_id(message)
             if not connection_id:
                 return False
+            thread_id = self._effective_message_thread_id(message)
+            runtime_profile = self._reply_index_runtime_profile(
+                message, thread_id=thread_id
+            )
+            if not runtime_profile:
+                return False
             return lookup_scoped(
                 platform="telegram",
+                runtime_profile=runtime_profile,
                 transport_profile=getattr(self, "_owner_profile", None) or "default",
                 business_connection_id=connection_id,
                 chat_id=str(chat_id),
+                thread_id=thread_id,
                 message_id=str(reply_id),
             ) is not None
         except Exception:
             return False
+
+    def _reply_index_runtime_profile(
+        self,
+        message: Any,
+        *,
+        thread_id: Optional[str],
+    ) -> Optional[str]:
+        """Resolve the runtime half of an inbound Business reply route."""
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return None
+        telegram_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = (
+            "group"
+            if telegram_type in {"group", "supergroup"}
+            else "channel" if telegram_type == "channel" else "dm"
+        )
+        source = self.build_source(
+            chat_id=str(chat_id),
+            chat_type=chat_type,
+            user_id=(
+                str(getattr(user, "id"))
+                if getattr(user, "id", None) is not None
+                else None
+            ),
+            thread_id=thread_id,
+        )
+        return self._session_key_profile(source) or "default"
 
     def _is_business_owner_wake_trigger(self, message: Any) -> bool:
         if not self._truthy_config_value(
@@ -2600,41 +2638,81 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]],
     ) -> bool:
-        """Persist reply text; Business ownership receipts are mandatory."""
+        """Persist optional reply text without redefining transport success."""
         business_connection_id = (metadata or {}).get("business_connection_id")
         try:
             from gateway import rich_sent_store
 
             if business_connection_id:
-                return bool(
-                    rich_sent_store.record_scoped(
-                        platform="telegram",
-                        transport_profile=(
-                            getattr(self, "_owner_profile", None) or "default"
-                        ),
-                        business_connection_id=business_connection_id,
-                        chat_id=str(chat_id),
-                        message_id=str(message_id),
-                        text=content,
+                from gateway.telegram_egress_policy import canonical_route_envelope
+
+                raw_route = (metadata or {}).get("route_envelope")
+                required = {
+                    "version",
+                    "platform",
+                    "runtime_profile",
+                    "transport_profile",
+                    "chat_id",
+                    "thread_id",
+                    "user_id",
+                    "business_connection_id",
+                    "external_safe_mode",
+                }
+                if not isinstance(raw_route, dict) or not required.issubset(raw_route):
+                    return False
+                for profile_field in ("runtime_profile", "transport_profile"):
+                    profile_value = raw_route.get(profile_field)
+                    if (
+                        not isinstance(profile_value, str)
+                        or not profile_value.strip()
+                        or profile_value != profile_value.strip()
+                    ):
+                        return False
+                if type(raw_route.get("external_safe_mode")) is not bool:
+                    return False
+                route = canonical_route_envelope(raw_route)
+                adapter_owner = str(
+                    getattr(self, "_owner_profile", None) or "default"
+                ).strip()
+                if (
+                    route["chat_id"] != str(chat_id)
+                    or route["business_connection_id"]
+                    != str(business_connection_id)
+                    or route["transport_profile"] != adapter_owner
+                ):
+                    return False
+                persisted = bool(rich_sent_store.record_scoped(
+                    platform="telegram",
+                    runtime_profile=route["runtime_profile"],
+                    transport_profile=route["transport_profile"],
+                    business_connection_id=business_connection_id,
+                    chat_id=str(chat_id),
+                    thread_id=route["thread_id"],
+                    message_id=str(message_id),
+                    text=content,
+                ))
+                if not persisted:
+                    logger.error(
+                        "[%s] Telegram Business reply index degraded after "
+                        "wire delivery (chat=%s, message=%s)",
+                        self.name,
+                        chat_id,
+                        message_id,
                     )
-                )
+                return persisted
             # Ordinary bot chats retain the legacy best-effort reply index.
             rich_sent_store.record(str(chat_id), str(message_id), content)
             return True
         except Exception:
+            if business_connection_id:
+                logger.exception(
+                    "[%s] Telegram Business reply index degraded after wire "
+                    "delivery (chat=%s, message=%s)",
+                    self.name,
+                    chat_id,
+                    message_id,
+                )
             return not bool(business_connection_id)
-
-    @staticmethod
-    def _business_receipt_failure() -> SendResult:
-        # The wire effect already happened.  Mark this non-retryable so a
-        # caller cannot duplicate the delivered message while surfacing that
-        # future reply ownership could not be proven.
-        return SendResult(
-            success=False,
-            error="telegram_business_receipt_persist_failed",
-            retryable=False,
-            error_kind="permanent",
-        )
 
     async def _try_send_rich(
         self,
@@ -2735,10 +2813,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
-            if not self._record_sent_reply_text(
+            self._record_sent_reply_text(
                 str(chat_id), str(message_id), content, metadata
-            ):
-                return self._business_receipt_failure()
+            )
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
@@ -2818,10 +2895,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # first rich send, so mirror the fresh-send index here too: a streamed
         # final finalized via editMessageText is otherwise never recorded, and
         # replies to it would have no native echo to recover from.
-        if not self._record_sent_reply_text(
+        self._record_sent_reply_text(
             str(chat_id), str(message_id), content, metadata
-        ):
-            return self._business_receipt_failure()
+        )
         return SendResult(success=True, message_id=message_id)
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -5995,10 +6071,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_id = str(msg.message_id)
                 message_ids.append(message_id)
-                if not self._record_sent_reply_text(
+                self._record_sent_reply_text(
                     str(chat_id), message_id, _strip_mdv2(chunk), metadata
-                ):
-                    return self._business_receipt_failure()
+                )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -11922,12 +11997,16 @@ class TelegramAdapter(BasePlatformAdapter):
                             # legacy (chat, message, business) key.
                             reply_to_text = rich_sent_store.lookup_scoped(
                                 platform="telegram",
+                                runtime_profile=(
+                                    self._session_key_profile(source) or "default"
+                                ),
                                 transport_profile=(
                                     getattr(self, "_owner_profile", None)
                                     or "default"
                                 ),
                                 business_connection_id=reply_business_id,
                                 chat_id=str(chat.id),
+                                thread_id=thread_id_str,
                                 message_id=reply_to_id,
                             )
                         else:

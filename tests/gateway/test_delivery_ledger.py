@@ -1042,7 +1042,9 @@ async def test_gateway_reconnect_quarantines_ambiguous_telegram_route(case):
         Platform.TELEGRAM, adapter=adapter
     ) == 0
     adapter.send.assert_not_awaited()
-    assert _row(f"runtime-{case}")["state"] == "abandoned"
+    # The transport-filtered sweep cannot prove ownership of an invalid or
+    # cross-transport row, so it leaves it untouched for operator repair.
+    assert _row(f"runtime-{case}")["state"] == "failed"
 
 
 @pytest.mark.asyncio

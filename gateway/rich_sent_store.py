@@ -11,8 +11,8 @@ index.
 
 Dependency-free and crash-safe: records use an OS-locked read/merge/atomic
 replace with file and directory fsync. Ordinary-chat callers may keep treating
-the index as best-effort; Telegram Business callers use the boolean scoped
-receipt and fail non-retryably when ownership cannot be committed.
+the index as best-effort. Telegram Business reply recovery uses the full
+durable route, but this auxiliary index never redefines a successful wire send.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from typing import Optional
 _MAX_ENTRIES = 1000
 _MAX_TEXT_CHARS = 2000
 _PROCESS_LOCK = threading.RLock()
+_MISSING = object()
 
 
 def _store_path() -> str:
@@ -47,22 +48,32 @@ def _key(chat_id, message_id, business_connection_id=None) -> str:
 def _scoped_key(
     *,
     platform,
+    runtime_profile,
     transport_profile,
     business_connection_id,
     chat_id,
+    thread_id,
     message_id,
 ) -> Optional[str]:
-    parts = (
+    required = (
         platform,
+        runtime_profile,
         transport_profile,
         business_connection_id,
         chat_id,
         message_id,
     )
-    normalized = tuple(str(value).strip() for value in parts)
-    if not all(normalized):
+    if any(value is None for value in required):
         return None
-    return "scope:v1:" + json.dumps(
+    normalized_required = tuple(str(value).strip() for value in required)
+    if not all(normalized_required):
+        return None
+    normalized = (
+        *normalized_required[:5],
+        str(thread_id).strip() if thread_id is not None else None,
+        normalized_required[5],
+    )
+    return "scope:v2:" + json.dumps(
         normalized,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -77,6 +88,8 @@ def _exclusive_store_lock():
     lock_path = f"{path}.lock"
     with _PROCESS_LOCK:
         with open(lock_path, "a+b") as lock_file:
+            if os.name != "nt":
+                os.chmod(lock_path, 0o600)
             if os.name == "nt":
                 import msvcrt
 
@@ -131,6 +144,7 @@ def _write_unlocked(data: dict) -> None:
         # Persist the directory entry on platforms that support directory
         # fsync.  Windows' atomic replace is already the durable primitive.
         if os.name != "nt":
+            os.chmod(path, 0o600)
             dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
@@ -192,9 +206,11 @@ def record(
 def record_scoped(
     *,
     platform,
+    runtime_profile,
     transport_profile,
     business_connection_id,
     chat_id,
+    thread_id,
     message_id,
     text: Optional[str],
 ) -> bool:
@@ -202,9 +218,11 @@ def record_scoped(
     return _record_key(
         _scoped_key(
             platform=platform,
+            runtime_profile=runtime_profile,
             transport_profile=transport_profile,
             business_connection_id=business_connection_id,
             chat_id=chat_id,
+            thread_id=thread_id,
             message_id=message_id,
         ),
         text,
@@ -221,17 +239,23 @@ def lookup(chat_id, message_id, business_connection_id=None) -> Optional[str]:
 def lookup_scoped(
     *,
     platform,
+    runtime_profile=_MISSING,
     transport_profile,
     business_connection_id,
     chat_id,
+    thread_id=_MISSING,
     message_id,
 ) -> Optional[str]:
     """Return text only for one exact transport route; never widen scope."""
+    if runtime_profile is _MISSING or thread_id is _MISSING:
+        return None
     key = _scoped_key(
         platform=platform,
+        runtime_profile=runtime_profile,
         transport_profile=transport_profile,
         business_connection_id=business_connection_id,
         chat_id=chat_id,
+        thread_id=thread_id,
         message_id=message_id,
     )
     if key is None:

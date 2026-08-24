@@ -566,12 +566,13 @@ def sweep_failed_for_runtime(
     now: Optional[float] = None,
     *,
     profile: Optional[str] = None,
+    transport_profile: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Claim this process's reconnect-retryable failed rows for one adapter.
 
-    ``profile`` scopes multiplexed gateways to the bot identity that actually
-    owned the failed send; ``None`` means the primary/default adapter. The
-    persisted adapter owner is independent of the routed session namespace.
+    ``transport_profile`` scopes Telegram replay using the immutable durable
+    route envelope. ``profile`` remains the compatibility selector for older
+    callers and non-Telegram rows whose adapter owner is stored separately.
 
     Startup recovery intentionally ignores rows owned by a live gateway. That
     protects concurrent processes, but it also means a final response rejected
@@ -588,6 +589,11 @@ def sweep_failed_for_runtime(
     marker because the failed send's acknowledgement is not safe to infer.
     """
     now = now if now is not None else time.time()
+    expected_transport = (
+        str(transport_profile).strip()
+        if transport_profile is not None
+        else None
+    )
     pid, started = _owner_stamp()
     if started is None:
         # PID equality alone cannot distinguish this process from a stale row
@@ -630,8 +636,62 @@ def sweep_failed_for_runtime(
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
             )
-            if adapter_profile != expected_profile:
+            # New Telegram reconnects are selected by immutable route
+            # provenance. Legacy callers still use adapter_profile, preserving
+            # compatibility without allowing that mutable column to override a
+            # transport stamped into the exact route envelope.
+            if expected_transport is None and adapter_profile != expected_profile:
                 continue
+            raw_route = None
+            if row_platform == "telegram":
+                try:
+                    raw_route = json.loads(route_envelope_json or "")
+                    if not isinstance(raw_route, dict):
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import (
+                        canonical_route_envelope,
+                    )
+
+                    canonical_route = canonical_route_envelope(raw_route)
+                    if (
+                        canonical_route["platform"] != row_platform
+                        or canonical_route["chat_id"] != str(chat_id)
+                        or canonical_route["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    if (
+                        expected_transport is not None
+                        and canonical_route["transport_profile"]
+                        != expected_transport
+                    ):
+                        continue
+                except Exception as exc:
+                    raw_transport = (
+                        raw_route.get("transport_profile")
+                        if isinstance(raw_route, dict)
+                        else None
+                    )
+                    owns_route = (
+                        expected_transport is None
+                        or (
+                            isinstance(raw_transport, str)
+                            and raw_transport == expected_transport
+                            and raw_transport.strip() == raw_transport
+                        )
+                    )
+                    if owns_route:
+                        error = str(exc) or "ambiguous_route_envelope"
+                        if "denied" not in error:
+                            error = "ambiguous_route_envelope"
+                        conn.execute(
+                            """UPDATE delivery_obligations
+                               SET state='abandoned', updated_at=?, last_error=?
+                               WHERE obligation_id=? AND state='failed'
+                                 AND owner_pid IS ? AND owner_started_at IS ?""",
+                            (now, error, oid, owner_pid, owner_started_at),
+                        )
+                    continue
             # Runtime reconnect recovery may act only on its own rows. Exact
             # process-start matching prevents PID reuse from stealing work.
             if owner_pid != pid or owner_started_at != started:
@@ -694,6 +754,28 @@ def sweep_failed_for_runtime(
                     "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def abandon_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    error: str = "",
+) -> bool:
+    """Abandon only the reconnect generation represented by ``claim_token``."""
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='abandoned', runtime_claim_token='', updated_at=?,
+                   last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                time.time(),
+                str(error or "")[:500] or None,
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
 
 
 def settle_runtime_claim(

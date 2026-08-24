@@ -15,7 +15,12 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    resume_origin_from_snapshot,
+)
 
 
 ACTIVE_TURN_MAX_AGE_SECONDS = 60 * 60
@@ -74,16 +79,20 @@ def test_active_turn_fields_round_trip_and_legacy_payload_defaults(tmp_path):
     payload = _entry_for(store, source).to_dict()
     assert payload["active_turn_token"] == token
     assert payload["active_turn_started_at"] is not None
+    assert payload["active_turn_origin_snapshot"]["active_turn_token"] == token
 
     restored = SessionEntry.from_dict(payload)
     assert restored.active_turn_token == token
     assert restored.active_turn_started_at is not None
+    assert restored.active_turn_origin_snapshot is not None
 
     payload.pop("active_turn_token")
     payload.pop("active_turn_started_at")
+    payload.pop("active_turn_origin_snapshot")
     legacy = SessionEntry.from_dict(payload)
     assert legacy.active_turn_token is None
     assert legacy.active_turn_started_at is None
+    assert legacy.active_turn_origin_snapshot is None
 
     payload["active_turn_token"] = {"invalid": "not-a-token"}
     payload["active_turn_started_at"] = datetime.now().isoformat()
@@ -124,6 +133,73 @@ def test_active_turn_clear_is_compare_and_swap(tmp_path):
     current = _entry_for(store, source)
     assert current.active_turn_token is None
     assert current.active_turn_started_at is None
+    assert current.active_turn_origin_snapshot is None
+
+
+def test_active_turn_snapshot_binds_exact_live_source_to_resume(tmp_path):
+    store = _make_store(tmp_path)
+    initial = _make_source("same-route")
+    entry = store.get_or_create_session(initial)
+    live = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same-route",
+        user_id="user-2",
+        chat_type="channel",
+        thread_id="thread-1",
+        message_id="message-2",
+        scope_id="guild-2",
+        profile="runtime-2",
+        transport_profile="transport-2",
+        external_safe_mode=True,
+    )
+
+    token = store.mark_turn_active(entry.session_key, live)
+    assert token is not None
+    current = _entry_for(store, initial)
+    assert current.origin == live
+
+    assert store.mark_resume_pending(entry.session_key, "restart_timeout") is True
+    resumed = _entry_for(store, initial)
+    assert resume_origin_from_snapshot(resumed) == live
+
+
+def test_resume_origin_snapshot_rejects_same_key_transport_mutation(tmp_path):
+    store = _make_store(tmp_path)
+    original = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="recipient-A",
+        user_id="recipient-A",
+        chat_type="dm",
+        transport_profile="default",
+    )
+    entry = store.get_or_create_session(original)
+    assert store.mark_turn_active(entry.session_key, original)
+    assert store.mark_resume_pending(entry.session_key, "restart_timeout")
+
+    with store._lock:
+        store._entries[entry.session_key].origin = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="recipient-A",
+            user_id="recipient-A",
+            chat_type="dm",
+            transport_profile="transport-B",
+        )
+
+    assert resume_origin_from_snapshot(_entry_for(store, original)) is None
+
+
+def test_resume_origin_snapshot_is_bound_to_continuation_cas(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source()
+    entry = store.get_or_create_session(source)
+    assert store.mark_turn_active(entry.session_key, source)
+    assert store.mark_resume_pending(entry.session_key, "restart_timeout")
+    assert resume_origin_from_snapshot(_entry_for(store, source)) == source
+
+    with store._lock:
+        store._entries[entry.session_key].continuation_claim_token = "new-claim"
+
+    assert resume_origin_from_snapshot(_entry_for(store, source)) is None
 
 
 def test_mark_and_clear_use_single_entry_persistence(tmp_path):
@@ -281,6 +357,8 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
     assert recovered.last_resume_marked_at > datetime.now() - timedelta(seconds=5)
     assert recovered.active_turn_token is None
     assert recovered.active_turn_started_at is None
+    assert recovered.active_turn_origin_snapshot is None
+    assert resume_origin_from_snapshot(recovered) == source
     assert token
 
 
@@ -413,7 +491,7 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
             clear_turn_active=clear_active,
         ),
     )
-    event = SimpleNamespace()
+    event = SimpleNamespace(source=_make_source())
 
     await runner._mark_durable_active_turn(
         cast(Any, event), "resolved-session-key"
@@ -421,6 +499,9 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
 
     assert event._gateway_active_turn_session_key == "resolved-session-key"
     assert event._gateway_active_turn_token == "token-1"
+    mark_active.assert_awaited_once_with(
+        "resolved-session-key", event.source
+    )
 
     await runner._clear_durable_active_turn(cast(Any, event))
 
