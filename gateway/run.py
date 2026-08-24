@@ -1080,6 +1080,66 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _resolve_start_ack_text(
+    user_config: dict,
+    platform_key: str,
+    platform: Any,
+    *,
+    startup_resume: bool = False,
+    trusted_restart_wake: Any = None,
+    trusted_parent_task_continuation: Any = None,
+    persist_user_display_kind: Optional[str] = None,
+) -> str:
+    """Resolve a user-turn-only fallback ack; service-origin turns stay silent."""
+    if (
+        _gateway_platform_value(platform) == "webhook"
+        or startup_resume
+        or trusted_restart_wake is not None
+        or trusted_parent_task_continuation is not None
+        or persist_user_display_kind == "internal_notification"
+    ):
+        return ""
+    from gateway.display_config import resolve_display_setting
+
+    return str(
+        resolve_display_setting(user_config, platform_key, "start_ack_text") or ""
+    ).strip()
+
+
+def _resolve_start_ack_policy(
+    user_config: dict,
+    platform_key: str,
+    platform: Any,
+    **origin_kwargs: Any,
+) -> tuple[str, bool]:
+    """Return validated per-turn text and strictness for the routed platform."""
+    from gateway.display_config import resolve_display_setting
+
+    mode = str(
+        resolve_display_setting(
+            user_config, platform_key, "start_ack_mode", "best_effort"
+        )
+        or ""
+    ).strip().lower()
+    if mode not in {"best_effort", "required"}:
+        raise ValueError(
+            "start_ack_mode must be 'best_effort' or 'required' "
+            f"for platform {platform_key}"
+        )
+    text = _resolve_start_ack_text(
+        user_config, platform_key, platform, **origin_kwargs
+    )
+    configured_text = str(
+        resolve_display_setting(user_config, platform_key, "start_ack_text") or ""
+    ).strip()
+    if mode == "required" and not configured_text:
+        raise ValueError(
+            "start_ack_text must be non-empty when start_ack_mode=required "
+            f"for platform {platform_key}"
+        )
+    return text, mode == "required" and bool(text)
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -4468,6 +4528,55 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    def start_ack_callback(self) -> bool:
+        """Bound and settle the configured pre-tool ack from the agent thread."""
+        ctx = self._ctx
+        agent = ctx.agent_holder[0] if ctx.agent_holder else None
+        visible_text = getattr(agent, "_pending_start_ack_visible_text", None)
+        text = str(visible_text or ctx.start_ack_text or "").strip()
+        if (
+            not text
+            or not ctx._status_adapter
+            or not ctx._loop_for_step
+            or not ctx._run_still_current()
+        ):
+            return False
+        metadata = _interim_metadata(ctx._status_thread_metadata)
+        reply_to = (
+            str(ctx.event_message_id)
+            if ctx.source.platform == Platform.TELEGRAM
+            and ctx.event_message_id is not None
+            else None
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                ctx._status_adapter.send(
+                    ctx._status_chat_id,
+                    text,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                ),
+                ctx._loop_for_step,
+            )
+            try:
+                result = future.result(timeout=ctx.start_ack_timeout_s)
+            except concurrent.futures.TimeoutError:
+                # Do not leave a scheduled send that can surface after tool
+                # execution has begun. Cancellation is best-effort at the
+                # remote API boundary, but it deterministically prevents a
+                # locally blocked adapter coroutine from delivering late.
+                future.cancel()
+                return False
+            if not getattr(result, "success", False):
+                return False
+            message_id = getattr(result, "message_id", None)
+            if ctx._cleanup_progress and message_id is not None:
+                ctx._cleanup_msg_ids.append(str(message_id))
+            return True
+        except Exception:
+            logger.debug("start ack delivery failed", exc_info=True)
+            return False
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
@@ -6042,6 +6151,10 @@ class TurnRunner:
         )
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+        agent.start_ack_callback = (
+            ctx.start_ack_callback if ctx.start_ack_text and ctx.start_ack_callback else None
+        )
+        agent.start_ack_required = bool(ctx.start_ack_required)
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
@@ -7176,6 +7289,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Display policy lives in the authoritative profile config rather than
+        # the typed transport-only GatewayConfig. Validate it for every public
+        # construction path, including start_gateway(config=...).
+        from gateway.display_config import validate_start_ack_configuration
+        from hermes_cli.config import load_config
+
+        validate_start_ack_configuration(load_config())
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -24872,6 +24992,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if thread_id is None:
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
+        if platform == Platform.TELEGRAM and reply_to_message_id is not None:
+            metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
         if self._is_telegram_dm_topic_target(
             platform,
             chat_id,
@@ -29555,6 +29677,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
+        start_ack_text, start_ack_required = _resolve_start_ack_policy(
+            user_config,
+            platform_key,
+            source.platform,
+            startup_resume=startup_resume,
+            trusted_restart_wake=_trusted_restart_wake,
+            trusted_parent_task_continuation=_trusted_parent_task_continuation,
+            persist_user_display_kind=persist_user_display_kind,
+        )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
@@ -29676,6 +29807,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets=disabled_toolsets,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+            start_ack_text=start_ack_text,
+            start_ack_required=start_ack_required,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
             _voice_ack_fired=_voice_ack_fired,
@@ -29716,6 +29849,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # TurnRunner.progress_callback (bound method, same signature).
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
+        turn_ctx.start_ack_callback = turn_runner.start_ack_callback
         turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
         turn_ctx.native_tool_complete_callback = (
             turn_runner.native_tool_complete_callback

@@ -6749,18 +6749,70 @@ class AIAgent:
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        self._latest_interim_visible_text = visible
+        if (
+            getattr(self, "start_ack_required", False)
+            and not getattr(self, "_tool_start_ack_emitted", False)
+        ):
+            # Buffer first-boundary commentary for the synchronous receipt
+            # barrier. Queueing it through the ordinary callback would not be
+            # proof of user-visible delivery and could duplicate the barrier.
+            return
+        if cb is None:
+            return
         try:
-            cb(visible, already_streamed=False)
+            callback_result = cb(visible, already_streamed=False)
+            if callback_result is False:
+                return
             self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+
+    def _emit_tool_start_ack_if_needed(
+        self, assistant_msg: Dict[str, Any]
+    ) -> Optional[bool]:
+        """Emit one gateway fallback acknowledgment before the first tool effect.
+
+        Model-authored commentary always wins. The latch is claimed before the
+        callback so a delivery timeout/failure cannot create duplicate retries.
+        """
+        if getattr(self, "_tool_start_ack_emitted", False):
+            return None
+        if not isinstance(assistant_msg, dict) or not assistant_msg.get("tool_calls"):
+            return None
+        # Claim the first tool boundary even when visible commentary already
+        # satisfied the progress contract. A later empty tool batch must never
+        # emit a misleading "starting" acknowledgment after side effects.
+        self._tool_start_ack_emitted = True
+        callback = getattr(self, "start_ack_callback", None)
+        if callback is None:
+            return False if getattr(self, "start_ack_required", False) else None
+        if (
+            not getattr(self, "start_ack_required", False)
+            and getattr(self, "_delivered_interim_texts", set())
+        ):
+            return True
+        visible = self._interim_assistant_visible_text(assistant_msg) or str(
+            getattr(self, "_latest_interim_visible_text", None) or ""
+        ).strip()
+        self._pending_start_ack_visible_text = visible or None
+        try:
+            delivered = bool(callback())
+            if delivered and visible:
+                self._record_delivered_interim_text(visible)
+            return delivered
+        except Exception:
+            logger.debug("start_ack_callback error", exc_info=True)
+            return False
+        finally:
+            self._pending_start_ack_visible_text = None
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6822,7 +6874,9 @@ class AIAgent:
         if cb is None:
             return
         try:
-            cb(visible, already_streamed=already_streamed)
+            callback_result = cb(visible, already_streamed=already_streamed)
+            if callback_result is False:
+                return
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)

@@ -1934,6 +1934,8 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    agent._tool_start_ack_emitted = False
+    agent._latest_interim_visible_text = None
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
@@ -7448,6 +7450,35 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                _start_ack_required = bool(
+                    getattr(agent, "start_ack_required", False)
+                )
+                _start_ack_outcome = None
+                if _start_ack_required:
+                    # Strict mode settles visibility before publishing the
+                    # tool-call row. On failure, publish the assistant call and
+                    # its no-effect cancellation results atomically in the same
+                    # flush; a crash cannot leave durable replay ambiguity.
+                    _start_ack_outcome = agent._emit_tool_start_ack_if_needed(
+                        assistant_msg
+                    )
+                    if _start_ack_outcome is False:
+                        for _cancelled_tc in assistant_message.tool_calls or []:
+                            append_message(
+                                messages,
+                                {
+                                    "role": "tool",
+                                    "name": _cancelled_tc.function.name,
+                                    "tool_call_id": coalesce_tool_call_id(_cancelled_tc),
+                                    "effect_disposition": "none",
+                                    "content": (
+                                        "Tool execution cancelled before start: "
+                                        "required user-visible acknowledgment was "
+                                        "not delivered. No tool effect was attempted."
+                                    ),
+                                },
+                            )
+
                 _tool_turn_persisted = None
                 try:
                     # Persist the assistant tool-call turn before any tool
@@ -7484,9 +7515,23 @@ def run_conversation(
                     failed = True
                     break
 
+                if _start_ack_outcome is False and _start_ack_required:
+                    _turn_exit_reason = "start_ack_delivery_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
+                # A gateway may require immediate execution visibility even
+                # when the model's first tool-call turn contains no prose.
+                # This settles before the first tool side effect. Model-authored
+                # commentary rides the same receipt-bearing barrier; only an
+                # already-confirmed streamed delivery suppresses another send.
+                if not _start_ack_required:
+                    agent._emit_tool_start_ack_if_needed(assistant_msg)
+
                 if not duplicate_previous_interim:
                     agent._emit_interim_assistant_message(assistant_msg)
 
