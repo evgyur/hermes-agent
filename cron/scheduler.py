@@ -6633,6 +6633,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
+        consecutive_errors = 0
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
@@ -6643,14 +6644,17 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     )
                     return
                 last_confirmed = time.monotonic()
+                consecutive_errors = 0
             except Exception:
+                consecutive_errors += 1
                 logger.debug(
                     "Job '%s': fire_claim heartbeat failed",
                     job_id,
                     exc_info=True,
                 )
                 if (
-                    time.monotonic() - last_confirmed
+                    consecutive_errors >= 2
+                    and time.monotonic() - last_confirmed
                     >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
                 ):
                     lost_ownership.set()
