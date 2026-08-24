@@ -218,9 +218,26 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if _platform_name(getattr(source, "platform", None)) == "telegram":
+        business_connection_id = getattr(source, "business_connection_id", None)
+        if business_connection_id:
+            metadata["business_connection_id"] = str(business_connection_id)
+            metadata["telegram_business_external_contact"] = True
+        if getattr(source, "external_safe_mode", False):
+            metadata["external_safe_mode"] = True
+        profile = getattr(source, "profile", None)
+        if profile:
+            metadata["profile"] = str(profile)
+        transport_profile = getattr(source, "transport_profile", None)
+        if transport_profile:
+            metadata["transport_profile"] = str(transport_profile)
     if not metadata:
         return None
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    if (
+        _platform_name(getattr(source, "platform", None)) == "telegram"
+        and getattr(source, "chat_type", None) == "dm"
+        and thread_id is not None
+    ):
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
@@ -6711,6 +6728,7 @@ class BasePlatformAdapter(ABC):
                                 mark_attempting,
                                 record_obligation,
                             )
+                            from gateway.session import build_route_envelope
 
                             if await asyncio.to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
@@ -6729,6 +6747,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    route_envelope=build_route_envelope(event.source),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -7403,6 +7422,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            transport_profile=getattr(self, "_owner_profile", None) or "default",
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,

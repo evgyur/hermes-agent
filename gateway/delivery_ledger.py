@@ -110,6 +110,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT
         )"""
     )
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    if "route_envelope_json" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN route_envelope_json TEXT"
+        )
 
 
 @contextmanager
@@ -209,20 +216,33 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    route_envelope: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
+    envelope_json = None
+    if route_envelope is not None:
+        if str(platform) == "telegram":
+            from gateway.telegram_egress_policy import canonical_route_envelope
+
+            route_envelope = canonical_route_envelope(route_envelope)
+        envelope_json = json.dumps(
+            route_envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, route_envelope_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, envelope_json),
         )
     _prune()
 
@@ -281,12 +301,13 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, route_envelope_json
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at,
+             route_envelope_json) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -303,6 +324,44 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            route_envelope = None
+            if platform == "telegram":
+                try:
+                    if not route_envelope_json:
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import (
+                        assert_recipient_allowed,
+                        canonical_route_envelope,
+                    )
+
+                    route_envelope = canonical_route_envelope(
+                        json.loads(route_envelope_json)
+                    )
+                    if (
+                        route_envelope["chat_id"] != str(chat_id)
+                        or route_envelope["platform"] != str(platform)
+                        or route_envelope["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    assert_recipient_allowed(chat_id)
+                except Exception as exc:
+                    error = str(exc) or "ambiguous_route_envelope"
+                    if "denied" not in error:
+                        error = "ambiguous_route_envelope"
+                    conn.execute(
+                        """UPDATE delivery_obligations
+                           SET state='abandoned', updated_at=?, last_error=?
+                           WHERE obligation_id=?""",
+                        (now, error, oid),
+                    )
+                    continue
+            elif route_envelope_json:
+                try:
+                    decoded = json.loads(route_envelope_json)
+                    route_envelope = decoded if isinstance(decoded, dict) else None
+                except (TypeError, ValueError):
+                    route_envelope = None
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
@@ -322,6 +381,7 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "route_envelope": route_envelope,
                 })
     return claimed
 
