@@ -463,13 +463,17 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
+        # Rehydrate terminal completions and restartable work at cold startup.
+        # They share a queue but remain distinct typed lifecycle events.
         try:
-            from tools.async_delegation import restore_undelivered_completions
+            from tools.async_delegation import (
+                restore_restartable_delegations,
+                restore_undelivered_completions,
+            )
+            restore_restartable_delegations(self.completion_queue)
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+            logger.warning("Could not restore async delegation lifecycle: %s", exc)
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications

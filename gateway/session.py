@@ -15,6 +15,7 @@ import os
 import json
 import threading
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
@@ -182,6 +183,11 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    # Telegram Business routing identity.  The connection id must survive
+    # persistence so finals/recovery use the same Business connection.  The
+    # safety flag separates trusted owner conversations from external clients.
+    business_connection_id: Optional[str] = None
+    external_safe_mode: bool = False
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
@@ -279,6 +285,10 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.business_connection_id:
+            d["business_connection_id"] = self.business_connection_id
+        if self.external_safe_mode:
+            d["external_safe_mode"] = True
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -306,6 +316,8 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            business_connection_id=data.get("business_connection_id"),
+            external_safe_mode=bool(data.get("external_safe_mode", False)),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
@@ -854,6 +866,12 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    # Exact continuation identity.  Delivery obligations copy this tuple and
+    # may clear the marker only with a full compare-and-clear match.
+    resume_task_id: str = ""
+    continuation_generation: int = 0
+    continuation_claim_owner: str = ""
+    continuation_claim_token: str = ""
 
     # Durable ownership marker for the agent turn currently executing on this
     # routing entry.  A normal unwind clears it with compare-and-swap semantics;
@@ -898,6 +916,10 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "resume_task_id": self.resume_task_id,
+            "continuation_generation": self.continuation_generation,
+            "continuation_claim_owner": self.continuation_claim_owner,
+            "continuation_claim_token": self.continuation_claim_token,
             "active_turn_token": self.active_turn_token,
             "active_turn_started_at": (
                 self.active_turn_started_at.isoformat()
@@ -995,6 +1017,16 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            resume_task_id=str(data.get("resume_task_id") or ""),
+            continuation_generation=int(
+                data.get("continuation_generation") or 0
+            ),
+            continuation_claim_owner=str(
+                data.get("continuation_claim_owner") or ""
+            ),
+            continuation_claim_token=str(
+                data.get("continuation_claim_token") or ""
+            ),
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
@@ -1132,6 +1164,20 @@ def build_session_key(
         if source.platform == Platform.SLACK and source.scope_id
         else None
     )
+    if source.platform == Platform.TELEGRAM and source.business_connection_id:
+        trust_lane = "external" if source.external_safe_mode else "trusted"
+        connection_id = quote(str(source.business_connection_id), safe="")
+        return ":".join(
+            str(part) for part in (
+                ns,
+                platform,
+                "business",
+                connection_id,
+                source.chat_id,
+                source.user_id or source.chat_id,
+                trust_lane,
+            )
+        )
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -3224,17 +3270,25 @@ class SessionStore:
                     marker_is_stale = True
 
                 if not marker_is_stale and not entry.suspended:
+                    interrupted_token = str(entry.active_turn_token or "")
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
                         if entry.last_resume_marked_at is None:
                             entry.last_resume_marked_at = now
+                        if not entry.resume_task_id:
+                            self._stamp_resume_identity(
+                                entry, task_id=interrupted_token
+                            )
                     else:
                         entry.resume_pending = True
                         entry.resume_reason = "restart_interrupted"
                         # Freshness starts when recovery is discovered, not
                         # when a potentially hours-long turn began.
                         entry.last_resume_marked_at = now
+                        self._stamp_resume_identity(
+                            entry, task_id=interrupted_token
+                        )
                         promoted += 1
 
                 entry.active_turn_token = None
@@ -3288,9 +3342,49 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                self._stamp_resume_identity(
+                    entry,
+                    task_id=str(entry.active_turn_token or ""),
+                )
                 self._save()
                 return True
         return False
+
+    def mark_resume_pending_with_receipt(
+        self,
+        session_key: str,
+        reason: str = "restart_timeout",
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically mark and return the immutable continuation identity."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.suspended:
+                return None
+            entry.resume_pending = True
+            entry.resume_reason = reason
+            entry.last_resume_marked_at = _now()
+            self._stamp_resume_identity(
+                entry,
+                task_id=str(entry.active_turn_token or ""),
+            )
+            receipt = {
+                "resume_task_id": str(entry.resume_task_id or ""),
+                "continuation_generation": int(entry.continuation_generation or 0),
+                "continuation_claim_owner": str(entry.continuation_claim_owner or ""),
+                "continuation_claim_token": str(entry.continuation_claim_token or ""),
+            }
+            self._save()
+            return receipt
+
+    @staticmethod
+    def _stamp_resume_identity(entry: SessionEntry, *, task_id: str = "") -> None:
+        entry.resume_task_id = str(task_id or uuid.uuid4().hex)
+        entry.continuation_generation = int(
+            entry.continuation_generation or 0
+        ) + 1
+        entry.continuation_claim_owner = f"gateway:{os.getpid()}"
+        entry.continuation_claim_token = uuid.uuid4().hex
 
     def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
@@ -3309,6 +3403,66 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.resume_task_id = ""
+            entry.continuation_generation = 0
+            entry.continuation_claim_owner = ""
+            entry.continuation_claim_token = ""
+            self._save()
+            return True
+
+    def clear_resume_pending_exact(
+        self,
+        session_key: str,
+        *,
+        resume_task_id: str,
+        continuation_generation: int,
+        continuation_claim_owner: str,
+        continuation_claim_token: str,
+    ) -> bool:
+        """Compare-and-clear one exact continuation marker."""
+        expected = (
+            str(resume_task_id or ""),
+            int(continuation_generation or 0),
+            str(continuation_claim_owner or ""),
+            str(continuation_claim_token or ""),
+        )
+        if not all(expected):
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_pending:
+                return False
+            current = (
+                str(entry.resume_task_id or ""),
+                int(entry.continuation_generation or 0),
+                str(entry.continuation_claim_owner or ""),
+                str(entry.continuation_claim_token or ""),
+            )
+            if not all(current):
+                metadata = entry.metadata or {}
+                current = (
+                    str(metadata.get("resume_task_id") or ""),
+                    int(metadata.get("continuation_generation") or 0),
+                    str(metadata.get("continuation_claim_owner") or ""),
+                    str(metadata.get("continuation_claim_token") or ""),
+                )
+            if current != expected:
+                return False
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
+            entry.resume_task_id = ""
+            entry.continuation_generation = 0
+            entry.continuation_claim_owner = ""
+            entry.continuation_claim_token = ""
+            for key in (
+                "resume_task_id",
+                "continuation_generation",
+                "continuation_claim_owner",
+                "continuation_claim_token",
+            ):
+                entry.metadata.pop(key, None)
             self._save()
             return True
 

@@ -32,11 +32,18 @@ def _store_path() -> str:
     return os.path.join(str(home), "state", "rich_sent_index.json")
 
 
-def _key(chat_id, message_id) -> str:
+def _key(chat_id, message_id, business_connection_id=None) -> str:
+    if business_connection_id:
+        return f"business:{business_connection_id}:{chat_id}:{message_id}"
     return f"{chat_id}:{message_id}"
 
 
-def record(chat_id, message_id, text: Optional[str]) -> None:
+def record(
+    chat_id,
+    message_id,
+    text: Optional[str],
+    business_connection_id=None,
+) -> None:
     """Persist ``text`` for ``(chat_id, message_id)``. No-op on any failure."""
     if not text or message_id is None or chat_id is None:
         return
@@ -50,7 +57,7 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
                 data = {}
         except (FileNotFoundError, ValueError):
             data = {}
-        data[_key(chat_id, message_id)] = {
+        data[_key(chat_id, message_id, business_connection_id)] = {
             "t": text[:_MAX_TEXT_CHARS],
             "ts": int(time.time()),
         }
@@ -68,14 +75,14 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
         return
 
 
-def lookup(chat_id, message_id) -> Optional[str]:
+def lookup(chat_id, message_id, business_connection_id=None) -> Optional[str]:
     """Return stored text for ``(chat_id, message_id)`` or ``None``."""
     if message_id is None or chat_id is None:
         return None
     try:
         with open(_store_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        entry = data.get(_key(chat_id, message_id))
+        entry = data.get(_key(chat_id, message_id, business_connection_id))
         if isinstance(entry, dict):
             return entry.get("t") or None
     except (FileNotFoundError, ValueError, AttributeError):

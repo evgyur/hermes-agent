@@ -59,6 +59,7 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _start_ack_receipt: Any = None
 
     # --- progress threading metadata (assigned after construction, before
     #     send_progress_messages is scheduled) ----------------------------
@@ -101,6 +102,9 @@ class TurnContext:
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    # Legacy/manual contexts that set ``enabled=True`` expect raw delivery;
+    # the real gateway always overwrites this with off|raw|generic per turn.
+    interim_assistant_messages_mode: str = "raw"
     start_ack_text: str = ""
     start_ack_required: bool = False
     start_ack_timeout_s: float = 3.0

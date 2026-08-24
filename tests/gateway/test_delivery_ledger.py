@@ -36,6 +36,14 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        resume_task_id=kw.get("resume_task_id", "resume-task-1"),
+        continuation_generation=kw.get("continuation_generation", 1),
+        continuation_claim_owner=kw.get(
+            "continuation_claim_owner", "gateway:test"
+        ),
+        continuation_claim_token=kw.get(
+            "continuation_claim_token", "claim-test-1"
+        ),
     )
 
 
@@ -154,6 +162,7 @@ class TestGatewayRedeliverySweep:
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending_exact = AsyncMock()
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
@@ -181,8 +190,12 @@ class TestGatewayRedeliverySweep:
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
 
     @pytest.mark.asyncio
@@ -246,13 +259,17 @@ class TestGatewayRedeliverySweep:
         task = asyncio.create_task(runner._redeliver_pending_obligations())
 
         deadline = asyncio.get_running_loop().time() + 2
-        while runner._async_session_store.clear_resume_pending.await_count == 0:
+        while runner._async_session_store.clear_resume_pending_exact.await_count == 0:
             if asyncio.get_running_loop().time() >= deadline:
                 raise AssertionError("resume_pending was not cleared before send")
             await asyncio.sleep(0)
 
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
         assert not task.done()
 
@@ -391,3 +408,84 @@ class TestOwnerAlivePidProbe:
 
         monkeypatch.setattr(status, "_pid_exists", boom)
         assert dl._owner_alive(12345, 999) is False
+
+
+def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
+    dl.record_obligation(
+        obligation_id="runtime-claim",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="already generated",
+        resume_task_id="resume-3",
+        continuation_generation=3,
+        continuation_claim_owner="gateway:owner",
+        continuation_claim_token="continuation-token",
+    )
+    dl.mark_failed("runtime-claim", "offline")
+    rows = dl.sweep_failed_for_runtime("telegram")
+    assert len(rows) == 1
+    assert rows[0]["continuation_generation"] == 3
+    assert rows[0]["continuation_claim_token"] == "continuation-token"
+    assert dl.sweep_failed_for_runtime("telegram") == []
+    assert dl.settle_runtime_claim(
+        "runtime-claim", rows[0]["runtime_claim_token"], delivered=True
+    )
+    assert _row("runtime-claim")["state"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_sends_stored_final_without_model_replay():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    _record(
+        "runtime-send",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        thread_id=None,
+        content="stored final",
+    )
+    dl.mark_failed("runtime-send", "offline")
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m1", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM
+    ) == 1
+    assert adapter.send.await_args.kwargs["content"].endswith("stored final")
+    runner._async_session_store.clear_resume_pending_exact.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settlement_continues_db_only_after_inline_lock_budget(monkeypatch):
+    import asyncio
+    import sqlite3
+
+    _record("settle-after-locks")
+    real_mark = dl.mark_delivered
+    calls = 0
+
+    def locked_then_open(obligation_id):
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark(obligation_id)
+
+    monkeypatch.setattr(dl, "mark_delivered", locked_then_open)
+    assert await dl.settle_with_retry(dl.mark_delivered, "settle-after-locks") is False
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while calls < 5 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert calls >= 5
+    assert _row("settle-after-locks")["state"] == "delivered"

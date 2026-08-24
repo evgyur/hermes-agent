@@ -40,12 +40,15 @@ or delay an actual send. Callers wrap every call in try/except.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -62,6 +65,20 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_UNDELIVERED_ROWS = 2000
+_MAX_UNDELIVERED_BYTES = 128 * 1024 * 1024
+
+
+class DeliveryLedgerCapacityError(RuntimeError):
+    """The durable outbox is full; an unreceipted send must not proceed."""
+
+
+@dataclass(frozen=True)
+class ObligationRecordResult:
+    """Transactional admission/duplicate disposition for one exact effect."""
+
+    disposition: str
+    claim_token: str = ""
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -110,6 +127,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT
         )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    for name, sql_type in (
+        ("resume_task_id", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("continuation_claim_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("runtime_claim_token", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
+            )
 
 
 @contextmanager
@@ -209,22 +238,87 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
-) -> None:
+    resume_task_id: str = "",
+    continuation_generation: int = 0,
+    continuation_claim_owner: str = "",
+    continuation_claim_token: str = "",
+) -> ObligationRecordResult:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """SELECT session_key, platform, chat_id, thread_id, content, state
+               FROM delivery_obligations WHERE obligation_id=?""",
+            (obligation_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+            )
+            if tuple(existing[:5]) != expected:
+                raise ValueError(
+                    "delivery obligation id collision with different payload"
+                )
+            state = str(existing[5] or "")
+            if state in {"pending", "failed"}:
+                claim_token = uuid.uuid4().hex
+                changed = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='attempting', attempts=attempts+1,
+                           owner_pid=?, owner_started_at=?, runtime_claim_token=?,
+                           updated_at=?, last_error=NULL
+                       WHERE obligation_id=? AND state=?""",
+                    (pid, started, claim_token, now, obligation_id, state),
+                )
+                if changed.rowcount == 1:
+                    return ObligationRecordResult("retry_claimed", claim_token)
+                return ObligationRecordResult("attempting")
+            return ObligationRecordResult(state or "attempting")
+        pending_count, pending_bytes = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(
+                     LENGTH(CAST(content AS BLOB))
+                     + LENGTH(CAST(session_key AS BLOB))
+                     + LENGTH(CAST(chat_id AS BLOB))
+                   ), 0)
+               FROM delivery_obligations
+               WHERE state NOT IN ('delivered','abandoned')"""
+        ).fetchone()
+        planned_bytes = len(content.encode("utf-8")) + len(
+            session_key.encode("utf-8")
+        ) + len(str(chat_id).encode("utf-8"))
+        if (
+            int(pending_count or 0) >= _MAX_UNDELIVERED_ROWS
+            or int(pending_bytes or 0) + planned_bytes
+            > _MAX_UNDELIVERED_BYTES
+        ):
+            raise DeliveryLedgerCapacityError(
+                "delivery outbox capacity is full; final was not sent"
+            )
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, resume_task_id,
+                continuation_generation, continuation_claim_owner,
+                continuation_claim_token, runtime_claim_token)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, str(resume_task_id or ""),
+             int(continuation_generation or 0),
+             str(continuation_claim_owner or ""),
+             str(continuation_claim_token or "")),
         )
     _prune()
+    return ObligationRecordResult("created")
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -281,12 +375,16 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, resume_task_id,
+                      continuation_generation, continuation_claim_owner,
+                      continuation_claim_token
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at, resume_task_id,
+             continuation_generation, continuation_owner,
+             continuation_token) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -322,8 +420,155 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
                 })
     return claimed
+
+
+def sweep_failed_for_runtime(
+    platform: str,
+    now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Claim failed sends after reconnect without stealing another live owner."""
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, attempts, created_at, owner_pid, owner_started_at,
+                      resume_task_id, continuation_generation,
+                      continuation_claim_owner, continuation_claim_token
+               FROM delivery_obligations
+               WHERE state='failed' AND platform=?
+               ORDER BY created_at, obligation_id""",
+            (str(platform),),
+        ).fetchall()
+        for row in rows:
+            (oid, session_key, platform_name, chat_id, thread_id, content,
+             attempts, created_at, owner_pid, owner_started_at, resume_task_id,
+             continuation_generation, continuation_owner,
+             continuation_token) = row
+            exact_current_owner = int(owner_pid or 0) == int(pid) and (
+                owner_started_at is None
+                or started is None
+                or int(owner_started_at) == int(started)
+            )
+            if _owner_alive(owner_pid, owner_started_at) and not exact_current_owner:
+                continue
+            if int(attempts or 0) >= MAX_ATTEMPTS or (
+                now - float(created_at or now)
+            ) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    "UPDATE delivery_obligations SET state='abandoned', "
+                    "updated_at=? WHERE obligation_id=? AND state='failed'",
+                    (now, oid),
+                )
+                continue
+            claim_token = uuid.uuid4().hex
+            changed = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       attempts=attempts+1, runtime_claim_token=?, updated_at=?
+                   WHERE obligation_id=? AND state='failed'
+                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                (pid, started, claim_token, now, oid, owner_pid, owner_started_at),
+            ).rowcount
+            if changed:
+                claimed.append({
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": platform_name,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    "needs_marker": True,
+                    "attempts": int(attempts or 0) + 1,
+                    "runtime_claim_token": claim_token,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
+                })
+    return claimed
+
+
+def settle_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    *,
+    delivered: bool,
+    error: str = "",
+) -> bool:
+    """Settle only the exact reconnect claim generation."""
+    state = "delivered" if delivered else "failed"
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state=?, runtime_claim_token='', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                state,
+                time.time(),
+                None if delivered else str(error or "")[:500],
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
+
+
+async def settle_with_retry(callable_, *args, **kwargs):
+    """Retry only an idempotent post-wire ledger settlement off-loop."""
+    delay = 0.01
+    for attempt in range(4):
+        try:
+            return await asyncio.to_thread(callable_, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked:
+                raise
+            if attempt == 3:
+                task = asyncio.create_task(
+                    _settle_locked_until_owned(callable_, args, kwargs)
+                )
+                _PENDING_SETTLEMENT_TASKS.add(task)
+                task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)
+                # Give the supervised owner one short handoff slice. If the
+                # lock clears on the next attempt, callers observe the settled
+                # row before returning; a persistent lock still continues in
+                # the retained background task without blocking wire delivery.
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                return False
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+_PENDING_SETTLEMENT_TASKS: set[asyncio.Task] = set()
+
+
+async def _settle_locked_until_owned(callable_, args, kwargs) -> None:
+    """Continue DB-only settlement after irreversible wire acceptance."""
+    delay = 0.08
+    while True:
+        try:
+            await asyncio.to_thread(callable_, *args, **kwargs)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                logger.error("delivery settlement failed permanently: %s", exc)
+                return
+            await asyncio.sleep(delay)
+            delay = min(2.0, delay * 2)
+        except Exception:
+            logger.exception("delivery settlement failed permanently")
+            return
 
 
 def _prune(now: Optional[float] = None) -> None:
@@ -344,11 +589,8 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered','abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )
