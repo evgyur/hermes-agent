@@ -12868,8 +12868,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_constants import get_hermes_home
 
         ambient_home = Path(get_hermes_home()).resolve()
+        ambient_adapters = dict(self.adapters)
+        for profile_adapters in (
+            getattr(self, "_profile_adapters", {}) or {}
+        ).values():
+            if Platform.TELEGRAM in profile_adapters:
+                ambient_adapters.setdefault(
+                    Platform.TELEGRAM, profile_adapters[Platform.TELEGRAM]
+                )
         scopes: list[tuple[str, Path, dict]] = [
-            ("", ambient_home, self.adapters)
+            ("", ambient_home, ambient_adapters)
         ]
         _runner_config = getattr(self, "config", None)
         if getattr(_runner_config, "multiplex_profiles", False):
@@ -12887,8 +12895,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         claimed_all: list[dict] = []
         for profile_name, profile_home, adapter_map in scopes:
-            if not adapter_map:
-                continue
             try:
                 with _profile_runtime_scope(profile_home):
                     if not await asyncio.to_thread(ledger_enabled):
@@ -12932,6 +12938,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return claimed_all
 
+    @staticmethod
+    def _telegram_replay_source(row: Dict[str, Any]) -> SessionSource:
+        """Rebuild one exact Telegram route or reject it as ambiguous."""
+        from gateway.telegram_egress_policy import (
+            canonical_route_envelope,
+            is_private_peer_id,
+        )
+
+        raw_route = row.get("route_envelope")
+        required = {
+            "version",
+            "platform",
+            "runtime_profile",
+            "transport_profile",
+            "chat_id",
+            "thread_id",
+            "user_id",
+            "business_connection_id",
+            "external_safe_mode",
+        }
+        if not isinstance(raw_route, dict) or not required.issubset(raw_route):
+            raise ValueError("ambiguous_route_envelope")
+        for profile_field in ("runtime_profile", "transport_profile"):
+            profile = raw_route.get(profile_field)
+            if (
+                not isinstance(profile, str)
+                or not profile.strip()
+                or profile != profile.strip()
+            ):
+                raise ValueError("ambiguous_route_envelope")
+        if type(raw_route.get("external_safe_mode")) is not bool:
+            raise ValueError("ambiguous_route_envelope")
+
+        route = canonical_route_envelope(raw_route)
+        expected_thread = (
+            str(row["thread_id"]) if row.get("thread_id") is not None else None
+        )
+        if (
+            route["platform"] != str(row.get("platform") or "")
+            or route["chat_id"] != str(row.get("chat_id") or "")
+            or route["thread_id"] != expected_thread
+        ):
+            raise ValueError("ambiguous_route_envelope")
+
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=route["chat_id"],
+            chat_type=(
+                "dm" if is_private_peer_id(route["chat_id"]) else "group"
+            ),
+            user_id=route["user_id"],
+            thread_id=route["thread_id"],
+            profile=route["runtime_profile"],
+            transport_profile=route["transport_profile"],
+            business_connection_id=route["business_connection_id"],
+            external_safe_mode=route["external_safe_mode"],
+        )
+
+    def _adapter_for_delivery_replay(self, source: SessionSource):
+        """Resolve the adapter named by durable transport provenance."""
+        transport_profile = str(source.transport_profile or "").strip()
+        if not transport_profile:
+            return None
+        if transport_profile == "default":
+            adapter = (getattr(self, "adapters", {}) or {}).get(source.platform)
+        else:
+            profile_adapters = (
+                (getattr(self, "_profile_adapters", {}) or {}).get(
+                    transport_profile
+                )
+                or {}
+            )
+            adapter = profile_adapters.get(source.platform)
+        if adapter is None:
+            return None
+        registered_owner = getattr(adapter, "_owner_profile", None) or "default"
+        if registered_owner != transport_profile:
+            return None
+        return adapter
+
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for rows already claimed (and
         resume-cleared) by :meth:`_claim_pending_obligations`.
@@ -12945,6 +13031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
+                mark_abandoned,
                 mark_delivered,
                 mark_failed,
                 settle_with_retry,
@@ -12974,7 +13061,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter_map = (
                         getattr(self, "_profile_adapters", {}) or {}
                     ).get(ledger_profile, {})
-            adapter = adapter_map.get(platform)
+            if platform == Platform.TELEGRAM:
+                try:
+                    source = self._telegram_replay_source(row)
+                except Exception:
+                    logger.warning(
+                        "obligation %s: quarantined ambiguous Telegram route",
+                        row["obligation_id"],
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            mark_abandoned,
+                            row["obligation_id"],
+                            "ambiguous_route_envelope",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "delivery ledger quarantine update failed",
+                            exc_info=True,
+                        )
+                    continue
+                adapter = self._adapter_for_delivery_replay(source)
+                if adapter is None:
+                    logger.warning(
+                        "obligation %s: exact Telegram transport unavailable",
+                        row["obligation_id"],
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            mark_failed,
+                            row["obligation_id"],
+                            "delivery_route_unavailable",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "delivery ledger route-failure update failed",
+                            exc_info=True,
+                        )
+                    continue
+                from gateway.platforms.base import (
+                    _thread_metadata_for_source as _route_metadata_for_source,
+                )
+
+                metadata = _route_metadata_for_source(source)
+            else:
+                adapter = adapter_map.get(platform)
+                metadata = (
+                    {"thread_id": row["thread_id"]}
+                    if row.get("thread_id")
+                    else None
+                )
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
@@ -12982,9 +13118,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
 
             scope_home = Path(ledger_home_raw) if ledger_home_raw else None
             try:
