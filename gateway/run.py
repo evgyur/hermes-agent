@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -64,6 +65,12 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
+)
+from agent.turn_result import (
+    DeliveryDisposition,
+    TurnDeliveryControl,
+    normalize_delivery_control,
+    normalize_gateway_turn_result,
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -1904,6 +1911,41 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 
+def _prepare_gateway_delivery_text(
+    result: Dict[str, Any],
+    final_response: Optional[str],
+    *,
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+) -> tuple[str, TurnDeliveryControl]:
+    """Apply one delivery gate before any automatic attachment enrichment."""
+
+    response = str(final_response or "")
+    control = normalize_delivery_control(result, logger=logger)
+    if control.disposition != DeliveryDisposition.SEND or "MEDIA:" in response:
+        return response, control
+
+    media_tags, has_voice_directive = _collect_auto_append_media_tags(
+        result.get("messages", []),
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+    )
+    if not media_tags:
+        return response, control
+
+    seen: set[str] = set()
+    unique_tags: List[str] = []
+    for tag in media_tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        unique_tags.append(tag)
+    if has_voice_directive:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    separator = "\n" if response else ""
+    return response + separator + "\n".join(unique_tags), control
+
+
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     """Collect every media path already delivered in prior assistant/tool output.
 
@@ -3512,6 +3554,41 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     return cleaned.strip()
 
 
+def _parent_task_turn_buffers_streaming(agent: Any, marker: Any = None) -> bool:
+    """Buffer a gateway turn before any potentially provisional token escapes."""
+    valid_tools = getattr(agent, "valid_tool_names", set()) if agent is not None else set()
+    can_launch_required_child = isinstance(
+        valid_tools, (set, frozenset, list, tuple)
+    ) and "delegate_task" in valid_tools
+    return bool(marker or can_launch_required_child)
+
+
+def _parent_task_stream_allowed(agent: Any, *, run_still_current: bool) -> bool:
+    """Block response/interim streaming after durable required-child admission."""
+    return bool(run_still_current) and not bool(
+        agent is not None
+        and getattr(agent, "_parent_task_barrier_stream_suppressed", False)
+    )
+
+
+def _merge_gateway_agent_delivery_controls(
+    payload: Dict[str, Any], agent_result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Compatibility wrapper around the sole gateway delivery normalizer."""
+    return normalize_gateway_turn_result(payload, agent_result, logger=logger)
+
+
+def _queued_first_response_delivery_policy(
+    *, final_text_delivered: bool, failed: bool,
+) -> tuple[bool, bool]:
+    """Return ``(text_already_delivered, deliver_media)`` for queued fallback.
+
+    A failed turn must replay its normalized failure text even if streaming
+    emitted partial output. Attachments from failed turns remain suppressed.
+    """
+    return final_text_delivered and not failed, not failed
+
+
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive the /command slug and declared frontmatter name from a SKILL.md.
 
@@ -4162,6 +4239,91 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _goal_turn_outcome(
+    result: Any,
+    *,
+    response_already_delivered: bool,
+) -> Optional[Dict[str, Any]]:
+    """Normalize one completed model turn for later goal reconciliation."""
+    if not isinstance(result, dict):
+        return None
+    if "turn_exit_reason" not in result and "final_response" not in result:
+        return None
+
+    reason = str(result.get("turn_exit_reason") or "")
+    is_technical_cap = reason.startswith("max_iterations_reached(")
+    if not is_technical_cap and (
+        result.get("interrupted")
+        or result.get("failed")
+        or result.get("partial")
+        or result.get("error")
+        or result.get("completed") is False
+    ):
+        return None
+    response = str(result.get("final_response") or "")
+    messages = result.get("messages")
+    message_count = len(messages) if isinstance(messages, list) else None
+    offset = result.get("history_offset")
+    control = normalize_delivery_control(result, logger=logger)
+    identity = str(control.outcome_id or result.get("outcome_id") or "")
+    if not identity:
+        payload = json.dumps(
+            {
+                "history_offset": offset if isinstance(offset, int) else None,
+                "message_count": message_count,
+                "turn_exit_reason": reason,
+                "final_response": response,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    silence_markers = {"NO_REPLY", "[SILENT]"}
+    return {
+        "outcome_id": identity,
+        "turn_exit_reason": reason,
+        "final_response": response,
+        "response_already_delivered": bool(
+            control.disposition == DeliveryDisposition.ALREADY_DELIVERED
+            or result.get("response_already_delivered", response_already_delivered)
+        ),
+        "delivery_suppressed": (
+            control.disposition == DeliveryDisposition.DEFER
+            or response.strip() in silence_markers
+        ),
+        "defer_goal_evaluation": control.defer_goal_evaluation,
+    }
+
+
+def _goal_turn_outcomes(agent_result: Any) -> List[Dict[str, Any]]:
+    """Return every drained model-turn outcome in chronological order."""
+    if not isinstance(agent_result, dict):
+        return []
+
+    outcomes: List[Dict[str, Any]] = []
+    existing = agent_result.get("goal_turn_outcomes")
+    if isinstance(existing, list):
+        for item in existing:
+            normalized = _goal_turn_outcome(item, response_already_delivered=True)
+            if normalized is not None:
+                outcomes.append(normalized)
+
+    current = _goal_turn_outcome(agent_result, response_already_delivered=False)
+    if current is not None:
+        outcomes.append(current)
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for outcome in outcomes:
+        identity = outcome["outcome_id"]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(outcome)
+    return deduped
 
 
 def _preserve_queued_followup_history_offset(
@@ -5479,7 +5641,10 @@ class TurnRunner:
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
-                            if ctx._run_still_current():
+                            if _parent_task_stream_allowed(
+                                agent,
+                                run_still_current=ctx._run_still_current(),
+                            ):
                                 _stream_consumer.on_delta(text)
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
@@ -5493,11 +5658,17 @@ class TurnRunner:
         # receives LLM deltas for audio synthesis (#60671).
         if _stream_delta_cb is None and _stts_consumer_ref is not None:
             def _stream_delta_cb(text: str) -> None:
-                if ctx._run_still_current():
+                if _parent_task_stream_allowed(
+                    agent,
+                    run_still_current=ctx._run_still_current(),
+                ):
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not _parent_task_stream_allowed(
+                agent,
+                run_still_current=ctx._run_still_current(),
+            ):
                 return
             display_text = text
             if _stream_consumer is not None:
@@ -5841,6 +6012,20 @@ class TurnRunner:
             else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
+        # Cached agents may retain per-turn parent-barrier state. Persistent
+        # messaging turns that can launch required delegation are buffered from
+        # their first token: prose can precede a tool call, so waiting until
+        # admission would leak a provisional prefix. CLI/non-gateway paths do
+        # not pass through this adapter.
+        _parent_marker = getattr(
+            ctx, "_trusted_parent_task_continuation", None
+        )
+        agent._parent_task_barrier_stream_suppressed = (
+            _parent_task_turn_buffers_streaming(agent, _parent_marker)
+        )
+        agent._parent_task_continuation_barrier_id = str(
+            (_parent_marker or {}).get("barrier_id") or ""
+        )
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
@@ -6430,6 +6615,23 @@ class TurnRunner:
                 pass
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
+        _delivery_control = normalize_delivery_control(result, logger=logger)
+
+        if getattr(agent, "_parent_task_prebuffering", False):
+            agent._parent_task_prebuffering = False
+            _publish_parent_buffer = (
+                _delivery_control.disposition == DeliveryDisposition.SEND
+            )
+            if _publish_parent_buffer:
+                agent._parent_task_barrier_stream_suppressed = False
+                for _kind, _text, _already_streamed in _parent_task_stream_buffer:
+                    if _kind == "delta" and _stream_delta_cb is not None:
+                        _stream_delta_cb(_text)
+                    elif _kind == "interim":
+                        _interim_assistant_cb(
+                            _text, already_streamed=_already_streamed
+                        )
+            _parent_task_stream_buffer.clear()
 
         # Signal the stream consumer that the agent is done. Pass the
         # completed final_response as the authoritative finalize payload:
@@ -6590,6 +6792,39 @@ class TurnRunner:
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
 
+        # Delivery ownership is evaluated before empty-response recovery and
+        # before MEDIA/local-file discovery. A deferred or already-delivered
+        # turn may carry provisional text or artifacts in its internal result,
+        # but neither is eligible for platform enqueue.
+        final_response, _delivery_control = _prepare_gateway_delivery_text(
+            result,
+            final_response,
+            history_offset=len(agent_history),
+            history_media_paths=_history_media_paths,
+        )
+        if _delivery_control.disposition != DeliveryDisposition.SEND:
+            return _merge_gateway_agent_delivery_controls({
+                "final_response": final_response or "",
+                "messages": result.get("messages", []),
+                "api_calls": result.get("api_calls", 0),
+                "failed": result.get("failed", False),
+                "failure_reason": result.get("failure_reason"),
+                "partial": result.get("partial", False),
+                "completed": result.get("completed"),
+                "interrupted": result.get("interrupted", False),
+                "interrupt_message": result.get("interrupt_message"),
+                "error": result.get("error"),
+                "tools": ctx.tools_holder[0] or [],
+                "history_offset": _effective_history_offset,
+                "compacted_in_place": _compacted_in_place,
+                "session_id": effective_session_id,
+                "last_prompt_tokens": _last_prompt_toks,
+                "input_tokens": _input_toks,
+                "output_tokens": _output_toks,
+                "model": _resolved_model,
+                "context_length": _context_length,
+            }, result)
+
         if not final_response:
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
@@ -6597,7 +6832,7 @@ class TurnRunner:
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
-            return {
+            return _merge_gateway_agent_delivery_controls({
                 "final_response": final_response,
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
@@ -6625,45 +6860,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
-            }
-
-        # Scan tool results for MEDIA:<path> tags that need to be delivered
-        # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-        # in its JSON response, but the model's final text reply usually
-        # doesn't include them.  We collect unique tags from tool results and
-        # append any that aren't already present in the final response, so the
-        # adapter's extract_media() can find and deliver the files exactly once.
-        #
-        # Scope the scan to THIS turn's tool results only. ``agent_history``
-        # was passed into run_conversation as ``conversation_history``, so the
-        # agent's returned ``messages`` list is ``agent_history`` followed by
-        # the messages produced this turn. Slicing at ``len(agent_history)``
-        # isolates the current turn precisely, so a stale MEDIA: path emitted
-        # by a tool several turns earlier (still present in the full message
-        # list) can never leak onto a later text-only reply. (Fixes #34608)
-        #
-        # Path-based deduplication against _history_media_paths (collected
-        # before run_conversation) is retained as a secondary guard. It is
-        # also the sole guard on the fallback branch taken when mid-run
-        # context compression shrinks the message list below the original
-        # history length, preserving the compression-safe behaviour of #160.
-        if "MEDIA:" not in final_response:
-            media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                result.get("messages", []),
-                history_offset=len(agent_history),
-                history_media_paths=_history_media_paths,
-            )
-
-            if media_tags:
-                seen = set()
-                unique_tags = []
-                for tag in media_tags:
-                    if tag not in seen:
-                        seen.add(tag)
-                        unique_tags.append(tag)
-                if has_voice_directive:
-                    unique_tags.insert(0, "[[audio_as_voice]]")
-                final_response = final_response + "\n" + "\n".join(unique_tags)
+            }, result)
 
         # Auto-titling runs at TURN START (agent/turn_context.py) from the
         # user's message alone, so it no longer waits on final_response — a
@@ -6673,7 +6870,7 @@ class TurnRunner:
         # _attach_session_title_callback), because the titler now fires from
         # inside the turn prologue rather than from here.
 
-        return {
+        return _merge_gateway_agent_delivery_controls({
             "final_response": final_response,
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
@@ -6714,7 +6911,7 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
-        }
+        }, result)
 
 
 
@@ -10008,6 +10205,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
             return False
+        # ``_active_children`` is intentionally a short-lived registry: each
+        # child removes itself before ``delegate_task`` returns to the parent
+        # tool executor.  During that teardown window the parent is still
+        # inside delegate_task, but the list can already be empty.  Treat the
+        # parent tool marker as authoritative for the full tool-call lifetime
+        # so a conversational follow-up cannot slip through as an interrupt.
+        current_tool = getattr(running_agent, "_current_tool", None)
+        if not isinstance(current_tool, str):
+            try:
+                summary = running_agent.get_activity_summary()
+            except Exception:
+                summary = None
+            if isinstance(summary, dict):
+                current_tool = summary.get("current_tool")
+        if isinstance(current_tool, str):
+            active_tools = {part.strip() for part in current_tool.split(",")}
+            if "delegate_task" in active_tools:
+                return True
+
         children = getattr(running_agent, "_active_children", None)
         # AIAgent always initialises this as a concrete list (see
         # agent/agent_init.py). Reject anything that isn't a real
@@ -12487,6 +12703,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Barrier DDL/migrations are startup-owned. Fail before adapters can
+        # accept external events instead of mutating schema on the hot path.
+        from tools.parent_task_barrier import initialize_storage
+
+        await asyncio.to_thread(initialize_storage)
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -17964,6 +18185,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
+                            from subprocess_limits import bounded_child_kwargs
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
                             proc = await asyncio.create_subprocess_shell(
@@ -17971,6 +18193,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
+                                **bounded_child_kwargs(),
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
@@ -20355,6 +20578,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Ordinary user input is parked behind an active required-child
+        # continuation instead of cancelling it or entering the wrong root turn.
+        # Explicit /stop, /new, and /reset are handled by the existing command
+        # paths before this point and still cancel child + barrier ownership.
+        if not bool(getattr(event, "internal", False)):
+            try:
+                parked = await self._park_user_event_for_parent_barrier(
+                    event=event,
+                    session_key=session_key,
+                    parent_session_id=str(session_entry.session_id or ""),
+                )
+            except Exception:
+                logger.exception("Could not inspect active parent-task barrier")
+                return
+            if parked:
+                return
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
@@ -20389,6 +20629,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _parent_continuation_start = getattr(
+                event, "_hermes_parent_task_continuation", None
+            )
+            if _parent_continuation_start is not None:
+                from tools.parent_task_barrier import (
+                    TrustedParentTaskContinuation,
+                    accept_continuation,
+                )
+
+                if not isinstance(
+                    _parent_continuation_start, TrustedParentTaskContinuation
+                ):
+                    logger.error("Rejected untrusted parent-task continuation start")
+                    return
+                accepted_turn_id = (
+                    f"{session_key}:{run_generation}:"
+                    f"{getattr(event, 'message_id', '') or 'internal'}"
+                )
+                accepted = await asyncio.to_thread(
+                    accept_continuation,
+                    str(_parent_continuation_start.get("barrier_id") or ""),
+                    str(
+                        _parent_continuation_start.get("continuation_claim") or ""
+                    ),
+                    accepted_turn_id=accepted_turn_id,
+                    owner_pid=os.getpid(),
+                )
+                if not accepted:
+                    logger.error(
+                        "Parent-task continuation claim was not current at turn start"
+                    )
+                    return
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -20405,8 +20677,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                startup_resume=bool(getattr(event, "startup_resume", False)),
+                _trusted_restart_wake=getattr(
+                    event, "_hermes_trusted_restart_event", None
+                ),
+                _trusted_parent_task_continuation=_parent_continuation_start,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+
+            _parent_continuation = getattr(
+                event, "_hermes_parent_task_continuation", None
+            )
+            _delivery_control = normalize_delivery_control(
+                agent_result if isinstance(agent_result, dict) else {}, logger=logger
+            )
+            _parent_delivery_result = None
+            if _parent_continuation is not None:
+                try:
+                    from tools.parent_task_barrier import (
+                        TrustedParentTaskContinuation,
+                    )
+
+                    if not isinstance(
+                        _parent_continuation, TrustedParentTaskContinuation
+                    ):
+                        raise RuntimeError(
+                            "untrusted parent-task continuation marker"
+                        )
+                    if isinstance(agent_result, dict):
+                        _parent_delivery_result = normalize_gateway_turn_result(
+                            {
+                                "final_response": str(
+                                    agent_result.get("final_response") or ""
+                                ),
+                                "turn_exit_reason": str(
+                                    agent_result.get("turn_exit_reason") or ""
+                                ),
+                            },
+                            agent_result,
+                            logger=logger,
+                        )
+                    else:
+                        _parent_delivery_result = {
+                            "final_response": str(agent_result or "")
+                        }
+                except Exception as _parent_prepare_exc:
+                    try:
+                        from tools.parent_task_barrier import (
+                            release_accepted_continuation,
+                        )
+
+                        await asyncio.to_thread(
+                            release_accepted_continuation,
+                            str(_parent_continuation.get("barrier_id") or ""),
+                            str(
+                                _parent_continuation.get("continuation_claim")
+                                or ""
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not release invalid parent-task continuation"
+                        )
+                    logger.error(
+                        "Parent-task continuation delivery could not prepare: %s",
+                        _parent_prepare_exc,
+                        exc_info=True,
+                    )
+                    if isinstance(agent_result, dict):
+                        agent_result["suppress_delivery"] = True
+                        agent_result["defer_goal_evaluation"] = True
+                        agent_result["error"] = (
+                            "parent-task continuation preparation failed: "
+                            + str(_parent_prepare_exc)
+                        )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -20461,6 +20805,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 _intentional_silence = False
+            if _delivery_control.disposition != DeliveryDisposition.SEND:
+                if (
+                    _delivery_control.disposition == DeliveryDisposition.DEFER
+                    and _parent_continuation is not None
+                ):
+                    _nested_barrier = str(_delivery_control.barrier_id or "")
+                    _current_barrier = str(
+                        _parent_continuation.get("barrier_id") or ""
+                    )
+                    if _nested_barrier != _current_barrier:
+                        try:
+                            from tools.parent_task_barrier import (
+                                release_accepted_continuation,
+                            )
+
+                            await asyncio.to_thread(
+                                release_accepted_continuation,
+                                _current_barrier,
+                                str(
+                                    _parent_continuation.get(
+                                        "continuation_claim"
+                                    )
+                                    or ""
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not release suppressed parent continuation"
+                            )
+                logger.info(
+                    "agent result suppressed delivery: platform=%s chat=%s error=%s",
+                    _platform_name,
+                    source.chat_id or "unknown",
+                    str(agent_result.get("error") or "")[:160],
+                )
+                return None
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -20979,7 +21359,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                not _streaming_tts_done
+                _parent_continuation is None
+                and not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -21027,9 +21408,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
                 return None
 
+            if (
+                _parent_continuation is not None
+                and _parent_delivery_result is not None
+            ):
+                from tools.parent_task_barrier import TrustedParentTaskDelivery
+
+                return TrustedParentTaskDelivery(
+                    response,
+                    barrier_id=str(
+                        _parent_continuation.get("barrier_id") or ""
+                    ),
+                    continuation_claim=str(
+                        _parent_continuation.get("continuation_claim") or ""
+                    ),
+                    result=_parent_delivery_result,
+                )
             return response
             
         except Exception as e:
+            _failed_parent_continuation = locals().get(
+                "_parent_continuation_start"
+            )
+            if _failed_parent_continuation is not None:
+                try:
+                    from tools.parent_task_barrier import (
+                        release_accepted_continuation,
+                    )
+
+                    await asyncio.to_thread(
+                        release_accepted_continuation,
+                        str(_failed_parent_continuation.get("barrier_id") or ""),
+                        str(
+                            _failed_parent_continuation.get(
+                                "continuation_claim"
+                            )
+                            or ""
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not release failed parent-task continuation"
+                    )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -25387,6 +25807,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
+            from tools.async_delegation import TrustedRestartEvent
+            from tools.parent_task_barrier import TrustedParentTaskContinuation
+
+            if isinstance(evt, TrustedRestartEvent):
+                # Preserve the trusted in-process object through a busy-session
+                # FIFO. A ContextVar around handle_message would be reset before
+                # that queued event eventually creates its TurnContext.
+                setattr(synth_event, "_hermes_trusted_restart_event", evt)
+            elif isinstance(evt, TrustedParentTaskContinuation):
+                setattr(synth_event, "_hermes_parent_task_continuation", evt)
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -25999,6 +26429,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _pr.completion_queue.put(evt)
         return delivered
 
+    async def _park_user_event_for_parent_barrier(
+        self,
+        *,
+        event: Any,
+        session_key: str,
+        parent_session_id: str,
+    ) -> bool:
+        """Park ordinary steering behind an active required-child continuation."""
+        from tools.parent_task_barrier import has_active_barrier
+
+        active = await asyncio.to_thread(
+            has_active_barrier,
+            origin_session=session_key,
+            parent_session_id=parent_session_id,
+        )
+        if not active:
+            return False
+        self._queue_or_replace_pending_event(session_key, event)
+        logger.info(
+            "Parked user event behind active parent-task barrier: session=%s",
+            session_key,
+        )
+        return True
+
+    async def _consume_parent_barrier_child(self, evt: dict) -> Optional[bool]:
+        """Acknowledge a child outcome absorbed by a parent barrier."""
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return False
+        from tools.parent_task_barrier import barrier_for_child
+
+        barrier_id = await asyncio.to_thread(barrier_for_child, delegation_id)
+        if not barrier_id:
+            return False
+
+        from tools.async_delegation import (
+            claim_completion_delivery,
+            complete_completion_delivery,
+            completion_delivery_disposition,
+        )
+
+        claim_id = f"parent-barrier:{id(self)}:{__import__('uuid').uuid4().hex}"
+        claimed = await asyncio.to_thread(
+            claim_completion_delivery, delegation_id, claim_id
+        )
+        if not claimed:
+            disposition = await asyncio.to_thread(
+                completion_delivery_disposition, delegation_id
+            )
+            return True if disposition not in {"pending", "claimed"} else None
+        completed = await asyncio.to_thread(
+            complete_completion_delivery, delegation_id, claim_id
+        )
+        if not completed:
+            raise RuntimeError(
+                f"could not acknowledge barrier child completion {delegation_id}"
+            )
+        return True
+
+    async def _deliver_parent_task_continuation(self, evt: dict) -> bool:
+        """Inject one trusted aggregate continuation under its durable claim."""
+        from tools.parent_task_barrier import (
+            TrustedParentTaskContinuation,
+            release_continuation_claim,
+        )
+
+        if not isinstance(evt, TrustedParentTaskContinuation):
+            return False
+        accepted = await self._inject_watch_notification(
+            str(evt.get("synthetic_message") or ""), evt
+        )
+        if accepted is True:
+            return True
+        await asyncio.to_thread(
+            release_continuation_claim,
+            str(evt.get("barrier_id") or ""),
+            str(evt.get("continuation_claim") or ""),
+        )
+        return False
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -26033,6 +26543,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
+                from tools.parent_task_barrier import claim_next_ready_continuation
+
+                parent_continuation = await asyncio.to_thread(
+                    claim_next_ready_continuation,
+                    owner=f"gateway:{os.getpid()}:{id(self)}",
+                )
+                if parent_continuation is not None:
+                    async_events.append(parent_continuation)
+
                 # A same-tick drain often carries several completions for the
                 # SAME originating session (a fan-out of background subagents
                 # finishing together).  Delivering each one individually floods
@@ -26043,6 +26562,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 group_order: list[tuple[str, ...]] = []
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    if evt.get("type") == "parent_task_continuation":
+                        await self._deliver_parent_task_continuation(evt)
+                        continue
+                    if evt.get("type") == "async_delegation_restart":
+                        from tools.async_delegation import TrustedRestartEvent
+
+                        if not isinstance(evt, TrustedRestartEvent):
+                            continue
+                        delivered = await self._inject_watch_notification(
+                            "Internal delegation recovery wake", evt
+                        )
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                        continue
+                    consumed = await self._consume_parent_barrier_child(evt)
+                    if consumed is True:
+                        continue
+                    if consumed is None:
+                        _pr.completion_queue.put(evt)
+                        continue
                     key = self._async_delegation_group_key(evt)
                     if key not in groups:
                         groups[key] = []
@@ -28118,6 +28657,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        startup_resume: bool = False,
+        _trusted_restart_wake: Any = None,
+        _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28138,6 +28680,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                startup_resume=startup_resume,
+                _trusted_restart_wake=_trusted_restart_wake,
+                _trusted_parent_task_continuation=(
+                    _trusted_parent_task_continuation
+                ),
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28151,6 +28698,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                startup_resume=startup_resume,
+                _trusted_restart_wake=_trusted_restart_wake,
+                _trusted_parent_task_continuation=(
+                    _trusted_parent_task_continuation
+                ),
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28294,6 +28846,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        startup_resume: bool = False,
+        _trusted_restart_wake: Any = None,
+        _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28604,6 +29159,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
         )
+        if _trusted_restart_wake is not None:
+            from tools.async_delegation import TrustedRestartEvent
+
+            if isinstance(_trusted_restart_wake, TrustedRestartEvent):
+                setattr(turn_ctx, "_trusted_restart_wake", _trusted_restart_wake)
+        if _trusted_parent_task_continuation is not None:
+            from tools.parent_task_barrier import TrustedParentTaskContinuation
+
+            if isinstance(
+                _trusted_parent_task_continuation,
+                TrustedParentTaskContinuation,
+            ):
+                setattr(
+                    turn_ctx,
+                    "_trusted_parent_task_continuation",
+                    _trusted_parent_task_continuation,
+                )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
         # TurnRunner.progress_callback (bound method, same signature).

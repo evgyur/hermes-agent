@@ -4,7 +4,8 @@ Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. Top-level model calls run in the background; orchestrator children
+modes. Top-level model calls run in the background when ``wait`` is omitted or
+false; ``wait=true`` returns the ordered aggregate inline. Orchestrator children
 wait for their own workers so they can synthesize the results.
 
 Each child gets:
@@ -19,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -31,6 +33,7 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -44,6 +47,22 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_HOST_RESTART_CONTEXT = contextvars.ContextVar(
+    "HERMES_HOST_RESTART_CONTEXT", default=None
+)
+
+
+@contextmanager
+def host_restart_context(**private_values):
+    """Bind host-only retained-work metadata outside the tool schema."""
+
+    token = _HOST_RESTART_CONTEXT.set(dict(private_values))
+    try:
+        yield
+    finally:
+        _HOST_RESTART_CONTEXT.reset(token)
 
 
 # Tools that children must never have access to
@@ -1626,6 +1645,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    forced_session_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1999,6 +2019,7 @@ def _build_child_agent(
                     else dict(getattr(parent_agent, "request_overrides", {}) or {})
                 ),
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
+                session_id=forced_session_id,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
@@ -2816,11 +2837,15 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                call_kwargs = {
+                    "user_message": goal,
+                    "task_id": child_task_id,
+                    "stream_callback": _relay_child_text,
+                }
+                restart_history = getattr(child, "_restart_history", None)
+                if restart_history:
+                    call_kwargs["conversation_history"] = restart_history
+                return child.run_conversation(**call_kwargs)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3410,6 +3435,37 @@ def _build_child_preserving_parent_tools(**kwargs):
     return child
 
 
+def _apply_child_capability_ceiling(child, capability_names: list[str]) -> None:
+    """Freeze a resumed child to its original exact tool-name capability set."""
+    ceiling = frozenset(
+        str(name) for name in capability_names
+        if isinstance(name, str) and name
+    )
+    digest = hashlib.sha256("\0".join(sorted(ceiling)).encode()).hexdigest()[:20]
+    toolset_name = f"delegate-capability-{digest}"
+    TOOLSETS.setdefault(
+        toolset_name,
+        {
+            "description": "Exact durable capability ceiling for a resumed subagent",
+            "tools": sorted(ceiling),
+            "includes": [],
+        },
+    )
+    child.enabled_toolsets = [toolset_name]
+    child._delegate_capability_name_ceiling = ceiling
+    child.tools = [
+        schema for schema in (getattr(child, "tools", None) or [])
+        if str((schema.get("function") or schema).get("name") or "") in ceiling
+    ]
+    child.valid_tool_names = {
+        str((schema.get("function") or schema).get("name") or "")
+        for schema in child.tools
+    }
+    engine_names = getattr(child, "_context_engine_tool_names", None)
+    if isinstance(engine_names, set):
+        engine_names.intersection_update(ceiling)
+
+
 def _parent_finalization_lock(parent_agent) -> threading.RLock:
     """Return the per-parent lock that serializes lifecycle side effects."""
     if parent_agent is None:
@@ -3673,6 +3729,9 @@ def delegate_task(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
         )
 
+    # Trusted host metadata is absent from the model schema and signature.
+    _restart_ctx = _HOST_RESTART_CONTEXT.get() or {}
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -3814,7 +3873,12 @@ def delegate_task(
         task_schemas.append(coerced_schema)
 
     overall_start = time.monotonic()
-    results = []
+    durable_existing = {
+        int(entry.get("task_index", -1)): dict(entry)
+        for entry in (_restart_ctx.get("completed_results") or [])
+        if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)
+    }
+    results = list(durable_existing.values())
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -3831,9 +3895,14 @@ def delegate_task(
         wrap_progress_callback,
     )
 
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
-    )
+    if _restart_ctx.get("delegation_id"):
+        live_deleg_id = str(_restart_ctx["delegation_id"])
+        live_writers = [None] * len(task_list)
+        live_paths = []
+    else:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3862,7 +3931,12 @@ def delegate_task(
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
     children = []
+    _restart_capabilities = list(
+        _restart_ctx.get("child_capability_names") or []
+    )
     for i, t in enumerate(task_list):
+        if i in durable_existing:
+            continue
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3895,11 +3969,24 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                forced_session_id=(
+                    (_restart_ctx.get("child_session_ids") or [])[i]
+                    if i < len(_restart_ctx.get("child_session_ids") or [])
+                    else None
+                ),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
             # missing from PATH) refuse the spawn loudly (#80450).
             return tool_error(str(exc))
+        child._restart_history = None
+        if _restart_ctx.get("delegation_id"):
+            _apply_child_capability_ceiling(child, _restart_capabilities[i])
+            child_session_id = str(getattr(child, "session_id", "") or "")
+            if child_session_id:
+                child._restart_history = (
+                    _restart_ctx.get("transcripts") or {}
+                ).get(child_session_id)
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -3934,7 +4021,23 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
-        if n_tasks == 1:
+        def _commit_durable(entry: Dict[str, Any], decision: str = "executed") -> None:
+            if not _restart_ctx.get("delegation_id") and not background:
+                return
+            try:
+                from tools.async_delegation import commit_child_terminal
+
+                commit_child_terminal(
+                    int(entry.get("task_index", -1)),
+                    entry,
+                    replay_decision=decision,
+                )
+            except Exception:
+                logger.exception("Could not persist delegated child terminal result")
+
+        if not children:
+            pass
+        elif len(children) == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
             result = _run_single_child(
@@ -3947,6 +4050,7 @@ def delegate_task(
                 owner_session_record=_origin_owner_session_record,
             )
             results.append(result)
+            _commit_durable(result)
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -4021,6 +4125,7 @@ def delegate_task(
                                     ),
                                 }
                             results.append(entry)
+                            _commit_durable(entry)
                             completed_count += 1
                         break
 
@@ -4046,6 +4151,7 @@ def delegate_task(
                                 ),
                             }
                         results.append(entry)
+                        _commit_durable(entry)
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
@@ -4278,6 +4384,34 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _raw_turn_id = getattr(parent_agent, "_current_turn_id", "")
+        _raw_platform = getattr(parent_agent, "platform", "")
+        _platform_name = (
+            _raw_platform.strip().lower()
+            if isinstance(_raw_platform, str)
+            else ""
+        )
+        _required_root_turn_id = (
+            _raw_turn_id.strip()
+            if (
+                isinstance(_raw_turn_id, str)
+                and _raw_turn_id.strip()
+                and not _restart_ctx.get("delegation_id")
+                and bool(_session_key)
+                and _platform_name not in {"cli", "tui", "api"}
+            )
+            else ""
+        )
+        _raw_existing_barrier_id = getattr(
+            parent_agent,
+            "_parent_task_continuation_barrier_id",
+            "",
+        )
+        _existing_parent_barrier_id = (
+            _raw_existing_barrier_id.strip()
+            if isinstance(_raw_existing_barrier_id, str)
+            else ""
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4290,6 +4424,8 @@ def delegate_task(
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,
+            root_turn_id=_required_root_turn_id,
+            existing_parent_barrier_id=_existing_parent_barrier_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
@@ -4297,9 +4433,46 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            child_session_ids=[
+                str(getattr(child, "session_id", "") or "")
+                for child in _child_agents
+            ],
+            child_capability_names=[
+                sorted(str(name) for name in getattr(child, "valid_tool_names", set()))
+                for child in _child_agents
+            ],
+            task_specs=[dict(task) for task in task_list],
+            output_schemas=list(task_schemas),
+            output_schema_fingerprints=[
+                (
+                    hashlib.sha256(
+                        json.dumps(
+                            schema, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if schema is not None
+                    else ""
+                )
+                for schema in task_schemas
+            ],
+            restart_policy=(
+                "gateway_owned_v1"
+                if _restart_ctx.get("restartable") or _required_root_turn_id
+                else ""
+            ),
+            resume_claim=bool(_restart_ctx.get("delegation_id")),
+            execution_generation=int(
+                _restart_ctx.get("execution_generation", 0) or 0
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
+            if _required_root_turn_id:
+                setattr(
+                    parent_agent,
+                    "_parent_task_barrier_stream_suppressed",
+                    True,
+                )
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -4364,6 +4537,227 @@ def delegate_task(
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+
+
+_RECOVERY_NOTE = (
+    "Internal recovery after a gateway interruption. Inspect the existing "
+    "workspace artifacts and SessionDB history before continuing. Do not "
+    "repeat any external or destructive effect whose completion is unknown."
+)
+
+_RESTART_DISPATCHED = "dispatched"
+_RESTART_FAILED = "failed"
+_RESTART_UNSAFE = "unsafe"
+
+
+def _side_effect_result_proves_safe_completion(
+    tool_name: str, result: Dict[str, Any]
+) -> bool:
+    """Accept only durable, structured success evidence for effectful tools."""
+
+    disposition = str(result.get("effect_disposition") or "").lower()
+    if disposition == "none":
+        return True
+    if disposition in {"unknown", "ambiguous", "attempting"}:
+        return False
+    content = result.get("content")
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            return False
+    elif isinstance(content, dict):
+        payload = content
+    else:
+        return False
+    if not isinstance(payload, dict) or payload.get("error"):
+        return False
+    normalized = str(tool_name or "").strip().lower()
+    if normalized in {"terminal", "execute_code", "run_command"}:
+        return payload.get("exit_code") == 0
+    if normalized in {
+        "write_file", "edit_file", "apply_patch", "file_write", "file_edit"
+    }:
+        return payload.get("verified") is True and isinstance(
+            payload.get("bytes_written"), int
+        )
+    for key in ("job_id", "message_id", "id", "url", "image", "path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return payload.get("verified") is True
+
+
+def _restart_history_has_unknown_side_effect(history: List[Dict[str, Any]]) -> bool:
+    """Detect side-effecting calls without a durable successful tool result."""
+    from agent.replay_cleanup import is_interrupted_tool_result, tool_may_have_side_effect
+
+    for index, message in enumerate(history):
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        results: Dict[str, Dict[str, Any]] = {}
+        cursor = index + 1
+        while cursor < len(history) and history[cursor].get("role") == "tool":
+            result = history[cursor]
+            result_id = str(result.get("tool_call_id") or "")
+            if not result_id or result_id in results:
+                return True
+            results[result_id] = result
+            cursor += 1
+        seen_call_ids = set()
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if not tool_may_have_side_effect(str(function.get("name") or "")):
+                continue
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id in seen_call_ids:
+                return True
+            seen_call_ids.add(call_id)
+            result = results.get(call_id)
+            if (
+                result is None
+                or is_interrupted_tool_result(result.get("content", ""))
+                or not _side_effect_result_proves_safe_completion(
+                    str(function.get("name") or ""), result
+                )
+            ):
+                return True
+    return False
+
+
+def resume_async_delegation(claim: Dict[str, Any], parent_agent) -> str:
+    """Resume only safe children; terminalize ambiguous effects per child."""
+    task = dict(claim.get("task") or {})
+    task_fingerprint = hashlib.sha256(
+        json.dumps(task, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if (
+        int(claim.get("contract_version", 0) or 0) != 2
+        or task_fingerprint != str(claim.get("task_fingerprint") or "")
+    ):
+        return _RESTART_FAILED
+
+    goals = list(task.get("goals") or [])
+    if not goals:
+        goal = str(task.get("goal") or "").strip()
+        goals = [goal] if goal else []
+    task_specs = list(task.get("tasks") or [])
+    if not task_specs:
+        task_specs = [
+            {"goal": goal, "context": task.get("context"), "role": task.get("role", "leaf")}
+            for goal in goals
+        ]
+    output_schemas = list(task.get("output_schemas") or [None] * len(goals))
+    child_session_ids = list(claim.get("child_session_ids") or [])
+    child_capability_names = list(claim.get("child_capability_names") or [])
+    children = list(claim.get("children") or [])
+    if (
+        not goals
+        or len(task_specs) != len(goals)
+        or len(output_schemas) != len(goals)
+        or len(child_session_ids) != len(goals)
+        or len(child_capability_names) != len(goals)
+        or len(children) != len(goals)
+        or any(
+            not isinstance(names, list)
+            or any(not isinstance(name, str) or not name for name in names)
+            for names in child_capability_names
+        )
+    ):
+        return _RESTART_FAILED
+
+    expected_schema_fingerprints = [
+        (
+            hashlib.sha256(
+                json.dumps(schema, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if schema is not None
+            else ""
+        )
+        for schema in output_schemas
+    ]
+    for index, child in enumerate(children):
+        if (
+            int(child.get("child_index", -1)) != index
+            or str(child.get("output_schema_fingerprint") or "")
+            != expected_schema_fingerprints[index]
+        ):
+            return _RESTART_FAILED
+
+    session_db = getattr(parent_agent, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    transcripts = {}
+    completed_results = []
+    from agent.replay_cleanup import sanitize_replay_history
+
+    from tools.async_delegation import commit_child_terminal
+
+    generation = int(claim.get("execution_generation", 0) or 0)
+    for index, child_session_id in enumerate(child_session_ids):
+        child = children[index]
+        child_state = str(child.get("state") or "")
+        child_result = dict(child.get("result") or {})
+        if child_state in {"completed", "unknown", "failed", "cancelled"} and child_result:
+            completed_results.append(child_result)
+            continue
+        if session_db is None:
+            return _RESTART_FAILED
+        history = session_db.get_messages_as_conversation(child_session_id)
+        if _restart_history_has_unknown_side_effect(history):
+            blocked = {
+                "task_index": index,
+                "status": "blocked_unknown_effect",
+                "summary": None,
+                "error": (
+                    "Interrupted child has an unresolved side-effecting tool call; "
+                    "automatic replay was withheld to prevent duplicate effects."
+                ),
+            }
+            if not commit_child_terminal(
+                index,
+                blocked,
+                delegation_id=str(claim["delegation_id"]),
+                replay_decision="ambiguous_tool_effect",
+                execution_generation=generation,
+            ):
+                return _RESTART_FAILED
+            completed_results.append(blocked)
+            continue
+        reopen_session = getattr(session_db, "reopen_session", None)
+        if callable(reopen_session):
+            reopen_session(child_session_id)
+        transcripts[child_session_id] = sanitize_replay_history(history)
+
+    with host_restart_context(
+        restartable=True,
+        delegation_id=claim["delegation_id"],
+        child_session_ids=child_session_ids,
+        child_capability_names=child_capability_names,
+        transcripts=transcripts,
+        completed_results=completed_results,
+        execution_generation=generation,
+    ):
+        launch_kwargs = {
+            "background": True,
+            "parent_agent": parent_agent,
+        }
+        if len(task_specs) == 1:
+            launch_kwargs.update(task_specs[0])
+            launch_kwargs["output_schema"] = output_schemas[0]
+        else:
+            launch_kwargs["tasks"] = [
+                {**spec, "output_schema": output_schemas[index]}
+                for index, spec in enumerate(task_specs)
+            ]
+        result = json.loads(delegate_task(**launch_kwargs))
+    if (
+        result.get("status") == "dispatched"
+        and result.get("delegation_id") == claim["delegation_id"]
+    ):
+        return _RESTART_DISPATCHED
+    return _RESTART_FAILED
 
 
 def _resolve_child_credential_pool(
@@ -4649,19 +5043,20 @@ def _build_top_level_description() -> str:
     here, check it is not already stated in a parameter description.
     """
     return (
-        "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
+        "Spawn isolated subagents; only final summaries return. Use 'goal' for "
+        "one task or 'tasks' for a parallel batch; limits and nesting are in "
+        "the parameter descriptions.\n\n"
+        "Runs in the background by default: dispatch returns immediately and "
+        "the result (one consolidated message for a batch) re-enters on its "
+        "own. Set "
+        "wait=true when your final answer depends on the workers. Workers still "
+        "run concurrently, but the ordered aggregate returns inline before the "
+        "parent continues.\n\n"
         "LIVE ORCHESTRATION: while children run, this tool also controls "
         "them — action='list' (live children + ids), action='steer' "
         "(subagent_id + message, redirect without stopping), action='stop' "
         "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "a child drifts.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4847,16 +5242,14 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
-            "background": {
+            "wait": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
+                    "Wait for every worker and return the ordered aggregate in "
+                    "the current turn before the parent continues. Use this "
+                    "when the final answer depends on delegated findings. "
+                    "Defaults to false (background execution). Nested "
+                    "orchestrator delegations wait automatically."
                 ),
             },
             "action": {
@@ -4904,18 +5297,17 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
+    Top-level delegations default to background execution. ``wait=true``
+    selects the existing synchronous aggregate path so every worker result is
+    available before the parent continues. Delegations from an orchestrator
+    subagent (depth > 0) always wait for their workers. The live path is
+    ``run_agent._dispatch_delegate_task``; this helper mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    keep the historical synchronous default and ``background`` argument.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    wait_requested = args.get("wait") is True
+    return not (is_subagent or wait_requested)
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

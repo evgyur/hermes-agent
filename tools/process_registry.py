@@ -2907,6 +2907,16 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+_ASYNC_DELEGATION_REENTRY_POLICY = (
+    "INTERNAL CALLBACK POLICY: this completion is system-generated and is not a new user request.",
+    "If the original task is unfinished and awaited this result, resume it now and continue until you reach a "
+    "user-visible result or real blocker.",
+    "Respond exactly NO_REPLY only when the original task is already terminally answered, explicitly cancelled, "
+    "or clearly superseded.",
+    "Never use silence merely because this completion is an internal substep.",
+)
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2948,8 +2958,8 @@ def _format_async_delegation(evt: dict) -> str:
             f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
             "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
+            "consolidated results are below.",
+            *_ASYNC_DELEGATION_REENTRY_POLICY,
             "",
         ]
         if isinstance(dispatched_at, (int, float)):
@@ -3018,9 +3028,9 @@ def _format_async_delegation(evt: dict) -> str:
 
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        "A background subagent you dispatched earlier has finished. The full "
+        "task source is below for continuity.",
+        *_ASYNC_DELEGATION_REENTRY_POLICY,
         "",
     ]
     if isinstance(dispatched_at, (int, float)):
