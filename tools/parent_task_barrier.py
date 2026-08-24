@@ -545,6 +545,13 @@ def finalization_policy(
     turn = str(root_turn_id or "").strip()
     if not parent or not turn:
         return {"action": "deliver"}
+    # Standalone agents and fresh profiles can finalize an ordinary turn before
+    # gateway startup has installed the optional barrier schema.  No initialized
+    # storage means no durable barrier can exist, so keep this read-only and
+    # deliver normally instead of creating a database from the finalizer path.
+    with _read_connection() as conn:
+        if conn is None:
+            return {"action": "deliver"}
     now = time.time()
     with _transaction() as conn:
         row = conn.execute(
