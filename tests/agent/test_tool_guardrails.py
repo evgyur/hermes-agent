@@ -63,6 +63,45 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.no_progress_block_after == 8
 
 
+def test_config_adds_explicit_read_only_mcp_tools_to_idempotent_guardrails():
+    tool_name = "mcp__seya__get_workshop"
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"additional_idempotent_tools": [tool_name]}
+    )
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+            idempotent_tools=cfg.idempotent_tools,
+        )
+    )
+    args = {"workshop_id": "human20"}
+
+    assert controller.before_call(tool_name, args).action == "allow"
+    assert (
+        controller.after_call(tool_name, args, "same content", failed=False).action
+        == "allow"
+    )
+    assert controller.before_call(tool_name, args).action == "allow"
+    warning = controller.after_call(tool_name, args, "same content", failed=False)
+    assert warning.code == "idempotent_no_progress_warning"
+
+    blocked = controller.before_call(tool_name, args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
+
+
+def test_config_rejects_invalid_additional_idempotent_tool_values():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"additional_idempotent_tools": ["mcp__seya__get_workshop", "", 7, None]}
+    )
+
+    assert "mcp__seya__get_workshop" in cfg.idempotent_tools
+    assert "" not in cfg.idempotent_tools
+    assert 7 not in cfg.idempotent_tools
+
+
 def test_default_repeated_identical_failed_call_warns_without_blocking():
     controller = ToolCallGuardrailController()
     args = {"query": "same"}
@@ -167,7 +206,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

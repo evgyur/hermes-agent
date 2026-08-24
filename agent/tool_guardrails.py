@@ -149,6 +149,14 @@ class ToolCallGuardrailConfig:
             hard_stop_after = {}
 
         defaults = cls()
+        additional_idempotent_tools = data.get("additional_idempotent_tools", ())
+        if not isinstance(additional_idempotent_tools, (list, tuple, set, frozenset)):
+            additional_idempotent_tools = ()
+        explicit_read_only_tools = frozenset(
+            tool_name.strip()
+            for tool_name in additional_idempotent_tools
+            if isinstance(tool_name, str) and tool_name.strip()
+        )
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
@@ -176,6 +184,7 @@ class ToolCallGuardrailConfig:
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
             ),
+            idempotent_tools=defaults.idempotent_tools | explicit_read_only_tools,
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
 

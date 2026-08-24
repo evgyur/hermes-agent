@@ -16,6 +16,12 @@ workspace_overlay:
 config_patch:
   agent:
     run_budget_seconds: 300
+  tool_loop_guardrails:
+    additional_idempotent_tools:
+      - mcp__seya__list_resources
+      - mcp__seya__get_workshop
+      - mcp__seya__get_section
+      - mcp__seya__get_content_detail
   tools:
     tool_search:
       enabled: "off"
