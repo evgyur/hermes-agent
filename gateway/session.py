@@ -1192,7 +1192,9 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
-    ns = _session_key_namespace(profile if profile is not None else source.profile)
+    ns = _session_key_namespace(
+        profile if profile is not None else getattr(source, "profile", None)
+    )
     platform = source.platform.value
     slack_scope_id = (
         str(source.scope_id)
@@ -1201,7 +1203,9 @@ def build_session_key(
     )
     business_connection_id = getattr(source, "business_connection_id", None)
     if source.platform == Platform.TELEGRAM and business_connection_id:
-        trust_lane = "external" if source.external_safe_mode else "trusted"
+        trust_lane = (
+            "external" if getattr(source, "external_safe_mode", False) else "trusted"
+        )
         connection_id = quote(str(business_connection_id), safe="")
         return ":".join(
             str(part) for part in (
@@ -1219,14 +1223,14 @@ def build_session_key(
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
 
-        if source.platform == Platform.TELEGRAM and source.business_connection_id:
+        if source.platform == Platform.TELEGRAM and business_connection_id:
             # Keep Business conversations outside the ordinary bot-DM keyspace
             # and scope them to the exact Telegram-issued connection.  The
             # connection id is opaque and may contain separators, so store a
             # stable digest in the key while retaining the exact value in the
             # serialized SessionSource used for delivery.
             connection_scope = hashlib.sha256(
-                str(source.business_connection_id).encode("utf-8", "replace")
+                str(business_connection_id).encode("utf-8", "replace")
             ).hexdigest()[:24]
             dm_parts = [ns, platform, "business", connection_scope]
         else:
