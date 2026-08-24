@@ -1476,6 +1476,41 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
+        # ``hermes_tools.py`` always lives in the staging directory, so that
+        # directory must be importable even when project mode changes CWD.
+        # Hermes's own package root is useful too, but only when the child
+        # uses the same Python environment. Project mode can select an
+        # external venv; exposing Hermes's site-packages to that interpreter
+        # can mix incompatible compiled extensions (for example, Python 3.12
+        # NumPy with a Python 3.9 project interpreter).
+        #
+        # Before re-injecting PYTHONPATH, strip Hermes-owned entries that
+        # leaked through _scrub_child_env (PYTHONPATH is in _SAFE_ENV_PREFIXES
+        # so it passes the scrub).  They are redundant for same-Hermes-
+        # environment children and may be incompatible with external
+        # interpreters (project mode can select a different venv), so they
+        # must not shadow or poison the child's sys.path (#74817).
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+        _strip_hermes_owned_pythonpath(child_env)
+        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _existing_pp = child_env.get("PYTHONPATH", "")
+        _pp_parts = [tmpdir]
+        if _uses_hermes_python_environment(_child_python):
+            _pp_parts.append(_hermes_root)
+        elif _child_python not in _external_env_logged:
+            # Import behavior changes silently otherwise — surface it (once
+            # per interpreter path) so "import hermes_constants suddenly
+            # fails" reports are diagnosable without log spam.
+            _external_env_logged.add(_child_python)
+            logger.info(
+                "execute_code: child interpreter %s is outside the Hermes "
+                "environment; hermes root omitted from PYTHONPATH",
+                _child_python,
+            )
+        if _existing_pp:
+            _pp_parts.append(_existing_pp)
+        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+
         from subprocess_limits import bounded_child_kwargs
 
         proc = subprocess.Popen(

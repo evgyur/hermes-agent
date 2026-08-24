@@ -190,12 +190,6 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
-        # Deterministic post-turn evidence boundary. When enabled, first-person
-        # completion/promise claims are checked against successful current-turn
-        # mutation, test, and live-probe receipts before delivery. Unsupported
-        # wording is replaced with a transparent blocked status. Off by default;
-        # operators opt in after validating their language/tool mix.
-        "claim_integrity_guard": False,
         # Universal parallel-tool-call guidance — short prompt block applied to
         # all models that tells the model to batch independent tool calls
         # (reads, searches, web fetches, read-only commands) into one turn
@@ -2066,12 +2060,16 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
-        # Skill-body routing policy. `conservative` preserves the legacy
-        # mandatory loading contract. `lean_canary` is only an allow-list:
-        # it still requires an explicit task override, risk_class=low, and an
-        # explicitly empty protected-boundary set; otherwise resolution fails
-        # closed to conservative.
-        "routing_policy": "conservative",
+        # Project-local skill discovery: when a session starts inside a git
+        # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
+        # are sourced as the highest-precedence skill tier — but ONLY when the
+        # project root is listed in trusted_project_dirs below. Trust a repo
+        # with ``hermes skills trust`` (run from inside it). Set to false to
+        # disable discovery entirely (no scan, no untrusted-skills notice).
+        "project_discovery": True,
+        # Absolute paths of project roots whose repo-local skills may load.
+        # Managed by ``hermes skills trust`` / ``hermes skills untrust``.
+        "trusted_project_dirs": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -3182,13 +3180,6 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
-        # Trigram CJK/substring derivative. It can dominate state.db on long
-        # histories, so operators may disable it after measuring their query
-        # mix. Canonical messages and ordinary unicode61 FTS remain intact;
-        # CJK/substring queries fall back to LIKE. Disabling stops maintenance
-        # but does not drop stored pages — reclaim them in a maintenance window.
-        # Bridged to HERMES_TRIGRAM_FTS (internal carrier).
-        "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
         # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)

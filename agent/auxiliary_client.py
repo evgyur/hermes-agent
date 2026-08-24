@@ -4249,26 +4249,6 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
-def _is_server_error(exc: Exception) -> bool:
-    """Detect provider-side HTTP 5xx failures after transient retries.
-
-    A reachable endpoint can still be unable to serve the selected auxiliary
-    model. Once Hermes exhausts its bounded same-provider retries, a 5xx is a
-    capacity failure for this request and must advance the configured fallback
-    chain. Some local gateways wrap the route-unavailable error without keeping
-    ``status_code``, so preserve that exact sentinel as a defensive fallback.
-    """
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int) and 500 <= status <= 599:
-        return True
-    return "forced_litellm_route_unavailable" in str(exc).lower()
-
-
-def _is_forced_litellm_route_unavailable(exc: Exception) -> bool:
-    """Return True for the H20 gateway's deterministic route-miss sentinel."""
-    return "forced_litellm_route_unavailable" in str(exc).lower()
-
-
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -5229,14 +5209,7 @@ def _call_fallback_candidate_sync(
     On an auth error: refresh the candidate's provider credentials and retry
     once with a rebuilt client; if the retry also auth-fails (non-refreshable
     expired token), mark the provider unhealthy and return ``None`` so the
-    caller can continue to the next fallback layer.
-
-    Compression is a critical recovery path, so a fallback candidate that is
-    itself unavailable (5xx/timeout/quota/capability failure) is also skippable.
-    This matters when a configured fallback shares infrastructure with the
-    primary: a primary ``mmfast`` 503 followed by a ``glm`` 503 must still
-    advance to an independent provider instead of aborting compaction. Other
-    non-auth errors keep propagating unchanged.
+    caller can continue to the next fallback layer. Non-auth errors raise.
 
     ``effective_timeout`` is the task-level deadline; a configured-chain
     candidate with its own ``timeout`` entry gets that instead, so a
@@ -5274,20 +5247,6 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
-        if task == "compression" and (
-            _is_server_error(fb_err)
-            or _is_connection_error(fb_err)
-            or _is_payment_error(fb_err)
-            or _is_rate_limit_error(fb_err)
-            or _is_model_incompatible_error(fb_err)
-            or _is_invalid_aux_response_error(fb_err)
-        ):
-            logger.warning(
-                "Auxiliary compression: fallback candidate %s is unavailable "
-                "(%s) — skipping to the next fallback layer",
-                fb_label, fb_err,
-            )
-            return None
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -5394,20 +5353,6 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
-        if task == "compression" and (
-            _is_server_error(fb_err)
-            or _is_connection_error(fb_err)
-            or _is_payment_error(fb_err)
-            or _is_rate_limit_error(fb_err)
-            or _is_model_incompatible_error(fb_err)
-            or _is_invalid_aux_response_error(fb_err)
-        ):
-            logger.warning(
-                "Auxiliary compression (async): fallback candidate %s is "
-                "unavailable (%s) — skipping to the next fallback layer",
-                fb_label, fb_err,
-            )
-            return None
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -5647,7 +5592,6 @@ def _candidate_context_window(
     model: str,
     base_url: str = "",
     api_key: str = "",
-    config_context_length: Optional[int] = None,
 ) -> Optional[int]:
     """Resolve the effective context window for a fallback candidate.
 
@@ -5668,7 +5612,6 @@ def _candidate_context_window(
             model,
             base_url=base_url,
             api_key=api_key,
-            config_context_length=config_context_length,
             provider=provider,
         )
     except Exception as exc:
@@ -5782,7 +5725,6 @@ def _try_configured_fallback_chain(
                     resolved_model,
                     base_url=str(entry.get("base_url") or ""),
                     api_key=_fallback_entry_api_key(entry) or "",
-                    config_context_length=_fallback_entry_context_length(entry),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -5838,18 +5780,6 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     from hermes_cli.fallback_config import resolve_entry_api_key
 
     return resolve_entry_api_key(entry)
-
-
-def _fallback_entry_context_length(entry: Dict[str, Any]) -> Optional[int]:
-    """Return a positive context-window override from a fallback entry."""
-    raw = entry.get("context_length")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
 
 
 def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
@@ -5937,7 +5867,6 @@ def _try_main_fallback_chain(
                     resolved_model or fb_model,
                     base_url=str(entry.get("base_url") or ""),
                     api_key=_fallback_entry_api_key(entry) or "",
-                    config_context_length=_fallback_entry_context_length(entry),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -9696,17 +9625,10 @@ def _call_llm_impl(
             # back — doubling the user-visible stall (issue #54465). Skip the
             # same-provider retry for compression on a full-budget timeout and
             # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a generic 5xx) still retry, since those are
-            # cheap.  The H20 forced-route sentinel is different: that route is
-            # deterministically unavailable and can hold the request for most
-            # of the timeout budget before returning 503, so retrying it blocks
-            # the healthy fallback behind the gateway hygiene deadline.
-            if task == "compression" and (
-                _is_timeout_error(transient_err)
-                or _is_forced_litellm_route_unavailable(transient_err)
-            ):
+            # streaming-close or a 5xx) still retry, since those are cheap.
+            if task == "compression" and _is_timeout_error(transient_err):
                 logger.info(
-                    "Auxiliary compression: exhausted route on the critical path; "
+                    "Auxiliary compression: timeout on the critical path; "
                     "skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
@@ -10069,7 +9991,6 @@ def _call_llm_impl(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10093,7 +10014,6 @@ def _call_llm_impl(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10112,8 +10032,6 @@ def _call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
-            elif _is_server_error(first_err):
-                reason = "server error"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -10170,27 +10088,11 @@ def _call_llm_impl(
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
-                # The candidate itself failed (stale credential or exhausted
-                # capacity). Preserve the normal layering instead of jumping
-                # straight to generic discovery: for an explicit auxiliary
-                # provider, the independently-authenticated main agent model is
-                # the intended safety net.
-                if is_auto:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto",
-                        reason="failed fallback candidate")
-                    if fb_client is None:
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            resolved_provider, task,
-                            reason="failed fallback candidate")
-                else:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task,
-                        reason="failed fallback candidate")
-                    if fb_client is None:
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            resolved_provider, task,
-                            reason="failed fallback candidate")
+                # The candidate had a stale/unrefreshable credential and was
+                # quarantined — walk the discovery chain once more; unhealthy
+                # entries are skipped so the next viable candidate serves.
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     _record_route_info(
                         route_info, _fallback_provider_from_label(fb_label), fb_model
@@ -10204,30 +10106,6 @@ def _call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
-                    # The explicit-provider path has now exhausted both its
-                    # configured fallback and the independent main-agent
-                    # safety net. A transient main transport failure must
-                    # still reach generic discovery. Resolve the concrete
-                    # failed backend from the candidate URL so discovery does
-                    # not immediately select the same provider again.
-                    if not is_auto:
-                        failed_layer_provider = _auth_refresh_provider_for_route(
-                            "auto", str(getattr(fb_client, "base_url", "") or ""))
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            failed_layer_provider or resolved_provider,
-                            task,
-                            reason="failed main-agent fallback candidate",
-                        )
-                        if fb_client is not None:
-                            fb_resp = _call_fallback_candidate_sync(
-                                fb_client, fb_model, fb_label,
-                                task=task, messages=messages,
-                                temperature=temperature, max_tokens=max_tokens,
-                                tools=tools, effective_timeout=effective_timeout,
-                                effective_extra_body=effective_extra_body,
-                                reasoning_config=reasoning_config)
-                            if fb_resp is not None:
-                                return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -10516,15 +10394,11 @@ async def _async_call_llm_impl(
             if not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
-            # so skip a same-provider retry after a full-budget timeout or the
-            # deterministic H20 route-unavailable sentinel. Both can consume
-            # the hygiene deadline before an independent fallback is tried.
-            if task == "compression" and (
-                _is_timeout_error(transient_err)
-                or _is_forced_litellm_route_unavailable(transient_err)
-            ):
+            # so skip the same-provider retry on a full-budget timeout and
+            # fall straight through to fallback (issue #54465).
+            if task == "compression" and _is_timeout_error(transient_err):
                 logger.info(
-                    "Auxiliary compression (async): exhausted route on the critical "
+                    "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
@@ -10827,7 +10701,6 @@ async def _async_call_llm_impl(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10843,7 +10716,6 @@ async def _async_call_llm_impl(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or (task == "compression" and _is_server_error(first_err))
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10858,8 +10730,6 @@ async def _async_call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
-            elif _is_server_error(first_err):
-                reason = "server error"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -10922,24 +10792,10 @@ async def _async_call_llm_impl(
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
-                # Mirror the sync layering after the selected fallback itself
-                # fails: top-level/main-agent safety net, then discovery.
-                if is_auto:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto",
-                        reason="failed fallback candidate")
-                    if fb_client is None:
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            resolved_provider, task,
-                            reason="failed fallback candidate")
-                else:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task,
-                        reason="failed fallback candidate")
-                    if fb_client is None:
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            resolved_provider, task,
-                            reason="failed fallback candidate")
+                # Stale/unrefreshable candidate credential — quarantined; walk
+                # the discovery chain once more (unhealthy entries skipped).
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
@@ -10958,28 +10814,6 @@ async def _async_call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
-                    if not is_auto:
-                        failed_layer_provider = _auth_refresh_provider_for_route(
-                            "auto", str(getattr(fb_client, "base_url", "") or ""))
-                        fb_client, fb_model, fb_label = _try_payment_fallback(
-                            failed_layer_provider or resolved_provider,
-                            task,
-                            reason="failed main-agent fallback candidate",
-                        )
-                        if fb_client is not None:
-                            async_fb, async_fb_model = _to_async_client(
-                                fb_client, fb_model or "",
-                                is_vision=(task == "vision"),
-                            )
-                            fb_resp = await _call_fallback_candidate_async(
-                                async_fb, async_fb_model or fb_model, fb_label,
-                                task=task, messages=messages,
-                                temperature=temperature, max_tokens=max_tokens,
-                                tools=tools, effective_timeout=effective_timeout,
-                                effective_extra_body=effective_extra_body,
-                                reasoning_config=reasoning_config)
-                            if fb_resp is not None:
-                                return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "

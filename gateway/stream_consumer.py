@@ -421,35 +421,6 @@ class GatewayStreamConsumer:
         except Exception:
             pass
 
-
-    def final_delivery_matches(self, final_text: str) -> bool:
-        """Return True only when the last confirmed stream payload matches final_text.
-
-        The gateway uses this as a last-mile guard before suppressing its normal
-        final send. A stream consumer can have sent/edited *some* Telegram text
-        and still be missing the tail of the model's final response after an
-        edit/finalize race. In that case the safe outcome is to let the gateway
-        send the complete final answer and clean up the stale preview.
-        """
-        final = self._clean_for_display(final_text or "")
-        if not final.strip():
-            return False
-
-        # Do not second-guess oversized split deliveries here: their visible
-        # text spans several platform messages, while _last_sent_text may hold
-        # only the last chunk (or be reset after an adopted continuation id).
-        try:
-            if len(final) > max(500, self._raw_message_limit() - 100):
-                return True
-        except Exception:
-            pass
-
-        delivered = self._clean_for_display(self._last_sent_text or "")
-        if self.cfg.cursor:
-            delivered = delivered.replace(self.cfg.cursor, "")
-        return delivered == final
-
-
     async def _edit_message(
         self,
         *,
@@ -2218,14 +2189,11 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata, chat_id=self.chat_id)
+                result = fn(text, metadata=self.metadata)
             except TypeError:
-                try:
-                    result = fn(text, metadata=self.metadata)
-                except TypeError:
-                    # Adapter / test double whose hook doesn't accept the metadata
-                    # keyword — fall back to the positional-only form.
-                    result = fn(text)
+                # Adapter / test double whose hook doesn't accept the metadata
+                # keyword — fall back to the positional-only form.
+                result = fn(text)
         except Exception as e:
             logger.debug("prefers_fresh_final_streaming check failed: %s", e)
             return False

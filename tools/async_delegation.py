@@ -36,10 +36,9 @@ logic stays in one place.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import hashlib
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -55,8 +54,15 @@ from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
-CONTINUUM_RUNTIME_REVISION = "0.1.0rc19-native-delegation-recovery-v2"
-logger.info("Continuum async runtime loaded revision=%s", CONTINUUM_RUNTIME_REVISION)
+_DELEGATION_CONTRACT_VERSION = 2
+_MAX_RESTART_ATTEMPTS = 3
+_RESTART_POLICY = "gateway_owned_v1"
+_CURRENT_DELEGATION_ID: ContextVar[str] = ContextVar(
+    "HERMES_CURRENT_ASYNC_DELEGATION_ID", default=""
+)
+_CURRENT_EXECUTION_GENERATION: ContextVar[int] = ContextVar(
+    "HERMES_CURRENT_ASYNC_DELEGATION_GENERATION", default=-1
+)
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -83,39 +89,18 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
-_STALE_RESERVATION_SECONDS = 300
-# Pending terminal outcomes are delivery obligations, not bounded history. They
-# remain durable until acknowledged delivery or explicit operator archival.
-# Never count-prune them: dropping an undelivered callback is data loss.
+_MAX_DURABLE_PENDING = 1000
 # A pending completion whose delivery keeps failing is retried across claim
 # cycles (and across restarts via restore_undelivered_completions). Cap the
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
-_MAX_RESTART_ATTEMPTS = 3
-_RESTART_POLICY = "gateway_owned_v1"
-_DELEGATION_CONTRACT_VERSION = 2
+# Staleness cap for restart replay: a pending completion older than this is
+# terminally dropped instead of re-run as a fresh full-context turn (see
+# restore_undelivered_completions). 48h keeps overnight/weekend results
+# deliverable while stopping weeks-old sessions from replaying after upgrades.
+_MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
-_CURRENT_DELEGATION_ID: ContextVar[str] = ContextVar(
-    "HERMES_CURRENT_ASYNC_DELEGATION_ID", default=""
-)
-_CURRENT_EXECUTION_GENERATION: ContextVar[int] = ContextVar(
-    "HERMES_CURRENT_ASYNC_DELEGATION_GENERATION", default=-1
-)
-_PRIVATE_PATH_RE = re.compile(r"(?<![\w:])/(?:[^\s`]+)")
-_PRIVATE_METADATA_RE = re.compile(
-    r"(?i)\b(?:origin|session|parent[_ -]?session|transcript|callback)"
-    r"(?:[_ -]?(?:id|path|payload))?(?:\s*[=:]\s*|\s+)[^\s,;]+"
-)
-_SECRET_RE = re.compile(
-    r"(?i)(?:bearer\s+|api[_-]?key\s*[=:]\s*|token\s*[=:]\s*|password\s*[=:]\s*)"
-    r"[^\s,;]+"
-)
-_CHECKPOINT_STATES = {"planned", "running", "blocked", "completed", "summarizing"}
-
-
-class TrustedRestartEvent(dict):
-    """Internal wake envelope; DB nonce + CAS provide authenticity."""
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -168,8 +153,10 @@ def _connect() -> sqlite3.Connection:
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_state import apply_wal_with_fallback
+    from tools.parent_task_barrier import initialize_schema_on_connection
 
     apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    initialize_schema_on_connection(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -190,13 +177,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT '',
-            public_title TEXT NOT NULL DEFAULT '',
-            progress_json TEXT,
-            heartbeat_at REAL,
-            api_calls INTEGER NOT NULL DEFAULT 0,
-            current_tool TEXT NOT NULL DEFAULT '',
-            status_revision INTEGER NOT NULL DEFAULT 1
+            origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -224,7 +205,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("restart_reason", "TEXT NOT NULL DEFAULT ''"),
         ("restart_nonce", "TEXT NOT NULL DEFAULT ''"),
         ("runner_returned", "INTEGER NOT NULL DEFAULT 0"),
-        ("contract_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("contract_version", "INTEGER NOT NULL DEFAULT 2"),
         ("task_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("restart_budget", "INTEGER NOT NULL DEFAULT 3"),
         ("execution_generation", "INTEGER NOT NULL DEFAULT 0"),
@@ -241,7 +222,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             capability_names_json TEXT NOT NULL DEFAULT '[]',
             capability_fingerprint TEXT NOT NULL DEFAULT '',
             output_schema_fingerprint TEXT NOT NULL DEFAULT '',
-            state TEXT NOT NULL DEFAULT 'pending',
+            state TEXT NOT NULL DEFAULT 'running',
             execution_generation INTEGER NOT NULL DEFAULT 0,
             replay_decision TEXT NOT NULL DEFAULT '',
             result_json TEXT,
@@ -251,58 +232,6 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(delegation_id) REFERENCES async_delegations(delegation_id)
                 ON DELETE CASCADE
         )"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_async_children_state "
-        "ON async_delegation_children(delegation_id, state, execution_generation)"
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS continuum_status_rails (
-            origin_session TEXT PRIMARY KEY,
-            message_id TEXT NOT NULL DEFAULT '',
-            rendered_hash TEXT NOT NULL DEFAULT '',
-            source_revision INTEGER NOT NULL DEFAULT 0,
-            revision INTEGER NOT NULL DEFAULT 0,
-            pinned INTEGER NOT NULL DEFAULT 0,
-            last_attempt_at REAL,
-            last_published_at REAL,
-            create_state TEXT NOT NULL DEFAULT '',
-            create_token TEXT NOT NULL DEFAULT '',
-            create_started_at REAL,
-            updated_at REAL NOT NULL,
-            last_error TEXT NOT NULL DEFAULT ''
-        )"""
-    )
-    rail_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(continuum_status_rails)")
-    }
-    for name, sql_type in (
-        ("create_state", "TEXT NOT NULL DEFAULT ''"),
-        ("create_token", "TEXT NOT NULL DEFAULT ''"),
-        ("create_started_at", "REAL"),
-    ):
-        if name not in rail_columns:
-            conn.execute(f"ALTER TABLE continuum_status_rails ADD COLUMN {name} {sql_type}")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS continuum_task_cards (
-            delegation_id TEXT PRIMARY KEY,
-            origin_session TEXT NOT NULL,
-            message_id TEXT NOT NULL DEFAULT '',
-            rendered_hash TEXT NOT NULL DEFAULT '',
-            source_revision INTEGER NOT NULL DEFAULT 0,
-            revision INTEGER NOT NULL DEFAULT 0,
-            last_attempt_at REAL,
-            last_published_at REAL,
-            create_state TEXT NOT NULL DEFAULT '',
-            create_token TEXT NOT NULL DEFAULT '',
-            create_started_at REAL,
-            updated_at REAL NOT NULL,
-            last_error TEXT NOT NULL DEFAULT ''
-        )"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_continuum_task_cards_origin "
-        "ON continuum_task_cards(origin_session)"
     )
 
 
@@ -325,36 +254,46 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _sanitize_public_text(value: Any, *, limit: int) -> str:
-    text = " ".join(str(value or "").split())
+def _capture_routing_origin() -> Dict[str, Any]:
+    """Snapshot the dispatching turn's routing origin for the completion event.
+
+    Captured on the PARENT thread at dispatch time (the daemon worker doesn't
+    carry the contextvars) and persisted with the durable record, so a
+    completion replayed after a restart can reconstruct a full SessionSource
+    even when the session-store origin and in-memory source cache are gone.
+    scope_id matters most: on a relay-fronted deployment the connector's
+    fail-closed egress guard needs the tenant discriminator (or a user
+    binding) to route a scoped reply; without it, post-restart scoped
+    completions bounce with "target not routed to an onboarded tenant"
+    (staging 2026-08-09 defect #4). Best-effort — empty values are simply
+    omitted so CLI/contextvar-unaware paths persist nothing new.
+    """
+    origin: Dict[str, Any] = {}
     try:
-        from agent.redact import redact_sensitive_text
+        from gateway.session_context import get_session_env
 
-        text = redact_sensitive_text(text, force=True)
-    except Exception:
-        # A failed central redactor must fail closed rather than persist raw text.
-        text = "[скрыто]" if text else ""
-    text = _SECRET_RE.sub("[скрыто]", text)
-    text = _PRIVATE_PATH_RE.sub("[скрытый путь]", text)
-    text = _PRIVATE_METADATA_RE.sub("[скрыто]", text)
-    return text[:limit].rstrip()
-
-
-def _load_durable_json(value: Any, default: Any) -> Any:
-    """Decode typed persisted JSON without stranding a claimed row."""
-    try:
-        decoded = json.loads(value) if value else default
-    except (TypeError, ValueError):
-        return default
-    return decoded if isinstance(decoded, type(default)) else default
+        for evt_key, env_name in (
+            ("scope_id", "HERMES_SESSION_SCOPE_ID"),
+            ("user_id", "HERMES_SESSION_USER_ID"),
+            ("user_name", "HERMES_SESSION_USER_NAME"),
+        ):
+            value = get_session_env(env_name, "")
+            if value:
+                origin[evt_key] = value
+    except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
+        pass
+    return origin
 
 
 def _public_title(record: Dict[str, Any]) -> str:
+    """Return a bounded, single-line title safe for operator-facing status."""
+
     goal = record.get("goal")
     if not isinstance(goal, str):
         return ""
     first_line = next((line.strip() for line in goal.splitlines() if line.strip()), "")
-    return _sanitize_public_text(first_line, limit=80)
+    printable = "".join(ch for ch in first_line if ch.isprintable())
+    return " ".join(printable.split())[:80]
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> bool:
@@ -369,87 +308,60 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
         for key in (
             "goal", "goals", "tasks", "output_schemas", "context", "toolsets",
             "role", "model", "is_batch",
+            # Routing origin (scope_id/user_id/user_name): persisted so a
+            # restart-recovered completion can reconstruct a full
+            # SessionSource — see _capture_routing_origin.
+            "scope_id", "user_id", "user_name",
         )
         if key in record
     }
     task_json = json.dumps(task_payload, sort_keys=True, separators=(",", ":"))
-    task_fingerprint = hashlib.sha256(task_json.encode()).hexdigest()
+    task_fingerprint = hashlib.sha256(task_json.encode("utf-8")).hexdigest()
+    generation = int(record.get("execution_generation", 0) or 0)
     child_sessions = list(record.get("child_session_ids") or [])
     child_capabilities = list(record.get("child_capability_names") or [])
     output_fingerprints = list(record.get("output_schema_fingerprints") or [])
     with _DB_LOCK, _transaction() as conn:
         existing = conn.execute(
-            """SELECT state, task_fingerprint, child_count
-               FROM async_delegations WHERE delegation_id=?""",
+            "SELECT state, task_fingerprint, execution_generation "
+            "FROM async_delegations WHERE delegation_id=?",
             (record["delegation_id"],),
         ).fetchone()
         if record.get("resume_claim"):
-            if not existing or existing[0] != "restarting":
+            if (
+                not existing
+                or existing[0] != "restarting"
+                or str(existing[1] or "") != task_fingerprint
+                or int(existing[2] or 0) != generation
+            ):
                 return False
-            if len(child_sessions) != int(existing[2] or 0):
-                return False
-            stored_children = conn.execute(
-                """SELECT child_index, child_session_id, capability_fingerprint
-                   FROM async_delegation_children WHERE delegation_id=?
-                   ORDER BY child_index""",
-                (record["delegation_id"],),
-            ).fetchall()
-            if len(stored_children) != len(child_sessions):
-                return False
-            for index, child_session_id in enumerate(child_sessions):
-                names = child_capabilities[index] if index < len(child_capabilities) else []
-                fingerprint = hashlib.sha256(
-                    "\0".join(sorted({str(name) for name in names if str(name)})).encode()
-                ).hexdigest()
-                stored = stored_children[index]
-                if int(stored[0]) != index or stored[1] != child_session_id or stored[2] != fingerprint:
-                    return False
             changed = conn.execute(
                 """UPDATE async_delegations SET state='running', updated_at=?,
                    heartbeat_at=?, owner_pid=?, owner_started_at=?,
                    child_session_ids_json=?, child_capability_names_json=?,
                    restart_reason='', runner_returned=0
-                   WHERE delegation_id=? AND state='restarting'
-                     AND task_fingerprint=? AND child_count=?""",
+                   WHERE delegation_id=? AND state='restarting'""",
                 (
                     now,
                     now,
                     __import__("os").getpid(),
                     owner_started_at,
-                    json.dumps(child_sessions),
-                    json.dumps(child_capabilities),
+                    json.dumps(record.get("child_session_ids") or []),
+                    json.dumps(record.get("child_capability_names") or []),
                     record["delegation_id"],
-                    existing[1],
-                    int(existing[2] or 0),
                 ),
             )
-            if changed.rowcount == 1:
-                conn.execute(
-                    """UPDATE async_delegation_children
-                       SET state=CASE WHEN state IN ('completed','failed','unknown','cancelled')
-                                      THEN state ELSE 'running' END,
-                           replay_decision=CASE WHEN state IN ('completed','failed','unknown','cancelled')
-                                      THEN 'reuse_terminal' ELSE 'resume' END,
-                           execution_generation=(SELECT execution_generation
-                              FROM async_delegations WHERE delegation_id=?),
-                           updated_at=?
-                       WHERE delegation_id=?""",
-                    (record["delegation_id"], now, record["delegation_id"]),
-                )
             return changed.rowcount == 1
-        try:
-            conn.execute(
+        if existing is not None:
+            return False
+        conn.execute(
             """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id,
-                public_title, heartbeat_at, status_revision, restart_policy,
-                restart_count, restart_budget, contract_version,
-                task_fingerprint, execution_generation, child_count,
-                output_schema_fingerprints_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, 1,
-                       ?, 0, ?, ?, ?, 0, ?, ?)""",
+                public_title, heartbeat_at, status_revision)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, 1)""",
             (
                 record["delegation_id"],
                 record.get("session_key", ""),
@@ -463,41 +375,58 @@ def _persist_dispatch(record: Dict[str, Any]) -> bool:
                 record.get("origin_session_id", ""),
                 _public_title(record),
                 now,
-                record.get("restart_policy", ""),
-                int(record.get("restart_budget", _MAX_RESTART_ATTEMPTS) or 0),
-                _DELEGATION_CONTRACT_VERSION,
-                task_fingerprint,
-                len(child_sessions),
-                json.dumps(output_fingerprints),
             ),
         )
-        except sqlite3.IntegrityError:
-            return False
         conn.execute(
             """UPDATE async_delegations SET child_session_ids_json=?,
-               child_capability_names_json=?, restart_reason=''
+               child_capability_names_json=?, restart_policy=?, restart_count=?,
+               restart_reason='', contract_version=?, task_fingerprint=?,
+               restart_budget=?, execution_generation=?, child_count=?,
+               output_schema_fingerprints_json=?
                WHERE delegation_id=?""",
-            (json.dumps(child_sessions), json.dumps(child_capabilities),
-             record["delegation_id"]),
+            (
+                json.dumps(child_sessions),
+                json.dumps(child_capabilities),
+                record.get("restart_policy", ""),
+                int(record.get("restart_count", 0) or 0),
+                _DELEGATION_CONTRACT_VERSION,
+                task_fingerprint,
+                int(record.get("restart_budget", _MAX_RESTART_ATTEMPTS) or 0),
+                generation,
+                len(child_sessions),
+                json.dumps(output_fingerprints),
+                record["delegation_id"],
+            ),
         )
         for index, child_session_id in enumerate(child_sessions):
             names = child_capabilities[index] if index < len(child_capabilities) else []
-            names = sorted({str(name) for name in names if str(name)})
+            normalized_names = sorted({str(name) for name in names if str(name)})
+            capability_json = json.dumps(normalized_names, separators=(",", ":"))
             capability_fingerprint = hashlib.sha256(
-                "\0".join(names).encode()
+                capability_json.encode("utf-8")
             ).hexdigest()
             output_fingerprint = (
-                output_fingerprints[index] if index < len(output_fingerprints) else ""
+                str(output_fingerprints[index])
+                if index < len(output_fingerprints)
+                else ""
             )
             conn.execute(
-                """INSERT INTO async_delegation_children
-                   (delegation_id, child_index, child_session_id,
-                    capability_names_json, capability_fingerprint,
-                    output_schema_fingerprint, state, execution_generation,
-                    updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?)""",
-                (record["delegation_id"], index, child_session_id,
-                 json.dumps(names), capability_fingerprint, output_fingerprint, now),
+                """INSERT INTO async_delegation_children(
+                       delegation_id, child_index, child_session_id,
+                       capability_names_json, capability_fingerprint,
+                       output_schema_fingerprint, state, execution_generation,
+                       updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
+                (
+                    record["delegation_id"],
+                    index,
+                    str(child_session_id),
+                    capability_json,
+                    capability_fingerprint,
+                    output_fingerprint,
+                    generation,
+                    now,
+                ),
             )
     _prune_durable_records()
     return True
@@ -508,20 +437,8 @@ def _delete_durable_delegation(delegation_id: str) -> None:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
-def _mark_runner_returned(delegation_id: str, execution_generation: int) -> bool:
-    """Close the dead-owner replay window for exactly one execution generation."""
-    with _DB_LOCK, _transaction() as conn:
-        changed = conn.execute(
-            """UPDATE async_delegations SET runner_returned=1, updated_at=?
-               WHERE delegation_id=? AND execution_generation=?
-                 AND state IN ('running','stalling')""",
-            (time.time(), delegation_id, int(execution_generation)),
-        ).rowcount
-        return changed == 1
-
-
 def _prune_durable_records() -> None:
-    """Bound acknowledged terminal history without deleting delivery obligations."""
+    """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
@@ -529,21 +446,33 @@ def _prune_durable_records() -> None:
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
         )
-        delivered_count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing')
-                 AND delivery_state='delivered'"""
+        terminal_count = conn.execute(
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
         ).fetchone()[0]
-        excess = max(0, delivered_count - _MAX_RETAINED_COMPLETED)
+        excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                       AND delivery_state='delivered'
-                     ORDER BY updated_at ASC LIMIT ?
+                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                              updated_at ASC LIMIT ?
                    )""",
                 (excess,),
+            )
+        pending_count = conn.execute(
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
+        ).fetchone()[0]
+        overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
+        if overflow:
+            conn.execute(
+                """DELETE FROM async_delegations WHERE delegation_id IN (
+                     SELECT delegation_id FROM async_delegations
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     ORDER BY updated_at ASC LIMIT ?
+                   )""",
+                (overflow,),
             )
 
 
@@ -575,12 +504,21 @@ def _record_parent_terminal_in_tx(
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
     """CAS one terminal outcome; lose cleanly to a concurrent restart defer."""
     now = time.time()
+    generation = event.get("execution_generation")
     with _DB_LOCK, _transaction() as conn:
+        if generation is None:
+            row = conn.execute(
+                "SELECT execution_generation FROM async_delegations "
+                "WHERE delegation_id=?",
+                (event["delegation_id"],),
+            ).fetchone()
+            generation = int(row[0] or 0) if row is not None else -1
         changed = conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                heartbeat_at=?, event_json=?, result_json=?, delivery_state='pending',
                status_revision=status_revision+1
-               WHERE delegation_id=? AND execution_generation=?
+               WHERE delegation_id=?
+                 AND execution_generation=?
                  AND state IN ('running','stalling','finalizing')""",
             (
                 event.get("status", "completed"),
@@ -590,7 +528,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
                 json.dumps(event),
                 json.dumps(result),
                 event["delegation_id"],
-                int(event.get("execution_generation", 0)),
+                int(generation),
             ),
         ).rowcount
         if changed:
@@ -603,6 +541,96 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
                 now=now,
             )
     return bool(changed)
+
+
+def current_delegation_id() -> str:
+    """Return the worker-bound delegation id; empty outside a retained child."""
+
+    return _CURRENT_DELEGATION_ID.get()
+
+
+def commit_child_terminal(
+    child_index: int,
+    result: Dict[str, Any],
+    *,
+    delegation_id: str = "",
+    replay_decision: str = "executed",
+    execution_generation: Optional[int] = None,
+) -> bool:
+    """Durably CAS one child result before aggregate completion is published."""
+
+    delegation_id = delegation_id or current_delegation_id()
+    if not delegation_id or int(child_index) < 0:
+        return False
+    generation = (
+        _CURRENT_EXECUTION_GENERATION.get()
+        if execution_generation is None
+        else int(execution_generation)
+    )
+    if generation < 0:
+        return False
+    status = str(result.get("status") or "completed")
+    state = {
+        "error": "failed",
+        "failed": "failed",
+        "interrupted": "failed",
+        "unknown": "unknown",
+        "blocked_unknown_effect": "unknown",
+        "cancelled": "cancelled",
+    }.get(status, "completed")
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        current = conn.execute(
+            "SELECT execution_generation, state FROM async_delegations "
+            "WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if (
+            current is None
+            or int(current[0] or 0) != generation
+            or str(current[1]) not in {"running", "stalling", "finalizing", "restarting"}
+        ):
+            return False
+        changed = conn.execute(
+            """UPDATE async_delegation_children
+               SET state=?, result_json=?, replay_decision=?, completed_at=?,
+                   updated_at=?
+               WHERE delegation_id=? AND child_index=?
+                 AND execution_generation=?
+                 AND state IN ('running','restarting')""",
+            (
+                state,
+                json.dumps(result, sort_keys=True, separators=(",", ":")),
+                str(replay_decision or "executed"),
+                now,
+                now,
+                delegation_id,
+                int(child_index),
+                generation,
+            ),
+        ).rowcount
+    return bool(changed)
+
+
+def _mark_runner_returned(
+    delegation_id: str, execution_generation: Optional[int] = None
+) -> bool:
+    generation = (
+        _CURRENT_EXECUTION_GENERATION.get()
+        if execution_generation is None
+        else int(execution_generation)
+    )
+    if generation < 0:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        return bool(
+            conn.execute(
+                """UPDATE async_delegations SET runner_returned=1, updated_at=?
+                   WHERE delegation_id=? AND execution_generation=?
+                     AND state IN ('running','stalling','finalizing')""",
+                (time.time(), delegation_id, generation),
+            ).rowcount
+        )
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -665,65 +693,66 @@ def claim_restartable_delegation(
         changed = conn.execute(
             """UPDATE async_delegations SET state='restarting', owner_pid=?,
                owner_started_at=?, restart_count=restart_count+1,
-               execution_generation=execution_generation+1,
-               restart_nonce='', updated_at=?
+               restart_nonce='', updated_at=?,
+               execution_generation=execution_generation+1
                WHERE delegation_id=? AND state='restart_pending'
                  AND restart_policy=? AND restart_count < restart_budget
                  AND origin_session=? AND restart_nonce=?""",
             (owner_pid, owner_started_at, now, delegation_id,
-             _RESTART_POLICY, expected_session_key, restart_nonce),
+             _RESTART_POLICY, expected_session_key,
+             restart_nonce),
         ).rowcount
         if not changed:
             return None
-        conn.execute(
-            """UPDATE async_delegation_children
-               SET execution_generation=(SELECT execution_generation
-                    FROM async_delegations WHERE delegation_id=?),
-                   state='restarting', replay_decision='', updated_at=?
-               WHERE delegation_id=?
-                 AND state NOT IN ('completed','failed','unknown','cancelled')""",
-            (delegation_id, now, delegation_id),
-        )
         row = conn.execute(
             """SELECT task_json, child_session_ids_json,
                       child_capability_names_json, restart_count,
                       parent_session_id, origin_session, origin_ui_session_id,
-                      execution_generation, task_fingerprint, contract_version
+                      task_fingerprint, contract_version, execution_generation,
+                      output_schema_fingerprints_json
                FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
-        children = conn.execute(
+        generation = int(row[9] or 0)
+        conn.execute(
+            """UPDATE async_delegation_children
+               SET state='restarting', execution_generation=?, updated_at=?
+               WHERE delegation_id=?
+                 AND state IN ('running','failed','cancelled')""",
+            (generation, now, delegation_id),
+        )
+        child_rows = conn.execute(
             """SELECT child_index, child_session_id, capability_names_json,
-                      capability_fingerprint, output_schema_fingerprint,
-                      state, result_json, replay_decision
+                      output_schema_fingerprint, state, result_json,
+                      replay_decision
                FROM async_delegation_children WHERE delegation_id=?
                ORDER BY child_index""",
             (delegation_id,),
         ).fetchall()
     return {
         "delegation_id": delegation_id,
-        "task": _load_durable_json(row[0], {}),
-        "child_session_ids": _load_durable_json(row[1], []),
-        "child_capability_names": _load_durable_json(row[2], []),
+        "task": json.loads(row[0] or "{}"),
+        "child_session_ids": json.loads(row[1] or "[]"),
+        "child_capability_names": json.loads(row[2] or "[]"),
         "restart_count": row[3],
         "parent_session_id": row[4],
         "session_key": row[5],
         "origin_ui_session_id": row[6],
-        "execution_generation": row[7],
-        "task_fingerprint": row[8],
-        "contract_version": row[9],
+        "task_fingerprint": row[7],
+        "contract_version": int(row[8] or 0),
+        "execution_generation": generation,
+        "output_schema_fingerprints": json.loads(row[10] or "[]"),
         "children": [
             {
-                "child_index": child[0],
-                "child_session_id": child[1],
-                "capability_names": _load_durable_json(child[2], []),
-                "capability_fingerprint": child[3],
-                "output_schema_fingerprint": child[4],
-                "state": child[5],
-                "result": _load_durable_json(child[6], {}),
-                "replay_decision": child[7],
+                "child_index": int(child[0]),
+                "child_session_id": str(child[1] or ""),
+                "capability_names": json.loads(child[2] or "[]"),
+                "output_schema_fingerprint": str(child[3] or ""),
+                "state": str(child[4] or "unknown"),
+                "result": json.loads(child[5] or "{}"),
+                "replay_decision": str(child[6] or ""),
             }
-            for child in children
+            for child in child_rows
         ],
     }
 
@@ -735,7 +764,8 @@ def claim_restartable_delegations(*, owner_pid: int, owner_started_at: int) -> L
             """SELECT delegation_id, origin_session, restart_nonce
                FROM async_delegations
                WHERE state='restart_pending' AND restart_policy=?
-                 AND restart_count < restart_budget ORDER BY dispatched_at, delegation_id""",
+                 AND restart_count < restart_budget
+               ORDER BY dispatched_at, delegation_id""",
             (_RESTART_POLICY,),
         ).fetchall()
     return [claim for delegation_id, session_key, restart_nonce in rows if (
@@ -762,14 +792,14 @@ def finalize_exhausted_restarts() -> int:
             (_RESTART_POLICY,),
         ).fetchall()
         for delegation_id, task_json, origin, origin_ui, parent_sid in rows:
-            task = _load_durable_json(task_json, {})
+            task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation",
                 "delegation_id": delegation_id,
                 "status": "error",
                 "task": task,
                 "result": {
-                    "error": "Continuum recovery failed after 3 restart attempts"
+                    "error": "Delegation recovery exhausted its restart budget"
                 },
                 "session_key": origin,
                 "origin_ui_session_id": origin_ui,
@@ -804,7 +834,8 @@ def restore_restartable_delegations(target_queue) -> int:
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, restart_nonce FROM async_delegations
                WHERE state='restart_pending' AND restart_policy=?
-                 AND restart_count < restart_budget ORDER BY dispatched_at, delegation_id""",
+                 AND restart_count < restart_budget
+               ORDER BY dispatched_at, delegation_id""",
             (_RESTART_POLICY,),
         ).fetchall()
     for delegation_id, session_key, origin_ui, parent_sid, restart_nonce in rows:
@@ -824,27 +855,17 @@ def release_restart_claim(delegation_id: str, reason: str) -> bool:
     if not restart_reason_is_eligible(reason):
         return False
     with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT restart_count, restart_budget FROM async_delegations
-               WHERE delegation_id=? AND state='restarting'""",
-            (delegation_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        changed = conn.execute(
+        return bool(conn.execute(
             """UPDATE async_delegations SET state='restart_pending',
                restart_reason=?, restart_nonce=?, updated_at=? WHERE delegation_id=?
-               AND state='restarting'""",
+               AND state='restarting' AND restart_count < restart_budget""",
             (
                 reason,
                 _new_restart_nonce(),
                 time.time(),
                 delegation_id,
             ),
-        ).rowcount
-        # At the cap the row is deliberately returned to restart_pending but
-        # False tells the gateway to finalize+enqueue exhaustion immediately.
-        return bool(changed and int(row[0]) < int(row[1]))
+        ).rowcount)
 
 
 def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
@@ -861,7 +882,7 @@ def finalize_unsafe_restart(delegation_id: str, error: str) -> bool:
         ).fetchone()
         if row is None:
             return False
-        task = _load_durable_json(row[0], {})
+        task = json.loads(row[0] or "{}")
         result = {
             "status": "unknown",
             "summary": None,
@@ -949,7 +970,7 @@ def _interrupt_pending_restarts(
             [_RESTART_POLICY, *params],
         ).fetchall()
         for delegation_id, task_json, origin, origin_ui, parent_sid, dispatched_at in rows:
-            task = _load_durable_json(task_json, {})
+            task = json.loads(task_json or "{}")
             error = f"Retained work stopped before automatic recovery ({reason})"
             duration = round(max(0.0, now - float(dispatched_at or now)), 2)
             if task.get("is_batch"):
@@ -997,20 +1018,6 @@ def _interrupt_pending_restarts(
                 ),
             ).rowcount
             if changed:
-                child_cancel = {
-                    "status": "cancelled",
-                    "summary": None,
-                    "error": error,
-                    "replay_decision": "explicit_cancel",
-                }
-                conn.execute(
-                    """UPDATE async_delegation_children
-                       SET state='cancelled', result_json=?, completed_at=?,
-                           updated_at=?, replay_decision='explicit_cancel'
-                       WHERE delegation_id=?
-                         AND state NOT IN ('completed','failed','unknown','cancelled')""",
-                    (json.dumps(child_cancel), now, now, delegation_id),
-                )
                 _record_parent_terminal_in_tx(
                     conn,
                     delegation_id=str(delegation_id),
@@ -1044,17 +1051,14 @@ def recover_abandoned_delegations() -> int:
     recovered = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, state, origin_session, origin_ui_session_id,
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id,
-                      runner_returned
-               FROM async_delegations
-               WHERE state IN ('running','stalling','finalizing','restarting')"""
+                      owner_started_at, task_json, origin_session_id
+               FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            (delegation_id, state, session_key, origin_ui, parent_id,
-             dispatched_at, pid, started, task_json, origin_session_id,
-             runner_returned) = row
+            (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+             pid, started, task_json, origin_session_id) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -1062,28 +1066,7 @@ def recover_abandoned_delegations() -> int:
                     live = get_process_start_time(int(pid)) == int(started)
             if live:
                 continue
-            restart_row = conn.execute(
-                "SELECT restart_policy, restart_count, restart_budget FROM async_delegations WHERE delegation_id=?",
-                (delegation_id,),
-            ).fetchone()
-            if (
-                state != "finalizing"
-                and not bool(runner_returned)
-                and task_json
-                and restart_row is not None
-                and restart_row[0] == _RESTART_POLICY
-                and int(restart_row[1] or 0) < int(restart_row[2] or 0)
-            ):
-                conn.execute(
-                    """UPDATE async_delegations SET state='restart_pending',
-                       restart_reason='dead_owner', restart_nonce=?, owner_pid=NULL,
-                       owner_started_at=NULL, updated_at=?, heartbeat_at=?
-                       WHERE delegation_id=?""",
-                    (_new_restart_nonce(), now, now, delegation_id),
-                )
-                recovered += 1
-                continue
-            task = _load_durable_json(task_json, {})
+            task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -1185,8 +1168,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?,
-                      updated_at=?, status_revision=status_revision+1
+            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
@@ -1211,25 +1193,6 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (claim_id, now, now, delegation_id, now - 300),
         )
         return cur.rowcount == 1
-
-
-def completion_delivery_disposition(delegation_id: str) -> str:
-    """Classify a durable completion without exposing payload or route."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT delivery_state, delivery_claim, delivery_claimed_at
-               FROM async_delegations WHERE delegation_id=?""",
-            (delegation_id,),
-        ).fetchone()
-    if row is None:
-        return "legacy"
-    state = str(row[0] or "")
-    if state != "pending":
-        return state
-    if row[1] and float(row[2] or 0) >= now - 300:
-        return "claimed"
-    return "pending"
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -1279,21 +1242,6 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def release_completion_delivery_waiting(delegation_id: str, claim_id: str) -> bool:
-    """Release a claim while waiting for idempotent card reconciliation."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations
-               SET delivery_claim=NULL, delivery_claimed_at=NULL,
-                   delivery_attempts=MAX(0, delivery_attempts-1), updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=?""",
-            (now, delegation_id, claim_id),
-        )
-        return cur.rowcount == 1
-
-
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Terminally drop a claimed completion that can never be delivered.
 
@@ -1323,7 +1271,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL, status_revision=status_revision+1
+                      delivery_claimed_at=NULL
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
@@ -1336,986 +1284,29 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def completion_delivery_disposition(delegation_id: str) -> str:
+    """Classify a durable completion without exposing payload or route."""
 
-
-def current_delegation_id() -> str:
-    """Return the worker-bound delegation id; empty outside a retained child."""
-    return _CURRENT_DELEGATION_ID.get()
-
-
-def commit_child_terminal(
-    child_index: int,
-    result: Dict[str, Any],
-    *,
-    delegation_id: str = "",
-    replay_decision: str = "executed",
-    execution_generation: Optional[int] = None,
-) -> bool:
-    """CAS one child terminal result before aggregate completion is published."""
-    delegation_id = delegation_id or current_delegation_id()
-    if not delegation_id:
-        return False
-    status = str(result.get("status") or "completed")
-    state = {
-        "error": "failed",
-        "interrupted": "failed",
-        "unknown": "unknown",
-        "blocked_unknown_effect": "unknown",
-        "cancelled": "cancelled",
-    }.get(status, "completed")
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT state, execution_generation FROM async_delegations
-               WHERE delegation_id=?""",
-            (delegation_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        parent_state = str(row[0] or "")
-        current_generation = int(row[1] or 0)
-        if parent_state not in {"running", "stalling", "finalizing", "restarting"}:
-            return False
-        expected_generation = (
-            int(execution_generation)
-            if execution_generation is not None
-            else int(_CURRENT_EXECUTION_GENERATION.get())
-        )
-        if expected_generation < 0 or expected_generation != current_generation:
-            return False
-        changed = conn.execute(
-            """UPDATE async_delegation_children
-               SET state=?, result_json=?, completed_at=?, updated_at=?,
-                   replay_decision=?
-               WHERE delegation_id=? AND child_index=?
-                 AND execution_generation=?
-                 AND state NOT IN ('completed','failed','unknown','cancelled')""",
-            (
-                state,
-                json.dumps(result),
-                now,
-                now,
-                replay_decision,
-                delegation_id,
-                int(child_index),
-                expected_generation,
-            ),
-        ).rowcount
-        return changed == 1
-
-
-def durable_child_results(delegation_id: str) -> List[Dict[str, Any]]:
-    """Return committed child outcomes in original task order."""
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT child_index, state, result_json, replay_decision
-               FROM async_delegation_children WHERE delegation_id=?
-               ORDER BY child_index""",
-            (delegation_id,),
-        ).fetchall()
-    results: List[Dict[str, Any]] = []
-    for index, state, payload, replay_decision in rows:
-        result = _load_durable_json(payload, {})
-        if not result:
-            continue
-        result.setdefault("task_index", int(index))
-        result.setdefault("status", "unknown" if state == "unknown" else state)
-        result.setdefault("replay_decision", replay_decision or "reuse_terminal")
-        results.append(result)
-    return results
-
-
-def record_current_delegation_checkpoint(
-    *,
-    stage: int,
-    total: int,
-    label: str,
-    state: str,
-    note: str = "",
-    plan: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Persist a redacted semantic checkpoint for the currently running child."""
-    delegation_id = current_delegation_id()
-    if not delegation_id:
-        return {"ok": False, "state": "blocked", "diagnostic": "NO_ACTIVE_DELEGATION"}
-    if not 1 <= int(total) <= 32 or not 1 <= int(stage) <= int(total):
-        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_RANGE"}
-    if state not in _CHECKPOINT_STATES:
-        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_STATE"}
-    if plan is not None and (not isinstance(plan, list) or len(plan) != int(total)):
-        return {"ok": False, "state": "blocked", "diagnostic": "INVALID_STAGE_PLAN"}
-
-    now = time.time()
-    safe_label = _sanitize_public_text(label, limit=72) or f"этап {stage}"
-    safe_note = _sanitize_public_text(note, limit=120)
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            "SELECT state, progress_json FROM async_delegations WHERE delegation_id=?",
-            (delegation_id,),
-        ).fetchone()
-        if row is None or row[0] not in {"running", "stalling", "finalizing"}:
-            return {"ok": False, "state": "blocked", "diagnostic": "DELEGATION_NOT_RUNNING"}
-        try:
-            progress = json.loads(row[1]) if row[1] else {}
-        except (TypeError, ValueError):
-            progress = {}
-        raw_stages = progress.get("stages")
-        stages: List[Dict[str, Any]] = (
-            [dict(item) for item in raw_stages if isinstance(item, dict)]
-            if isinstance(raw_stages, list)
-            else []
-        )
-        requested_total = int(total)
-        if int(stage) < 1 or int(stage) > requested_total:
-            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_STAGE_RANGE"}
-        if len(stages) > requested_total:
-            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_TOTAL_REGRESSION"}
-        if len(stages) < requested_total:
-            labels = plan if plan is not None else [f"этап {i}" for i in range(1, requested_total + 1)]
-            for index in range(len(stages), requested_total):
-                item = labels[index] if index < len(labels) else f"этап {index + 1}"
-                stages.append(
-                    {
-                        "label": _sanitize_public_text(item, limit=72),
-                        "state": "planned",
-                    }
-                )
-        target = stages[int(stage) - 1]
-        previous = str(target.get("state") or "planned")
-        if any(
-            str(item.get("state") or "planned") != "completed"
-            for item in stages[: int(stage) - 1]
-        ) and state != "planned":
-            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_ORDER"}
-        allowed_transitions = {
-            "planned": {"planned", "running", "blocked", "summarizing", "completed"},
-            "running": {"running", "blocked", "summarizing", "completed"},
-            "blocked": {"blocked", "running", "summarizing", "completed"},
-            "summarizing": {"summarizing", "completed"},
-            "completed": {"completed"},
-        }
-        if state not in allowed_transitions.get(previous, set()):
-            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_REGRESSION"}
-        if previous == "completed" and safe_label != str(target.get("label") or ""):
-            return {"ok": False, "state": "blocked", "diagnostic": "CHECKPOINT_IMMUTABLE"}
-        target["label"] = safe_label
-        if state in {"running", "blocked", "summarizing"} and not target.get("started_at"):
-            target["started_at"] = now
-        if state == "completed":
-            target.setdefault("started_at", now)
-            target.setdefault("completed_at", now)
-        target["state"] = state
-        progress = {"stages": stages, "note": safe_note, "updated_at": now}
-        conn.execute(
-            """UPDATE async_delegations SET progress_json=?, heartbeat_at=?, updated_at=?,
-                      status_revision=status_revision+1
-               WHERE delegation_id=?""",
-            (json.dumps(progress), now, now, delegation_id),
-        )
-    return {"ok": True, "stage": int(stage), "total": int(total), "state": state}
-
-
-def _persist_progress_telemetry(delegation_id: str, token: Any, in_tool: bool) -> None:
-    api_calls = 0
-    tools: List[str] = []
-    if isinstance(token, (tuple, list)):
-        nested = bool(token) and all(isinstance(part, (tuple, list)) for part in token)
-        parts = token if nested else (token,)
-        for part in parts:
-            if part and isinstance(part[0], int):
-                api_calls += max(0, part[0])
-            if len(part) > 1 and isinstance(part[1], str) and part[1]:
-                tools.append(part[1])
-    unique_tools = list(dict.fromkeys(tools))
-    current_tool = ""
-    if len(unique_tools) == 1:
-        current_tool = unique_tools[0]
-    elif len(unique_tools) > 1:
-        current_tool = f"{len(unique_tools)} active tools"
-    if not in_tool:
-        current_tool = ""
-    safe_tool = _sanitize_public_text(current_tool, limit=48)
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            "SELECT api_calls, current_tool FROM async_delegations WHERE delegation_id=?",
-            (delegation_id,),
-        ).fetchone()
-        if row is None or (int(row[0] or 0), str(row[1] or "")) == (api_calls, safe_tool):
-            return
-        conn.execute(
-            """UPDATE async_delegations SET heartbeat_at=?, updated_at=?, api_calls=?,
-                      current_tool=? WHERE delegation_id=?
-               AND state IN ('running','stalling','finalizing')""",
-            (now, now, api_calls, safe_tool, delegation_id),
-        )
-
-
-def list_continuum_rail_snapshots(*, terminal_age_seconds: float = 86400) -> List[Dict[str, Any]]:
-    """Return internal origin-scoped snapshots for the gateway status publisher."""
-    now = time.time()
-    cutoff = now - max(0, float(terminal_age_seconds))
-    reservation_cutoff = now - _STALE_RESERVATION_SECONDS
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT delegation_id, origin_session, state, dispatched_at, completed_at,
-                      updated_at, heartbeat_at, delivery_state, api_calls, current_tool,
-                      public_title, progress_json, status_revision
-               FROM async_delegations
-               WHERE origin_session!=''
-                 AND (
-                   state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
-                   OR origin_session IN (
-                     SELECT origin_session FROM continuum_status_rails WHERE message_id!=''
-                   )
-                 )
-                 AND (
-                   state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
-                   OR completed_at>=?
-                 )
-                 AND (state!='reserved' OR dispatched_at>=?)
-               ORDER BY origin_session, dispatched_at""",
-            (cutoff, reservation_cutoff),
-        ).fetchall()
-        rail_rows = conn.execute(
-            """SELECT origin_session, message_id, rendered_hash, source_revision,
-                      revision, pinned, last_attempt_at, last_published_at,
-                      create_state, create_started_at
-               FROM continuum_status_rails"""
-        ).fetchall()
-    bindings = {
-        row[0]: {
-            "message_id": row[1],
-            "rendered_hash": row[2],
-            "source_revision": row[3],
-            "revision": row[4],
-            "pinned": bool(row[5]),
-            "last_attempt_at": row[6],
-            "last_published_at": row[7],
-            "create_state": row[8],
-            "create_started_at": row[9],
-        }
-        for row in rail_rows
-    }
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for row in rows:
-        try:
-            progress = json.loads(row[11]) if row[11] else None
-        except (TypeError, ValueError):
-            progress = None
-        grouped.setdefault(row[1], []).append(
-            {
-                "delegation_id": row[0],
-                "state": row[2],
-                "dispatched_at": row[3],
-                "completed_at": row[4],
-                "updated_at": row[5],
-                "heartbeat_at": row[6],
-                "delivery_state": row[7],
-                "api_calls": row[8],
-                "current_tool": row[9],
-                "public_title": row[10],
-                "progress": progress,
-                "status_revision": row[12],
-            }
-        )
-    snapshots = [
-        {
-            "origin_session": origin,
-            "rows": grouped[origin],
-            "source_revision": max(
-                int(row.get("status_revision") or 0) for row in grouped[origin]
-            ),
-            "rail": bindings.get(origin, {}),
-        }
-        for origin in sorted(grouped)
-    ]
-    for origin in sorted(set(bindings) - set(grouped)):
-        binding = bindings[origin]
-        if not binding.get("message_id"):
-            continue
-        snapshots.append(
-            {
-                "origin_session": origin,
-                "rows": [],
-                "source_revision": int(binding.get("source_revision") or 0),
-                "rail": binding,
-            }
-        )
-    return snapshots
-
-
-def continuum_rail_publish_due(
-    origin_session: str,
-    rendered_hash: str,
-    *,
-    now: Optional[float] = None,
-    min_interval_seconds: float = 5,
-) -> bool:
-    """Rate-limit edits and suppress byte-identical dashboard renders."""
-    current = time.time() if now is None else float(now)
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT rendered_hash, last_attempt_at FROM continuum_status_rails
-               WHERE origin_session=?""",
-            (origin_session,),
-        ).fetchone()
-        if row and row[0] == rendered_hash:
-            return False
-        if row and row[1] is not None and current - float(row[1]) < min_interval_seconds:
-            return False
-        conn.execute(
-            """INSERT INTO continuum_status_rails(origin_session, last_attempt_at, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(origin_session) DO UPDATE SET
-                 last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
-            (origin_session, current, current),
-        )
-    return True
-
-
-def claim_continuum_rail_create(origin_session: str) -> str:
-    """Reserve one create attempt; an uncertain attempt is never replayed."""
-    token = uuid.uuid4().hex
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            "SELECT message_id, create_state FROM continuum_status_rails WHERE origin_session=?",
-            (origin_session,),
-        ).fetchone()
-        if row and (str(row[0] or "") or str(row[1] or "")):
-            return ""
-        conn.execute(
-            """INSERT INTO continuum_status_rails(
-                   origin_session, create_state, create_token, create_started_at,
-                   last_attempt_at, updated_at
-               ) VALUES (?, 'in_flight', ?, ?, ?, ?)
-               ON CONFLICT(origin_session) DO UPDATE SET
-                   create_state='in_flight', create_token=excluded.create_token,
-                   create_started_at=excluded.create_started_at,
-                   last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
-            (origin_session, token, now, now, now),
-        )
-    return token
-
-
-def mark_continuum_rail_missing(origin_session: str, message_id: str) -> bool:
-    """Clear a durable binding only after the provider confirms it is gone."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        cursor = conn.execute(
-            """UPDATE continuum_status_rails
-               SET message_id='', rendered_hash='', create_state='', create_token='',
-                   create_started_at=NULL, updated_at=?
-               WHERE origin_session=? AND message_id=?""",
-            (now, origin_session, str(message_id)),
-        )
-        return cursor.rowcount == 1
-
-
-def reconcile_continuum_rail_create(
-    origin_session: str,
-    create_token: str,
-    *,
-    confirmed_message_id: str = "",
-    confirmed_absent: bool = False,
-) -> bool:
-    """Resolve an ambiguous create only after an operator checks Telegram.
-
-    Exactly one resolution is allowed: bind the provider-confirmed message or
-    clear the claim after confirming that no message exists. The claim token
-    makes stale/manual guesses fail closed; this function is never called by
-    the automatic publisher.
-    """
-    message_id = str(confirmed_message_id).strip()
-    if bool(message_id) == bool(confirmed_absent):
-        return False
-    if message_id and (not message_id.isdigit() or int(message_id) <= 0):
-        return False
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        if message_id:
-            cursor = conn.execute(
-                """UPDATE continuum_status_rails
-                   SET message_id=?, rendered_hash='', create_state='', create_token='',
-                       create_started_at=NULL, revision=revision+1, updated_at=?, last_error=''
-                   WHERE origin_session=? AND message_id='' AND create_token=?
-                     AND create_state IN ('in_flight','uncertain')""",
-                (message_id, now, origin_session, create_token),
-            )
-        else:
-            cursor = conn.execute(
-                """UPDATE continuum_status_rails
-                   SET create_state='', create_token='', create_started_at=NULL,
-                       updated_at=?, last_error='operator confirmed create absent'
-                   WHERE origin_session=? AND message_id='' AND create_token=?
-                     AND create_state IN ('in_flight','uncertain')""",
-                (now, origin_session, create_token),
-            )
-        return cursor.rowcount == 1
-
-
-def _continuum_rail_reconcile_handle(origin_session: str, create_token: str) -> str:
-    material = f"{origin_session}\0{create_token}".encode()
-    return hashlib.sha256(material).hexdigest()[:20]
-
-
-def list_continuum_rail_reconciliations() -> List[Dict[str, Any]]:
-    """List ambiguous creates by opaque local handle, never by origin/token."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT origin_session, create_token, create_state, create_started_at
-               FROM continuum_status_rails
-               WHERE message_id='' AND create_token!=''
-                 AND create_state IN ('in_flight','uncertain')"""
-        ).fetchall()
-    return sorted(
-        (
-            {
-                "handle": _continuum_rail_reconcile_handle(row[0], row[1]),
-                "state": row[2],
-                "age_seconds": max(0, int(now - float(row[3] or now))),
-            }
-            for row in rows
-        ),
-        key=lambda item: item["handle"],
-    )
-
-
-def reconcile_continuum_rail_create_by_handle(
-    handle: str,
-    *,
-    confirmed_message_id: str = "",
-    confirmed_absent: bool = False,
-) -> bool:
-    """Operator surface for one opaque reconciliation handle."""
-    candidate = str(handle).strip().lower()
-    if re.fullmatch(r"[0-9a-f]{20}", candidate) is None:
-        return False
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT origin_session, create_token
-               FROM continuum_status_rails
-               WHERE message_id='' AND create_token!=''
-                 AND create_state IN ('in_flight','uncertain')"""
-        ).fetchall()
-    matches = [
-        row
-        for row in rows
-        if _continuum_rail_reconcile_handle(str(row[0]), str(row[1])) == candidate
-    ]
-    if len(matches) != 1:
-        return False
-    return reconcile_continuum_rail_create(
-        str(matches[0][0]),
-        str(matches[0][1]),
-        confirmed_message_id=confirmed_message_id,
-        confirmed_absent=confirmed_absent,
-    )
-
-
-def record_continuum_rail_publish(
-    origin_session: str,
-    *,
-    message_id: str,
-    rendered_hash: str,
-    source_revision: int,
-    pinned: bool,
-    error: str = "",
-    create_token: str = "",
-) -> bool:
-    """Persist an accepted binding; reject a stale or foreign create claim."""
-    now = time.time()
-    safe_error = _sanitize_public_text(error, limit=160)
-    with _DB_LOCK, _transaction() as conn:
-        if create_token:
-            row = conn.execute(
-                "SELECT create_token FROM continuum_status_rails WHERE origin_session=?",
-                (origin_session,),
-            ).fetchone()
-            if row is None or str(row[0] or "") != create_token:
-                return False
-        conn.execute(
-            """INSERT INTO continuum_status_rails(
-                   origin_session, message_id, rendered_hash, source_revision,
-                   revision, pinned, last_attempt_at, last_published_at,
-                   create_state, create_token, create_started_at, updated_at, last_error
-               ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, '', '', NULL, ?, ?)
-               ON CONFLICT(origin_session) DO UPDATE SET
-                   message_id=excluded.message_id,
-                   rendered_hash=excluded.rendered_hash,
-                   source_revision=MAX(source_revision, excluded.source_revision),
-                   revision=revision+1,
-                   pinned=MAX(pinned, excluded.pinned),
-                   last_attempt_at=excluded.last_attempt_at,
-                   last_published_at=excluded.last_published_at,
-                   create_state='', create_token='', create_started_at=NULL,
-                   updated_at=excluded.updated_at,
-                   last_error=excluded.last_error""",
-            (
-                origin_session,
-                str(message_id),
-                rendered_hash,
-                max(0, int(source_revision)),
-                int(bool(pinned)),
-                now,
-                now,
-                now,
-                safe_error,
-            ),
-        )
-    return True
-
-
-def record_continuum_rail_failure(
-    origin_session: str, error: str, *, create_token: str = ""
-) -> None:
-    now = time.time()
-    safe_error = _sanitize_public_text(error, limit=160)
-    with _DB_LOCK, _transaction() as conn:
-        if create_token:
-            conn.execute(
-                """UPDATE continuum_status_rails
-                   SET create_state='uncertain', updated_at=?, last_error=?, last_attempt_at=?
-                   WHERE origin_session=? AND create_token=?""",
-                (now, safe_error, now, origin_session, create_token),
-            )
-            return
-        conn.execute(
-            """INSERT INTO continuum_status_rails(origin_session, updated_at, last_error, last_attempt_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(origin_session) DO UPDATE SET
-                 updated_at=excluded.updated_at, last_error=excluded.last_error,
-                 last_attempt_at=excluded.last_attempt_at""",
-            (origin_session, now, safe_error, now),
-        )
-
-
-def register_continuum_task_card(delegation_id: str, parent_session_id: str) -> bool:
-    """Bind a freshly launched Continuum task to its host-owned trusted origin."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT origin_session FROM async_delegations
-               WHERE delegation_id=? AND parent_session_id=? AND origin_session!=''""",
-            (delegation_id, parent_session_id),
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute(
-            """INSERT INTO continuum_task_cards(
-                   delegation_id, origin_session, last_attempt_at, updated_at
-               ) VALUES (?, ?, NULL, ?)
-               ON CONFLICT(delegation_id) DO NOTHING""",
-            (delegation_id, str(row[0]), now),
-        )
-    return True
-
-
-def list_continuum_task_card_snapshots(
-    *, terminal_age_seconds: float = 86400
-) -> List[Dict[str, Any]]:
-    """Return one internal, trusted-origin snapshot per durable task card."""
-    now = time.time()
-    cutoff = now - max(0, float(terminal_age_seconds))
-    reservation_cutoff = now - _STALE_RESERVATION_SECONDS
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT d.delegation_id, d.origin_session, d.state, d.dispatched_at,
-                      d.completed_at, d.updated_at, d.heartbeat_at, d.delivery_state,
-                      d.api_calls, d.current_tool, d.public_title, d.progress_json,
-                      d.status_revision,
-                      c.message_id, c.rendered_hash, c.source_revision, c.revision,
-                      c.last_attempt_at, c.last_published_at, c.create_state,
-                      c.create_started_at
-               FROM async_delegations AS d
-               INNER JOIN continuum_task_cards AS c
-                 ON c.delegation_id=d.delegation_id AND c.origin_session=d.origin_session
-               WHERE d.origin_session!=''
-                 AND (d.state!='reserved' OR d.dispatched_at>=?)
-                 AND (
-                   d.state IN ('reserved','dispatched','running','stalling','finalizing','restart_pending','restarting')
-                   OR d.completed_at>=?
-                 )
-               ORDER BY d.dispatched_at, d.delegation_id""",
-            (reservation_cutoff, cutoff),
-        ).fetchall()
-    snapshots: List[Dict[str, Any]] = []
-    for row in rows:
-        try:
-            progress = json.loads(row[11]) if row[11] else None
-        except (TypeError, ValueError):
-            progress = None
-        snapshots.append(
-            {
-                "delegation_id": row[0],
-                "origin_session": row[1],
-                "row": {
-                    "delegation_id": row[0],
-                    "state": row[2],
-                    "dispatched_at": row[3],
-                    "completed_at": row[4],
-                    "updated_at": row[5],
-                    "heartbeat_at": row[6],
-                    "delivery_state": row[7],
-                    "api_calls": row[8],
-                    "current_tool": row[9],
-                    "public_title": row[10],
-                    "progress": progress,
-                    "status_revision": row[12],
-                },
-                "source_revision": int(row[12] or 0),
-                "card": {
-                    "message_id": row[13] or "",
-                    "rendered_hash": row[14] or "",
-                    "source_revision": int(row[15] or 0),
-                    "revision": int(row[16] or 0),
-                    "last_attempt_at": row[17],
-                    "last_published_at": row[18],
-                    "create_state": row[19] or "",
-                    "create_started_at": row[20],
-                },
-            }
-        )
-    return snapshots
-
-
-def continuum_task_card_delivery_state(delegation_id: str) -> str:
-    """Return unmanaged, pending, or delivered for a managed task card."""
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT d.state, d.status_revision, c.message_id,
-                      c.rendered_hash, c.source_revision
-               FROM async_delegations AS d
-               JOIN continuum_task_cards AS c
-                 ON c.delegation_id=d.delegation_id
-                AND c.origin_session=d.origin_session
-               WHERE d.delegation_id=?""",
+            """SELECT delivery_state, delivery_claim, delivery_claimed_at
+               FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
     if row is None:
-        return "unmanaged"
+        return "legacy"
     state = str(row[0] or "")
-    terminal = state not in {"reserved", "running", "stalling", "finalizing"}
-    delivered = (
-        terminal
-        and bool(str(row[2] or ""))
-        and bool(str(row[3] or ""))
-        and int(row[4] or 0) >= int(row[1] or 0)
-    )
-    return "delivered" if delivered else "pending"
+    if state != "pending":
+        return state
+    if row[1] and float(row[2] or 0) >= now - 300:
+        return "claimed"
+    return "pending"
 
 
-def continuum_task_card_publish_due(
-    delegation_id: str,
-    rendered_hash: str,
-    *,
-    now: Optional[float] = None,
-    min_interval_seconds: float = 5,
-) -> bool:
-    """Suppress unchanged renders and coalesce semantic card updates."""
-    current = time.time() if now is None else float(now)
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT rendered_hash, last_attempt_at FROM continuum_task_cards
-               WHERE delegation_id=?""",
-            (delegation_id,),
-        ).fetchone()
-        if row and row[0] == rendered_hash:
-            return False
-        if row and row[1] is not None and current - float(row[1]) < min_interval_seconds:
-            return False
-        origin = conn.execute(
-            "SELECT origin_session FROM async_delegations WHERE delegation_id=?",
-            (delegation_id,),
-        ).fetchone()
-        if origin is None or not str(origin[0] or ""):
-            return False
-        conn.execute(
-            """INSERT INTO continuum_task_cards(
-                   delegation_id, origin_session, last_attempt_at, updated_at
-               ) VALUES (?, ?, ?, ?)
-               ON CONFLICT(delegation_id) DO UPDATE SET
-                 last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
-            (delegation_id, str(origin[0]), current, current),
-        )
-    return True
-
-
-def claim_continuum_task_card_create(delegation_id: str, origin_session: str) -> str:
-    """Reserve the only automatic create attempt for one trusted task binding."""
-    token = uuid.uuid4().hex
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        owner = conn.execute(
-            """SELECT 1 FROM async_delegations
-               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
-            (delegation_id, origin_session),
-        ).fetchone()
-        if owner is None:
-            return ""
-        row = conn.execute(
-            """SELECT message_id, create_state FROM continuum_task_cards
-               WHERE delegation_id=? AND origin_session=?""",
-            (delegation_id, origin_session),
-        ).fetchone()
-        if row and (str(row[0] or "") or str(row[1] or "")):
-            return ""
-        conn.execute(
-            """INSERT INTO continuum_task_cards(
-                   delegation_id, origin_session, create_state, create_token,
-                   create_started_at, last_attempt_at, updated_at
-               ) VALUES (?, ?, 'in_flight', ?, ?, ?, ?)
-               ON CONFLICT(delegation_id) DO UPDATE SET
-                   create_state='in_flight', create_token=excluded.create_token,
-                   create_started_at=excluded.create_started_at,
-                   last_attempt_at=excluded.last_attempt_at, updated_at=excluded.updated_at""",
-            (delegation_id, origin_session, token, now, now, now),
-        )
-    return token
-
-
-def mark_continuum_task_card_missing(
-    delegation_id: str, origin_session: str, message_id: str
-) -> bool:
-    """Clear a task-card binding only after Telegram proves it is gone."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        cursor = conn.execute(
-            """UPDATE continuum_task_cards
-               SET message_id='', rendered_hash='', create_state='', create_token='',
-                   create_started_at=NULL, updated_at=?
-               WHERE delegation_id=? AND origin_session=? AND message_id=?""",
-            (now, delegation_id, origin_session, str(message_id)),
-        )
-        return cursor.rowcount == 1
-
-
-def record_continuum_task_card_publish(
-    delegation_id: str,
-    origin_session: str,
-    *,
-    message_id: str,
-    rendered_hash: str,
-    source_revision: int,
-    error: str = "",
-    create_token: str = "",
-) -> bool:
-    """Persist one accepted create/edit without accepting caller-selected routing."""
-    now = time.time()
-    safe_error = _sanitize_public_text(error, limit=160)
-    with _DB_LOCK, _transaction() as conn:
-        owner = conn.execute(
-            """SELECT 1 FROM async_delegations
-               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
-            (delegation_id, origin_session),
-        ).fetchone()
-        if owner is None:
-            return False
-        if create_token:
-            row = conn.execute(
-                """SELECT create_token FROM continuum_task_cards
-                   WHERE delegation_id=? AND origin_session=?""",
-                (delegation_id, origin_session),
-            ).fetchone()
-            if row is None or str(row[0] or "") != create_token:
-                return False
-        conn.execute(
-            """INSERT INTO continuum_task_cards(
-                   delegation_id, origin_session, message_id, rendered_hash,
-                   source_revision, revision, last_attempt_at, last_published_at,
-                   create_state, create_token, create_started_at, updated_at, last_error
-               ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', '', NULL, ?, ?)
-               ON CONFLICT(delegation_id) DO UPDATE SET
-                   message_id=excluded.message_id,
-                   rendered_hash=excluded.rendered_hash,
-                   source_revision=MAX(source_revision, excluded.source_revision),
-                   revision=revision+1,
-                   last_attempt_at=excluded.last_attempt_at,
-                   last_published_at=excluded.last_published_at,
-                   create_state='', create_token='', create_started_at=NULL,
-                   updated_at=excluded.updated_at, last_error=excluded.last_error""",
-            (
-                delegation_id,
-                origin_session,
-                str(message_id),
-                rendered_hash,
-                max(0, int(source_revision)),
-                now,
-                now,
-                now,
-                safe_error,
-            ),
-        )
-    return True
-
-
-def record_continuum_task_card_failure(
-    delegation_id: str,
-    origin_session: str,
-    error: str,
-    *,
-    create_token: str = "",
-) -> None:
-    """Record delivery failure internally; never turn it into a chat message."""
-    now = time.time()
-    safe_error = _sanitize_public_text(error, limit=160)
-    with _DB_LOCK, _transaction() as conn:
-        if create_token:
-            conn.execute(
-                """UPDATE continuum_task_cards
-                   SET create_state='uncertain', updated_at=?, last_error=?, last_attempt_at=?
-                   WHERE delegation_id=? AND origin_session=? AND create_token=?""",
-                (now, safe_error, now, delegation_id, origin_session, create_token),
-            )
-            return
-        conn.execute(
-            """UPDATE continuum_task_cards
-               SET updated_at=?, last_error=?, last_attempt_at=?
-               WHERE delegation_id=? AND origin_session=?""",
-            (now, safe_error, now, delegation_id, origin_session),
-        )
-
-
-def _continuum_task_card_reconcile_handle(delegation_id: str, create_token: str) -> str:
-    """Return an opaque operator handle without exposing task or routing ids."""
-    if not delegation_id or not create_token:
-        return ""
-    return hashlib.sha256(f"{delegation_id}:{create_token}".encode()).hexdigest()[:24]
-
-
-def list_continuum_task_card_reconciliations() -> List[Dict[str, Any]]:
-    """List ambiguous creates using opaque handles only."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT delegation_id, create_token, create_state, create_started_at
-               FROM continuum_task_cards
-               WHERE message_id='' AND create_state IN ('in_flight','uncertain')
-                     AND create_token!=''
-               ORDER BY create_started_at, delegation_id"""
-        ).fetchall()
-    return [
-        {
-            "handle": _continuum_task_card_reconcile_handle(str(row[0]), str(row[1])),
-            "state": str(row[2]),
-            "age_seconds": max(0, int(now - float(row[3] or now))),
-        }
-        for row in rows
-    ]
-
-
-def reconcile_continuum_task_card_create_by_handle(
-    handle: str,
-    *,
-    accepted_message_id: str = "",
-    retry_create: bool = False,
-) -> bool:
-    """Resolve one ambiguous create after an operator verifies Telegram reality.
-
-    Exactly one resolution is allowed: bind the accepted Telegram message, or
-    clear the reservation so the publisher may retry after absence is proved.
-    No origin, session, delegation, or create token is accepted from the caller.
-    """
-    candidate = str(handle or "").strip().lower()
-    accepted = str(accepted_message_id or "").strip()
-    if (
-        len(candidate) != 24
-        or bool(accepted) == bool(retry_create)
-        or (accepted and not re.fullmatch(r"[1-9][0-9]{0,31}", accepted))
-    ):
-        return False
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT delegation_id, origin_session, create_token
-               FROM continuum_task_cards
-               WHERE message_id='' AND create_state IN ('in_flight','uncertain')
-                     AND create_token!=''"""
-        ).fetchall()
-        matches = [
-            row
-            for row in rows
-            if _continuum_task_card_reconcile_handle(str(row[0]), str(row[2]))
-            == candidate
-        ]
-        if len(matches) != 1:
-            return False
-        delegation_id, origin_session, create_token = map(str, matches[0])
-        owner = conn.execute(
-            """SELECT 1 FROM async_delegations
-               WHERE delegation_id=? AND origin_session=? AND origin_session!=''""",
-            (delegation_id, origin_session),
-        ).fetchone()
-        if owner is None:
-            return False
-        if accepted:
-            cursor = conn.execute(
-                """UPDATE continuum_task_cards
-                   SET message_id=?, rendered_hash='', source_revision=0,
-                       revision=revision+1, last_published_at=?, last_attempt_at=?,
-                       create_state='', create_token='', create_started_at=NULL,
-                       updated_at=?, last_error=''
-                   WHERE delegation_id=? AND origin_session=? AND create_token=?
-                         AND message_id=''""",
-                (
-                    accepted,
-                    now,
-                    now,
-                    now,
-                    delegation_id,
-                    origin_session,
-                    create_token,
-                ),
-            )
-        else:
-            cursor = conn.execute(
-                """UPDATE continuum_task_cards
-                   SET create_state='', create_token='', create_started_at=NULL,
-                       last_attempt_at=NULL, updated_at=?, last_error=''
-                   WHERE delegation_id=? AND origin_session=? AND create_token=?
-                         AND message_id=''""",
-                (now, delegation_id, origin_session, create_token),
-            )
-        return cursor.rowcount == 1
-
-
-def list_durable_delegations(
-    limit: int = 20, *, origin_session: str | None = None
-) -> List[Dict[str, Any]]:
-    """Return newest durable task statuses for read-only operator surfaces.
-
-    Deliberately excludes goals, context, origin identifiers, and ownership
-    metadata. Result payloads stay available for exact-ID capability lookup.
-    """
-    bounded = max(1, min(int(limit), 50))
-    where = " WHERE origin_session=?" if origin_session else ""
-    params: tuple[Any, ...] = (origin_session, bounded) if origin_session else (bounded,)
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            f"""SELECT delegation_id, state, dispatched_at, completed_at,
-                       updated_at, result_json, delivery_state, delivery_attempts
-                FROM async_delegations{where}
-                ORDER BY dispatched_at DESC, delegation_id DESC LIMIT ?""",
-            params,
-        ).fetchall()
-    return [
-        {
-            "delegation_id": row[0],
-            "state": row[1],
-            "dispatched_at": row[2],
-            "completed_at": row[3],
-            "updated_at": row[4],
-            "result": json.loads(row[5]) if row[5] else None,
-            "delivery_state": row[6],
-            "delivery_attempts": row[7],
-        }
-        for row in rows
-    ]
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    if claim_id and evt.get("type") == "async_delegation":
+        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
@@ -2563,8 +1554,6 @@ def dispatch_async_delegation(
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
-    if root_turn_id and not restart_policy:
-        restart_policy = _RESTART_POLICY
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -2576,6 +1565,7 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        **_capture_routing_origin(),
         "child_session_ids": list(child_session_ids or []),
         "child_capability_names": [
             sorted({str(name) for name in names if str(name)})
@@ -2596,11 +1586,6 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
-        if delegation_id in _records:
-            return {
-                "status": "rejected",
-                "error": "Delegation identity already exists",
-            }
         running = sum(
             1 for r in _records.values()
             if r.get("status") in ("running", "stalling")
@@ -2647,11 +1632,13 @@ def dispatch_async_delegation(
         result: Dict[str, Any] = {}
         status = "error"
         context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
-        generation_token = _CURRENT_EXECUTION_GENERATION.set(0)
+        generation_token = _CURRENT_EXECUTION_GENERATION.set(
+            int(record.get("execution_generation", 0) or 0)
+        )
         try:
             result = runner() or {}
             commit_child_terminal(0, result, delegation_id=delegation_id)
-            _mark_runner_returned(delegation_id, 0)
+            _mark_runner_returned(delegation_id)
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
@@ -2662,7 +1649,13 @@ def dispatch_async_delegation(
                 "api_calls": 0,
                 "duration_seconds": round(time.time() - dispatched_at, 2),
             }
-            commit_child_terminal(0, result, delegation_id=delegation_id)
+            commit_child_terminal(
+                0,
+                result,
+                delegation_id=delegation_id,
+                replay_decision="runner_exception",
+            )
+            _mark_runner_returned(delegation_id)
             status = "error"
         finally:
             try:
@@ -2677,18 +1670,6 @@ def dispatch_async_delegation(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         if root_turn_id:
-            commit_child_terminal(
-                0,
-                {
-                    "task_index": 0,
-                    "status": "error",
-                    "summary": None,
-                    "error": f"Failed to schedule async delegation: {exc}",
-                },
-                delegation_id=delegation_id,
-                replay_decision="schedule_failure",
-                execution_generation=0,
-            )
             _finalize(
                 delegation_id,
                 {
@@ -2728,9 +1709,8 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         delegation_id, str(event_record.get("_interrupt_reason") or "")
     ):
         return
-
-    if _push_completion_event(event_record, result, status):
-        _finish_finalization(delegation_id, status)
+    _push_completion_event(event_record, result, status)
+    _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -2764,7 +1744,7 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
 
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
-) -> bool:
+) -> None:
     """Push a type='async_delegation' event onto the shared completion queue.
 
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
@@ -2778,7 +1758,7 @@ def _push_completion_event(
             "result lost: %s",
             record.get("delegation_id"), exc,
         )
-        return False
+        return
 
     summary = result.get("summary")
     error = result.get("error")
@@ -2794,13 +1774,13 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
-        "execution_generation": int(record.get("execution_generation", 0)),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
         "role": record.get("role"),
         "model": result.get("model") or record.get("model"),
         "status": status,
+        "execution_generation": int(record.get("execution_generation", 0) or 0),
         "summary": summary,
         "error": error,
         "api_calls": result.get("api_calls", 0),
@@ -2827,8 +1807,7 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    if not _persist_completion(evt, result):
-        return False
+    _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -2837,7 +1816,6 @@ def _push_completion_event(
             "result lost: %s",
             record.get("delegation_id"), exc,
         )
-    return True
 
 
 def dispatch_async_delegation_batch(
@@ -2890,8 +1868,6 @@ def dispatch_async_delegation_batch(
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
-    if root_turn_id and not restart_policy:
-        restart_policy = _RESTART_POLICY
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -2902,7 +1878,6 @@ def dispatch_async_delegation_batch(
         "goals": list(goals),
         "tasks": list(task_specs or []),
         "output_schemas": list(output_schemas or []),
-        "output_schema_fingerprints": list(output_schema_fingerprints or []),
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
@@ -2911,6 +1886,7 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        **_capture_routing_origin(),
         "child_session_ids": list(child_session_ids or []),
         "child_capability_names": [
             sorted({str(name) for name in names if str(name)})
@@ -2918,7 +1894,8 @@ def dispatch_async_delegation_batch(
         ],
         "restart_policy": restart_policy,
         "resume_claim": resume_claim,
-        "execution_generation": int(execution_generation),
+        "execution_generation": int(execution_generation or 0),
+        "output_schema_fingerprints": list(output_schema_fingerprints or []),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -2933,7 +1910,7 @@ def dispatch_async_delegation_batch(
         if delegation_id in _records:
             return {
                 "status": "rejected",
-                "error": "Delegation identity already exists",
+                "error": "Delegation id is already active or retained",
             }
         running = sum(
             1 for r in _records.values()
@@ -2981,7 +1958,7 @@ def dispatch_async_delegation_batch(
         status = "error"
         context_token = _CURRENT_DELEGATION_ID.set(delegation_id)
         generation_token = _CURRENT_EXECUTION_GENERATION.set(
-            int(record.get("execution_generation", 0))
+            int(record.get("execution_generation", 0) or 0)
         )
         try:
             combined = runner() or {}
@@ -2991,9 +1968,7 @@ def dispatch_async_delegation_batch(
                     child_result,
                     delegation_id=delegation_id,
                 )
-            _mark_runner_returned(
-                delegation_id, int(record.get("execution_generation", 0))
-            )
+            _mark_runner_returned(delegation_id)
             # A mixed batch is successful only when every child is successful.
             child_results = combined.get("results") or []
             if child_results and all(
@@ -3005,26 +1980,27 @@ def dispatch_async_delegation_batch(
                 status = "error"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
-            error_text = f"{type(exc).__name__}: {exc}"
-            child_count = max(len(record.get("goals") or []), 1)
-            for child_index in range(child_count):
-                commit_child_terminal(
-                    child_index,
+            combined = {
+                "results": [
                     {
-                        "task_index": child_index,
+                        "task_index": index,
                         "status": "error",
                         "summary": None,
-                        "error": error_text,
-                        "replay_decision": "runner_exception",
-                    },
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    for index in range(n)
+                ],
+                "error": f"{type(exc).__name__}: {exc}",
+                "total_duration_seconds": round(time.time() - dispatched_at, 2),
+            }
+            for child_result in combined["results"]:
+                commit_child_terminal(
+                    int(child_result["task_index"]),
+                    child_result,
                     delegation_id=delegation_id,
                     replay_decision="runner_exception",
                 )
-            combined = {
-                "results": durable_child_results(delegation_id),
-                "error": error_text,
-                "total_duration_seconds": round(time.time() - dispatched_at, 2),
-            }
+            _mark_runner_returned(delegation_id)
             status = "error"
         finally:
             try:
@@ -3038,19 +2014,6 @@ def dispatch_async_delegation_batch(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         if root_turn_id:
-            for child_index in range(max(len(goals), 1)):
-                commit_child_terminal(
-                    child_index,
-                    {
-                        "task_index": child_index,
-                        "status": "error",
-                        "summary": None,
-                        "error": f"Failed to schedule async delegation batch: {exc}",
-                    },
-                    delegation_id=delegation_id,
-                    replay_decision="schedule_failure",
-                    execution_generation=int(execution_generation),
-                )
             _finalize_batch(
                 delegation_id,
                 {
@@ -3086,13 +2049,17 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    if _push_batch_completion_event(event_record, combined, status):
-        _finish_finalization(delegation_id, status)
+    if status == "interrupted" and defer_restartable_interruption(
+        delegation_id, str(event_record.get("_interrupt_reason") or "")
+    ):
+        return
+    _push_batch_completion_event(event_record, combined, status)
+    _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
-) -> bool:
+) -> None:
     """Push a combined async-delegation batch completion event."""
     try:
         from tools.process_registry import process_registry
@@ -3102,28 +2069,10 @@ def _push_batch_completion_event(
             "failed; result lost: %s",
             event_record.get("delegation_id"), exc,
         )
-        return False
+        return
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
-    delegation_id = str(event_record.get("delegation_id") or "")
-    with _DB_LOCK, _transaction() as conn:
-        child_rows = conn.execute(
-            """SELECT state, result_json FROM async_delegation_children
-               WHERE delegation_id=? ORDER BY child_index""",
-            (delegation_id,),
-        ).fetchall()
-    if child_rows:
-        terminal_states = {"completed", "failed", "unknown", "cancelled"}
-        if any(row[0] not in terminal_states or not row[1] for row in child_rows):
-            logger.error(
-                "Async delegation batch %s reached aggregate finalization before "
-                "all child outcomes were durable",
-                delegation_id,
-            )
-            return False
-        combined = dict(combined)
-        combined["results"] = durable_child_results(delegation_id)
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
@@ -3131,7 +2080,6 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
-        "execution_generation": int(event_record.get("execution_generation", 0)),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -3139,6 +2087,9 @@ def _push_batch_completion_event(
         "role": event_record.get("role"),
         "model": event_record.get("model"),
         "status": status,
+        "execution_generation": int(
+            event_record.get("execution_generation", 0) or 0
+        ),
         "is_batch": True,
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
@@ -3166,8 +2117,7 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    if not _persist_completion(evt, combined):
-        return False
+    _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -3176,7 +2126,6 @@ def _push_batch_completion_event(
             "result lost: %s",
             event_record.get("delegation_id"), exc,
         )
-    return True
 
 
 def _ensure_stale_monitor() -> None:
@@ -3220,7 +2169,6 @@ def _stale_monitor_loop() -> None:
         now = time.time()
         stalled: List[tuple] = []  # (delegation_id, is_batch, quiet_for, in_tool)
         expired: List[str] = []  # stalling past grace → force-finalize
-        telemetry: List[tuple[str, Any, bool]] = []
         any_monitorable = False
         with _records_lock:
             for record in _records.values():
@@ -3243,7 +2191,6 @@ def _stale_monitor_loop() -> None:
                     # An unreadable child must not look permanently healthy —
                     # keep the last timestamp running instead of refreshing it.
                     token, in_tool = record.get("_progress_token"), False
-                telemetry.append((record["delegation_id"], token, bool(in_tool)))
                 if token != record.get("_progress_token"):
                     record["_progress_token"] = token
                     record["_progress_ts"] = now
@@ -3270,15 +2217,6 @@ def _stale_monitor_loop() -> None:
                             in_tool,
                         )
                     )
-        for delegation_id, token, in_tool in telemetry:
-            try:
-                _persist_progress_telemetry(delegation_id, token, in_tool)
-            except Exception:
-                logger.debug(
-                    "Async delegation %s telemetry persistence failed",
-                    delegation_id,
-                    exc_info=True,
-                )
         for delegation_id, _is_batch, quiet_for, in_tool in stalled:
             logger.warning(
                 "Async delegation %s made no progress for %.0fs "
@@ -3467,40 +2405,27 @@ def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 
     Used on ``/stop`` and gateway shutdown so a dangling background subagent
-    can't keep burning tokens with no one listening. Explicit stops are first
-    durably terminalized; restart-enabled gateway-drain interruptions are
-    durably deferred for same-id recovery and emit no intermediate outcome.
+    can't keep burning tokens with no one listening. The child still emits a
+    completion event (status='interrupted') via the normal finalize path.
     """
+    count = 0
     with _records_lock:
         targets = [
             r for r in _records.values()
             if r.get("status") in ("running", "stalling")
         ]
-    terminalized = (
-        set()
-        if reason.startswith("gateway shutdown")
-        else _interrupt_pending_restarts(reason, all_rows=True)
-    )
-    signalled: set[str] = set()
     for r in targets:
-        r["_interrupt_reason"] = (
-            "gateway_drain" if reason.startswith("gateway shutdown") else reason
-        )
-        if r["_interrupt_reason"] == "gateway_drain":
-            # Persist restart_pending before the hard child interrupt can race
-            # through normal interrupted finalization and publish a terminal.
-            defer_restartable_interruption(r["delegation_id"], "gateway_drain")
+        r["_interrupt_reason"] = reason
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:
                 fn()
-                signalled.add(str(r.get("delegation_id") or ""))
+                count += 1
             except Exception as exc:
                 logger.debug(
                     "interrupt_all: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
                 )
-    count = len((terminalized | signalled) - {""})
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
     return count
@@ -3538,6 +2463,7 @@ def interrupt_for_session(
         origin_session=session_key,
         parent_session_id=parent_session_id,
     )
+    count = 0
     with _records_lock:
         targets = [
             r for r in _records.values()
@@ -3549,25 +2475,18 @@ def interrupt_for_session(
                 parent_session_id=parent_session_id,
             )
         ]
-    terminalized = _interrupt_pending_restarts(
-        reason,
-        session_key=session_key,
-        origin_ui_session_id=origin_ui_session_id,
-        parent_session_id=parent_session_id,
-    )
-    signalled: set[str] = set()
     for r in targets:
+        r["_interrupt_reason"] = reason
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:
                 fn()
-                signalled.add(str(r.get("delegation_id") or ""))
+                count += 1
             except Exception as exc:
                 logger.debug(
                     "interrupt_for_session: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
                 )
-    count = len((terminalized | signalled) - {""})
     if count:
         logger.info(
             "Interrupted %d async delegation(s) for ending session (%s)",

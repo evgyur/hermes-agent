@@ -381,7 +381,7 @@ def register(ctx):
 在 Telegram、Discord、WhatsApp、Slack 或 Signal 上发送的语音消息会被自动转录并作为文本注入对话。Agent 将转录内容视为普通文本。
 
 | 提供商 | 质量 | 费用 | API 密钥 |
-|----------|---------|------|---------|
+|----------|---------|------|---------| 
 | **本地 Whisper**（默认） | 良好 | 免费 | 无需 |
 | **Groq Whisper API** | 良好至最佳 | 免费额度 | `GROQ_API_KEY` |
 | **OpenAI Whisper API** | 良好至最佳 | 付费 | `VOICE_TOOLS_OPENAI_KEY` 或 `OPENAI_API_KEY` |

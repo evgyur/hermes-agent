@@ -1831,9 +1831,7 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = gateway_tool_subprocess_kwargs()
-        if _IS_WINDOWS:
-            _popen_kwargs["creationflags"] = windows_hide_flags()
+        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
             args,

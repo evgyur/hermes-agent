@@ -1,63 +1,69 @@
-"""Regression contract for the canonical bundled hermes-agent hub skill."""
+"""The `hermes-agent` skill is what a running Hermes knows about itself.
+
+`website/` is never packaged, so an installed Hermes has no local copy of the
+user guide; skills ARE synced into `$HERMES_HOME/skills/`. The skill therefore
+does not try to restate the product — it routes to the published `llms.txt`,
+which is generated from the docs tree on every build and so can never be behind
+the feature set. These tests keep that routing honest: the index has to be where
+the skill says it is, and every reference has to be reachable, otherwise a
+shipped feature is invisible and the agent answers "Hermes can't do that."
+"""
 
 from __future__ import annotations
 
+import importlib.util
 import re
 from pathlib import Path
 
-from agent.skill_utils import parse_frontmatter
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+SKILL_DIR = REPO / "skills" / "autonomous-ai-agents" / "hermes-agent"
+SKILL_MD = SKILL_DIR / "SKILL.md"
+GENERATOR = REPO / "website" / "scripts" / "generate-llms-txt.py"
 
 
-ROOT = Path(__file__).resolve().parents[2] / "skills" / "autonomous-ai-agents" / "hermes-agent"
-SKILL = ROOT / "SKILL.md"
+@pytest.fixture(scope="module")
+def skill_text() -> str:
+    return SKILL_MD.read_text(encoding="utf-8")
 
 
-def test_hermes_agent_root_stays_within_progressive_disclosure_budget():
-    size = SKILL.stat().st_size
-    assert 8_000 <= size <= 12_000
+def test_every_referenced_file_exists(skill_text):
+    """Routing a question to a file that isn't there is a dead end."""
+    targets = set(re.findall(r"`((?:references|templates)/[^`]+)`", skill_text))
+
+    assert targets, "the skill's routing table no longer references any files"
+    for target in sorted(targets):
+        assert (SKILL_DIR / target).exists(), f"SKILL.md routes to missing {target}"
 
 
-def test_hermes_agent_frontmatter_trigger_is_narrow_and_prompt_safe():
-    frontmatter, _ = parse_frontmatter(SKILL.read_text(encoding="utf-8"))
-    description = str(frontmatter["description"])
-    assert len(description) <= 60
-    assert "Hermes Agent" in description
-    assert "code" not in description.lower()
-    assert "bug" not in description.lower()
+def test_every_reference_is_reachable_from_the_skill(skill_text):
+    """An unrouted reference is one the agent will never think to open.
+
+    This is the failure that produced the original complaint: content can exist
+    and still be invisible because nothing points at it.
+    """
+    on_disk = {f"references/{path.name}" for path in (SKILL_DIR / "references").glob("*.md")}
+    routed = set(re.findall(r"`(references/[^`]+)`", skill_text))
+
+    assert not (on_disk - routed), (
+        f"reference files no reader will ever reach: {sorted(on_disk - routed)} — "
+        "add a routing-table row in SKILL.md"
+    )
 
 
-def test_every_root_reference_and_template_link_exists():
-    text = SKILL.read_text(encoding="utf-8")
-    links = set(re.findall(r"`((?:references|templates)/[^`]+)`", text))
-    assert links
-    missing = [relative for relative in sorted(links) if not (ROOT / relative).is_file()]
-    assert missing == []
+def test_unknown_features_route_to_the_published_index(skill_text):
+    """The catch-all is what makes coverage of the whole product possible."""
+    assert "/docs/llms.txt" in skill_text
+    # web_extract can be disabled; terminal never is.
+    assert "curl" in skill_text, "no way to reach the index without web tools"
 
 
-def test_representative_tasks_route_to_cold_references():
-    text = SKILL.read_text(encoding="utf-8")
-    expected = {
-        "| CLI commands": "references/cli-reference.md",
-        "| Provider setup": "references/providers-and-models.md",
-        "| config.yaml sections": "references/configuration.md",
-        "| Delegation, cron, curator, kanban": "references/background-systems.md",
-        "| MCP servers": "references/native-mcp.md",
-        "| A desktop app UI element": "references/desktop-plugins.md",
-        "| Debugging: voice, tools missing, gateway": "references/troubleshooting.md",
-        "| Contributing code": "references/contributor-guide.md",
-    }
-    for task_fragment, reference in expected.items():
-        line = next(line for line in text.splitlines() if task_fragment in line)
-        assert reference in line
+def test_the_index_is_published_where_the_skill_says_it_is(skill_text):
+    """A skill pointing at a URL nobody generates is worse than no routing."""
+    spec = importlib.util.spec_from_file_location("generate_llms_txt", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
 
-
-def test_root_preserves_docs_and_safety_boundaries():
-    text = SKILL.read_text(encoding="utf-8")
-    for required in (
-        "https://hermes-agent.nousresearch.com/docs/",
-        "Check the live repository and official docs",
-        "Never break prompt caching",
-        "Secrets in `.env`, settings in `config.yaml`",
-        "get_hermes_home()",
-    ):
-        assert required in text
+    assert f"{gen.SITE_BASE}/llms.txt" in skill_text

@@ -1980,8 +1980,6 @@ def _transcribe_local(
 
         try:
             segments, info = model.transcribe(file_path, **transcribe_kwargs)
-            segments = list(segments)
-            segment_items = _extract_transcript_segments({"segments": segments})
             transcript = _join_confident_segments(segments, local_config)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
@@ -2002,8 +2000,6 @@ def _transcribe_local(
                 _local_model = model
                 _local_model_name = model_name
             segments, info = model.transcribe(file_path, **transcribe_kwargs)
-            segments = list(segments)
-            segment_items = _extract_transcript_segments({"segments": segments})
             transcript = _join_confident_segments(segments, local_config)
 
         logger.info(
@@ -2016,12 +2012,7 @@ def _transcribe_local(
         if idle_timeout > 0:
             _start_idle_unload_watcher(idle_timeout)
 
-        return {
-            "success": True,
-            "transcript": transcript,
-            "provider": "local",
-            "segments": segment_items,
-        }
+        return {"success": True, "transcript": transcript, "provider": "local"}
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
@@ -2122,13 +2113,24 @@ def _transcribe_local_command(
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
-            # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
-            use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-            if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            # Scrub Hermes secrets from the child env (sibling path to #56332 /
+            # _run_command_stt — this local-whisper path previously inherited
+            # the full process environment).
+            from tools.environments.local import hermes_subprocess_env
 
+            child_env = hermes_subprocess_env(inherit_credentials=False)
+            subprocess.run(
+                shlex.split(command),
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+                env=child_env,
+                creationflags=windows_hide_flags(),
+            )
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
@@ -2210,26 +2212,16 @@ def _transcribe_groq(
                 # request stays byte-identical to today's.
                 create_kwargs["prompt"] = prompt
             with open(file_path, "rb") as audio_file:
-                try:
-                    transcription = client.audio.transcriptions.create(
-                        model=model_name,
-                        file=audio_file,
-                        response_format="verbose_json",
-                    )
-                except Exception:
-                    audio_file.seek(0)
-                    transcription = client.audio.transcriptions.create(
-                        model=model_name,
-                        file=audio_file,
-                        response_format="text",
-                    )
+                transcription = client.audio.transcriptions.create(
+                    file=audio_file,
+                    **create_kwargs,
+                )
 
-            transcript_text = _extract_transcript_text(transcription)
-            segments = _extract_transcript_segments(transcription)
-            logger.info("Transcribed %s via Groq API (%s, %d chars)",
-                         Path(file_path).name, model_name, len(transcript_text))
+            transcript_text = str(transcription).strip()
+            logger.info("Transcribed %s via Groq API (%s, lang=%s, %d chars)",
+                         Path(file_path).name, model_name, language or "auto", len(transcript_text))
 
-            return {"success": True, "transcript": transcript_text, "provider": "groq", "segments": segments}
+            return {"success": True, "transcript": transcript_text, "provider": "groq"}
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -3375,39 +3367,6 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
         f"{managed_gateway.gateway_origin.rstrip('/')}/", "v1"
     )
 
-
-
-
-def _extract_transcript_segments(transcription: Any) -> list[dict[str, Any]]:
-    """Normalize provider segment/word timing payloads to simple dicts."""
-    raw_segments = None
-    if isinstance(transcription, dict):
-        raw_segments = transcription.get("segments") or transcription.get("words")
-    elif hasattr(transcription, "segments"):
-        raw_segments = getattr(transcription, "segments")
-    elif hasattr(transcription, "words"):
-        raw_segments = getattr(transcription, "words")
-
-    if not raw_segments:
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    for item in raw_segments:
-        if isinstance(item, dict):
-            text = item.get("text") or item.get("word") or ""
-            start = item.get("start")
-            end = item.get("end")
-            speaker = item.get("speaker") or item.get("speaker_id")
-        else:
-            text = getattr(item, "text", None) or getattr(item, "word", "")
-            start = getattr(item, "start", None)
-            end = getattr(item, "end", None)
-            speaker = getattr(item, "speaker", None) or getattr(item, "speaker_id", None)
-        text = str(text or "").strip()
-        if not text:
-            continue
-        normalized.append({"start": start, "end": end, "text": text, "speaker": speaker})
-    return normalized
 
 def _extract_transcript_text(transcription: Any) -> str:
     """Normalize text and JSON transcription responses to a plain string."""

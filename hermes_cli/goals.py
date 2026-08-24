@@ -42,11 +42,6 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_cli.goal_policies import (
-    evaluate_structured_completion_guard,
-    is_structured_handoff_reason,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -76,8 +71,10 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # exhausted with every reply shaped like `judge returned empty response` or
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
-# Persistent API/auth/network failures indicate a broken judge configuration,
-# so stop the loop before it consumes the entire turn budget.
+# Transport failures (API auth errors 401, timeouts, DNS, etc.) are also
+# tracked and auto-pause the loop after this many consecutive failures.
+# A broken/invalid API key returns 401 every call — the loop must not
+# run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
 # Quality gates: deterministic shell commands that must pass before the goal
@@ -92,20 +89,10 @@ DEFAULT_GATE_MAX_RETRIES = 3
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
-CONTINUATION_EXECUTION_POLICY = (
-    "Execution policy: keep taking every safe dependent step you can execute now in this same turn. "
-    "Do not stop after one step, a plan, a checkpoint, a local commit, a review dispatch, or a progress report. "
-    "Do not ask for approval the user already granted. Continue until the goal is verified complete or you hit "
-    "a genuine blocker that requires missing user-only input. A gateway restart or tool-turn boundary is not a "
-    "blocker: persist authoritative goal state and resume automatically after recovery."
-)
-
-
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
-    "Continue working toward this goal. "
-    + CONTINUATION_EXECUTION_POLICY + " "
+    "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
 )
@@ -119,8 +106,7 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Completion contract:\n"
     "{contract_block}\n\n"
-    "Continue working toward the outcome above. "
-    + CONTINUATION_EXECUTION_POLICY + " "
+    "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
@@ -136,9 +122,8 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
-    "Continue working toward the goal AND all additional criteria. "
-    + CONTINUATION_EXECUTION_POLICY + " "
-    "If you believe the goal and every "
+    "Continue working toward the goal AND all additional criteria. Take "
+    "the next concrete step. If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
@@ -160,8 +145,7 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "```\n\n"
     "Fix the underlying problem so this gate passes, then re-run it to "
     "confirm. Do not declare the goal complete while any gate fails. If the "
-    "gate itself is wrong or cannot pass, say so clearly and stop. "
-    + CONTINUATION_EXECUTION_POLICY
+    "gate itself is wrong or cannot pass, say so clearly and stop."
 )
 
 
@@ -564,7 +548,7 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
-    status: str = "active"          # active | paused | done | cleared | blocked
+    status: str = "active"          # active | paused | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
@@ -573,6 +557,9 @@ class GoalState:
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
+    # Transport failures are API/auth/network errors.  Broken API keys return
+    # 401 every call — track them separately so the loop auto-pauses instead
+    # of burning every turn budget slot on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
     # User-added criteria appended mid-loop via the /subgoal command.
     # When non-empty the judge prompt and continuation prompt both
@@ -678,12 +665,30 @@ def _meta_key(session_id: str) -> str:
 _DB_CACHE: Dict[str, Any] = {}
 _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
+
+# How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap
+# before degrading to None. Normal SessionDB init is ~10-100ms, so a call
+# that arrives mid-bootstrap usually picks the cached instance up within
+# this window. A contended init (locked state.db mid-migration) blows past
+# it and the caller degrades. The loop stalls far under the watchdog's
+# probe window.
 _DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
+
+# The call that STARTS the bootstrap (cold cache, nothing in flight)
+# waits this long instead of the short window above. A fresh state.db
+# init measures ~300ms warm on a fast machine: schema DDL, FTS table
+# creation, and the first hermes_cli.config import (journal-mode
+# resolution). It is longer on a slow CI box, and it is well past 0.25s.
+# The old window dropped the first /goal write. The response said
+# "Goal set" but nothing persisted. The longer window is a bounded
+# one-time stall. Only the kick call pays it. Every later call keeps
+# the short window, so a contended migration never stalls the loop
+# repeatedly.
 _DB_BOOTSTRAP_INIT_WAIT_S = 1.5
 
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
-    """Construct SessionDB off-loop and populate the scoped cache."""
+    """Construct SessionDB off-loop and populate the cache (worker thread)."""
     try:
         from hermes_constants import (
             reset_hermes_home_override,
@@ -691,6 +696,12 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
         )
         from hermes_state import SessionDB
 
+        # Bind the caller's home for this thread. The cache key is the
+        # caller's scoped home, so the constructed SessionDB must point at
+        # that home's state.db too. Without the override, a multiplexed
+        # worker thread resolves the process env (the default profile's
+        # HERMES_HOME). It then caches the wrong profile's DB under this
+        # profile's key.
         token = set_hermes_home_override(home)
         try:
             db = SessionDB()
@@ -704,7 +715,6 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
             _DB_CACHE[home] = db
         _DB_BOOTSTRAP_INFLIGHT.pop(home, None)
     done.set()
-_MIGRATABLE_GOAL_STATUSES = {"active", "paused", "blocked"}
 
 
 def _get_session_db() -> Optional[Any]:
@@ -801,11 +811,27 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
-def _load_goal_exact(session_id: str, db: Optional[Any] = None) -> Optional[GoalState]:
-    """Load only ``goal:<session_id>`` without compression-lineage fallback."""
+def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
+    """Log a dropped state write at WARNING.
+
+    The reply already told the user that the state was set. A silent
+    drop makes that reply a lie. One shared message keeps the goal,
+    loop, and heartbeat logs greppable as one bug class.
+    """
+    logger.warning(
+        "%s: %s for %s not persisted — session DB unavailable "
+        "(bootstrap window exceeded, in-memory state still active)",
+        manager,
+        kind,
+        session_id,
+    )
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
-    db = db or _get_session_db()
+    db = _get_session_db()
     if db is None:
         return None
     try:
@@ -820,193 +846,6 @@ def _load_goal_exact(session_id: str, db: Optional[Any] = None) -> Optional[Goal
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
-
-
-def load_goal_exact_strict(session_id: str) -> Optional[GoalState]:
-    """Read one goal row without suppressing storage or parse failures.
-
-    Most legacy goal lifecycle operations remain best-effort. The gateway's
-    latest-user scope gate uses this strict variant before and after pausing so
-    an in-memory state change can never masquerade as a persisted pause.
-    """
-    if not session_id:
-        raise RuntimeError("strict goal load requires a session id")
-    db = _get_session_db()
-    if db is None:
-        raise RuntimeError("goal storage is unavailable")
-    raw = db.get_meta(_meta_key(session_id))
-    if not raw:
-        return None
-    return GoalState.from_json(raw)
-
-
-def _session_row(db: Any, session_id: str) -> Optional[Dict[str, Any]]:
-    """Best-effort direct read of the sessions row for compression lineage."""
-    try:
-        with db._lock:  # noqa: SLF001 - SessionDB exposes no narrow helper here.
-            row = db._conn.execute(  # noqa: SLF001
-                "SELECT id, parent_session_id, end_reason FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-    except Exception as exc:
-        logger.debug("GoalManager: session row lookup failed for %s: %s", session_id, exc)
-        return None
-    if row is None:
-        return None
-    try:
-        return dict(row)
-    except Exception:
-        return {
-            "id": row[0],
-            "parent_session_id": row[1],
-            "end_reason": row[2],
-        }
-
-
-def _compression_child_session_ids(db: Any, parent_session_id: str) -> List[str]:
-    """Return direct compression children for a session, best-effort."""
-    if not parent_session_id:
-        return []
-    try:
-        with db._lock:  # noqa: SLF001 - no public child-session helper.
-            rows = db._conn.execute(  # noqa: SLF001
-                "SELECT id FROM sessions WHERE parent_session_id = ?",
-                (parent_session_id,),
-            ).fetchall()
-    except Exception as exc:
-        logger.debug(
-            "GoalManager: compression child lookup failed for %s: %s",
-            parent_session_id,
-            exc,
-        )
-        return []
-    ids: List[str] = []
-    for row in rows or []:
-        try:
-            value = row["id"]
-        except Exception:
-            value = row[0] if row else ""
-        if value:
-            ids.append(str(value))
-    return ids
-
-
-def _clear_parent_goal_if_migrated_to_child(
-    session_id: str,
-    state: GoalState,
-    db: Any,
-) -> GoalState:
-    """Heal a stale parent goal row after compression migration.
-
-    The normal migration path copies parent -> child and marks the parent
-    cleared.  In tests and crashy real processes there may be two open DB
-    handles during the handoff; if the child already has the copied goal but
-    the parent row is still active, clear the parent lazily so future startup
-    recovery never sees two active goals for one compression lineage.
-    """
-    if state.status not in _MIGRATABLE_GOAL_STATUSES:
-        return state
-    row = _session_row(db, session_id)
-    if (row or {}).get("end_reason") != "compression":
-        return state
-    for child_id in _compression_child_session_ids(db, session_id):
-        child = _load_goal_exact(child_id, db=db)
-        if child is not None and child.status in _MIGRATABLE_GOAL_STATUSES:
-            if child.goal == state.goal:
-                state.status = "cleared"
-                state.last_reason = f"migrated to {child_id} after context compression"
-                save_goal(session_id, state)
-                return state
-    return state
-
-
-def migrate_goal_to_session(
-    old_session_id: str,
-    new_session_id: str,
-    *,
-    reason: str = "",
-) -> bool:
-    """Move an active goal across a context-compression session split.
-
-    Session compression rotates the transcript from parent -> child while the
-    user's standing goal is stored separately in ``state_meta`` under
-    ``goal:<session_id>``. Without migrating that key, the next gateway turn
-    lands in the compressed child and the official /goal loop silently stops.
-
-    Returns True when a migratable goal was copied to the new session. The old
-    key is marked ``cleared`` after the copy so stale continuations tied to the
-    parent cannot keep running in the wrong session.
-    """
-    old_session_id = str(old_session_id or "")
-    new_session_id = str(new_session_id or "")
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    db = _get_session_db()
-    if db is None:
-        return False
-
-    state = _load_goal_exact(old_session_id, db=db)
-    if state is None or state.status not in _MIGRATABLE_GOAL_STATUSES:
-        return False
-    existing = _load_goal_exact(new_session_id, db=db)
-    if existing is not None and existing.status != "cleared":
-        return False
-
-    # Copy by JSON round-trip so mutating the old row below cannot alter the
-    # child state object we just saved.
-    migrated = GoalState.from_json(state.to_json())
-    save_goal(new_session_id, migrated)
-
-    state.status = "cleared"
-    state.last_reason = f"migrated to {new_session_id} after context compression"
-    save_goal(old_session_id, state)
-    logger.info(
-        "GoalManager: migrated goal %s -> %s (%s)",
-        old_session_id,
-        new_session_id,
-        reason or "compression",
-    )
-    return True
-
-
-def _migrate_goal_from_compression_ancestor(session_id: str, db: Any) -> Optional[GoalState]:
-    """If ``session_id`` is a compression child, inherit the nearest active goal."""
-    current = str(session_id or "")
-    seen = {current}
-    for _ in range(32):
-        row = _session_row(db, current)
-        parent_id = str((row or {}).get("parent_session_id") or "")
-        if not parent_id or parent_id in seen:
-            return None
-        parent_row = _session_row(db, parent_id)
-        # Only inherit across real context-compression splits. Branch/resume/new
-        # sessions must not accidentally pick up a stale goal from a parent.
-        if (parent_row or {}).get("end_reason") != "compression":
-            return None
-        parent_goal = _load_goal_exact(parent_id, db=db)
-        if parent_goal is not None and parent_goal.status in _MIGRATABLE_GOAL_STATUSES:
-            if migrate_goal_to_session(parent_id, session_id):
-                return _load_goal_exact(session_id, db=db)
-            return None
-        seen.add(parent_id)
-        current = parent_id
-    return None
-
-
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, following compression lineage if needed."""
-    state = _load_goal_exact(session_id)
-    if state is not None:
-        db = _get_session_db()
-        if db is not None:
-            state = _clear_parent_goal_if_migrated_to_child(session_id, state, db)
-        return state
-    if not session_id:
-        return None
-    db = _get_session_db()
-    if db is None:
-        return None
-    return _migrate_goal_from_compression_ancestor(session_id, db)
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
@@ -1030,6 +869,44 @@ def clear_goal(session_id: str) -> None:
         return
     state.status = "cleared"
     save_goal(session_id, state)
+
+
+def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+    """Carry a persistent /goal from a parent session to its continuation.
+
+    Context compression rotates ``session_id`` to a fresh child session,
+    but ``load_goal`` does a flat ``goal:<session_id>`` lookup with no
+    parent-lineage walk — so an active goal silently dies at the
+    compaction boundary (#33618). Copy the goal onto the new session and
+    archive the old row as ``cleared`` so exactly one active goal row
+    exists per logical conversation (avoids the "two active goals"
+    hazard of a pure copy).
+
+    Returns True when a goal was migrated, False when there was nothing
+    to migrate or the DB was unavailable. Best-effort and never raises —
+    a failure here must not block compression.
+    """
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return False
+    try:
+        state = load_goal(old_session_id)
+        if state is None or getattr(state, "status", None) == "cleared":
+            return False
+        # Don't clobber a goal already set on the child (e.g. a resumed
+        # lineage that re-established its own goal).
+        if load_goal(new_session_id) is not None:
+            return False
+        save_goal(new_session_id, state)
+        # Archive the parent's row so it isn't double-counted as active.
+        clear_goal(old_session_id)
+        logger.debug(
+            "GoalManager: migrated goal %s -> %s (%s)",
+            old_session_id, new_session_id, reason or "rotation",
+        )
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GoalManager: goal migration failed: %s", exc)
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1089,11 +966,6 @@ def _session_waiting(session_id: str) -> bool:
         return bool(process_registry.is_session_waiting(session_id))
     except Exception:
         return False
-
-
-# Structured completion marker/blocker policy lives in
-# hermes_cli.goal_policies so GoalManager can remain the engine while the
-# deterministic pre-judge contract stays testable and gateway-free.
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -1312,7 +1184,13 @@ def judge_goal(
 
     ``parse_failed`` is True only when the judge call succeeded but its output
     was unusable (empty or non-JSON). API/transport errors return False — they
-    are transient and should fail-open silently. Callers use this flag to
+    are transient and should fail-open silently.
+
+    ``transport_failed`` is True only when the judge couldn't reach the API at
+    all (auth 401, timeout, DNS, connection error).  Repeated transport
+    failures signal a permanent config problem (e.g. invalid API key).  Callers
+    use this flag to auto-pause after N consecutive transport failures (see
+    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``). Callers use this flag to
     auto-pause after N consecutive parse failures (see
     ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``).
 
@@ -1328,9 +1206,11 @@ def judge_goal(
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
 
-    This is deliberately fail-open: any error returns ``("continue", ..., False, None)``
-    so a broken judge doesn't wedge progress — the turn budget and the
-    consecutive-parse-failures auto-pause are the backstops.
+    This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
+    — the ``transport_failed=True`` flag lets callers track and auto-pause after
+    N consecutive transport failures (see
+    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
+    judge doesn't burn the entire turn budget.
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
@@ -1341,16 +1221,6 @@ def judge_goal(
         # The declared default for this path is the config key, not the
         # module constant — see _goal_judge_timeout (#91022).
         timeout = _goal_judge_timeout()
-
-    structured_decision = evaluate_structured_completion_guard(goal, last_response)
-    if structured_decision is not None:
-        clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
-        # User-added subgoals are extra completion criteria.  A deterministic
-        # SuperGoal terminal marker proves the base goal contract, but it cannot
-        # prove arbitrary later /subgoal text.  Let the subgoal-aware judge make
-        # the final call instead of silently bypassing those criteria.
-        if structured_decision.verdict != "done" or not clean_subgoals:
-            return structured_decision.verdict, structured_decision.reason, False, None, False
 
     try:
         from agent.auxiliary_client import call_llm
@@ -1401,6 +1271,9 @@ def judge_goal(
         )
 
     try:
+        # Route through call_llm so auxiliary.goal_judge.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566).
         resp = call_llm(
             task="goal_judge",
             messages=[
@@ -1429,15 +1302,10 @@ def judge_goal(
     return verdict, reason, parse_failed, wait_directive, False
 
 
-def gather_background_processes(
-    task_id: Optional[str] = None,
-    session_key: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return the live background-process snapshot for the goal judge.
 
-    Thin, fail-safe wrapper over ``process_registry.list_sessions``. Gateway
-    callers pass a session key so one chat cannot park its goal on another
-    chat's process.
+    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
     Returns only RUNNING processes (an exited one is nothing to wait on) and
     never raises — any import/registry failure yields ``[]`` so the goal loop
     degrades to its pre-wait-barrier behavior (judge just won't see processes).
@@ -1447,91 +1315,11 @@ def gather_background_processes(
     try:
         from tools.process_registry import process_registry
 
-        sessions = process_registry.list_sessions(
-            task_id=task_id,
-            session_key=session_key,
-        ) or []
+        sessions = process_registry.list_sessions(task_id=task_id) or []
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []
-    result: List[Dict[str, Any]] = []
-    for process in sessions:
-        if not isinstance(process, dict) or process.get("status") == "exited":
-            continue
-        owned = dict(process)
-        if session_key:
-            # Internal provenance for the post-judge live reread. The judge
-            # renderer ignores unknown/private fields, so raw routing identity
-            # never enters the model prompt.
-            owned["_hermes_owner_session_key"] = session_key
-        result.append(owned)
-    return result
-
-
-def _registered_process_callback_is_live(
-    wait_directive: Dict[str, Any],
-    background_processes: Optional[List[Dict[str, Any]]],
-) -> bool:
-    """Require an exact, still-running process with a real wake callback.
-
-    The supplied snapshot is session-scoped by the gateway, but it may become
-    stale while the judge call is in flight. Re-read the process registry and
-    require ``notify_on_complete`` or active ``watch_patterns`` before parking.
-    """
-
-    wait_session = str(wait_directive.get("session_id") or "")
-    wait_pid = wait_directive.get("pid")
-
-    def matches(process: Dict[str, Any]) -> bool:
-        status = str(process.get("status") or "").lower()
-        if status not in {"running", "active"}:
-            return False
-        has_pending_watch = bool(process.get("watch_patterns")) and not bool(
-            process.get("watch_hit")
-        )
-        has_wake = bool(process.get("notify_on_complete")) or has_pending_watch
-        if not has_wake:
-            return False
-        if wait_session and str(process.get("session_id") or "") == wait_session:
-            return True
-        if wait_pid is None or process.get("pid") is None:
-            return False
-        try:
-            return int(process["pid"]) == int(wait_pid)
-        except (TypeError, ValueError):
-            return False
-
-    if not any(
-        matches(process)
-        for process in background_processes or []
-        if isinstance(process, dict)
-    ):
-        return False
-
-    owners = {
-        str(process.get("_hermes_owner_session_key") or "")
-        for process in background_processes or []
-        if isinstance(process, dict)
-        and str(process.get("_hermes_owner_session_key") or "")
-    }
-    if len(owners) != 1:
-        return False
-    owner_session_key = next(iter(owners))
-
-    try:
-        from tools.process_registry import process_registry
-
-        live_processes = process_registry.list_sessions(
-            session_key=owner_session_key,
-        ) or []
-    except Exception as exc:
-        logger.debug("process callback revalidation failed: %s", exc)
-        return False
-    return any(
-        matches(process)
-        for process in live_processes
-        if isinstance(process, dict)
-    )
+    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
 def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
@@ -1558,6 +1346,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
         return None
 
     try:
+        # Route through call_llm — same #35566 fix as the judge call above.
         resp = call_llm(
             task="goal_judge",
             messages=[
@@ -1646,7 +1435,6 @@ class GoalManager:
         return self._state
 
     def is_active(self) -> bool:
-        self.reconcile_structured_completion_from_state()
         return self._state is not None and self._state.status == "active"
 
     def has_goal(self) -> bool:
@@ -1679,10 +1467,6 @@ class GoalManager:
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
-        if s.status == "blocked":
-            extra = f" — {s.last_reason}" if s.last_reason else ""
-            return f"⏸ Goal blocked ({meta}{extra}): {s.goal}"
-
         if s.status == "done":
             return f"✓ Goal done ({meta}): {s.goal}"
         return f"Goal ({s.status}, {meta}): {s.goal}"
@@ -1754,10 +1538,6 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         self._state = None
 
-    def _reload_state(self) -> Optional[GoalState]:
-        self._state = load_goal(self.session_id)
-        return self._state
-
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
@@ -1765,39 +1545,6 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
-
-    def reconcile_structured_completion_from_state(self) -> Optional[Dict[str, Any]]:
-        """Close active structured goals whose disk state is already terminal.
-
-        SuperGoal wrappers can survive a restart or a weak final response even
-        after the package's own ``.supergoal/STATE.md`` records completion. In
-        that case generating another continuation prompt is a control-plane bug,
-        so reconcile persisted GoalManager state before prompting the LLM again.
-        """
-        state = self._reload_state()
-        if state is None or state.status != "active" or state.subgoals:
-            return None
-        decision = evaluate_structured_completion_guard(state.goal, "")
-        if decision is None or decision.verdict != "done":
-            return None
-        is_handoff = is_structured_handoff_reason(decision.reason)
-        state.status = "blocked" if is_handoff else "done"
-        state.last_verdict = "done"
-        state.last_reason = decision.reason
-        state.last_turn_at = time.time()
-        save_goal(self.session_id, state)
-        return {
-            "status": state.status,
-            "should_continue": False,
-            "continuation_prompt": None,
-            "verdict": "done",
-            "reason": decision.reason,
-            "message": (
-                f"⏸ Goal stopped: {decision.reason}"
-                if is_handoff
-                else f"✓ Goal achieved: {decision.reason}"
-            ),
-        }
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -2119,10 +1866,6 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
-        technical_boundary: Optional[str] = None,
-        defer_budget_pause: bool = False,
-        ignore_wait_barrier: bool = False,
-        durable_resume_scheduled: bool = False,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -2135,29 +1878,6 @@ class GoalManager:
         to WAIT on an in-flight process (CI poller, build, ...) instead of
         re-poking the agent — the automatic counterpart to ``/goal wait``.
 
-        ``technical_boundary`` identifies a deterministic per-turn runtime
-        boundary such as ``max_iterations_reached(...)``.  It is a checkpoint,
-        not evidence that the standing goal is done, so this path bypasses the
-        semantic judge and schedules a fresh cycle while still consuming one
-        goal turn from the configured budget.
-
-        ``defer_budget_pause`` is used while reconciling a queued drain chain.
-        Earlier outcomes still consume turns, but budget enforcement waits for
-        the final already-completed outcome so a later semantic completion is
-        not masked by an earlier technical checkpoint.
-
-        ``ignore_wait_barrier`` is used only for a later outcome that already
-        completed after an earlier outcome in the same drain chain set WAIT.
-        It clears that newly-created barrier so the later evidence is still
-        counted and judged; a barrier that predates the chain remains binding.
-
-        ``durable_resume_scheduled`` is a fail-closed parking gate for waits
-        that have no registered process callback. A live process/session from
-        ``background_processes`` is already owned by the process registry and
-        will emit its completion callback, so it may park without forcing the
-        caller to create a goal-specific cron. Bare deadlines still require a
-        durable resume schedule.
-
         Decision keys:
           - ``status``: current goal status after update
           - ``should_continue``: bool — caller should fire another turn
@@ -2166,7 +1886,7 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
-        state = self._reload_state()
+        state = self._state
         if state is None or state.status != "active":
             return {
                 "status": state.status if state else None,
@@ -2180,10 +1900,7 @@ class GoalManager:
         # Wait barrier: if the loop is parked (on a live process OR a time
         # deadline that hasn't passed), quiesce — do NOT burn a turn or call
         # the judge. Resumes automatically once the barrier clears.
-        if self.is_waiting() and ignore_wait_barrier:
-            self.stop_waiting()
-            state = self._state
-        elif self.is_waiting():
+        if self.is_waiting():
             if state.waiting_on_session is not None:
                 tgt = f"session {state.waiting_on_session}"
             elif state.waiting_on_pid is not None:
@@ -2201,80 +1918,41 @@ class GoalManager:
                 "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
             }
 
-        reconciled = self.reconcile_structured_completion_from_state()
-        if reconciled is not None:
-            return reconciled
-        state = self._state
-        if state is None or state.status != "active":
-            return {
-                "status": state.status if state else None,
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "inactive",
-                "reason": "no active goal",
-                "message": "",
-            }
-
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
 
-        if technical_boundary:
-            boundary = str(technical_boundary).strip()[:200]
-            reason = (
-                f"technical iteration limit reached ({boundary}); "
-                "starting a fresh goal cycle automatically"
-            )
-            state.last_verdict = "continue"
-            state.last_reason = reason
-            state.consecutive_parse_failures = 0
-
-            if state.turns_used >= state.max_turns and not defer_budget_pause:
+        # Quality gates run BEFORE the LLM judge: a failing gate is
+        # deterministic evidence the goal is not done, so the judge call is
+        # skipped entirely and the gate's output drives the next turn. Gate
+        # continuations respect the same turn budget as judge continuations.
+        gate_decision = self._check_gates()
+        if gate_decision is not None:
+            if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
-                state.paused_reason = (
-                    f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                )
+                state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
                 save_goal(self.session_id, state)
                 return {
                     "status": "paused",
                     "should_continue": False,
                     "continuation_prompt": None,
-                    "verdict": "continue",
-                    "reason": reason,
+                    "verdict": "gate_failed",
+                    "reason": gate_decision.get("reason", ""),
                     "message": (
-                        f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
+                        f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used "
+                        f"(a quality gate is still failing). "
                         "Use /goal resume to keep going, or /goal clear to stop."
                     ),
                 }
+            return gate_decision
 
-            save_goal(self.session_id, state)
-            return {
-                "status": "active",
-                "should_continue": True,
-                "continuation_prompt": self.next_continuation_prompt(),
-                "verdict": "continue",
-                "reason": reason,
-                "message": (
-                    f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
-                ),
-            }
-
-        judge_result = judge_goal(
+        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,
             last_response,
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
         )
-        if len(judge_result) == 3:
-            verdict, reason, parse_failed = judge_result
-            wait_directive = None
-            transport_failed = False
-        elif len(judge_result) == 4:
-            verdict, reason, parse_failed, wait_directive = judge_result
-            transport_failed = False
-        else:
-            verdict, reason, parse_failed, wait_directive, transport_failed = judge_result
         state.last_verdict = verdict
         state.last_reason = reason
 
@@ -2286,38 +1964,22 @@ class GoalManager:
         else:
             state.consecutive_parse_failures = 0
 
+        # Track consecutive transport failures separately — persistent API
+        # errors (401 auth, DNS, timeout) signal a broken config, not
+        # transient network flakiness.  Auto-pause after N consecutive
+        # transport failures so a permanently broken judge doesn't burn
+        # every turn budget slot on an unreachable API.
         if transport_failed:
             state.consecutive_transport_failures += 1
         else:
             state.consecutive_transport_failures = 0
 
-        # A registered process/session is already coupled to the process
-        # registry's completion notification path, so it can park the goal
-        # without manufacturing a recurring cron.  Match the judge directive
-        # against the live registry snapshot; arbitrary PIDs/session IDs and
-        # bare time delays still fail closed unless a durable resume exists.
-        registered_process_wait = False
-        if verdict == "wait" and wait_directive:
-            registered_process_wait = _registered_process_callback_is_live(
-                wait_directive,
-                background_processes,
-            )
-
-        if (
-            verdict == "wait"
-            and wait_directive
-            and not durable_resume_scheduled
-            and not registered_process_wait
-        ):
-            reason = (
-                f"{reason}; WAIT rejected because no verified durable resume cron "
-                "or registered process callback was available for this exact goal"
-            )
-            verdict = "continue"
-            wait_directive = None
-            state.last_verdict = verdict
-            state.last_reason = reason
-
+        # WAIT verdict: the judge decided the agent is blocked on async work
+        # and re-poking now would be busy-work. Set the barrier and park —
+        # the turn we just counted stands (the judge call happened), but no
+        # continuation fires. The loop resumes automatically when the pid
+        # exits or the deadline passes (next evaluate_after_turn falls through
+        # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
             if wait_directive.get("session_id"):
                 self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
@@ -2338,18 +2000,8 @@ class GoalManager:
             }
 
         if verdict == "done":
-            is_handoff = is_structured_handoff_reason(reason)
-            state.status = "blocked" if is_handoff else "done"
+            state.status = "done"
             save_goal(self.session_id, state)
-            if is_handoff:
-                return {
-                    "status": "blocked",
-                    "should_continue": False,
-                    "continuation_prompt": None,
-                    "verdict": "done",
-                    "reason": reason,
-                    "message": f"⏸ Goal stopped: {reason}",
-                }
             return {
                 "status": "done",
                 "should_continue": False,
@@ -2359,6 +2011,11 @@ class GoalManager:
                 "message": f"✓ Goal achieved: {reason}",
             }
 
+        # Auto-pause when the judge cannot reach the API at all N turns in a
+        # row (401 auth, DNS failure, timeout).  Persistent transport failures
+        # signal a broken configuration (e.g. invalid API key), not transient
+        # flakiness.  Without this guard, a permanently broken judge burns
+        # every turn budget slot on an unreachable API.
         if state.consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
             state.status = "paused"
             state.paused_reason = (
@@ -2375,8 +2032,12 @@ class GoalManager:
                 "message": (
                     f"⏸ Goal paused — judge API returned errors "
                     f"({state.consecutive_transport_failures} turns). "
-                    "Check the goal_judge provider/key in ~/.hermes/config.yaml, "
-                    "then /goal resume to continue."
+                    "Check the goal_judge provider/key in ~/.hermes/config.yaml:\n"
+                    "  auxiliary:\n"
+                    "    goal_judge:\n"
+                    "      provider: deepseek\n"
+                    "      model: deepseek-v4-flash\n"
+                    "Then /goal resume to continue."
                 ),
             }
 
@@ -2410,7 +2071,7 @@ class GoalManager:
                 ),
             }
 
-        if state.turns_used >= state.max_turns and not defer_budget_pause:
+        if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
             save_goal(self.session_id, state)
@@ -2441,9 +2102,6 @@ class GoalManager:
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
-        if self.reconcile_structured_completion_from_state() is not None:
-            return None
-
         # Contract takes priority: it carries the verification surface and
         # constraints the agent must target. Subgoals fold in as extra
         # criteria appended to the contract block.
@@ -2459,7 +2117,6 @@ class GoalManager:
                 goal=self._state.goal,
                 contract_block=contract_block,
             )
-
         if self._state.subgoals:
             return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
@@ -2596,7 +2253,7 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")

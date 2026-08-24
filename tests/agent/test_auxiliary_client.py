@@ -1556,24 +1556,6 @@ class TestCallLlmPaymentFallback:
         exc.status_code = 429
         return exc
 
-    def test_non_compression_server_error_not_caught(self, monkeypatch):
-        """Generic 5xx fallback stays scoped to critical compression calls."""
-        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-
-        primary_client = MagicMock()
-        server_err = Exception("Internal Server Error")
-        server_err.status_code = 500
-        primary_client.chat.completions.create.side_effect = server_err
-
-        with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
-             patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
-            with pytest.raises(Exception, match="Internal Server Error"):
-                call_llm(
-                    task="title_generation",
-                    messages=[{"role": "user", "content": "hello"}],
-                )
 
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
@@ -1733,213 +1715,13 @@ class TestStaleFallbackCandidateSkip:
 
         assert result.choices[0].message.content == "openrouter-serves"
         assert mock_fb.call_count == 2
-        assert mock_fb.call_args_list[1].kwargs.get("reason") == "failed fallback candidate"
+        assert mock_fb.call_args_list[1].kwargs.get("reason") == "stale fallback credential"
         mock_mark.assert_called_once_with("anthropic")
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
-    def test_compression_fallback_503_skips_to_independent_candidate(self):
-        """A configured compression fallback can fail too.
-
-        Live case (Chip, Jul 28 2026): mmfast exhausted with
-        ``forced_litellm_route_unavailable``, Hermes correctly advanced to the
-        configured GLM fallback, but that route returned the same 503 and
-        escaped from the fallback helper.  The independent next candidate must
-        still get a chance to serve the summary.
-        """
-        class _Err503(Exception):
-            status_code = 503
-
-        primary_client = MagicMock()
-        primary_client.base_url = "http://127.0.0.1:18750/v1"
-        primary_client.chat.completions.create.side_effect = _Err503(
-            "forced_litellm_route_unavailable"
-        )
-
-        broken_glm = MagicMock()
-        broken_glm.base_url = "http://127.0.0.1:18750/v1"
-        broken_glm.chat.completions.create.side_effect = _Err503(
-            "forced_litellm_route_unavailable"
-        )
-
-        independent_fb = MagicMock()
-        independent_fb.base_url = "https://chatgpt.com/backend-api/codex"
-        independent_fb.chat.completions.create.return_value = _DummyResponse(
-            "independent-fallback"
-        )
-
-        with patch("agent.auxiliary_client._resolve_task_provider_model",
-                   return_value=("human20-keys", "mmfast", None, None, None)), \
-             patch("agent.auxiliary_client._get_cached_client",
-                   return_value=(primary_client, "mmfast")), \
-             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(broken_glm, "glm", "fallback_chain[0](human20-keys-glm)")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(independent_fb, "gpt-5.5", "main-agent(openai-codex)")) as next_fb:
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "summarize"}],
-            )
-
-        assert result.choices[0].message.content == "independent-fallback"
-        broken_glm.chat.completions.create.assert_called_once()
-        next_fb.assert_called_once_with(
-            "human20-keys", "compression", reason="failed fallback candidate"
-        )
-        independent_fb.chat.completions.create.assert_called_once()
-
-    def test_compression_main_fallback_transport_failure_reaches_discovery(self):
-        """Configured fallback and main model can both fail transiently.
-
-        The explicit-provider path must still reach generic discovery instead
-        of declaring every fallback exhausted after the main candidate alone.
-        """
-        class _Err503(Exception):
-            status_code = 503
-
-        primary_client = MagicMock()
-        primary_client.base_url = "http://127.0.0.1:18750/v1"
-        primary_client.chat.completions.create.side_effect = _Err503(
-            "forced_litellm_route_unavailable"
-        )
-
-        broken_glm = MagicMock()
-        broken_glm.base_url = "http://127.0.0.1:18750/v1"
-        broken_glm.chat.completions.create.side_effect = _Err503(
-            "forced_litellm_route_unavailable"
-        )
-
-        broken_main = MagicMock()
-        broken_main.base_url = "https://chatgpt.com/backend-api/codex"
-        broken_main.chat.completions.create.side_effect = RuntimeError(
-            "peer closed connection without sending complete message body "
-            "(incomplete chunked read)"
-        )
-
-        discovery_fb = MagicMock()
-        discovery_fb.base_url = "https://openrouter.ai/api/v1"
-        discovery_fb.chat.completions.create.return_value = _DummyResponse(
-            "discovery-fallback"
-        )
-
-        with patch("agent.auxiliary_client._resolve_task_provider_model",
-                   return_value=("human20-keys", "mmfast", None, None, None)), \
-             patch("agent.auxiliary_client._get_cached_client",
-                   return_value=(primary_client, "mmfast")), \
-             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(broken_glm, "glm", "fallback_chain[0](human20-keys-glm)")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(broken_main, "gpt-5.6-sol", "main-agent(openai-codex)")), \
-             patch("agent.auxiliary_client._try_payment_fallback",
-                   return_value=(discovery_fb, "fallback-model", "openrouter")) as discovery:
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "summarize"}],
-            )
-
-        assert result.choices[0].message.content == "discovery-fallback"
-        discovery.assert_called_once_with(
-            "openai-codex", "compression",
-            reason="failed main-agent fallback candidate",
-        )
-        discovery_fb.chat.completions.create.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_async_compression_main_fallback_failure_reaches_discovery(self):
-        """The async explicit-provider path reaches the same third layer."""
-        class _Err503(Exception):
-            status_code = 503
-
-        primary = MagicMock()
-        primary.base_url = "http://127.0.0.1:18750/v1"
-        primary.chat.completions.create = AsyncMock(
-            side_effect=_Err503("forced_litellm_route_unavailable")
-        )
-
-        glm_sync, main_sync, discovery_sync = MagicMock(), MagicMock(), MagicMock()
-        glm_sync.base_url = "http://127.0.0.1:18750/v1"
-        main_sync.base_url = "https://chatgpt.com/backend-api/codex"
-        discovery_sync.base_url = "https://openrouter.ai/api/v1"
-
-        glm_async, main_async, discovery_async = MagicMock(), MagicMock(), MagicMock()
-        glm_async.base_url = glm_sync.base_url
-        main_async.base_url = main_sync.base_url
-        discovery_async.base_url = discovery_sync.base_url
-        glm_async.chat.completions.create = AsyncMock(
-            side_effect=_Err503("forced_litellm_route_unavailable")
-        )
-        main_async.chat.completions.create = AsyncMock(
-            side_effect=RuntimeError("incomplete chunked read")
-        )
-        discovery_async.chat.completions.create = AsyncMock(
-            return_value=_DummyResponse("async-discovery-fallback")
-        )
-
-        async_clients = {
-            id(glm_sync): (glm_async, "glm"),
-            id(main_sync): (main_async, "gpt-5.6-sol"),
-            id(discovery_sync): (discovery_async, "fallback-model"),
-        }
-
-        with patch("agent.auxiliary_client._resolve_task_provider_model",
-                   return_value=("human20-keys", "mmfast", None, None, None)), \
-             patch("agent.auxiliary_client._get_cached_client",
-                   return_value=(primary, "mmfast")), \
-             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
-             patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(glm_sync, "glm", "fallback_chain[0](human20-keys-glm)")), \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(main_sync, "gpt-5.6-sol", "main-agent(openai-codex)")), \
-             patch("agent.auxiliary_client._try_payment_fallback",
-                   return_value=(discovery_sync, "fallback-model", "openrouter")) as discovery, \
-             patch("agent.auxiliary_client._to_async_client",
-                   side_effect=lambda client, model, **_: async_clients[id(client)]):
-            result = await async_call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "summarize"}],
-            )
-
-        assert result.choices[0].message.content == "async-discovery-fallback"
-        discovery.assert_called_once_with(
-            "openai-codex", "compression",
-            reason="failed main-agent fallback candidate",
-        )
-        discovery_async.chat.completions.create.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_async_compression_fallback_503_is_skippable(self):
-        """The async fallback helper mirrors the sync 5xx recovery rule."""
-        from agent.auxiliary_client import _call_fallback_candidate_async
-
-        class _Err503(Exception):
-            status_code = 503
-
-        broken_fb = MagicMock()
-        broken_fb.base_url = "http://127.0.0.1:18750/v1"
-        broken_fb.chat.completions.create = AsyncMock(
-            side_effect=_Err503("forced_litellm_route_unavailable")
-        )
-
-        result = await _call_fallback_candidate_async(
-            broken_fb,
-            "glm",
-            "fallback_chain[0](human20-keys-glm)",
-            task="compression",
-            messages=[{"role": "user", "content": "summarize"}],
-            temperature=0,
-            max_tokens=None,
-            tools=None,
-            effective_timeout=60,
-            effective_extra_body={},
-            reasoning_config=None,
-        )
-
-        assert result is None
-
     def test_non_auth_fallback_error_still_raises(self, monkeypatch):
-        """A non-capacity fallback error still propagates unchanged."""
+        """A non-auth error from the fallback candidate propagates unchanged."""
         primary_client = MagicMock()
         primary_client.base_url = "https://chatgpt.com/backend-api/codex"
         primary_client.chat.completions.create.side_effect = self._timeout_err()
@@ -2214,144 +1996,7 @@ class TestTransientTransportRetry:
             ),
         )
 
-    def test_retries_streaming_close_once_same_provider(self):
-        client = MagicMock()
-        client.base_url = "https://openrouter.ai/api/v1"
-        client.chat.completions.create.side_effect = [
-            Exception(
-                "peer closed connection without sending complete message body "
-                "(incomplete chunked read)"
-            ),
-            {"ok": True},
-        ]
-        p1, p2, p3 = self._patches(client)
-        with p1, p2, p3:
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-        assert result == {"ok": True}
-        assert client.chat.completions.create.call_count == 2
 
-    def test_retries_5xx_once_same_provider(self):
-        class _Err503(Exception):
-            status_code = 503
-
-        client = MagicMock()
-        client.base_url = "https://openrouter.ai/api/v1"
-        client.chat.completions.create.side_effect = [
-            _Err503("upstream"),
-            {"ok": True},
-        ]
-        p1, p2, p3 = self._patches(client)
-        with p1, p2, p3:
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-        assert result == {"ok": True}
-        assert client.chat.completions.create.call_count == 2
-
-
-
-    def test_forced_route_unavailable_skips_retry_to_compression_fallback(self):
-        """The H20 route-unavailable sentinel is a deterministic route miss.
-
-        Retrying the same route can consume the full 300-second compression
-        budget before a healthy independent fallback gets a chance. Generic
-        5xx responses still retain the bounded same-provider retry above.
-        """
-        class _Err503(Exception):
-            status_code = 503
-
-        primary = MagicMock()
-        primary.base_url = "http://127.0.0.1:18750/v1"
-        primary.chat.completions.create.side_effect = _Err503(
-            "forced_litellm_route_unavailable"
-        )
-
-        fallback = MagicMock()
-        fallback.base_url = "http://127.0.0.1:18750/v1"
-        fallback.chat.completions.create.return_value = {"model": "glm"}
-
-        p1, p2, p3 = self._patches(primary)
-        with (
-            p1, p2, p3,
-            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
-            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
-            patch(
-                "agent.auxiliary_client._try_configured_fallback_chain",
-                return_value=(
-                    fallback,
-                    "glm",
-                    "fallback_chain[0](human20-keys-glm)",
-                ),
-            ) as configured_chain,
-            patch(
-                "agent.auxiliary_client._try_main_agent_model_fallback"
-            ) as main_fallback,
-        ):
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "summarize"}],
-            )
-
-        assert result == {"model": "glm"}
-        primary.chat.completions.create.assert_called_once()
-        fallback.chat.completions.create.assert_called_once()
-        configured_chain.assert_called_once_with(
-            "compression",
-            "openrouter",
-            reason="server error",
-            failed_model="some-model",
-        )
-        main_fallback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_async_forced_route_unavailable_skips_retry_to_compression_fallback(self):
-        class _Err503(Exception):
-            status_code = 503
-
-        primary = MagicMock()
-        primary.base_url = "http://127.0.0.1:18750/v1"
-        primary.chat.completions.create = AsyncMock(
-            side_effect=_Err503("forced_litellm_route_unavailable")
-        )
-
-        fallback_sync = MagicMock()
-        fallback_sync.base_url = "http://127.0.0.1:18750/v1"
-        fallback_async = MagicMock()
-        fallback_async.base_url = fallback_sync.base_url
-        fallback_async.chat.completions.create = AsyncMock(
-            return_value={"model": "glm"}
-        )
-
-        p1, p2, p3 = self._patches(primary)
-        with (
-            p1, p2, p3,
-            patch(
-                "agent.auxiliary_client._try_configured_fallback_chain",
-                return_value=(
-                    fallback_sync,
-                    "glm",
-                    "fallback_chain[0](human20-keys-glm)",
-                ),
-            ),
-            patch(
-                "agent.auxiliary_client._to_async_client",
-                return_value=(fallback_async, "glm"),
-            ),
-            patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback,
-        ):
-            result = await async_call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "summarize"}],
-            )
-
-        assert result == {"model": "glm"}
-        primary.chat.completions.create.assert_awaited_once()
-        fallback_async.chat.completions.create.assert_awaited_once()
-        main_fallback.assert_not_called()
 
     def test_does_not_retry_non_transient_400(self):
         class _Err400(Exception):
@@ -3528,62 +3173,6 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_recovers_when_final_output_is_none(self):
-        streamed_item = SimpleNamespace(
-            type="message",
-            content=[SimpleNamespace(type="output_text", text="summary recovered")],
-        )
-        events = [
-            SimpleNamespace(type="response.output_item.done", item=streamed_item),
-            SimpleNamespace(type="response.completed", response=SimpleNamespace(
-                status="completed", id="r1", usage=None, output=None,
-            )),
-        ]
-
-        class FakeCreateStream:
-            def __iter__(self):
-                return iter(events)
-
-            def close(self):
-                pass
-
-        class FakeResponses:
-            def create(self, **kwargs):
-                return FakeCreateStream()
-
-        fake_client = SimpleNamespace(responses=FakeResponses())
-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
-
-        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
-
-        assert response.choices[0].message.content == "summary recovered"
-
-    def test_recovers_when_iterator_parser_hits_none_output(self):
-        streamed_item = SimpleNamespace(
-            type="message",
-            content=[SimpleNamespace(type="output_text", text="iterator recovered")],
-        )
-
-        class FakeCreateStream:
-            def __iter__(self):
-                yield SimpleNamespace(type="response.output_item.done", item=streamed_item)
-                # No terminal event: raw-event assembly should still return
-                # the collected output item instead of relying on SDK final output.
-
-            def close(self):
-                pass
-
-        class FakeResponses:
-            def create(self, **kwargs):
-                return FakeCreateStream()
-
-        fake_client = SimpleNamespace(responses=FakeResponses())
-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
-
-        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
-
-        assert response.choices[0].message.content == "iterator recovered"
-
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):
@@ -4450,41 +4039,18 @@ class TestCompressionFallbackContextFilter:
         assert model == "huge-1m"
         assert "big-provider" in label
 
-    def test_configured_chain_honors_explicit_context_length(self, monkeypatch):
-        """Private model aliases may not expose context metadata via /models.
-        A fallback entry can pin the verified window so the runtime does not
-        misclassify a 1M GLM alias as the generic 202K GLM family.
-        """
-        from agent.auxiliary_client import _try_configured_fallback_chain
 
-        client = MagicMock(name="glm_client")
-        entry = self._make_chain_entry("human20-keys-glm", "glm")
-        entry["context_length"] = 1_048_576
+    # ── same-provider, different-model chain entries ────────────────────
+    # A configured fallback_chain may legitimately list several models
+    # under the *same* provider (e.g. two more NVIDIA NIM models after the
+    # primary NIM model). failed_provider alone must not skip those
+    # sibling entries — only failed_model narrows the skip to the exact
+    # (provider, model) pair that just failed.
 
-        monkeypatch.setattr(
-            "agent.auxiliary_client._get_auxiliary_task_config",
-            lambda task: {"fallback_chain": [entry]} if task == "compression" else {},
-        )
 
-        with patch(
-            "agent.auxiliary_client._resolve_fallback_entry",
-            return_value=(client, "glm"),
-        ), patch(
-            "agent.auxiliary_client.get_model_context_length",
-            return_value=202_752,
-        ) as context_probe:
-            resolved_client, model, label = _try_configured_fallback_chain(
-                task="compression", failed_provider="human20-keys"
-            )
-
-        assert resolved_client is client
-        assert model == "glm"
-        assert "human20-keys-glm" in label
-        assert context_probe.call_args.kwargs["config_context_length"] == 1_048_576
-
-    def test_configured_chain_continues_after_skipping_too_small(self, monkeypatch):
-        """When all small candidates are skipped and only the last is large enough,
-        the chain still returns it (does not stop after first filter)."""
+    def test_same_provider_same_model_still_skipped(self, monkeypatch):
+        """The exact (provider, model) pair that just failed is still
+        skipped — failed_model narrows the skip, it doesn't disable it."""
         from agent.auxiliary_client import _try_configured_fallback_chain
 
         entries = [

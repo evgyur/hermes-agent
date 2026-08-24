@@ -292,3 +292,54 @@ class TestBareCustomNoBaseUrlHealsFromConfig:
 
         persisted = captured.get("model_config") or {}
         assert persisted.get("provider") == "custom:mimo-v2.5-pro"
+
+
+# --- Regression: bare "custom" + no base_url + DIFFERENT default provider ----
+#
+# The config-provider fallback above only heals when ``config.model.provider``
+# still points at the custom entry. A user whose global default is a built-in
+# provider (e.g. Nous) but who switched THIS session to a self-hosted model
+# gets no heal: the bare provider is dropped, resume falls back to the default
+# provider, and the default provider's endpoint 404s with "Model '<x>' not
+# found" (the b200/hermes-ultra-sft report). The stored MODEL NAME is the one
+# session-scoped fact that still identifies the entry — these tests lock the
+# model-name recovery tier.
+
+ULTRA_URL = "http://b200-cluster:30090/v1"
+
+ULTRA_CONFIG = {
+    # Global default deliberately points at a BUILT-IN provider — the config
+    # fallback must not fire; only the model lookup can recover the entry.
+    "model": {"default": "some-nous-model", "provider": "nous"},
+    "providers": {
+        "hermes-ultra": {
+            "api": ULTRA_URL,
+            "api_key": "sk-ultra",
+            "models": ["hermes-ultra-sft"],
+        }
+    },
+}
+
+ULTRA_LEGACY_CONFIG = {
+    "model": {"default": "some-nous-model", "provider": "nous"},
+    "custom_providers": [
+        {
+            "name": "hermes-ultra",
+            "base_url": ULTRA_URL,
+            "api_key": "sk-ultra",
+            "model": "hermes-ultra-sft",
+        }
+    ],
+}
+
+
+class TestModelNameRecoversEntryIdentity:
+    def test_identity_by_model_from_providers_dict_models_list(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_CONFIG)
+
+        assert (
+            rp.find_custom_provider_identity_by_model("hermes-ultra-sft")
+            == "custom:hermes-ultra"
+        )
+
+

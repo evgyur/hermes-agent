@@ -1399,7 +1399,138 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
-        self._retained_work: Any = None
+        self._state: PluginState | None = None
+        # Lazy-built capability-gated platform action facade (#64176).
+        self._platform_actions: Any = None
+
+    @property
+    def plugin_id(self) -> str:
+        """Return the effective registry id used for this plugin's namespaces."""
+        return self.manifest.key or self.manifest.name
+
+    def has_plugin(self, plugin_id: str) -> bool:
+        """Return True when another plugin is loaded and enabled (#64165).
+
+        Companion to the advisory ``requires_plugins`` manifest field: a
+        missing dependency never blocks load, so plugins probe availability
+        at runtime with this. Matches on registry key or manifest name.
+        """
+        for key, loaded in self._manager._plugins.items():
+            if not loaded.enabled:
+                continue
+            if key == plugin_id or loaded.manifest.name == plugin_id:
+                return True
+        return False
+
+    # -- namespaced config and durable state --------------------------------
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Read ``plugins.entries.<plugin_id>.settings.<key>``.
+
+        ``key`` is always plugin-relative.  For migration compatibility, a
+        missing canonical value falls back to the former ``config`` subtree;
+        no global config paths are exposed.
+        """
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        plugins = config.get("plugins") if isinstance(config, Mapping) else None
+        entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+        entry = entries.get(self.plugin_id) if isinstance(entries, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return default
+        missing = object()
+        value = _nested_plugin_value(entry.get("settings"), segments, missing)
+        if value is not missing:
+            return value
+        return _nested_plugin_value(entry.get("config"), segments, default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        """Atomically write one value in this plugin's ``settings`` subtree."""
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli import config as config_mod
+
+        if config_mod.is_managed():
+            raise PermissionError(
+                "Plugin settings cannot be changed in a managed install"
+            )
+        from hermes_cli import managed_scope
+
+        dotted_path = ".".join((
+            "plugins",
+            "entries",
+            self.plugin_id,
+            "settings",
+            *segments,
+        ))
+        if managed_scope.is_key_managed(dotted_path):
+            raise PermissionError(
+                f"Plugin setting {dotted_path!r} is administrator-managed"
+            )
+        partial = {
+            "plugins": {
+                "entries": {
+                    self.plugin_id: {
+                        "settings": _nested_plugin_mapping(segments, value),
+                    }
+                }
+            }
+        }
+        full_path = ("plugins", "entries", self.plugin_id, "settings", *segments)
+        # The lock covers the merge read plus atomic save, preventing sibling
+        # plugin writes from racing between those two steps.
+        # Serialize bridge-to-bridge writes across processes as well as
+        # threads. Other Hermes config writers still retain their existing
+        # atomic-replace semantics; this lock specifically prevents two
+        # plugin read/merge/write transactions from dropping siblings.
+        with _locked_plugin_state(config_mod.get_config_path()):
+            with config_mod._CONFIG_LOCK:
+                # Fail closed on malformed YAML. save_config's raw-cache reader
+                # intentionally degrades parse failures to {}, which is safe for
+                # reads but destructive for read-modify-write.
+                config_mod.read_user_config_raw()
+                config_mod.save_config(
+                    partial,
+                    preserve_keys={full_path},
+                    merge_existing=True,
+                )
+
+    @property
+    def state(self) -> PluginState:
+        """Return this plugin's profile-scoped durable JSON state facade."""
+        if self._state is None:
+            self._state = PluginState(self.plugin_id, self.manifest.skill_namespace)
+        return self._state
+
+    @property
+    def platform_actions(self):
+        """Capability-gated platform action facade (#64176, v1).
+
+        Minimal verb set (``add_reaction``, ``set_thread_title``) routed
+        through the live gateway adapter registry. Every call re-checks the
+        ``gateway.platform_actions`` capability (legacy gate:
+        ``plugins.entries.<id>.allow_platform_actions``, default OFF) and
+        returns a structured ``{"ok": bool, ...}`` dict — verbs never raise
+        into hook dispatch. No adapter handles or raw SDK objects are exposed.
+        """
+        if self._platform_actions is None:
+            from hermes_cli.platform_actions import PlatformActions
+
+            self._platform_actions = PlatformActions(self.plugin_id)
+        return self._platform_actions
 
     def _track(
         self,
@@ -1469,16 +1600,6 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
-
-    @property
-    def retained_work(self) -> Any:
-        """Return a plugin-bound native durable background-work facade."""
-        if self._retained_work is None:
-            from agent.plugin_retained_work import PluginRetainedWorkServiceV1
-
-            plugin_id = self.manifest.key or self.manifest.name
-            self._retained_work = PluginRetainedWorkServiceV1(plugin_id)
-        return self._retained_work
 
     # -- profile awareness --------------------------------------------------
 

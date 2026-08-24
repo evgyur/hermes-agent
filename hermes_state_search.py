@@ -27,7 +27,6 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
     escape_like as _escape_like,
-    trigram_fts_config_enabled,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -734,13 +733,10 @@ class SessionSearchMixin:
         # path above). Markers are already durable.
         with self._lock:
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            if trigram_fts_config_enabled():
-                trigram_ok = self._ensure_fts_schema(
-                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = bool(trigram_ok)
-            else:
-                self._trigram_available = False
+            trigram_ok = self._ensure_fts_schema(
+                self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+            )
+            self._trigram_available = bool(trigram_ok)
             if not base_ok:
                 raise sqlite3.OperationalError(
                     "failed to create v23 messages_fts during optimize-storage demote"
@@ -792,13 +788,10 @@ class SessionSearchMixin:
                 base_ok = self._ensure_fts_schema(
                     self._conn, "messages_fts", FTS_SQL
                 )
-                if trigram_fts_config_enabled():
-                    trigram_ok = self._ensure_fts_schema(
-                        self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                    )
-                    self._trigram_available = bool(trigram_ok)
-                else:
-                    self._trigram_available = False
+                trigram_ok = self._ensure_fts_schema(
+                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                self._trigram_available = bool(trigram_ok)
                 if not base_ok:
                     # Fail fast: without the base table the backfill loop
                     # below would retry "no such table" errors forever.
@@ -2442,11 +2435,6 @@ class SessionSearchMixin:
 
         Protocol (SQLite FTS5 §6.8-6.9):
 
-        - FTS5 ``automerge`` stays at its incremental default. ``crisismerge``
-          is raised to an effectively disabled threshold during schema
-          initialization because, unlike automerge, it fully merges a level
-          inside the triggering transcript INSERT. Runtime full-segment work
-          therefore happens only through these bounded positive-rank commands.
         - ``usermerge`` is lowered to its minimum of 2 (persisted in the
           ``%_config`` shadow table, applied once per instance) so a
           positive merge acts on ANY level holding >= 2 segments. With the

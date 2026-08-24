@@ -4,7 +4,6 @@ Verifies that unauthorized users are blocked before any text batching,
 event building, or response generation occurs.
 """
 import asyncio
-import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -161,111 +160,6 @@ def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
         def _get_unauthorized_dm_behavior(self, platform, *, profile=None):
             assert platform == Platform.TELEGRAM
             return "pair"
-
-def test_group_message_uses_group_allow_from_without_granting_dm_access():
-    """Group-only senders must pass intake without inheriting DM access."""
-    adapter = _make_adapter(
-        allow_from=["111"],
-        group_allow_from=["244"],
-    )
-
-    group_msg = _make_message(from_user_id=244, chat_type="group")
-    assert adapter._is_user_authorized_from_message(group_msg) is True
-
-    dm_msg = _make_message(from_user_id=244, chat_id=244, chat_type="private")
-    assert adapter._is_user_authorized_from_message(dm_msg) is False
-
-    platform_wide_group_msg = _make_message(from_user_id=111, chat_type="group")
-    assert adapter._is_user_authorized_from_message(platform_wide_group_msg) is True
-
-
-def test_group_message_uses_per_chat_allowlist_before_global_group_allowlist(monkeypatch):
-    """A per-chat group allowlist must override the global group sender list."""
-    monkeypatch.setenv(
-        "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS",
-        '{"-100": ["244"]}',
-    )
-    adapter = _make_adapter(
-        allow_from=["111"],
-        group_allow_from=["222"],
-    )
-
-    allowed_in_target = _make_message(from_user_id=244, chat_id=-100, chat_type="group")
-    assert adapter._is_user_authorized_from_message(allowed_in_target) is True
-
-    global_user_in_target = _make_message(from_user_id=222, chat_id=-100, chat_type="group")
-    assert adapter._is_user_authorized_from_message(global_user_in_target) is False
-
-    global_user_elsewhere = _make_message(from_user_id=222, chat_id=-200, chat_type="group")
-    assert adapter._is_user_authorized_from_message(global_user_elsewhere) is True
-
-    dm_from_per_chat_user = _make_message(from_user_id=244, chat_id=244, chat_type="private")
-    assert adapter._is_user_authorized_from_message(dm_from_per_chat_user) is False
-
-
-def test_apply_yaml_config_exports_per_chat_group_allowlist():
-    """YAML per-chat sender policy must reach the adapter/runner auth path."""
-    env_key = "TELEGRAM_PER_CHAT_GROUP_ALLOWED_USERS"
-    original = os.environ.pop(env_key, None)
-    try:
-        try:
-            from plugins.platforms.telegram.adapter import _apply_yaml_config
-        except ModuleNotFoundError:  # PR branch before Telegram plugin extraction
-            pytest.skip("Telegram plugin config hook is unavailable")
-
-        mapping = {"-100": ["244"]}
-        _apply_yaml_config({}, {"per_chat_group_allow_from": mapping})
-
-        assert os.environ[env_key] == '{"-100": ["244"]}'
-    finally:
-        os.environ.pop(env_key, None)
-        if original is not None:
-            os.environ[env_key] = original
-
-
-def test_is_user_authorized_from_message_wildcard():
-    """_is_user_authorized_from_message should accept wildcard '*'."""
-    adapter = _make_adapter(allow_from=["*"])
-
-    msg = _make_message(from_user_id=999)
-    assert adapter._is_user_authorized_from_message(msg) is True
-
-
-def test_is_user_authorized_from_message_no_from_user():
-    """_is_user_authorized_from_message should return True for messages without from_user."""
-    adapter = _make_adapter(allow_from=["111"])
-
-    msg = _make_message()
-    msg.from_user = None
-    assert adapter._is_user_authorized_from_message(msg) is True
-
-
-def test_is_user_authorized_from_message_callback():
-    """_is_user_authorized_from_message should use _is_callback_user_authorized."""
-    adapter = _make_adapter(callback_auth=lambda uid, **_kw: uid == "555")
-
-    msg = _make_message(from_user_id=555)
-    assert adapter._is_user_authorized_from_message(msg) is True
-
-    msg = _make_message(from_user_id=666)
-    assert adapter._is_user_authorized_from_message(msg) is False
-
-
-def test_unknown_dm_with_no_allowlist_passes_to_pairing(monkeypatch):
-    """Unknown DMs must still reach the gateway pairing flow when no allowlist exists."""
-    for key in (
-        "TELEGRAM_ALLOWED_USERS",
-        "TELEGRAM_GROUP_ALLOWED_USERS",
-        "TELEGRAM_GROUP_ALLOWED_CHATS",
-        "TELEGRAM_ALLOW_ALL_USERS",
-        "GATEWAY_ALLOWED_USERS",
-        "GATEWAY_ALLOW_ALL_USERS",
-    ):
-        monkeypatch.delenv(key, raising=False)
-
-    class Runner:
-        def _is_user_authorized(self, source):
-            return False
 
         async def handle(self, event):
             return None

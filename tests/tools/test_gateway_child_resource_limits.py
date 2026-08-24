@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
-import resource
 import subprocess
 import sys
+
+import pytest
+
+resource = pytest.importorskip("resource")
 
 from tools.environments.local import gateway_tool_subprocess_kwargs
 

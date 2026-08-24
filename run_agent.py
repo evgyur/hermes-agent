@@ -46,7 +46,7 @@ import time
 import threading
 import uuid
 import warnings
-from typing import List, Dict, Any, Optional, Callable, Iterable
+from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -243,10 +243,6 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
-    # Guard-enabled completion candidates stay in the in-memory verification
-    # loop but may not become durable until turn_finalizer validates/replaces
-    # the final candidate and removes this marker.
-    "_claim_integrity_pending",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
@@ -617,16 +613,6 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
-
-    def configure_tool_allowlist(self, qualified_tools: Iterable[str]) -> None:
-        """Apply an exact, process-local execution allowlist.
-
-        This is narrower than toolsets and is intended for externally supervised
-        sessions whose authority may only shrink between turns.
-        """
-        names = tuple(sorted({str(name) for name in qualified_tools if str(name)}))
-        self.qualified_tool_allowlist = frozenset(names)
-        self._tool_search_scope_cache = None
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -1552,9 +1538,9 @@ class AIAgent:
         changes — the heuristic stays in place as future-proofing even when
         the symptom is dormant.
 
-        The active mitigation is the Codex useful-byte watchdog in
-        ``interruptible_api_call``; this helper only labels stale-timeout
-        remnants with the known backend pattern.
+        Does NOT fix the backend issue.  Only converts an opaque stale-timeout
+        into actionable text so users learn the workaround in seconds rather
+        than digging through logs.
         """
         if self.api_mode != "codex_responses":
             return None
@@ -1579,9 +1565,11 @@ class AIAgent:
             f"Codex backend appears to be silently rejecting {eff_model!r} "
             "on chatgpt.com/backend-api/codex (no stream events, no error). "
             "This is a known backend-side pattern that has affected ChatGPT "
-            "Plus accounts intermittently. Hermes will keep using the requested "
-            "model and reconnect earlier when the stream produces no useful "
-            "bytes. See hermes-agent#21444 for symptom history."
+            "Plus accounts intermittently. "
+            "Workaround: try `gpt-5.4` on the same OAuth profile, or `gpt-5.3-codex`, "
+            "or switch to a different model/provider in your fallback chain. "
+            "Some ChatGPT Codex accounts do not support `gpt-5.4-codex`. "
+            "See hermes-agent#21444 for symptom history."
         )
 
     def _is_openrouter_url(self) -> bool:
@@ -1612,17 +1600,11 @@ class AIAgent:
 
     def _is_codex_backend(self) -> bool:
         """Return True for the ChatGPT OAuth Codex Responses backend."""
-        provider = (getattr(self, "provider", "") or "").strip().lower()
+        base_url = str(getattr(self, "base_url", "") or "")
         return (
             getattr(self, "api_mode", None) == "codex_responses"
-            and (
-                provider == "openai-codex"
-                or (
-                    getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-                    and "/backend-api/codex"
-                    in (getattr(self, "_base_url_lower", "") or "")
-                )
-            )
+            and base_url_hostname(base_url) == "chatgpt.com"
+            and "/backend-api/codex" in base_url.lower()
         )
 
     def _anthropic_prompt_cache_policy(
@@ -2421,6 +2403,13 @@ class AIAgent:
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    turn_lease_holder=getattr(
+                        self, "_active_session_turn_lease_holder", None
+                    ),
+                    turn_lease_ttl_seconds=getattr(
+                        self, "_active_session_turn_lease_ttl_seconds", 300.0
+                    )
+                    or 300.0,
                     parent_task_barrier_id=_parent_barrier_id,
                 )
                 for _written in _batch_msgs:
@@ -3478,13 +3467,7 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
-    def steer(
-        self,
-        text: str,
-        *,
-        receipt_id: Optional[str] = None,
-        receipt_transition: Optional[Callable[[str, str], None]] = None,
-    ) -> bool:
+    def steer(self, text: str) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3505,9 +3488,6 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _receipt = None
-        if receipt_id and callable(receipt_transition):
-            _receipt = (str(receipt_id), receipt_transition)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3515,37 +3495,13 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            if _receipt is not None:
-                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
-                pending.append(_receipt)
-                self._pending_steer_receipts = pending
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
-            if _receipt is not None:
-                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
-                pending.append(_receipt)
-                self._pending_steer_receipts = pending
         return True
-
-    def _mark_drained_steer_request_fenced(self) -> None:
-        """Fence the exact receipts whose trusted markers enter this request."""
-        receipts = list(getattr(self, "_drained_steer_receipts", []) or [])
-        self._fenced_steer_receipts = receipts
-        self._drained_steer_receipts = []
-        for receipt_id, transition in receipts:
-            transition(receipt_id, "REQUEST_FENCED")
-
-    def _mark_fenced_steer_provider_result(self, *, accepted: bool) -> None:
-        """Terminalize fenced receipts without replaying an ambiguous request."""
-        receipts = list(getattr(self, "_fenced_steer_receipts", []) or [])
-        self._fenced_steer_receipts = []
-        state = "CONSUMED_CURRENT" if accepted else "AMBIGUOUS_PROVIDER_REQUEST"
-        for receipt_id, transition in receipts:
-            transition(receipt_id, state)
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3669,18 +3625,10 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
-            self._drained_steer_receipts = list(
-                getattr(self, "_pending_steer_receipts", []) or []
-            )
-            self._pending_steer_receipts = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
-            self._drained_steer_receipts = list(
-                getattr(self, "_pending_steer_receipts", []) or []
-            )
-            self._pending_steer_receipts = []
         return text
 
     def _record_file_mutation_result(
@@ -4014,8 +3962,8 @@ class AIAgent:
                 return (
                     prefix
                     + "the turn was stopped because session storage was busy "
-                    "(another Hermes writer held the state database lock). "
-                    "Your message should already be saved — "
+                    "(another Hermes process was writing to the state "
+                    "database). Your message should already be saved — "
                     "please send it again in a moment."
                 )
             if cause == "corrupt":
@@ -8074,7 +8022,6 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
-        bypass_ineffective_guard: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8084,10 +8031,6 @@ class AIAgent:
         so users can bypass the summary-failure cooldown after an
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
-
-        ``bypass_ineffective_guard=True`` is narrower: critical gateway
-        hygiene may retry after the anti-thrash breaker trips, but it still
-        honors provider failure cooldowns and remains an automatic attempt.
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
@@ -8124,19 +8067,17 @@ class AIAgent:
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize the WHOLE attempt, not just fence publication. Otherwise a
-        # second attempt can replace the active fence while the first is still
-        # summarising, so hard_interrupt() cancels only the newer attempt and
-        # the older one can still commit after the surfaced stop.
+        # Serialize fence publication so a waiter cannot replace the fence of
+        # the attempt currently generating/committing a summary.
         fence_registration_lock = vars(self).setdefault(
             "_compression_commit_fence_lock", threading.RLock()
         )
-        fence_registration_lock.acquire()
-        missing_fence = object()
-        previous_fence = vars(self).get(
-            "_active_compression_commit_fence", missing_fence
-        )
-        self._active_compression_commit_fence = active_fence
+        with fence_registration_lock:
+            missing_fence = object()
+            previous_fence = vars(self).get(
+                "_active_compression_commit_fence", missing_fence
+            )
+            self._active_compression_commit_fence = active_fence
         try:
             def _run(fence=None, target_messages=None):
                 return compress_context(
@@ -8146,7 +8087,6 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
-                    bypass_ineffective_guard=bypass_ineffective_guard,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -8306,11 +8246,11 @@ class AIAgent:
                 )
             return result
         finally:
-            if previous_fence is missing_fence:
-                vars(self).pop("_active_compression_commit_fence", None)
-            else:
-                self._active_compression_commit_fence = previous_fence
-            fence_registration_lock.release()
+            with fence_registration_lock:
+                if previous_fence is missing_fence:
+                    vars(self).pop("_active_compression_commit_fence", None)
+                else:
+                    self._active_compression_commit_fence = previous_fence
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:
@@ -8322,10 +8262,12 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        tool = decision.tool_name or "a tool"
         return (
-            "I stopped retrying this step because it kept returning the same error. "
-            "I kept the results gathered before the failure; the next attempt should "
-            "use a different approach instead of repeating the same action."
+            f"I stopped retrying {tool} because it hit the tool-call guardrail "
+            f"({decision.code}) after {decision.count} repeated non-progressing "
+            "attempts. The last tool result explains the blocker; the next step is "
+            "to change strategy instead of repeating the same call."
         )
 
     def _append_guardrail_observation(
@@ -8455,6 +8397,9 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=_model_background_value(function_args, self),
+            action=function_args.get("action"),
+            subagent_id=function_args.get("subagent_id"),
+            message=function_args.get("message"),
             parent_agent=self,
         )
 

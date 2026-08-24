@@ -31,12 +31,9 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
-        ".backups",
-        ".sync-backups",
         ".venv",
         "venv",
         "node_modules",
-        "vendor",
         "site-packages",
         "__pycache__",
         ".tox",
@@ -46,20 +43,12 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".ruff_cache",
     )
 )
-EXCLUDED_SKILL_DIR_SUFFIXES = (
-    ".bak",
-    ".backup",
-    ".local-backup",
-)
 
-# Supporting files and embedded package snapshots live inside a concrete skill
-# root and are loaded explicitly by that skill. They are not standalone skills.
-# The names remain valid as top-level categories because the iterator prunes
-# them only when the current directory already owns a SKILL.md.
-SKILL_SUPPORT_DIRS = frozenset(
-    ("references", "templates", "assets", "scripts", "skills", "runtime", "upstream")
-)
-EXCLUDED_SKILL_PATH_SEGMENT_PAIRS = frozenset((("references", "absorbed"),))
+# Supporting files live inside a skill package and are loaded explicitly via
+# skill_view(skill, file_path=...). They are not standalone skills and must not
+# be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
+# archive workflow preserves a complete old skill package under references/.
+SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
@@ -74,6 +63,8 @@ EXCLUDED_SKILL_PATH_SEGMENT_PAIRS = frozenset((("references", "absorbed"),))
 ORG_MIRROR_DIR_NAME = "_org"
 ORG_ACTIVE_MARKER = ".active_org"
 ORG_PROVENANCE_FILE = ".org-provenance.json"
+# Records the fingerprint of each skill exactly as upstream sent it, so a
+# later local edit is detectable and an org pull can refuse to clobber it.
 ORG_BASELINE_FILE = ".org-baseline.json"
 
 
@@ -83,7 +74,8 @@ def read_active_org_id(skills_dir: Path) -> Optional[str]:
         marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
         if not marker.exists():
             return None
-        return marker.read_text(encoding="utf-8").strip() or None
+        val = marker.read_text(encoding="utf-8").strip()
+        return val or None
     except OSError:
         return None
 
@@ -108,16 +100,44 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return None
 
 
-def is_excluded_skill_dir(dirname: str) -> bool:
-    """Return True for operational/non-catalog skill directory names."""
-    normalized = str(dirname or "").strip().lower()
-    return normalized in EXCLUDED_SKILL_DIRS or normalized.endswith(EXCLUDED_SKILL_DIR_SUFFIXES)
+def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+    """True if *path* should be skipped by active skill scanners.
+
+    Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
+    prune dependency, virtualenv, VCS, cache, and progressive-disclosure
+    support-package paths. Centralising the check here keeps every
+    skill-scanning site in sync with the shared exclusion set.
+
+    Accepts a Path or string.
+    """
+    try:
+        parts = path.parts  # Path
+    except AttributeError:
+        from pathlib import PurePath
+        parts = PurePath(str(path)).parts
+    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
+        path, root=root
+    )
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
-    """True if *path* is under a support dir of an actual skill root."""
+    """True if *path* is under a support dir of an actual skill root.
+
+    ``references/``, ``templates/``, ``assets/``, and ``scripts/`` are
+    progressive-disclosure support areas when they sit directly inside a skill
+    directory containing ``SKILL.md``. They are not active discovery roots for
+    standalone skills. A preserved package such as
+    ``some-skill/references/old-skill-package/SKILL.md`` is documentation data
+    unless the caller explicitly loads it via ``file_path``.
+
+    Legitimate categories or skill names such as ``skills/scripts/foo`` remain
+    discoverable because their ``scripts`` component is not directly under a
+    directory that contains ``SKILL.md``.
+    """
     path_obj = path if isinstance(path, Path) else Path(str(path))
     parts = path_obj.parts
+    # Last component may be a file or candidate skill directory name. Only
+    # components before the leaf can be containing support directories.
     for idx, part in enumerate(parts[:-1]):
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
@@ -127,25 +147,6 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
         if (skill_root / "SKILL.md").exists():
             return True
     return False
-
-
-def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
-    """True if any component of *path* should be excluded from skill indexes."""
-    try:
-        parts = path.parts  # Path
-    except AttributeError:
-        from pathlib import PurePath
-        parts = PurePath(str(path)).parts
-    normalized_parts = tuple(str(part).strip().lower() for part in parts)
-    has_excluded_pair = any(
-        pair in tuple(zip(normalized_parts, normalized_parts[1:]))
-        for pair in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
-    )
-    return (
-        any(is_excluded_skill_dir(part) for part in normalized_parts)
-        or has_excluded_pair
-        or is_skill_support_path(path, root=root)
-    )
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -390,7 +391,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -409,13 +410,10 @@ def _load_raw_config() -> Dict[str, Any]:
     if not config_path.exists():
         return {}
     try:
-        data = config_path.read_bytes()
         stat = config_path.stat()
-        import hashlib
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size, hashlib.sha256(data).hexdigest())
+        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
     except OSError:
         cache_key = None
-        data = None
 
     if cache_key is not None:
         cached = _RAW_CONFIG_CACHE.get(cache_key)
@@ -423,8 +421,7 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        raw_text = data.decode("utf-8") if data is not None else config_path.read_text(encoding="utf-8")
-        parsed = yaml_load(raw_text)
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
@@ -1195,8 +1192,17 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
-    Excludes Hermes metadata, VCS, virtualenv/dependency, cache, vendored,
-    backup trees, and support dirs inside concrete skill roots.
+    Excludes Hermes metadata, VCS, virtualenv/dependency, cache, and skill
+    support directories. Support directories (references/templates/assets/
+    scripts) can contain arbitrary markdown and even archived package
+    ``SKILL.md`` files, but they are progressive-disclosure data loaded through
+    ``skill_view(..., file_path=...)`` rather than active skill roots.
+
+    M2 org mirrors (``_org/``): TOKEN-GATED resolution. Only the active org's
+    subdir (per the sync-client-written ``.active_org`` marker) is walked;
+    every other ``_org/<id>/`` (stale mirror from a previous org, or no
+    marker at all) is pruned — leave an org and its skills stop resolving,
+    without any manual cleanup.
     """
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
@@ -1209,27 +1215,16 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         elif root == org_root:
             # Inside _org/: descend ONLY into the active org's mirror.
             dirs[:] = [d for d in dirs if d == active_org]
-        try:
-            relative_root_parts = Path(root).relative_to(skills_dir).parts
-        except ValueError:
-            relative_root_parts = ()
         dirs[:] = [
             d
             for d in dirs
-            if not is_excluded_skill_dir(d)
-            and not (
-                relative_root_parts
-                and (str(relative_root_parts[-1]).lower(), str(d).lower())
-                in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
-            )
+            if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
-            path = Path(root) / filename
-            if not is_excluded_skill_path(path):
-                matches.append(path)
-    for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
-        yield path
+            matches.append(os.path.join(root, filename))
+    for path in sorted(matches):
+        yield Path(path)
 
 
 # ── Namespace helpers for plugin-provided skills ───────────────────────────

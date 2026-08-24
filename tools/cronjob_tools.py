@@ -50,7 +50,6 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
-    trigger_job_if_active,
     update_job,
 )
 
@@ -1253,11 +1252,7 @@ def cronjob(
     session_id: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
-    # Model/tool invocations carry a task_id.  Keep that signal so a manual
-    # cron run can be queued without blocking the parent agent turn for the
-    # entire duration of the spawned cron agent.  Direct CLI/Python callers do
-    # not carry a task_id and retain the historical immediate/waiting behavior.
-    agent_invocation = bool(task_id)
+    del task_id  # unused but kept for handler signature compatibility
 
     try:
         normalized = (action or "").strip().lower()
@@ -1422,7 +1417,7 @@ def cronjob(
                 indent=2,
             )
         # Resolve to canonical ID (supports name-based lookup)
-        job_id = str(job["id"])
+        job_id = job["id"]
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -1453,39 +1448,7 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            if agent_invocation:
-                # A cron agent can legitimately run for minutes.  Executing it
-                # inline here wedges the calling chat's tool invocation and
-                # trips the gateway inactivity watchdog.  Queue it for the
-                # scheduler instead; the gateway ticker dispatches due jobs on
-                # its persistent worker pool without blocking this turn.
-                queued_job, queue_status = trigger_job_if_active(job_id)
-                if queue_status == "paused":
-                    result = _format_job(queued_job or job)
-                    result["executed"] = False
-                    result["execution_state"] = "skipped"
-                    result["execution_success"] = False
-                    result["execution_skipped"] = (
-                        "Job is paused/disabled; resume it before running."
-                    )
-                    return json.dumps({"success": True, "job": result}, indent=2)
-                if queue_status == "missing" or not queued_job:
-                    return tool_error(
-                        f"Failed to queue cron job '{job_id}' for execution.",
-                        success=False,
-                    )
-                _notify_provider_jobs_changed_safe()
-                result = _format_job(queued_job)
-                result["executed"] = False
-                result["execution_state"] = "queued"
-                result["execution_success"] = None
-                result["message"] = (
-                    "Queued for the next scheduler tick; execution continues "
-                    "asynchronously. Inspect the job later with action='list'."
-                )
-                return json.dumps({"success": True, "job": result}, indent=2)
-
-# Per-run context (#57331, salvaged from #57342/@liuhao1024 and
+            # Per-run context (#57331, salvaged from #57342/@liuhao1024 and
             # #57360/@ghedeselmabot): `prompt` on the run action is transient
             # context appended to the stored prompt for THIS fire only, never
             # persisted. It goes through the same strict injection scan as
@@ -1721,8 +1684,6 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
-Agent-triggered `run` is non-blocking: it returns after queueing the job for the
-next scheduler tick. Use `list` later to inspect completion status/output.
 
 action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
 

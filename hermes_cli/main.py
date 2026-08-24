@@ -474,7 +474,6 @@ from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.context import build_context_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
@@ -694,15 +693,30 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
-# ``context audit --local`` is a strict diagnostic boundary. Dispatch it before
-# dotenv loading, file logging, plugin/hook/MCP discovery, or AIAgent creation.
-# The exact two-token match avoids stealing similarly named chat prompts.
-if len(sys.argv) >= 3 and sys.argv[1:3] == ["context", "audit"]:
-    sys.dont_write_bytecode = True
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    from hermes_cli.context_audit import early_cli_main as _context_audit_main
+# Windows launcher self-heal — the ``hermes`` command users run is a COPY of
+# the venv console script, staged into the managed binary dir (the default
+# Hermes root's ``bin``, next to the managed uv) by install.ps1. That dir
+# lives OUTSIDE the git checkout precisely because an earlier layout staged
+# the copies at ``<checkout>\bin``, where ``hermes update``'s autostash
+# (``git stash push --include-untracked``) swept them off disk; with the
+# desktop updater's ``--keep-stash`` nothing restored them and ``hermes``
+# stopped resolving in every new terminal (venv\Scripts itself must stay off
+# PATH — it shadows the user's ``python``, #83797). Re-staging at process
+# start reaches already-broken installs through the one channel that still
+# works there: the desktop app spawning its backend via
+# ``python -m hermes_cli.main``. Costs a few stat calls when healthy; gates
+# fail toward inaction so source checkouts are untouched. Sits AFTER the
+# profile override on purpose — no hermes module may be imported before
+# profiles resolve. The launcher dir itself is per-machine (the helper
+# anchors on the DEFAULT root, not HERMES_HOME), so profile sessions heal
+# the same shared dir.
+if sys.platform == "win32":
+    try:
+        from hermes_cli import _install_repair as _install_repair_mod
 
-    raise SystemExit(_context_audit_main(sys.argv[3:]))
+        _install_repair_mod.ensure_windows_bin_launchers(_bootstrap_root)
+    except Exception:
+        pass
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -3549,15 +3563,10 @@ def cmd_whatsapp_cloud(args):
 
 
 def cmd_setup(args):
-    """Interactive setup wizard, with deterministic Powerpack setup routing."""
-    if getattr(args, "section", None) == "power":
-        from hermes_cli.power import run_power_setup
-
-        return run_power_setup(args)
-
+    """Interactive setup wizard."""
     from hermes_cli.setup import run_setup_wizard
 
-    return run_setup_wizard(args)
+    run_setup_wizard(args)
 
 
 def cmd_model(args):
@@ -11880,7 +11889,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
-        "prompt-size", "context",
+        "prompt-size",
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
@@ -12944,11 +12953,6 @@ def main():
     # setup command  (parser built in hermes_cli/subcommands/setup.py)
     # =========================================================================
     build_setup_parser(subparsers, cmd_setup=cmd_setup)
-
-    # Powerpack-owned setup and diagnostics surface.
-    from hermes_cli.power import add_power_parser as _add_power_parser
-
-    _add_power_parser(subparsers)
 
 
     # =========================================================================
@@ -14117,10 +14121,6 @@ def main():
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)
     # =========================================================================
     build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
-
-    # ``context audit`` executes via the strict pre-bootstrap dispatch above;
-    # registration here keeps top-level help and parser introspection complete.
-    build_context_parser(subparsers)
 
     # =========================================================================
     # Parse and execute

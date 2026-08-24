@@ -3929,6 +3929,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    invocation_context: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4059,6 +4060,16 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if invocation_context:
+            safe_context = {
+                "HERMES_CRON_JOB_ID": str(invocation_context.get("job_id") or ""),
+                "HERMES_CRON_SCHEDULED_AT": str(invocation_context.get("scheduled_at") or ""),
+                "HERMES_CRON_TIMEZONE": str(invocation_context.get("timezone") or ""),
+                "HERMES_CRON_INVOCATION_KIND": str(invocation_context.get("invocation_kind") or ""),
+            }
+            if not all(safe_context.values()):
+                return False, "Blocked: incomplete cron invocation context for pre-run script"
+            env.update(safe_context)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4136,6 +4147,27 @@ def _run_job_script_with_claim_heartbeat(
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
     schedule = job.get("schedule")
+    scheduled_at = str(job.get("next_run_at") or "")
+    cron_now = _hermes_now()
+    cron_tz = cron_now.tzinfo
+    timezone_name = str(
+        job.get("timezone")
+        or getattr(cron_tz, "key", "")
+        or cron_now.tzname()
+        or "UTC"
+    )
+    try:
+        due_or_past = bool(scheduled_at) and datetime.fromisoformat(
+            scheduled_at.replace("Z", "+00:00")
+        ) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        due_or_past = False
+    invocation_context = {
+        "job_id": str(job.get("id") or ""),
+        "scheduled_at": scheduled_at,
+        "timezone": timezone_name,
+        "invocation_kind": "scheduled" if due_or_past else "manual_unbound",
+    }
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (
@@ -4143,7 +4175,10 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4174,10 +4209,16 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -5799,14 +5840,6 @@ def run_job(
                 # below, which already passes its fb_model.
                 "target_model": model,
             }
-            try:
-                import inspect
-                if "target_model" in inspect.signature(resolve_runtime_provider).parameters:
-                    runtime_kwargs["target_model"] = model
-            except (TypeError, ValueError):
-                # Some tests/plugins monkeypatch this resolver with a minimal
-                # callable; keep the cron path backward-compatible.
-                pass
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)

@@ -793,38 +793,24 @@ def _(rid, params: dict) -> dict:
             state = mgr.resume()
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            # Resume must restart work, not just flip persisted state
+            # (#75362). An `exec` result is display-only — nothing would
+            # re-enter the conversation loop until the user typed another
+            # message. Return a `send` dispatch carrying the canonical
+            # continuation prompt so the client fires the next turn
+            # immediately; `display` keeps the transcript showing the
+            # concise invocation instead of the model-facing scaffolding.
             prompt = mgr.next_continuation_prompt()
+            notice = f"▶ Goal resumed: {state.goal}\nContinuing now — taking the next step."
             if not prompt:
-                return _ok(rid, {"type": "exec", "output": mgr.status_line()})
-            notice = f"▶ Goal resumed: {state.goal}"
-            with session["history_lock"]:
-                if session.get("running"):
-                    if session.get("queued_prompt"):
-                        output = (
-                            f"{notice}\nExisting queued turn will run first; "
-                            "goal continuation will follow automatically."
-                        )
-                    else:
-                        _enqueue_prompt(
-                            session,
-                            prompt,
-                            current_transport() or session.get("transport"),
-                        )
-                        output = (
-                            f"{notice}\nContinuation queued for the next turn; "
-                            "the live turn was not interrupted."
-                        )
-                    session["last_active"] = time.time()
-                    return _ok(rid, {"type": "exec", "output": output})
+                return _ok(rid, {"type": "exec", "output": f"▶ Goal resumed: {state.goal}"})
             return _ok(
                 rid,
                 {
                     "type": "send",
-                    "notice": (
-                        f"{notice}\n"
-                        "Continuation queued immediately; no extra message needed."
-                    ),
+                    "notice": notice,
                     "message": prompt,
+                    "display": "/goal resume",
                 },
             )
         if lower in {"clear", "stop", "done"}:

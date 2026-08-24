@@ -179,15 +179,6 @@ class TestEdgeCases:
         assert paths == []
         assert cleaned == ""
 
-    def test_text_document_extensions_are_deliverable(self):
-        """Supported source and log documents are matched for delivery."""
-        paths, _ = _extract("See /tmp/script.py and /tmp/server.log here")
-        assert paths == ["/tmp/script.py", "/tmp/server.log"]
-
-    def test_path_with_spaces_not_matched(self):
-        """Paths with spaces are intentionally not matched (avoids false positives)."""
-        paths, _ = _extract("File at /tmp/my file.png here")
-        assert paths == []
 
     @pytest.mark.parametrize(
         "content,expected",

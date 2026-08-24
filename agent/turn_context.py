@@ -545,25 +545,8 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
-    # A claim-integrity decision needs the complete final response plus the
-    # current-turn tool trace. Streaming model text before that decision would
-    # leak wording the finalizer may later block, so guarded sessions buffer
-    # assistant text until finalization.
-    try:
-        from agent.claim_integrity import claim_guarded_callbacks
-        (
-            agent._stream_callback,
-            agent.stream_delta_callback,
-            agent.interim_assistant_callback,
-        ) = claim_guarded_callbacks(
-            stream_callback,
-            getattr(agent, "stream_delta_callback", None),
-            getattr(agent, "interim_assistant_callback", None),
-        )
-    except Exception:
-        agent._stream_callback = None
-        agent.stream_delta_callback = None
-        agent.interim_assistant_callback = None
+    # Store stream callback for _interruptible_api_call to pick up.
+    agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
@@ -818,7 +801,6 @@ def build_turn_context(
     # work; nothing has touched it yet this turn, so it measures the gap since
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
-    _idle_compacted = False
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if agent.compression_enabled and _idle_after > 0 and messages:
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
@@ -878,18 +860,6 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
-                    # One successful boundary is enough for this turn.  The
-                    # compressor has no provider-reported usage for the new
-                    # transcript yet, so an immediately-following threshold
-                    # preflight would judge the same state from the rough
-                    # estimator and can rewrite it a second time.  Besides
-                    # wasting the compaction, an in-place second pass archives
-                    # and re-inserts the whole surviving transcript, producing
-                    # duplicate active completion rows when the pass preserves
-                    # the protected tail.  Let the next real provider request
-                    # adjudicate the idle boundary before another automatic
-                    # turn-start compaction is allowed.
-                    _idle_compacted = True
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -909,15 +879,11 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if (
-        agent.compression_enabled
-        and not _idle_compacted
-        and _should_run_preflight_estimate(
-            messages,
-            agent.context_compressor.protect_first_n,
-            agent.context_compressor.protect_last_n,
-            agent.context_compressor.threshold_tokens,
-        )
+    if agent.compression_enabled and _should_run_preflight_estimate(
+        messages,
+        agent.context_compressor.protect_first_n,
+        agent.context_compressor.protect_last_n,
+        agent.context_compressor.threshold_tokens,
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,

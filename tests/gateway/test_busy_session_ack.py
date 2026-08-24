@@ -212,7 +212,7 @@ class TestBusySessionAck:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
-        assert agent.steer.call_args.args == ("also check the tests",)
+        agent.steer.assert_called_once_with("also check the tests")
         agent.interrupt.assert_not_called()
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
@@ -256,11 +256,11 @@ class TestBusySessionAck:
         runner._enrich_message_with_transcription.assert_awaited_once_with(
             "", ["/tmp/follow-up.ogg"]
         )
-        assert agent.steer.call_args.args == ('"yönü teknik mimariye çevir"',)
+        agent.steer.assert_called_once_with('"yönü teknik mimariye çevir"')
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]
-        assert "Accepted for the current run" in content
+        assert "Steered" in content
         assert "Queued" not in content
 
 

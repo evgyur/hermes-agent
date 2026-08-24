@@ -961,7 +961,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if stored_prompt:
         stored_state = "stale_runtime"
         logger.info(
-            "Stored system prompt for session %s has stale runtime identity or required prompt policy; "
+            "Stored system prompt for session %s has stale runtime identity; "
             "rebuilding for model=%s provider=%s.",
             agent.session_id,
             getattr(agent, "model", "") or "",
@@ -1029,17 +1029,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when runtime identity or a mandatory prompt policy is stale."""
-
-    # A stored prompt may predate a mandatory owner-binding policy.  Reusing it
-    # verbatim would let a resumed session reach its first tool call without the
-    # lock.  Fail closed only for tool-capable agents; tool-less model-only
-    # sessions cannot perform the protected effect and retain cache stability.
-    if getattr(agent, "valid_tool_names", None):
-        from agent.skill_routing import scope_ownership_guidance
-
-        if scope_ownership_guidance().strip() not in prompt:
-            return False
+    """Return False when the persisted runtime-identity lines are stale."""
 
     def line_value(label: str) -> str:
         """Last matching line wins.
@@ -2087,17 +2077,6 @@ def run_conversation(
                 else:
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
-                _drained_receipts = list(
-                    getattr(agent, "_drained_steer_receipts", []) or []
-                )
-                if _drained_receipts:
-                    pending_receipts = list(
-                        getattr(agent, "_pending_steer_receipts", []) or []
-                    )
-                    agent._pending_steer_receipts = (
-                        _drained_receipts + pending_receipts
-                    )
-                    agent._drained_steer_receipts = []
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
@@ -3156,9 +3135,6 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
-                _steer_request_fenced = bool(_pre_api_steer and _injected)
-                if _steer_request_fenced:
-                    agent._mark_drained_steer_request_fenced()
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -3176,13 +3152,6 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
-                except BaseException:
-                    if _steer_request_fenced:
-                        agent._mark_fenced_steer_provider_result(accepted=False)
-                    raise
-                else:
-                    if _steer_request_fenced:
-                        agent._mark_fenced_steer_provider_result(accepted=True)
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -6292,10 +6261,6 @@ def run_conversation(
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
-                    _is_codex_useful_byte_watchdog = (
-                        "codex stream produced no useful bytes" in str(_final_summary).lower()
-                        and "chatgpt.com/backend-api/codex" in str(_final_summary).lower()
-                    )
                     if classified.reason == FailoverReason.billing:
                         if classified.billing_unverified:
                             # Ambiguous body (#82154) — hedge the terminal line.
@@ -6319,14 +6284,6 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                             unverified=classified.billing_unverified,
-                        )
-                    elif _is_codex_useful_byte_watchdog:
-                        # This is retry/watchdog plumbing for the ChatGPT Codex
-                        # backend. Keep it in logs, but do not turn it into a
-                        # scary Telegram final message after retries exhaust.
-                        agent._vprint(
-                            f"{agent.log_prefix}   ⚠️ Codex useful-byte watchdog exhausted retries; suppressing chat delivery.",
-                            force=True,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -6443,9 +6400,10 @@ def run_conversation(
                             _final_response += f"\n\n{_billing_guidance}"
                         # Structured recovery descriptor so every surface renders
                         # the same link + label from one signal (see helper).
-                        _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
-                    elif _is_codex_useful_byte_watchdog:
-                        _final_response = ""
+                        _billing_block = _billing_block_dict(
+                            _provider, _base, _model, _billing_guidance,
+                            unverified=_billing_unverified,
+                        )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -6478,7 +6436,7 @@ def run_conversation(
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": "" if _is_codex_useful_byte_watchdog else _final_summary,
+                        "error": _final_summary,
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a
@@ -6494,7 +6452,6 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
-                        "suppress_delivery": bool(_is_codex_useful_byte_watchdog),
                     }
 
                 # For rate limits, respect the Retry-After header if present
@@ -7389,7 +7346,7 @@ def run_conversation(
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
-                        "⚠️ I stopped a repeatedly failing step and kept the results gathered so far."
+                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
                     )
                     append_message(messages, {"role": "assistant", "content": final_response})
                     # Emit the halt message to the client so it's not
@@ -8173,22 +8130,13 @@ def run_conversation(
                     # attempted final answer before the verification loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
+                    agent._emit_interim_assistant_message(final_msg)
+                    append_message(messages, final_msg)
                     try:
-                        from agent.claim_integrity import claim_integrity_enabled
-                        _claim_guard_buffers_interim = claim_integrity_enabled()
+                        agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
-                        _claim_guard_buffers_interim = True
-                    if not _claim_guard_buffers_interim:
-                        agent._emit_interim_assistant_message(final_msg)
-                    else:
-                        final_msg["_claim_integrity_pending"] = True
-                    messages.append(final_msg)
-                    if not _claim_guard_buffers_interim:
-                        try:
-                            agent._flush_messages_to_session_db(messages, conversation_history)
-                        except Exception:
-                            logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
+                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
+                    append_message(messages, {
                         "role": "user",
                         "content": _verify_nudge,
                         "_verification_stop_synthetic": True,
@@ -8254,22 +8202,13 @@ def run_conversation(
                     # attempted final answer before the pre_verify loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
+                    agent._emit_interim_assistant_message(final_msg)
+                    append_message(messages, final_msg)
                     try:
-                        from agent.claim_integrity import claim_integrity_enabled
-                        _claim_guard_buffers_interim = claim_integrity_enabled()
+                        agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
-                        _claim_guard_buffers_interim = True
-                    if not _claim_guard_buffers_interim:
-                        agent._emit_interim_assistant_message(final_msg)
-                    else:
-                        final_msg["_claim_integrity_pending"] = True
-                    messages.append(final_msg)
-                    if not _claim_guard_buffers_interim:
-                        try:
-                            agent._flush_messages_to_session_db(messages, conversation_history)
-                        except Exception:
-                            logger.debug("pre_verify interim flush failed", exc_info=True)
-                    messages.append({
+                        logger.debug("pre_verify interim flush failed", exc_info=True)
+                    append_message(messages, {
                         "role": "user",
                         "content": _verify_nudge2,
                         "_pre_verify_synthetic": True,

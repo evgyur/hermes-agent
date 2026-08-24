@@ -68,8 +68,6 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
-    # Governed shared memory through mem0g
-    "mem0g",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -517,10 +515,7 @@ TOOLSETS = {
 
     "hermes-telegram": {
         "description": "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        # Continuum owns no general gateway execution path. Its only host-side
-        # capability is the Telegram-origin card bridge, service-gated by the
-        # standalone daemon socket.
-        "tools": _HERMES_CORE_TOOLS + ["continuum_card_launch"],
+        "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
     

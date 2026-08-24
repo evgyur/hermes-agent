@@ -177,8 +177,6 @@ class SessionSource:
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
-    business_connection_id: Optional[str] = None  # Telegram Business delegated inbox route
-    external_safe_mode: bool = False  # True for untrusted external Business contacts
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
     # None => the gateway's active/default profile. Drives both session-key
@@ -281,10 +279,6 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
-        if self.business_connection_id:
-            d["business_connection_id"] = self.business_connection_id
-        if self.external_safe_mode:
-            d["external_safe_mode"] = True
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -312,11 +306,6 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
-            business_connection_id=(
-                data.get("business_connection_id")
-                or data.get("telegram_business_connection_id")
-            ),
-            external_safe_mode=bool(data.get("external_safe_mode", False)),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
@@ -865,11 +854,6 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
-    # Stable logical identity for this interrupted parent obligation. It is
-    # generated once (or inherited from the exact active-turn token) and stays
-    # unchanged across status replies and gateway generations until terminal
-    # proof, explicit cancellation, or supersession clears the obligation.
-    resume_task_id: Optional[str] = None
 
     # Durable ownership marker for the agent turn currently executing on this
     # routing entry.  A normal unwind clears it with compare-and-swap semantics;
@@ -909,7 +893,6 @@ class SessionEntry:
             "suspended": self.suspended,
             "resume_pending": self.resume_pending,
             "resume_reason": self.resume_reason,
-            "resume_task_id": self.resume_task_id,
             "last_resume_marked_at": (
                 self.last_resume_marked_at.isoformat()
                 if self.last_resume_marked_at
@@ -1011,7 +994,6 @@ class SessionEntry:
             suspended=data.get("suspended", False),
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
-            resume_task_id=data.get("resume_task_id"),
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
@@ -1145,20 +1127,6 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
-    if (
-        source.platform == Platform.TELEGRAM
-        and getattr(source, "business_connection_id", None)
-    ):
-        parts = [ns, platform, "business", source.chat_id]
-        if source.thread_id:
-            parts.append(source.thread_id)
-        parts.extend(
-            [
-                source.user_id or "unknown",
-                "external" if getattr(source, "external_safe_mode", False) else "trusted",
-            ]
-        )
-        return ":".join(str(part) for part in parts)
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -3091,12 +3059,7 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             if session_key in self._entries:
-                entry = self._entries[session_key]
-                entry.suspended = True
-                entry.resume_pending = False
-                entry.resume_reason = None
-                entry.last_resume_marked_at = None
-                entry.resume_task_id = None
+                self._entries[session_key].suspended = True
                 self._save()
                 return True
         return False
@@ -3203,12 +3166,9 @@ class SessionStore:
                         # generic crash reason; preserve it and its freshness.
                         if entry.last_resume_marked_at is None:
                             entry.last_resume_marked_at = now
-                        if not entry.resume_task_id:
-                            entry.resume_task_id = entry.active_turn_token
                     else:
                         entry.resume_pending = True
                         entry.resume_reason = "restart_interrupted"
-                        entry.resume_task_id = entry.active_turn_token
                         # Freshness starts when recovery is discovered, not
                         # when a potentially hours-long turn began.
                         entry.last_resume_marked_at = now
@@ -3264,19 +3224,12 @@ class SessionStore:
                     return False
                 entry.resume_pending = True
                 entry.resume_reason = reason
-                if not entry.resume_task_id:
-                    entry.last_resume_marked_at = _now()
-                    entry.resume_task_id = uuid.uuid4().hex
+                entry.last_resume_marked_at = _now()
                 self._save()
                 return True
         return False
 
-    def clear_resume_pending(
-        self,
-        session_key: str,
-        *,
-        expected_resume_task_id: Optional[str] = None,
-    ) -> bool:
+    def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
 
         Called from the gateway after ``run_conversation()`` returns a
@@ -3290,15 +3243,9 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
-            if (
-                expected_resume_task_id is not None
-                and entry.resume_task_id != expected_resume_task_id
-            ):
-                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
-            entry.resume_task_id = None
             self._save()
             return True
 
@@ -3383,7 +3330,6 @@ class SessionStore:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
-                    entry.resume_task_id = uuid.uuid4().hex
                     count += 1
             if count:
                 self._save()

@@ -690,29 +690,6 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
-    from agent.claim_integrity import claim_integrity_enabled
-
-    if claim_integrity_enabled():
-        # The app-server path owns its own event bridge, projection, streaming,
-        # and persistence and deliberately bypasses turn_finalizer. Until it
-        # produces the same typed evidence boundary, do not silently weaken the
-        # user's guard by switching runtimes.
-        return {
-            "final_response": (
-                "⚠️ Claim-integrity guard blocked the codex_app_server runtime: "
-                "this path cannot yet prove final claims before delivery. "
-                "Use the codex_responses/default runtime instead."
-            ),
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "interrupted": False,
-            "error": "claim_integrity_incompatible_runtime",
-            "agent_persisted": True,
-            "claim_integrity_blocked_runtime": True,
-        }
-
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
         _ServerRequestRouting,
@@ -1414,21 +1391,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_streamed_codex_commentary(text)
 
     def _on_event(event: Any) -> None:
-        # Raw SSE activity refreshes the idle watchdog. Useful activity is
-        # tracked separately so prelude/heartbeat-only streams do not defeat
-        # the Codex TTFB/TTFUB watchdog.
-        now = time.time()
-        agent._codex_stream_last_event_ts = now
-        event_type = _event_field(event, "type", "")
-        if isinstance(event_type, str) and (
-            "output_text.delta" in event_type
-            or event_type == "response.output_text.delta"
-            or "function_call" in event_type
-            or ("reasoning" in event_type and "delta" in event_type)
-            or event_type == "response.output_item.done"
-            or event_type in _TERMINAL_EVENT_TYPES
-        ):
-            agent._codex_stream_useful_event_ts = now
+        # TTFB watchdog and activity touch — runs once per SSE event.
+        agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):

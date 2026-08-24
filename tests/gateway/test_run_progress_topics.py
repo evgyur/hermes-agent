@@ -868,12 +868,6 @@ class StreamingRefineAgent:
         }
 
 
-class DelegationCapableStreamingAgent(StreamingRefineAgent):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.valid_tool_names = {"delegate_task"}
-
-
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -1187,30 +1181,6 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
-
-
-@pytest.mark.asyncio
-async def test_delegation_capable_non_delegating_turn_flushes_stream(monkeypatch, tmp_path):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DelegationCapableStreamingAgent,
-        session_id="sess-delegation-capable-stream",
-        config_data={
-            "display": {"tool_progress": "off", "interim_assistant_messages": False},
-            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
-        },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
-        chat_type="group",
-        thread_id="$thread",
-        adapter_cls=MetadataEditProgressCaptureAdapter,
-    )
-
-    assert result.get("already_sent") is True
-    delivered = [call["content"] for call in adapter.sent]
-    delivered.extend(edit["content"] for edit in adapter.edits)
-    assert any("Continuing to refine: Final answer." in text for text in delivered)
 
 
 class TransformedStreamAgent:
@@ -1590,37 +1560,6 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 
 @pytest.mark.asyncio
-async def test_run_agent_keeps_telegram_interim_commentary_in_forum_topic(monkeypatch, tmp_path):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DelayedInterimAgent,
-        session_id="sess-forum-interim",
-        chat_id="-1003971448755",
-        chat_type="forum",
-        thread_id="21452",
-        config_data={
-            "display": {
-                "tool_progress": "off",
-                "interim_assistant_messages": True,
-                "streaming": False,
-            }
-        },
-    )
-
-    interim = [
-        call for call in adapter.sent
-        if call["content"] in {"first interim", "second interim"}
-    ]
-    assert result["final_response"] == "done"
-    assert interim
-    assert all(
-        (call["metadata"] or {}).get("thread_id") == "21452"
-        for call in interim
-    )
-
-
-@pytest.mark.asyncio
 async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
     import yaml
 
@@ -1809,43 +1748,6 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     assert "node --version" not in all_content
     # No truncated quoted preview for the terminal command.
     assert 'terminal: "' not in all_content
-
-
-@pytest.mark.asyncio
-async def test_terminal_progress_can_use_compact_one_line(monkeypatch, tmp_path):
-    """Per-platform config restores the historical compact terminal preview."""
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        TerminalCommandAgent,
-        session_id="sess-terminal-compact-line",
-        config_data={
-            "display": {
-                "platforms": {
-                    "telegram": {
-                        "tool_progress": "all",
-                        "tool_preview_length": 120,
-                        "tool_progress_code_blocks": False,
-                    }
-                }
-            }
-        },
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id="",
-        adapter_cls=CodeBlockProgressAdapter,
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```" not in all_content
-    assert "set -euo pipefail" in all_content
-    assert "node --version" in all_content
-    assert all(
-        "\n" not in call["content"] for call in [*adapter.sent, *adapter.edits]
-    )
 
 
 @pytest.mark.asyncio

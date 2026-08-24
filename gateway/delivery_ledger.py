@@ -17,12 +17,8 @@ bounded retention). The gateway writes three checkpoints around the send:
     mark_failed()         state='failed'      on a definitive rejection
 
 On startup, ``sweep_recoverable()`` claims rows whose owning process is
-dead and hands them to the gateway for redelivery. At runtime,
-``sweep_failed_for_runtime()`` claims a platform's ``failed`` rows when
-that platform reconnects after an outage, so a rejection that happened
-while the gateway stayed alive (typically during the same network trouble
-that dropped the adapter) is retried without waiting for a restart. Crash
-semantics are explicit about ambiguity (the contract review of the earlier
+dead and hands them to the gateway for redelivery. Crash semantics are
+explicit about ambiguity (the contract review of the earlier
 delivery-outbox attempt, #61790, closed it for silently resending
 ambiguous sends):
 
@@ -111,29 +107,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT,
-            resume_task_id TEXT,
-            continuation_generation INTEGER,
-            continuation_claim_owner TEXT,
-            continuation_claim_token TEXT
+            last_error TEXT
         )"""
     )
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
-    }
-    if "resume_task_id" not in columns:
-        conn.execute(
-            "ALTER TABLE delivery_obligations ADD COLUMN resume_task_id TEXT"
-        )
-    for name, sql_type in (
-        ("continuation_generation", "INTEGER"),
-        ("continuation_claim_owner", "TEXT"),
-        ("continuation_claim_token", "TEXT"),
-    ):
-        if name not in columns:
-            conn.execute(
-                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
-            )
 
 
 @contextmanager
@@ -233,10 +209,6 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
-    resume_task_id: Optional[str] = None,
-    continuation_generation: Optional[int] = None,
-    continuation_claim_owner: Optional[str] = None,
-    continuation_claim_token: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -246,14 +218,11 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, resume_task_id,
-                continuation_generation, continuation_claim_owner,
-                continuation_claim_token)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started, resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token),
+             pid, started),
         )
     _prune()
 
@@ -312,16 +281,12 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, resume_task_id,
-                      continuation_generation, continuation_claim_owner,
-                      continuation_claim_token
+                      owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at,
-             resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token) in rows:
+             attempts, created_at, owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -341,7 +306,7 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       state='attempting', updated_at=?
+                       updated_at=?
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )
@@ -357,90 +322,6 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
-                    "resume_task_id": resume_task_id,
-                    "continuation_generation": continuation_generation,
-                    "continuation_claim_owner": continuation_claim_owner,
-                    "continuation_claim_token": continuation_claim_token,
-                })
-    return claimed
-
-
-def sweep_failed_for_runtime(
-    platform: str,
-    now: Optional[float] = None,
-) -> List[Dict[str, Any]]:
-    """Claim 'failed' rows for a platform so a just-reconnected gateway can
-    retry them without waiting for a restart.
-
-    The startup sweep (``sweep_recoverable``) only claims rows owned by a
-    DEAD process, so a final response definitively rejected while this
-    gateway stayed alive — typically during the network outage that also
-    dropped the adapter — would otherwise sit undelivered until the next
-    boot. Firing after a successful reconnect closes that gap: the platform
-    is known-good again, so a rejected send is worth one more attempt.
-
-    Claiming atomically re-stamps the owner to THIS process, sets
-    ``state='attempting'`` and increments ``attempts`` (the redelivery
-    budget), so a concurrent sweep cannot double-claim. Rows over the
-    attempts cap or older than the stale cutoff transition to 'abandoned'
-    instead of being returned, and rows owned by a DIFFERENT live process
-    are left untouched (that process owns their retry budget).
-    """
-    now = now if now is not None else time.time()
-    pid, started = _owner_stamp()
-    claimed: List[Dict[str, Any]] = []
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
-                      owner_pid, owner_started_at, resume_task_id,
-                      continuation_generation, continuation_claim_owner,
-                      continuation_claim_token
-               FROM delivery_obligations
-               WHERE state='failed' AND platform=?""",
-            (platform,),
-        ).fetchall()
-        for (oid, session_key, row_platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at,
-             resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token) in rows:
-            # Ownership is authoritative before every terminalization or claim.
-            # A stale/over-cap row owned by another live process is still that
-            # process's row and must not be abandoned by this gateway.
-            if owner_pid != pid and _owner_alive(owner_pid, owner_started_at):
-                continue
-            owner_guard = """owner_pid IS ? AND owner_started_at IS ?"""
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
-                conn.execute(
-                    f"""UPDATE delivery_obligations
-                        SET state='abandoned', updated_at=?
-                        WHERE obligation_id=? AND state='failed' AND {owner_guard}""",
-                    (now, oid, owner_pid, owner_started_at),
-                )
-                continue
-            cursor = conn.execute(
-                f"""UPDATE delivery_obligations
-                    SET owner_pid=?, owner_started_at=?, state='attempting',
-                        attempts=attempts+1, updated_at=?
-                    WHERE obligation_id=? AND state='failed' AND {owner_guard}""",
-                (pid, started, now, oid, owner_pid, owner_started_at),
-            )
-            if cursor.rowcount:
-                claimed.append({
-                    "obligation_id": oid,
-                    "session_key": session_key,
-                    "platform": row_platform,
-                    "chat_id": chat_id,
-                    "thread_id": thread_id,
-                    "content": content,
-                    # failed = definitively rejected once; a resend may
-                    # duplicate, so the marker labels the at-least-once retry.
-                    "needs_marker": True,
-                    "attempts": attempts + 1,
-                    "resume_task_id": resume_task_id,
-                    "continuation_generation": continuation_generation,
-                    "continuation_claim_owner": continuation_claim_owner,
-                    "continuation_claim_token": continuation_claim_token,
                 })
     return claimed
 

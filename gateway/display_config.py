@@ -33,9 +33,6 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
-    # Render terminal tool progress as fenced code blocks on markdown-capable
-    # platforms. Disable per platform to restore compact one-line previews.
-    "tool_progress_code_blocks": True,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -128,8 +125,8 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # assistant commentary (interim_assistant_messages) and DO send periodic
     # heartbeats (long_running_notifications) so the user has signal between
     # turn start and final answer. Otherwise it looks like "typing..." for
-    # 30 minutes with nothing happening. Opt out per profile when final-only
-    # delivery is preferred.
+    # 30 minutes with nothing happening. Opt in to verbose iteration detail
+    # via display.platforms.telegram.busy_ack_detail / tool_progress.
     "telegram":    {
         **_TIER_HIGH,
         "tool_progress": "off",
@@ -277,7 +274,6 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
-        "tool_progress_code_blocks",
     }:
         if isinstance(value, str):
             val = value.strip().lower()

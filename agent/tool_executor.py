@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-from contextlib import contextmanager
 from pathlib import Path
 import logging
 import os
@@ -56,31 +55,22 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
-def _record_persisted_path_for_stub(agent, tool_call_id: str, result: str) -> None:
-    """Let stall guards inspect a spilled tool result without losing its path."""
-    path = extract_persisted_path(result) if isinstance(result, str) else None
-    if path:
-        agent._tool_guardrails.record_persisted_result(tool_call_id, path)
+def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
+    """Tell the stall guards where a persisted result's full content lives.
 
-
-@contextmanager
-def _scoped_deferred_tool_authority(tool_name: Optional[str]):
-    """Bind exact host authority for an agent-level ``tool_call`` unwrap.
-
-    The executor unwraps Tool Search calls before ``model_tools`` sees them so
-    hooks and policy gates observe the real tool name. That bypasses the bridge
-    binding in ``model_tools.handle_function_call``; bind the same exact
-    admitted name around only the underlying dispatch. Direct calls receive no
-    authority.
+    When a large result is spilled to disk (<persisted-output> preview), a
+    later result-reference stub pointing at that first occurrence must carry
+    the spillover file path so the reference can't dangle. Best-effort: never
+    lets bookkeeping break tool execution.
     """
-
-    if tool_name is None:
-        yield
-        return
-    from tools.tool_search import _bind_scoped_deferred_tool_authority
-
-    with _bind_scoped_deferred_tool_authority(tool_name):
-        yield
+    try:
+        if not isinstance(function_result, str):
+            return
+        path = extract_persisted_path(function_result)
+        if path:
+            agent._tool_guardrails.record_persisted_result(tool_call_id, path)
+    except Exception as exc:
+        logger.debug("persisted-path record for result stub failed: %s", exc)
 
 
 def _ensure_file_checkpoint(
@@ -409,14 +399,6 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         pass
     return names
-
-
-def _qualified_tool_block(agent, function_name: str) -> str | None:
-    """Fail closed when a session-bound exact tool allowlist excludes a call."""
-    allowed = getattr(agent, "qualified_tool_allowlist", None)
-    if allowed is None or function_name in allowed:
-        return None
-    return f"'{function_name}' is not authorized for this session."
 
 
 @dataclass
@@ -1198,9 +1180,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        if _ts_scope_block is None:
-            _ts_scope_block = _qualified_tool_block(agent, function_name)
-
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
@@ -1307,17 +1286,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         start_order,
     ):
         """Worker function executed in a thread."""
-        try:
-            from tools.tool_search import TOOL_CALL_NAME
-
-            deferred_authority = (
-                function_name
-                if tool_call.function.name == TOOL_CALL_NAME
-                and function_name != TOOL_CALL_NAME
-                else None
-            )
-        except Exception:
-            deferred_authority = None
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -1371,18 +1339,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    with _scoped_deferred_tool_authority(deferred_authority):
-                        return agent._invoke_tool(
-                            function_name,
-                            next_args,
-                            effective_task_id,
-                            tool_call.id,
-                            messages=messages,
-                            pre_tool_block_checked=True,
-                            skip_tool_request_middleware=True,
-                            skip_tool_execution_middleware=True,
-                            tool_request_middleware_trace=list(middleware_trace),
-                        )
+                    return agent._invoke_tool(
+                        function_name,
+                        next_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
 
                 managed = _run_agent_tool_execution_middleware(
                     agent,
@@ -2039,7 +2006,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
         _ts_scope_block: Optional[str] = None
-        _ts_authority: Optional[str] = None
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
@@ -2065,7 +2031,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         else:
                             function_name = _underlying
                             function_args = _underlying_args
-                            _ts_authority = _underlying
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -2079,30 +2044,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_dispatched = False
 
         tool_start_time = time.time()
-
-        def _dispatch_registry_tool(next_args: dict) -> Any:
-            with _scoped_deferred_tool_authority(_ts_authority):
-                return _ra().handle_function_call(
-                    function_name,
-                    next_args,
-                    effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "")
-                    or "",
-                    enabled_tools=(
-                        list(agent.valid_tool_names)
-                        if agent.valid_tool_names
-                        else None
-                    ),
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    skip_tool_execution_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                )
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:
@@ -2531,7 +2472,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _spinner_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return _dispatch_registry_tool(next_args)
+                    from model_tools import suppress_post_tool_call_hook
+
+                    with suppress_post_tool_call_hook():
+                        return _ra().handle_function_call(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=agent.session_id or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            api_request_id=getattr(agent, "_current_api_request_id", "")
+                            or "",
+                            enabled_tools=(
+                                list(agent.valid_tool_names)
+                                if agent.valid_tool_names
+                                else None
+                            ),
+                            skip_pre_tool_call_hook=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        )
 
                 (
                     function_result,
@@ -2590,7 +2554,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         else:
             try:
                 def _execute(next_args: dict) -> Any:
-                    return _dispatch_registry_tool(next_args)
+                    from model_tools import suppress_post_tool_call_hook
+
+                    with suppress_post_tool_call_hook():
+                        return _ra().handle_function_call(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=agent.session_id or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            api_request_id=getattr(agent, "_current_api_request_id", "")
+                            or "",
+                            enabled_tools=(
+                                list(agent.valid_tool_names)
+                                if agent.valid_tool_names
+                                else None
+                            ),
+                            skip_pre_tool_call_hook=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        )
 
                 (
                     function_result,

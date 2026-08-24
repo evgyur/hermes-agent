@@ -776,8 +776,6 @@ def load_cli_config() -> Dict[str, Any]:
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
     if isinstance(sessions_config, dict):
-        if "trigram_fts" in sessions_config:
-            os.environ["HERMES_TRIGRAM_FTS"] = str(sessions_config["trigram_fts"])
         if "cjk_fts" in sessions_config:
             os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
         if "search_slow_ms" in sessions_config:
@@ -12375,27 +12373,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
-                    import shlex
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
-                        user_args = cmd_original[len(base_cmd):].strip()
-                        env = os.environ.copy()
-                        env["HERMES_COMMAND_NAME"] = base_cmd.lstrip("/")
-                        env["HERMES_COMMAND_ARGS"] = user_args
-                        if qcmd.get("append_args") and user_args:
-                            try:
-                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
-                            except ValueError:
-                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the CLI process which
                             # has all API keys in os.environ.
-                            from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(env)
+                            from tools.environments.local import build_subprocess_env
+                            sanitized_env = build_subprocess_env()
                             from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
@@ -12996,11 +12984,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         try:
             from hermes_cli.goals import gather_background_processes as _gather_bg
-            # Standalone CLI tool calls use the conversation session_id as the
-            # terminal process-registry session_key/task owner. Restrict the
-            # judge snapshot to that exact owner so another CLI session cannot
-            # authorize WAIT.
-            _bg_procs = _gather_bg(session_key=mgr.session_id)
+            _bg_procs = _gather_bg()
         except Exception:
             _bg_procs = None
 
@@ -16157,39 +16141,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
-        skill_runtime_requested = False
-        if isinstance(message, str):
-            try:
-                from agent.skill_commands import writing_skill_runtime_config
-
-                skill_runtime_requested = (
-                    writing_skill_runtime_config(message) is not None
-                )
-            except Exception as exc:
-                logging.debug("Writing-skill runtime check failed: %s", exc)
-
-        # Refresh the current session provider only when the turn does not carry
-        # its own fail-closed skill route. /sco resolves OpenRouter independently.
-        if not skill_runtime_requested and not self._ensure_runtime_credentials():
+        # Refresh provider credentials if needed (handles key rotation transparently)
+        if not self._ensure_runtime_credentials():
             return None
 
-        skill_reasoning_override = None
-        if isinstance(message, str):
-            try:
-                from agent.skill_commands import writing_skill_reasoning_config
-
-                skill_reasoning_override = writing_skill_reasoning_config(message)
-                if skill_reasoning_override is not None:
-                    self.reasoning_config = skill_reasoning_override
-            except Exception as exc:
-                logging.debug("Writing-skill reasoning override check failed: %s", exc)
-
-        try:
-            turn_route = self._resolve_turn_agent_config(message)
-        except Exception as exc:
-            logging.error("Writing-skill runtime resolution failed: %s", exc)
-            _cprint(f"  ✗ Required skill model route failed: {exc}")
-            return None
+        turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -16200,14 +16156,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
-            disable_fallbacks=turn_route.get("disable_fallbacks", False),
         ):
             return None
         agent = self.agent
         if agent is None:
             return None
-        if skill_reasoning_override is not None:
-            agent.reasoning_config = dict(skill_reasoning_override)
 
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -16223,16 +16176,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 from hermes_cli.config import load_config
 
-                _active_agent = self.agent
+                _img_model, _img_provider = "", ""
+                if isinstance(self.model, dict):
+                    _img_model, _ = _split_model_config_default(self.model)
+                else:
+                    _img_model = str(self.model or "")
+                if isinstance(self.provider, dict):
+                    _, _img_provider = _split_model_config_default(self.provider)
+                else:
+                    _img_provider = str(self.provider or "")
                 _img_mode = decide_image_input_mode(
-                    (getattr(_active_agent, "provider", None) or self.provider or "").strip(),
-                    (getattr(_active_agent, "model", None) or self.model or "").strip(),
+                    _img_provider.strip(),
+                    _img_model.strip(),
                     load_config(),
-                    requested_provider=(
-                        getattr(_active_agent, "requested_provider", None)
-                        or self.requested_provider
-                        or ""
-                    ).strip(),
+                    requested_provider=(self.requested_provider or "").strip(),
                 )
             except Exception as _img_exc:
                 logging.debug("image_routing decision failed, defaulting to text: %s", _img_exc)

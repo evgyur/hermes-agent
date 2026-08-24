@@ -180,157 +180,55 @@ def test_goal_bare_shows_status_when_none_set(server, session):
     assert "No active goal" in r["result"]["output"]
 
 
-def test_goal_whitespace_only_shows_status(server, session):
-    sid, _, _ = session
-    r = _call(server, "command.dispatch", name="goal", arg="   ", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "No active goal" in r["result"]["output"]
-
-
-def test_post_turn_goal_wait_snapshot_is_scoped_to_tui_session(server):
-    import inspect
-
-    source = inspect.getsource(server._run_prompt_submit)
-    assert "_gather_bg(session_key=sid_key)" in source
-    assert "_gather_bg()" not in source
-
-
-def test_goal_status_alias_shows_status(server, session):
-    sid, _, _ = session
-    r = _call(server, "command.dispatch", name="goal", arg="status", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "No active goal" in r["result"]["output"]
-
-
-def test_goal_set_returns_send_with_notice(server, session):
-    sid, session_key, _ = session
-    r = _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
-    result = r["result"]
-    assert result["type"] == "send"
-    assert result["message"] == "build a rocket"
-    assert "notice" in result
-    assert "Goal set" in result["notice"]
-    assert "20-turn budget" in result["notice"]
-
-    # Persisted in SessionDB
+def _exhaust_budget(session_key: str, goal_text: str = "finish the benchmark"):
+    """Set a 1-turn goal and drive it to budget-exhaustion auto-pause."""
     from hermes_cli.goals import GoalManager
 
     mgr = GoalManager(session_key)
-    assert mgr.state is not None
-    assert mgr.state.goal == "build a rocket"
-    assert mgr.state.status == "active"
+    mgr.set(goal_text, max_turns=1)
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "needs more steps", False, None, False),
+    ):
+        decision = mgr.evaluate_after_turn("worked a bit")
+    assert decision["status"] == "paused"
+    assert decision["should_continue"] is False
+    return mgr
 
 
-def test_goal_pause_after_set(server, session):
-    sid, session_key, _ = session
-    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
-    r = _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "paused" in r["result"]["output"].lower()
+def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
+    server, session
+):
+    """#75362: /goal resume must restart work, not just flip state.
 
+    The pre-fix handler returned a display-only `exec` payload, so the
+    resumed goal sat idle until the user sent another message. Resume
+    must return a sendable dispatch carrying the canonical continuation
+    prompt, with a concise `/goal resume` transcript projection.
+    """
     from hermes_cli.goals import GoalManager
 
+    sid, session_key, _ = session
+    _exhaust_budget(session_key)
     assert GoalManager(session_key).state.status == "paused"
 
-
-def test_goal_resume_reactivates(server, session):
-    sid, session_key, _ = session
-    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
-    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-    assert r["result"]["type"] == "send"
-    assert "resumed" in r["result"]["notice"].lower()
-    assert "continuation queued immediately" in r["result"]["notice"].lower()
-    assert r["result"]["message"].startswith(
-        "[Continuing toward your standing goal]\nGoal: write a story"
-    )
+    result = r["result"]
+    assert result["type"] == "send"
+    assert result["message"].startswith("[Continuing toward your standing goal]")
+    assert result["display"] == "/goal resume"
+    assert "Goal resumed" in result["notice"]
 
-    from hermes_cli.goals import GoalManager
-
-    assert GoalManager(session_key).state.status == "active"
-
-
-def test_goal_resume_while_turn_running_queues_without_redirect(server, session):
-    """A synthetic resume turn must not rewrite/redirect the live user turn."""
-    sid, session_key, s = session
-    _call(server, "command.dispatch", name="goal", arg="finish after live turn", session_id=sid)
-    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
-    agent = MagicMock()
-    agent._supports_active_turn_redirect = True
-    agent.redirect.return_value = True
-    s["agent"] = agent
-    s["running"] = True
-    s["inflight_turn"] = {"user": "original live prompt", "assistant": "", "streaming": True}
-
-    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-
-    assert r["result"]["type"] == "exec"
-    assert "queued" in r["result"]["output"].lower()
-    assert s["inflight_turn"]["user"] == "original live prompt"
-    agent.redirect.assert_not_called()
-    assert s["queued_prompt"]["text"].startswith(
-        "[Continuing toward your standing goal]\nGoal: finish after live turn"
-    )
-
-    from hermes_cli.goals import GoalManager
-
-    assert GoalManager(session_key).state.status == "active"
+    state = GoalManager(session_key).state
+    assert state.status == "active"
+    assert state.turns_used == 0, "resume must reset the turn budget"
 
 
-def test_goal_resume_preserves_existing_tui_user_queue(server, session):
-    """A real queued user turn wins; resume must not merge synthetic text into it."""
-    sid, session_key, s = session
-    _call(server, "command.dispatch", name="goal", arg="continue after user", session_id=sid)
-    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
-    existing = {"text": "real queued user turn", "transport": object()}
-    s["running"] = True
-    s["queued_prompt"] = existing
-
-    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-
-    assert r["result"]["type"] == "exec"
-    assert "existing queued turn will run first" in r["result"]["output"].lower()
-    assert s["queued_prompt"] is existing
-    assert s["queued_prompt"]["text"] == "real queued user turn"
-
-    from hermes_cli.goals import GoalManager
-
-    assert GoalManager(session_key).state.status == "active"
-
-
-def test_goal_clear_removes_active_goal(server, session):
-    sid, session_key, _ = session
-    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
-    r = _call(server, "command.dispatch", name="goal", arg="clear", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "cleared" in r["result"]["output"].lower()
-
-    from hermes_cli.goals import GoalManager
-
-    # After clear the row is marked status=cleared (kept for audit);
-    # ``has_goal()`` / ``is_active()`` return False so the goal loop
-    # stays off and ``status`` reports "No active goal".
-    mgr = GoalManager(session_key)
-    assert not mgr.has_goal()
-    assert not mgr.is_active()
-    assert "No active goal" in mgr.status_line()
-
-
-def test_goal_stop_and_done_are_clear_aliases(server, session):
+def test_goal_resume_without_goal_stays_exec(server, session):
     sid, _, _ = session
-    _call(server, "command.dispatch", name="goal", arg="first goal", session_id=sid)
-    r = _call(server, "command.dispatch", name="goal", arg="stop", session_id=sid)
-    assert "cleared" in r["result"]["output"].lower()
-
-    _call(server, "command.dispatch", name="goal", arg="second goal", session_id=sid)
-    r = _call(server, "command.dispatch", name="goal", arg="done", session_id=sid)
-    assert "cleared" in r["result"]["output"].lower()
-
-
-def test_goal_requires_session(server):
-    r = _call(server, "command.dispatch", name="goal", arg="nope", session_id="unknown")
-    assert "error" in r
-    assert r["error"]["code"] == 4001
+    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
+    assert r["result"]["type"] == "exec"
+    assert "No goal to resume" in r["result"]["output"]
 
 
 # ── slash.exec /goal routing ──────────────────────────────────────────

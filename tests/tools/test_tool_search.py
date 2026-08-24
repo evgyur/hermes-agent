@@ -521,60 +521,159 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
-    def test_scoped_deferred_dispatch_binds_exact_authority(self):
-        import model_tools
+
+# ---------------------------------------------------------------------------
+# Catalog listing (skills-style progressive disclosure)
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogListing:
+    def test_config_defaults(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw(None)
+        assert cfg.listing == "auto"
+        assert cfg.listing_max_tokens == 4000
+        # legacy bool shapes keep defaults too
+        assert ToolSearchConfig.from_raw(True).listing == "auto"
+
+
+    def test_default_listing_cap_bounds_fixed_catalog_overhead(self):
+        """The default manifest must not grow back to the old 20K-token cap."""
         from tools.registry import registry
-        from tools.tool_search import get_active_scoped_deferred_tool_authority
+        from tools.tool_search import (
+            ToolSearchConfig,
+            assemble_tool_defs,
+            estimate_tokens_from_schemas,
+        )
 
-        name = "continuum_authority_probe"
-
-        def _handler(args, **kwargs):
-            return json.dumps(
-                {"authority": get_active_scoped_deferred_tool_authority()}
+        defs = []
+        for i in range(500):
+            name = f"lean_catalog_tool_{i:04d}"
+            registry.register(
+                name=name,
+                handler=lambda args, **kwargs: "{}",
+                schema=_td(name, "Perform a deliberately verbose connected service action."),
+                toolset="mcp-lean-catalog",
             )
+            defs.append(_td(name, "Perform a deliberately verbose connected service action."))
 
-        registry.register(
-            name=name,
-            handler=_handler,
-            schema=_td(name, "effectful deferred authority probe"),
-            toolset="continuum-authority-probe",
+        cfg = ToolSearchConfig.from_raw(None)
+        result = assemble_tool_defs(defs, context_length=1_000_000, config=cfg)
+        search = next(
+            td for td in result.tool_defs
+            if td["function"]["name"] == "tool_search"
         )
+        description_tokens = estimate_tokens_from_schemas([search])
+        # Includes the bridge schema around the listing, so allow modest
+        # framing overhead above the 4K listing budget.
+        assert description_tokens < 4500
+        assert result.listing_form in {"names", "groups", "mixed"}
 
-        assert get_active_scoped_deferred_tool_authority() is None
-        result = model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": name, "arguments": {}},
-            enabled_toolsets=["continuum-authority-probe"],
-        )
+    def test_short_desc_first_sentence_and_clip(self):
+        from tools.tool_search import _short_desc
+        assert _short_desc("Open an issue. Second sentence dropped.") == "Open an issue."
+        long = "word " * 40
+        s = _short_desc(long)
+        assert len(s) <= 61  # 60 + ellipsis char
+        assert s.endswith("…")
+        assert _short_desc("") == ""
 
-        assert json.loads(result) == {"authority": name}
-        assert get_active_scoped_deferred_tool_authority() is None
 
-    def test_out_of_scope_deferred_call_never_binds_authority(self):
-        import model_tools
+    @staticmethod
+    def _register(name):
         from tools.registry import registry
-        from tools.tool_search import get_active_scoped_deferred_tool_authority
 
-        name = "continuum_out_of_scope_authority_probe"
-        calls = []
-
-        def _handler(args, **kwargs):
-            calls.append(get_active_scoped_deferred_tool_authority())
+        def _handler(args, task_id=None, **kw):
             return json.dumps({"ok": True})
 
         registry.register(
             name=name,
             handler=_handler,
-            schema=_td(name, "out-of-scope deferred authority probe"),
-            toolset="continuum-out-of-scope-probe",
+            schema=_td(name, "Deferred capability description.")["function"],
+            toolset="mcp-listingtest",
         )
 
-        result = model_tools.handle_function_call(
+
+    def test_assembly_listing_off_keeps_legacy_description(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+        for i in range(30):
+            self._register(f"mcp_x_{i}")
+        defs = [_td(f"mcp_x_{i}", "Deferred.") for i in range(30)]
+        result = assemble_tool_defs(
+            defs, context_length=1000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
+        )
+        assert result.activated
+        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
+        assert "mcp_x_0" not in search["function"]["description"]
+
+
+class TestDeferredCallSchemaProbe:
+    """Blind tool_call invocations missing required arguments must return
+    the tool's parameter schema instead of dispatching into an opaque
+    downstream failure (port of nearai/ironclaw#5149's describe-first fix).
+
+    A deferred tool's schema is invisible until tool_describe is called, so
+    models routinely invoke deferred tools by name alone. Pre-fix, that
+    produced ``KeyError: 'document_id'``-style errors that teach the model
+    nothing; post-fix, the probe returns the schema so the model repairs
+    the call in one round-trip. Valid calls dispatch untouched.
+    """
+
+    @staticmethod
+    def _register(name, toolset, required=("document_id",)):
+        from tools.registry import registry
+
+        def _handler(args, task_id=None, **kw):
+            # Simulates a tool that crashes opaquely on a missing required arg.
+            return json.dumps({"ok": True, "doc": args["document_id"]})
+
+        params = {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "description": "Doc id"},
+                "format": {"type": "string"},
+            },
+            "required": list(required),
+        }
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema={"type": "function",
+                    "function": {"name": name, "description": f"desc {name}",
+                                 "parameters": params}},
+            toolset=toolset,
+        )
+
+    def test_validator_returns_schema_for_missing_required(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register("mcp_probe_docs_get", "mcp-probe")
+        err = validate_deferred_call_args("mcp_probe_docs_get", {})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "document_id" in parsed["error"]
+        assert "NOT invoked" in parsed["error"]
+        assert parsed["parameters"]["required"] == ["document_id"]
+        assert "document_id" in parsed["parameters"]["properties"]
+
+
+    def test_validator_never_blocks_unvalidatable_tools(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        # Unknown tool → no schema → dispatch (downstream scope gate handles it).
+        assert validate_deferred_call_args("mcp_no_such_tool_xyz", {}) is None
+
+
+    def test_valid_tool_call_still_dispatches(self):
+        import model_tools
+
+        self._register("mcp_probe_valid_op", "mcp-probe-valid")
+        result = json.loads(model_tools.handle_function_call(
             function_name="tool_call",
-            function_args={"name": name, "arguments": {}},
-            enabled_toolsets=["continuum-authority-probe"],
-        )
-
-        assert "not available in this session" in result
-        assert calls == []
-        assert get_active_scoped_deferred_tool_authority() is None
+            function_args={"name": "mcp_probe_valid_op",
+                           "arguments": {"document_id": "abc"}},
+            enabled_toolsets=["mcp-probe-valid"],
+        ))
+        assert result.get("ok") is True
+        assert result.get("doc") == "abc"

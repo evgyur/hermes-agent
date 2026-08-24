@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import os
-import resource
 from typing import Any
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows has no POSIX rlimits
+    resource = None  # type: ignore[assignment]
 
 CHILD_NOFILE_LIMIT = 4096
 
 
 def child_resource_preexec() -> None:
+    if resource is None:
+        return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     cap = min(CHILD_NOFILE_LIMIT, hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (cap, cap))

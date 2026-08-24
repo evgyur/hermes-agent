@@ -114,12 +114,12 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_conflict_retry_preserves_pending_updates(monkeypatch):
-    """Conflict recovery must not discard updates before durable admission.
+async def test_conflict_retry_drops_pending_updates(monkeypatch):
+    """Conflict recovery must use drop_pending_updates=True (#75017).
 
-    The old conflict workaround dropped the Bot API queue to evict a stale
-    poller. That violates durable admission; retries must wait out the conflict
-    without deleting user updates.
+    Without this, each retry starts a new getUpdates session that
+    immediately gets 409'd by the previous still-expiring session,
+    creating the very conflict we are trying to recover from.
     """
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     adapter.set_fatal_error_handler(AsyncMock())
@@ -143,7 +143,10 @@ async def test_conflict_retry_preserves_pending_updates(monkeypatch):
         conflict("Conflict: terminated by other getUpdates request")
     )
 
-    assert captured.get("drop_pending_updates") is False
+    assert captured.get("drop_pending_updates") is True, (
+        "Conflict retry must use drop_pending_updates=True to terminate "
+        "stale getUpdates sessions on Telegram's servers (#75017)"
+    )
 
 
 @pytest.mark.asyncio
@@ -534,19 +537,6 @@ def _build_polling_app(monkeypatch, adapter):
     )
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
     return captured
-
-
-@pytest.mark.asyncio
-async def test_cold_start_preserves_pending_updates(monkeypatch):
-    """Cold startup must not discard updates received while Hermes was down."""
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
-    captured = _build_polling_app(monkeypatch, adapter)
-
-    ok = await adapter.connect()
-
-    assert ok is True
-    assert captured["drop_pending_updates"] is False
-    await _cancel_heartbeat(adapter)
 
 
 @pytest.mark.asyncio

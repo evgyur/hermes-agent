@@ -406,7 +406,6 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
 
     with (
         patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
-        patch.object(agent, "_emit_status") as emit_status,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -416,17 +415,6 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]
     assert "stopped retrying" in halt_text
-    assert "web_search" not in halt_text
-    assert "repeated_exact_failure_block" not in halt_text
-    assert "guardrail" not in halt_text.lower()
-    status_text = "\n".join(
-        call.args[0]
-        for call in emit_status.call_args_list
-        if call.args and isinstance(call.args[0], str)
-    )
-    assert "web_search" not in status_text
-    assert "repeated_exact_failure_block" not in status_text
-    assert "guardrail" not in status_text.lower()
 
     # The halt message must have been pushed through the callback at least
     # once.  Empty-queue SSE writers were the bug — clients saw no content

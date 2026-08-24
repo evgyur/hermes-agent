@@ -1158,17 +1158,8 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
-        # These paths came from the explicit ``artifacts`` payload of a
-        # kanban completion, not from free-form assistant prose. Validate each
-        # path against the delivery policy without applying the bare-image
-        # suppression used for ordinary chat text.
-        from gateway.platforms.base import validate_media_delivery_path
-
-        candidates = [
-            safe
-            for path in candidates
-            if (safe := validate_media_delivery_path(path)) is not None
-        ]
+        from gateway.platforms.base import BasePlatformAdapter
+        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
         if not candidates:
             return
 

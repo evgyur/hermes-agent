@@ -70,6 +70,7 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
@@ -84,7 +85,11 @@ def _read_connection() -> Iterator[Optional[sqlite3.Connection]]:
     if not path.is_file():
         yield None
         return
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    except sqlite3.OperationalError:
+        yield None
+        return
     conn.row_factory = sqlite3.Row
     try:
         if not _storage_initialized(conn):
@@ -112,6 +117,17 @@ def initialize_storage() -> None:
         raise
     finally:
         conn.close()
+
+
+def initialize_schema_on_connection(conn: sqlite3.Connection) -> None:
+    """Install the barrier schema inside an existing startup-owned connection.
+
+    Durable delegation and the parent barrier share one state database and one
+    admission transaction boundary.  Initializing both schemas together keeps
+    standalone/recovery dispatch from reaching barrier DML before gateway
+    startup has created the companion tables.
+    """
+    _ensure_schema(conn)
 
 
 @contextmanager
@@ -273,13 +289,21 @@ def _prune_terminal_in_tx(conn: sqlite3.Connection, now: float) -> None:
 
 
 def _pid_is_dead(pid: int) -> bool:
+    """Return whether ``pid`` is dead without signaling the target process.
+
+    ``os.kill(pid, 0)`` is the conventional POSIX probe, but on Windows
+    CPython maps signal zero to ``CTRL_C_EVENT`` and can interrupt the whole
+    console process group. Reuse the gateway's psutil/WinAPI-aware liveness
+    probe so recovery never changes the external state it is inspecting.
+    """
     try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError):
+        from gateway.status import _pid_exists
+
+        return not _pid_exists(int(pid))
+    except Exception:
+        # Import/bootstrap failures are fail-open: keep the lease until its
+        # bounded expiry instead of risking duplicate continuation delivery.
         return False
-    return False
 
 
 def _current_owner_stamp() -> tuple[int, Optional[int]]:
@@ -520,22 +544,6 @@ def finalization_policy(
     parent = str(parent_session_id or "").strip()
     turn = str(root_turn_id or "").strip()
     if not parent or not turn:
-        return {"action": "deliver"}
-    # Non-gateway entry points can finalize ordinary turns against a fresh
-    # state.db before gateway startup. No barrier can have been admitted
-    # without its table, so this exact first-run state means no barrier.
-    # Other read and transaction failures still propagate fail-closed.
-    path = _db_path()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        schema_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='parent_task_barriers'"
-        ).fetchone()
-    finally:
-        conn.close()
-    if schema_exists is None:
         return {"action": "deliver"}
     now = time.time()
     with _transaction() as conn:
@@ -1118,8 +1126,6 @@ def cancel_session_barriers(
         return 0
     now = time.time()
     with _transaction() as conn:
-        if not _storage_initialized(conn):
-            return 0
         rows = conn.execute(
             "SELECT barrier_id FROM parent_task_barriers "
             "WHERE state NOT IN ('closed','cancelled','failed') AND ("

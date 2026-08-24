@@ -9,22 +9,14 @@ duplicate agent.
 """
 
 import asyncio
-from datetime import datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import (
-    EventOrigin,
-    MessageEvent,
-    MessageType,
-    merge_pending_message_event,
-)
+from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
-from gateway.session import SessionEntry, SessionSource, build_session_key
-from hermes_state import SessionDB
+from gateway.session import SessionSource, build_session_key
 
 
 class _FakeAdapter:
@@ -71,24 +63,7 @@ def _make_runner():
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
-    def _entry(source):
-        return SessionEntry(
-            session_key=build_session_key(source),
-            session_id=f"session-{source.chat_id}",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            platform=source.platform,
-            chat_type=source.chat_type,
-        )
-    runner._async_session_store = SimpleNamespace(
-        _store=runner.session_store,
-        get_or_create_session=AsyncMock(side_effect=_entry),
-    )
     runner.delivery_router = MagicMock()
-    # Most race tests isolate session ownership from durable ledger behavior.
-    runner._record_gateway_ledger_received = MagicMock(return_value=None)
-    runner._update_gateway_ledger = MagicMock(return_value=True)
-    runner._ensure_preledger_ingress = MagicMock(return_value=True)
     return runner
 
 
@@ -126,110 +101,6 @@ async def test_sentinel_placed_before_agent_setup():
     assert sentinel_was_set, (
         "Sentinel must be in _running_agents when _handle_message_with_agent starts"
     )
-
-
-@pytest.mark.asyncio
-async def test_goal_pause_await_happens_after_session_claim():
-    runner = _make_runner()
-    first = _make_event(text="first")
-    second = _make_event(text="second")
-    session_key = build_session_key(first.source)
-    pause_entered = asyncio.Event()
-    release_pause = asyncio.Event()
-    agent_entries = []
-
-    async def slow_pause(**_kwargs):
-        pause_entered.set()
-        await release_pause.wait()
-        return True
-
-    async def record_agent(_event, _source, key, _generation):
-        agent_entries.append(key)
-        return "ok"
-
-    runner._pause_active_goal_for_user_turn = slow_pause
-    runner._handle_message_with_agent = record_agent
-
-    first_task = asyncio.create_task(runner._handle_message(first))
-    await asyncio.wait_for(pause_entered.wait(), timeout=1)
-    assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
-
-    await runner._handle_message(second)
-    release_pause.set()
-    await first_task
-
-    assert agent_entries == [session_key]
-    assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key].text == "second"
-
-
-@pytest.mark.asyncio
-async def test_goal_pause_failure_releases_claim_and_blocks_agent():
-    runner = _make_runner()
-    event = _make_event(text="new scope")
-    session_key = build_session_key(event.source)
-    runner._pause_active_goal_for_user_turn = AsyncMock(
-        side_effect=RuntimeError("state store unavailable")
-    )
-    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
-
-    result = await runner._handle_message(event)
-
-    assert "couldn't safely pause" in result
-    assert session_key not in runner._running_agents
-    runner._handle_message_with_agent.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_goal_storage_outage_retains_preledger_turn_for_retry():
-    runner = _make_runner()
-    event = _make_event(text="retain me")
-    session_key = build_session_key(event.source)
-    setattr(event, "_hermes_preledger_ingress", True)
-    setattr(event, "_hermes_deferred_spool_path", "/private/ingress.json")
-    runner._queue_preledger_retry = MagicMock()
-    runner._pause_active_goal_for_user_turn = AsyncMock(
-        side_effect=RuntimeError("state store unavailable")
-    )
-    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
-
-    result = await runner._handle_message(event)
-
-    assert isinstance(result, str)
-    assert "saved durably" in result
-    assert "don't resend" in result
-    assert session_key not in runner._running_agents
-    assert getattr(event, "_hermes_deferred_retry_pending") is True
-    runner._queue_preledger_retry.assert_called_once_with(event)
-    runner._handle_message_with_agent.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_unauthorized_turn_never_enters_durable_ledger(tmp_path):
-    db = SessionDB(tmp_path / "state.db")
-    try:
-        runner = _make_runner()
-        runner._session_db = db
-        runner._record_gateway_ledger_received = (
-            GatewayRunner._record_gateway_ledger_received.__get__(runner)
-        )
-        runner._finalize_gateway_ledger_after_handler = (
-            GatewayRunner._finalize_gateway_ledger_after_handler.__get__(runner)
-        )
-        runner._is_user_authorized = lambda source: False
-        event = _make_event(text="private unauthorized body")
-        event.source.chat_type = "group"
-        event.message_id = "unauthorized"
-        event.source.message_id = "unauthorized"
-
-        assert await runner._handle_message(event) is None
-        assert db.find_gateway_message_ledger(
-            platform="telegram",
-            chat_id="12345",
-            thread_id=None,
-            message_id="unauthorized",
-        ) is None
-    finally:
-        db.close()
 
 
 # ------------------------------------------------------------------
@@ -278,39 +149,6 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
-
-
-def test_recovery_and_real_inbound_never_merge_or_inherit_provenance():
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        user_id="u1",
-    )
-    session_key = build_session_key(source)
-    recovery = MessageEvent(
-        text="continue interrupted work",
-        message_type=MessageType.TEXT,
-        source=source,
-        internal=True,
-        startup_resume=True,
-        event_origin=EventOrigin.STARTUP_CONTINUATION,
-    )
-    inbound = MessageEvent(
-        text="?",
-        message_type=MessageType.TEXT,
-        source=source,
-    )
-
-    pending = {session_key: inbound}
-    merge_pending_message_event(pending, session_key, recovery, merge_text=True)
-    assert pending[session_key] is inbound
-    assert pending[session_key].startup_resume is False
-
-    pending = {session_key: recovery}
-    merge_pending_message_event(pending, session_key, inbound, merge_text=True)
-    assert pending[session_key] is inbound
-    assert pending[session_key].internal is False
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,6 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-import os
 from typing import Any
 
 from agent.skill_commands import (
@@ -323,26 +322,14 @@ FTS_STORAGE_VERSION = 1
 MAX_FTS5_QUERY_CHARS = 2_048
 
 
-_FTS_BASE_TRIGGERS = (
+_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
-)
-
-_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
-
-_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
-
-
-def trigram_fts_config_enabled() -> bool:
-    """Return whether the rebuildable trigram derivative should be served."""
-    return os.getenv("HERMES_TRIGRAM_FTS", "1").strip().lower() not in (
-        "0", "false", "off", "no",
-    )
 
 
 SCHEMA_SQL = """
@@ -482,45 +469,6 @@ CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     failure_streak INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS gateway_message_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lookup_key TEXT UNIQUE,
-    platform TEXT,
-    chat_id TEXT,
-    thread_id TEXT,
-    message_id TEXT,
-    user_id TEXT,
-    session_key TEXT,
-    session_id TEXT,
-    status TEXT NOT NULL DEFAULT 'received',
-    origin_type TEXT NOT NULL DEFAULT 'real_user',
-    received_at REAL NOT NULL,
-    dispatch_started_at REAL,
-    completed_at REAL,
-    drained_at REAL,
-    failed_at REAL,
-    updated_at REAL NOT NULL,
-    reason TEXT,
-    metadata TEXT,
-    snippet TEXT
-);
-
-CREATE TABLE IF NOT EXISTS gateway_steer_receipts (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    receipt_id TEXT NOT NULL UNIQUE,
-    session_key TEXT NOT NULL,
-    session_id TEXT,
-    generation INTEGER NOT NULL,
-    ingress_ledger_id INTEGER,
-    payload_json TEXT NOT NULL,
-    state TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    request_fenced_at REAL,
-    terminal_at REAL,
-    UNIQUE (session_key, generation, ingress_ledger_id)
-);
-
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -556,47 +504,12 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
-CREATE TABLE IF NOT EXISTS durable_continuations (
-    continuation_id TEXT PRIMARY KEY,
-    session_key TEXT NOT NULL,
-    session_id TEXT,
-    origin_turn_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    generation INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN (
-        'pending', 'claimed', 'waiting_unknown_effect', 'completed',
-        'cancelled', 'superseded', 'failed_terminal'
-    )),
-    input_digest TEXT NOT NULL,
-    descriptor_json TEXT NOT NULL DEFAULT '{}',
-    claim_token TEXT,
-    claim_owner TEXT,
-    lease_expires_at REAL,
-    effect_fence TEXT,
-    effect_started_at REAL,
-    outcome_digest TEXT,
-    outcome_descriptor_json TEXT,
-    superseded_by_continuation_id TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    completed_at REAL,
-    UNIQUE (session_key, origin_turn_id, kind, generation)
-);
-
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup ON gateway_message_ledger(lookup_key);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session ON gateway_message_ledger(session_key, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_platform ON gateway_message_ledger(platform, chat_id, thread_id, message_id);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status ON gateway_message_ledger(status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_session
-    ON gateway_steer_receipts(session_key, sequence);
-CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_state
-    ON gateway_steer_receipts(state, sequence);
 -- Partial index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of
@@ -611,13 +524,6 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_continuations_one_active
-    ON durable_continuations(session_key, kind)
-    WHERE state IN ('pending', 'claimed', 'waiting_unknown_effect');
-CREATE INDEX IF NOT EXISTS idx_durable_continuations_state_lease
-    ON durable_continuations(state, lease_expires_at);
-CREATE INDEX IF NOT EXISTS idx_durable_continuations_session
-    ON durable_continuations(session_key, kind, generation DESC);
 """
 
 
@@ -802,6 +708,11 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # have been written while those triggers were absent, so merely recreating
 # them would preserve an unknown index gap.
 FTS_STALE_KEY = "fts_stale"
+
+# Layout breadcrumb written when fail-open safely drops corrupt derived FTS
+# tables on their already-connected SQLite handle.  Reopen must recreate the
+# exact legacy/external shape (and optional trigram table) before clearing it.
+FTS_STALE_LAYOUT_KEY = "fts_stale_layout"
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────

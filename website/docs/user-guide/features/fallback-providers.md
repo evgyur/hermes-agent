@@ -268,8 +268,8 @@ Context compression is configured under `auxiliary.compression`:
 ```yaml
 auxiliary:
   compression:
-    provider: minimax                                 # Same provider options as other auxiliary tasks
-    model: MiniMax-M2.7
+    provider: main                                    # Same provider options as other auxiliary tasks
+    model: google/gemini-3-flash-preview
     base_url: null                                    # Custom OpenAI-compatible endpoint
 ```
 
