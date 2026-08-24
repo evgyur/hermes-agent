@@ -161,7 +161,7 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
-def _prepare_telegram_egress(chat_id, route_envelope=None) -> dict:
+def _prepare_telegram_egress(chat_id, thread_id=None, route_envelope=None) -> dict:
     """Authorize one standalone Telegram dispatch before Bot construction.
 
     The absolute recipient deny applies to legacy callers that do not yet
@@ -176,6 +176,9 @@ def _prepare_telegram_egress(chat_id, route_envelope=None) -> dict:
     route = canonical_route_envelope(route_envelope)
     if route["chat_id"] != str(chat_id):
         raise TelegramEgressDenied("telegram_route_recipient_mismatch")
+    requested_thread_id = str(thread_id) if thread_id is not None else None
+    if route["thread_id"] != requested_thread_id:
+        raise TelegramEgressDenied("telegram_route_thread_mismatch")
     assert_route_allowed(
         chat_id,
         metadata={**route, "route_envelope": route},
@@ -1478,7 +1481,9 @@ async def _send_telegram(
     instead, bypassing MarkdownV2 conversion.
     """
     try:
-        egress_kwargs = _prepare_telegram_egress(chat_id, route_envelope)
+        egress_kwargs = _prepare_telegram_egress(
+            chat_id, thread_id, route_envelope
+        )
 
         from telegram import Bot
         from telegram.constants import ParseMode
