@@ -70,12 +70,12 @@ def test_send_message_schema_exposes_explicit_route_envelope() -> None:
 
 
 def test_denied_plain_target_has_zero_text_wire_calls(monkeypatch) -> None:
-    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "268754981")
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "700000321")
     bot = _bot_with_successful_senders()
     bot_factory = MagicMock(return_value=bot)
     monkeypatch.setattr(telegram, "Bot", bot_factory)
 
-    result = asyncio.run(_send_telegram("token", "268754981", "must not send"))
+    result = asyncio.run(_send_telegram("token", "700000321", "must not send"))
 
     assert result == {"error": "Telegram send failed: telegram_recipient_denied"}
     bot_factory.assert_not_called()
@@ -85,7 +85,7 @@ def test_denied_plain_target_has_zero_text_wire_calls(monkeypatch) -> None:
 def test_denied_plain_target_has_zero_media_wire_calls(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "268754981")
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "700000321")
     media_path = tmp_path / "blocked.txt"
     media_path.write_text("blocked", encoding="utf-8")
     bot = _bot_with_successful_senders()
@@ -95,7 +95,7 @@ def test_denied_plain_target_has_zero_media_wire_calls(
     result = asyncio.run(
         _send_telegram(
             "token",
-            "268754981",
+            "700000321",
             "",
             media_files=[(str(media_path), False)],
         )

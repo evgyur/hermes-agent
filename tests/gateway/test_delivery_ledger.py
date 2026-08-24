@@ -495,7 +495,7 @@ async def test_gateway_reconnect_preserves_exact_business_route_envelope():
         "platform": "telegram",
         "runtime_profile": "hermesdev",
         "transport_profile": "hermesdev",
-        "chat_id": "268754981",
+        "chat_id": "700000321",
         "thread_id": "1858",
         "user_id": "711111111",
         "business_connection_id": "biz-42",
@@ -503,7 +503,7 @@ async def test_gateway_reconnect_preserves_exact_business_route_envelope():
     }
     _record(
         "runtime-business",
-        session_key="agent:hermesdev:telegram:business:biz-42:268754981:711111111:external",
+        session_key="agent:hermesdev:telegram:business:biz-42:700000321:711111111:external",
         platform="telegram",
         chat_id=route["chat_id"],
         thread_id=route["thread_id"],
@@ -550,7 +550,7 @@ async def test_gateway_reconnect_allows_distinct_runtime_and_transport_profiles(
         "transport_profile": "transport-b",
         "chat_id": "777000123",
         "thread_id": None,
-        "user_id": "617744661",
+        "user_id": "700000111",
         "business_connection_id": "biz-distinct",
         "external_safe_mode": True,
     }
@@ -558,7 +558,7 @@ async def test_gateway_reconnect_allows_distinct_runtime_and_transport_profiles(
         "runtime-distinct-transport",
         session_key=(
             "agent:runtime-a:telegram:business:biz-distinct:"
-            "777000123:617744661:external"
+            "777000123:700000111:external"
         ),
         platform="telegram",
         chat_id=route["chat_id"],
@@ -605,13 +605,13 @@ async def test_gateway_reconnect_quarantines_tampered_exact_session_route(tamper
         "transport_profile": "transport-b",
         "chat_id": "777000123",
         "thread_id": "1858",
-        "user_id": "617744661",
+        "user_id": "700000111",
         "business_connection_id": "biz-exact",
         "external_safe_mode": True,
     }
     session_key = (
         "agent:runtime-a:telegram:business:biz-exact:"
-        "777000123:617744661:external"
+        "777000123:700000111:external"
     )
     row_chat = route["chat_id"]
     row_thread = route["thread_id"]
@@ -620,7 +620,7 @@ async def test_gateway_reconnect_quarantines_tampered_exact_session_route(tamper
     elif tamper == "thread":
         row_thread = "9999"
     elif tamper == "user":
-        session_key = session_key.replace("617744661", "617744999")
+        session_key = session_key.replace("700000111", "700000999")
     elif tamper == "business":
         session_key = session_key.replace("biz-exact", "biz-other")
 

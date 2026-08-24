@@ -6296,6 +6296,16 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        # Recovery capabilities are likewise per-turn and must be overwritten
+        # on every cache hit so an ordinary later user turn cannot inherit a
+        # stale replay fence.
+        agent.startup_resume = ctx.startup_resume is True
+        agent.startup_resume_effect_fence = (
+            dict(ctx.startup_resume_effect_fence)
+            if agent.startup_resume
+            and isinstance(ctx.startup_resume_effect_fence, dict)
+            else {}
+        )
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -6989,6 +6999,14 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_message_id is not None:
+                _conversation_kwargs["persist_user_message_id"] = (
+                    ctx.persist_user_message_id
+                )
+            if ctx.after_user_row_commit is not None:
+                _conversation_kwargs["after_user_row_commit"] = (
+                    ctx.after_user_row_commit
+                )
             _restart_wake = getattr(ctx, "_trusted_restart_wake", None)
             if _restart_wake is not None:
                 # A marker type is only an envelope. The durable
@@ -12703,8 +12721,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Start the still-owed continuation after a newer human turn settles."""
         if not getattr(entry, "resume_pending", False):
             return False
-        event = self._build_startup_resume_event(entry, source)
-        await adapter.handle_message(event)
+        sealed_source = resume_origin_from_snapshot(entry)
+        if sealed_source is None:
+            return False
+        sealed_adapter = self._startup_resume_adapter_for_source(sealed_source)
+        if sealed_adapter is None:
+            return False
+        event = self._build_startup_resume_event(
+            entry,
+            sealed_source,
+        )
+        await sealed_adapter.handle_message(event)
         return True
 
     async def _finish_startup_restore(self) -> None:
@@ -12954,14 +12981,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return claimed_all
 
-    @staticmethod
     def _telegram_replay_source(
+        self,
         row: Dict[str, Any],
         *,
         expected_runtime_profile: Optional[str] = None,
     ) -> SessionSource:
         """Rebuild one exact Telegram route or reject it as ambiguous."""
         from gateway.telegram_egress_policy import (
+            assert_recipient_allowed,
             canonical_route_envelope,
             is_private_peer_id,
         )
@@ -13019,8 +13047,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             external_safe_mode=route["external_safe_mode"],
         )
         session_key = str(row.get("session_key") or "")
-        if not session_key or build_session_key(source) != session_key:
+        rebuilt_session_key = build_session_key(
+            source,
+            group_sessions_per_user=getattr(
+                getattr(self, "config", None), "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=getattr(
+                getattr(self, "config", None), "thread_sessions_per_user", False
+            ),
+            profile=source.profile,
+        )
+        if not session_key or rebuilt_session_key != session_key:
             raise ValueError("ambiguous_route_envelope")
+        assert_recipient_allowed(source.chat_id)
+        if source.user_id is not None and str(source.user_id) != str(source.chat_id):
+            assert_recipient_allowed(source.user_id)
         return source
 
     def _adapter_for_delivery_replay(self, source: SessionSource):
@@ -13206,7 +13247,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         candidates = []
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
-            candidates.extend([getattr(session_db, "_db", None), session_db])
+            # Prefer the public facade. In production an async facade is
+            # detected and skipped below, then its synchronous DB is used; in
+            # tests and alternate stores the facade may itself expose the one
+            # authoritative synchronous reader.
+            candidates.extend([session_db, getattr(session_db, "_db", None)])
         store = getattr(self, "session_store", None)
         if store is not None:
             try:
@@ -13233,96 +13278,227 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return None
 
-    def _startup_resume_history_disposition(self, session_id: str) -> str:
-        """Classify whether a synthetic continuation can safely reach a model."""
-        rows = self._startup_resume_history_rows(session_id)
-        if rows is None:
-            return "unsafe_unknown"
-        latest_call_index = -1
-        latest_calls: dict[str, str] = {}
-        for index, row in enumerate(rows):
-            if not isinstance(row, dict) or row.get("role") != "assistant":
-                continue
-            calls = row.get("tool_calls") or []
-            identified: dict[str, str] = {}
-            for call in calls:
-                if not isinstance(call, dict):
-                    continue
-                call_id = str(call.get("call_id") or call.get("id") or "")
-                function = call.get("function") or {}
-                tool_name = str(
-                    (function.get("name") if isinstance(function, dict) else "")
-                    or call.get("name")
-                    or ""
-                )
-                if call_id:
-                    identified[call_id] = tool_name
-            if identified:
-                latest_call_index = index
-                latest_calls = identified
-        if latest_call_index < 0:
-            return "continue"
-        settled: set[str] = set()
-        last_receipt_index = latest_call_index
-        for index, row in enumerate(rows[latest_call_index + 1 :], latest_call_index + 1):
-            if not isinstance(row, dict) or row.get("role") != "tool":
-                continue
-            call_id = str(row.get("tool_call_id") or "")
-            if call_id in latest_calls:
-                settled.add(call_id)
-                last_receipt_index = max(last_receipt_index, index)
-        dangling = set(latest_calls) - settled
-        if dangling:
-            from agent.tool_result_classification import tool_may_have_side_effect
+    @staticmethod
+    def _canonical_startup_tool_call(call: dict) -> Optional[tuple[str, str, str]]:
+        """Return ``(call id, name, canonical args)`` or fail closed."""
+        if not isinstance(call, dict):
+            return None
+        call_id = call.get("call_id") or call.get("id")
+        function = call.get("function")
+        if not isinstance(function, dict):
+            function = {}
+        name = function.get("name") or call.get("name")
+        raw_args = function.get("arguments", call.get("arguments"))
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        if not isinstance(name, str) or not name:
+            return None
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(args, dict):
+            return None
+        canonical_args = json.dumps(
+            args, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return call_id, name, canonical_args
 
-            if any(
-                tool_may_have_side_effect(latest_calls.get(call_id, ""))
-                for call_id in dangling
-            ):
-                return "unsafe_unknown"
-        for row in rows[last_receipt_index + 1 :]:
+    @staticmethod
+    def _startup_gateway_restart_proven(name: str, canonical_args: str) -> bool:
+        """Whether this boot proves one exact dangling lifecycle command ran."""
+        if name != "terminal":
+            return False
+        try:
+            args = json.loads(canonical_args)
+        except (TypeError, ValueError):
+            return False
+        command = args.get("command") if isinstance(args, dict) else None
+        if not isinstance(command, str):
+            return False
+        try:
+            import shlex
+
+            tokens = shlex.split(command, posix=(os.name != "nt"))
+        except ValueError:
+            return False
+        normalized = [str(token).casefold() for token in tokens]
+        return len(normalized) == 3 and normalized == [
+            "hermes",
+            "gateway",
+            "restart",
+        ]
+
+    @staticmethod
+    def _startup_real_user_row(row: dict) -> bool:
+        return bool(
+            isinstance(row, dict)
+            and row.get("role") == "user"
+            and row.get("observed") is not True
+            and row.get("internal") is not True
+            and row.get("display_kind") not in {"internal_notification", "hidden"}
+        )
+
+    def _analyze_startup_resume_rows(
+        self,
+        rows: Optional[list],
+        *,
+        source_message_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Freeze one exact authorized task slice and its replay capability."""
+        unsafe = {
+            "disposition": "unsafe_unknown",
+            "safe_dangling_calls": [],
+            "effect_fence": {},
+        }
+        if rows is None:
+            return unsafe
+        frozen_rows = [dict(row) if isinstance(row, dict) else row for row in rows]
+        target = str(source_message_id or "").strip()
+        if not target:
+            # Compatibility for direct classifier callers: infer the newest
+            # durable real-user row. Startup scheduling always supplies the
+            # sealed platform message id and never relies on this fallback.
+            for row in reversed(frozen_rows):
+                if not self._startup_real_user_row(row):
+                    continue
+                for key in ("platform_message_id", "message_id"):
+                    value = row.get(key)
+                    if isinstance(value, str) and value:
+                        target = value
+                        break
+                if target:
+                    break
+            if not target:
+                # Legacy direct safety classification can still reason about
+                # rows without platform identity, but it carries no startup
+                # authorization capability.
+                trigger_index = next(
+                    (
+                        index
+                        for index, row in reversed(list(enumerate(frozen_rows)))
+                        if self._startup_real_user_row(row)
+                    ),
+                    0,
+                )
+            else:
+                trigger_index = -1
+        else:
+            trigger_index = -1
+
+        if target:
+            matches: list[tuple[int, dict]] = []
+            for index, row in enumerate(frozen_rows):
+                if not isinstance(row, dict) or row.get("role") != "user":
+                    continue
+                identities = []
+                for key in ("platform_message_id", "message_id"):
+                    value = row.get(key)
+                    if value is not None:
+                        if not isinstance(value, str) or not value:
+                            return unsafe
+                        identities.append(value)
+                if target in identities:
+                    matches.append((index, row))
+            if len(matches) != 1 or not self._startup_real_user_row(matches[0][1]):
+                return unsafe
+            trigger_index = matches[0][0]
+
+        task_rows = frozen_rows[trigger_index:]
+        # A later human command owns the route now. Synthetic/internal notes do
+        # not steal the lease, but another real user row does.
+        if any(
+            self._startup_real_user_row(row)
+            for row in task_rows[1:]
+            if isinstance(row, dict)
+        ):
+            return {
+                "disposition": "new_human_turn",
+                "safe_dangling_calls": [],
+                "effect_fence": {},
+            }
+
+        from agent.tool_result_classification import tool_may_have_side_effect
+
+        calls: dict[str, tuple[str, str, int]] = {}
+        receipts: dict[str, tuple[dict, int]] = {}
+        last_effect_frontier = 0
+        for index, row in enumerate(task_rows):
+            if not isinstance(row, dict):
+                return unsafe
+            if row.get("role") == "assistant":
+                for call in row.get("tool_calls") or []:
+                    parsed = self._canonical_startup_tool_call(call)
+                    if parsed is None:
+                        return unsafe
+                    call_id, name, canonical_args = parsed
+                    if call_id in calls:
+                        return unsafe
+                    calls[call_id] = (name, canonical_args, index)
+                    last_effect_frontier = max(last_effect_frontier, index)
+            elif row.get("role") == "tool":
+                call_id = row.get("tool_call_id")
+                if not isinstance(call_id, str) or call_id not in calls:
+                    return unsafe
+                if call_id in receipts:
+                    return unsafe
+                receipts[call_id] = (row, index)
+                last_effect_frontier = max(last_effect_frontier, index)
+
+        safe_dangling: list[dict] = []
+        effect_fence: dict[tuple[str, str], str] = {}
+        for call_id, (name, canonical_args, _index) in calls.items():
+            receipt = receipts.get(call_id)
+            effectful = tool_may_have_side_effect(name)
+            if receipt is None:
+                if not effectful:
+                    safe_dangling.append(
+                        {"tool_call_id": call_id, "tool_name": name}
+                    )
+                    continue
+                if self._startup_gateway_restart_proven(name, canonical_args):
+                    effect_fence[(name, canonical_args)] = (
+                        "startup_proves_gateway_restart"
+                    )
+                    continue
+                return unsafe
+            receipt_row, _receipt_index = receipt
+            disposition = receipt_row.get("effect_disposition")
+            if disposition == "unknown" and effectful:
+                return unsafe
+            if effectful and disposition != "none":
+                effect_fence[(name, canonical_args)] = "completed_effect_receipt"
+
+        for row in task_rows[last_effect_frontier + 1 :]:
             if (
                 isinstance(row, dict)
                 and row.get("role") == "assistant"
                 and str(row.get("content") or "").strip()
             ):
-                return "terminal_checkpoint"
-        return "continue"
+                return {
+                    "disposition": "terminal_checkpoint",
+                    "safe_dangling_calls": safe_dangling,
+                    "effect_fence": effect_fence,
+                }
+        return {
+            "disposition": "continue",
+            "safe_dangling_calls": safe_dangling,
+            "effect_fence": effect_fence,
+        }
+
+    def _startup_resume_history_disposition(self, session_id: str) -> str:
+        """Compatibility wrapper around the one-snapshot task analyzer."""
+        analysis = self._analyze_startup_resume_rows(
+            self._startup_resume_history_rows(session_id)
+        )
+        return str(analysis["disposition"])
 
     def _startup_resume_safe_dangling_calls(self, session_id: str) -> list[dict]:
-        """Return unmatched canonical no-effect calls for protocol repair."""
-        rows = self._startup_resume_history_rows(session_id)
-        if rows is None:
-            return []
-        calls: dict[str, str] = {}
-        settled: set[str] = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if row.get("role") == "assistant" and row.get("tool_calls"):
-                calls = {}
-                settled = set()
-                for call in row.get("tool_calls") or []:
-                    if not isinstance(call, dict):
-                        continue
-                    call_id = str(call.get("call_id") or call.get("id") or "")
-                    function = call.get("function") or {}
-                    name = str(
-                        (function.get("name") if isinstance(function, dict) else "")
-                        or call.get("name")
-                        or ""
-                    )
-                    if call_id:
-                        calls[call_id] = name
-            elif row.get("role") == "tool":
-                settled.add(str(row.get("tool_call_id") or ""))
-        from agent.tool_result_classification import tool_may_have_side_effect
-
-        return [
-            {"tool_call_id": call_id, "tool_name": name}
-            for call_id, name in calls.items()
-            if call_id not in settled and not tool_may_have_side_effect(name)
-        ]
+        """Compatibility wrapper returning canonical no-effect repairs."""
+        analysis = self._analyze_startup_resume_rows(
+            self._startup_resume_history_rows(session_id)
+        )
+        return list(analysis["safe_dangling_calls"])
 
     def _unresolved_startup_tool_call_risk(
         self, session_id: str
@@ -13333,7 +13509,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     def _build_startup_resume_event(
-        self, entry, source: SessionSource
+        self,
+        entry,
+        source: SessionSource,
     ) -> MessageEvent:
         persisted_identity = getattr(entry, "metadata", None) or {}
         event = MessageEvent(
@@ -13341,6 +13519,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            message_id=str(source.message_id) if source.message_id is not None else None,
+            user_id=source.user_id,
         )
         event.startup_resume = True
         event.resume_task_id = str(
@@ -13370,9 +13550,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "continuation_generation": event.continuation_generation,
                 "continuation_claim_owner": event.continuation_claim_owner,
                 "continuation_claim_token": event.continuation_claim_token,
-                "startup_safe_dangling_calls": self._startup_resume_safe_dangling_calls(
-                    str(getattr(entry, "session_id", "") or "")
-                ),
+                # Scheduler/after-human admission cannot mint replay
+                # authority.  The leased handler replaces these empty values
+                # from its one exact transcript snapshot.
+                "startup_safe_dangling_calls": [],
+                "startup_resume_effect_fence": {},
             }
         )
         return event
@@ -13453,9 +13635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
-                    and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -13475,6 +13655,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     entry.session_key,
                 )
                 continue
+            if platform is not None and source.platform != platform:
+                continue
+            if source.platform == Platform.TELEGRAM and source.chat_type == "dm":
+                has_business_route = bool(source.business_connection_id)
+                ordinary_dm_is_exact = (
+                    source.user_id is not None
+                    and str(source.chat_id) == str(source.user_id)
+                    and source.external_safe_mode is False
+                )
+                business_dm_is_exact = (
+                    has_business_route and source.external_safe_mode is True
+                )
+                if not (ordinary_dm_is_exact or business_dm_is_exact):
+                    logger.warning(
+                        "Quarantining startup auto-resume for %s: impossible "
+                        "Telegram DM trust route",
+                        entry.session_key,
+                    )
+                    continue
             try:
                 # Rebuild from persisted source + session policy only. Never
                 # substitute the process's ambient active profile: profile=None
@@ -13562,12 +13761,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 continue
 
-            history_disposition = self._startup_resume_history_disposition(
-                entry.session_id
-            )
-            if history_disposition != "continue":
-                continue
-
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if self._is_session_running(entry.session_key):
@@ -13611,6 +13804,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            # Adapter resolution is an executable test seam and, in production,
+            # may race a freshly admitted human turn. Re-check after it before
+            # claiming the startup slot; never overwrite the human owner.
+            if (
+                entry.session_key
+                in getattr(self, "_startup_restore_priority_session_keys", set())
+                or self._is_session_running(entry.session_key)
+            ):
+                continue
+
+            # A normal boot can reject legacy Telegram snapshots before it
+            # allocates any work.  A platform-scoped reconnect may enumerate
+            # such a legacy entry for backward-compatible retry bookkeeping,
+            # but the leased handler below still requires the exact message id
+            # and matching durable user row before model/tool execution.  Keep
+            # this check after the second adapter lookup so a newly admitted
+            # human turn always wins the race even over an invalid candidate.
+            if (
+                source.platform == Platform.TELEGRAM
+                and not (
+                    isinstance(source.message_id, str)
+                    and source.message_id.strip()
+                )
+                and platform is None
+            ):
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: the sealed "
+                    "Telegram turn has no exact triggering message id",
+                    entry.session_key,
+                )
+                continue
+
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
             # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
@@ -13632,6 +13857,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            if source.platform == Platform.TELEGRAM:
+                try:
+                    from gateway.telegram_egress_policy import (
+                        assert_recipient_allowed,
+                    )
+
+                    assert_recipient_allowed(
+                        source.chat_id,
+                        username=getattr(source, "user_name", None),
+                    )
+                    if source.user_id is not None and str(source.user_id) != str(
+                        source.chat_id
+                    ):
+                        assert_recipient_allowed(source.user_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping auto-resume for %s: Telegram recipient policy "
+                        "failed closed: %s",
+                        entry.session_key,
+                        exc,
+                    )
+                    continue
+
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -13644,8 +13892,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = self._build_startup_resume_event(entry, source)
+            # system note before the turn runs.  The scheduler owns admission
+            # only: it must not read or classify a transcript before the exact
+            # resolved-session turn lease.  The leased handler below performs
+            # the one authoritative snapshot + task-slice analysis, including
+            # the final NEW-human-row priority check.
+            event = self._build_startup_resume_event(
+                entry,
+                source,
+            )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -18388,6 +18643,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
+        # Absolute Telegram policy is an ingress boundary as well as an egress
+        # boundary.  Check both the destination and the actor before startup
+        # queueing, profile/session resolution, hooks, auth, or liveness clocks.
+        # Internal recovery events are not exempt: their target is still a real
+        # recipient and a stale durable route must not bypass an operator block.
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            try:
+                from gateway.telegram_egress_policy import assert_recipient_allowed
+
+                assert_recipient_allowed(
+                    getattr(source, "chat_id", None),
+                    username=getattr(source, "user_name", None),
+                )
+                sender_id = getattr(source, "user_id", None)
+                if sender_id is not None and str(sender_id) != str(
+                    getattr(source, "chat_id", None)
+                ):
+                    assert_recipient_allowed(sender_id)
+            except Exception as exc:
+                logger.warning(
+                    "Dropping Telegram inbound before gateway side effects: %s",
+                    exc,
+                )
+                return None
+
         # Most adapters resolve profile routes in build_source(), before they
         # hand us the event. A few internal/voice paths construct SessionSource
         # directly, so resolve those here as the shared fail-closed ingress gate
@@ -20678,16 +20958,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._async_session_store = facade
         return facade
 
+    @staticmethod
+    def _turn_platform_message_id(event: "MessageEvent") -> Optional[str]:
+        """Return one exact inbound message id shared by row and snapshot."""
+
+        source_message_id = getattr(getattr(event, "source", None), "message_id", None)
+        event_message_id = getattr(event, "message_id", None)
+        for value in (source_message_id, event_message_id):
+            if value is not None and (
+                type(value) is not str
+                or not value.strip()
+                or value != value.strip()
+            ):
+                raise ValueError("platform message id must be an exact string")
+        if (
+            source_message_id is not None
+            and event_message_id is not None
+            and source_message_id != event_message_id
+        ):
+            raise ValueError("source and event platform message ids disagree")
+        return source_message_id or event_message_id
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
         session_key: str,
+        *,
+        preflight: bool = False,
     ) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Validate or persist the exact source that owns this running turn.
+
+        ``preflight`` is deliberately read-only.  It lets ingress fail before
+        handing work to the agent when the source cannot possibly mint a marker;
+        the real marker is committed only by the post-user-row callback.
+        """
+        source = event.source
+        try:
+            message_id = self._turn_platform_message_id(event)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Could not normalize active-turn message id for %s: %s",
+                session_key,
+                exc,
+            )
+            return False
+        if message_id is not None:
+            source = dataclasses.replace(source, message_id=message_id)
+        if preflight:
+            try:
+                persisted_profile = (
+                    str(getattr(source, "profile", "") or "").strip() or None
+                )
+                rebuilt_key = build_session_key(
+                    source,
+                    group_sessions_per_user=getattr(
+                        self.config,
+                        "group_sessions_per_user",
+                        True,
+                    ),
+                    thread_sessions_per_user=getattr(
+                        self.config,
+                        "thread_sessions_per_user",
+                        False,
+                    ),
+                    profile=persisted_profile,
+                )
+                return rebuilt_key == session_key
+            except Exception as exc:
+                logger.warning(
+                    "Could not validate active-turn source for %s: %s",
+                    session_key,
+                    exc,
+                )
+                return False
         try:
             token = await self.async_session_store.mark_turn_active(
                 session_key,
-                event.source,
+                source,
             )
         except Exception as exc:
             logger.warning(
@@ -21289,15 +21636,168 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
 
-        # A turn only becomes durable recovery work after it owns (or has
-        # explicitly degraded past) the per-session lease.  Marking before the
-        # await above would falsely recover an alias-routed message that never
-        # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        try:
+            triggering_platform_message_id = self._turn_platform_message_id(event)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Refusing turn %s: invalid platform message identity: %s",
+                session_entry.session_key,
+                exc,
+            )
+            self._clear_session_env(_session_env_tokens)
+            return
+
+        # Fail fast on a source/key mismatch without writing recovery authority.
+        # The real marker is committed later by ``after_user_row_commit`` after
+        # the exact user row has landed in state.db.
+        if not await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+            preflight=True,
+        ):
+            logger.warning(
+                "Refusing turn %s: active-turn source preflight failed",
+                session_entry.session_key,
+            )
+            self._clear_session_env(_session_env_tokens)
+            return
+
+        marker_loop = asyncio.get_running_loop()
+        marker_once_lock = threading.Lock()
+        marker_fired = [False]
+
+        def _after_user_row_commit() -> bool:
+            """Bridge the agent worker's durable-row boundary to the loop."""
+
+            with marker_once_lock:
+                if marker_fired[0]:
+                    return False
+                marker_fired[0] = True
+            future = asyncio.run_coroutine_threadsafe(
+                self._mark_durable_active_turn(
+                    event,
+                    session_entry.session_key,
+                ),
+                marker_loop,
+            )
+            try:
+                return bool(future.result(timeout=30.0))
+            except Exception:
+                future.cancel()
+                logger.warning(
+                    "Post-user-row active marker failed for %s",
+                    session_entry.session_key,
+                    exc_info=True,
+                )
+                return False
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
         if bool(getattr(event, "startup_resume", False)):
+            # The per-session turn lease above owns the sole authoritative
+            # transcript snapshot.  Revalidate the sealed continuation identity
+            # and derive every replay capability from this same loaded object
+            # before arming the active marker or entering the model/tool loop.
+            sealed_source = resume_origin_from_snapshot(session_entry)
+            sealed_message_id = (
+                str(getattr(sealed_source, "message_id", "") or "").strip()
+                if sealed_source is not None
+                else ""
+            )
+            event_message_id = str(getattr(event, "message_id", "") or "").strip()
+            expected_resume_identity = {
+                "resume_task_id": str(
+                    getattr(session_entry, "resume_task_id", "") or ""
+                ),
+                "continuation_generation": getattr(
+                    session_entry,
+                    "continuation_generation",
+                    0,
+                ),
+                "continuation_claim_owner": str(
+                    getattr(session_entry, "continuation_claim_owner", "") or ""
+                ),
+                "continuation_claim_token": str(
+                    getattr(session_entry, "continuation_claim_token", "") or ""
+                ),
+            }
+            event_resume_identity = {
+                "resume_task_id": str(getattr(event, "resume_task_id", "") or ""),
+                "continuation_generation": getattr(
+                    event,
+                    "continuation_generation",
+                    0,
+                ),
+                "continuation_claim_owner": str(
+                    getattr(event, "continuation_claim_owner", "") or ""
+                ),
+                "continuation_claim_token": str(
+                    getattr(event, "continuation_claim_token", "") or ""
+                ),
+            }
+            _startup_identity_valid = bool(
+                sealed_source is not None
+                and sealed_message_id
+                and event_message_id == sealed_message_id
+                and type(expected_resume_identity["continuation_generation"])
+                is int
+                and expected_resume_identity["continuation_generation"] > 0
+                and type(event_resume_identity["continuation_generation"])
+                is int
+                and event_resume_identity["continuation_generation"] > 0
+                and expected_resume_identity == event_resume_identity
+                and all(expected_resume_identity.values())
+                and canonical_resume_origin(sealed_source)
+                == canonical_resume_origin(source)
+            )
+            if not _startup_identity_valid:
+                logger.warning(
+                    "Refusing startup continuation for %s: leased origin or "
+                    "continuation identity is not exact",
+                    session_entry.session_key,
+                )
+                self._clear_session_env(_session_env_tokens)
+                return
+
+            analysis = self._analyze_startup_resume_rows(
+                history,
+                source_message_id=sealed_message_id,
+            )
+            disposition = str(analysis.get("disposition") or "unsafe_unknown")
+            if disposition == "terminal_checkpoint":
+                try:
+                    await self.async_session_store.clear_resume_pending_exact(
+                        session_entry.session_key,
+                        **expected_resume_identity,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not settle terminal startup continuation for %s",
+                        session_entry.session_key,
+                        exc_info=True,
+                    )
+                self._clear_session_env(_session_env_tokens)
+                return
+            if disposition != "continue":
+                logger.warning(
+                    "Refusing startup continuation for %s: leased task slice "
+                    "is %s",
+                    session_entry.session_key,
+                    disposition,
+                )
+                self._clear_session_env(_session_env_tokens)
+                return
+
+            # Publish only the leased analysis; scheduler admission carries no
+            # transcript-derived capability.
+            event_metadata["startup_safe_dangling_calls"] = list(
+                analysis.get("safe_dangling_calls") or []
+            )
+            event_metadata["startup_resume_effect_fence"] = dict(
+                analysis.get("effect_fence") or {}
+            )
+            event.metadata = event_metadata
+
             safe_dangling_calls = event_metadata.get("startup_safe_dangling_calls") or []
             for dangling in safe_dangling_calls:
                 if not isinstance(dangling, dict):
@@ -22428,9 +22928,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=(
+                    None
+                    if bool(getattr(event, "startup_resume", False))
+                    else triggering_platform_message_id
+                ),
+                after_user_row_commit=_after_user_row_commit,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 startup_resume=bool(getattr(event, "startup_resume", False)),
+                startup_resume_effect_fence=dict(
+                    event_metadata.get("startup_resume_effect_fence") or {}
+                ),
                 _trusted_restart_wake=getattr(
                     event, "_hermes_trusted_restart_event", None
                 ),
@@ -30788,9 +31297,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
+        after_user_row_commit: Optional[Callable[[], bool]] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
+        startup_resume_effect_fence: Optional[dict] = None,
         _trusted_restart_wake: Any = None,
         _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
@@ -30811,9 +31323,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
+                after_user_row_commit=after_user_row_commit,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
+                startup_resume_effect_fence=startup_resume_effect_fence,
                 _trusted_restart_wake=_trusted_restart_wake,
                 _trusted_parent_task_continuation=(
                     _trusted_parent_task_continuation
@@ -30829,9 +31344,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
+                after_user_row_commit=after_user_row_commit,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
+                startup_resume_effect_fence=startup_resume_effect_fence,
                 _trusted_restart_wake=_trusted_restart_wake,
                 _trusted_parent_task_continuation=(
                     _trusted_parent_task_continuation
@@ -30984,9 +31502,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
+        after_user_row_commit: Optional[Callable[[], bool]] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
+        startup_resume_effect_fence: Optional[dict] = None,
         _trusted_restart_wake: Any = None,
         _trusted_parent_task_continuation: Any = None,
     ) -> Dict[str, Any]:
@@ -31347,8 +31868,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_message_id=persist_user_message_id,
+            after_user_row_commit=after_user_row_commit,
             persist_user_display_kind=persist_user_display_kind,
             startup_resume=startup_resume,
+            startup_resume_effect_fence=dict(
+                startup_resume_effect_fence or {}
+            ),
         )
         if trusted_restart_wake is not None:
             setattr(turn_ctx, "_trusted_restart_wake", trusted_restart_wake)

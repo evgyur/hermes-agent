@@ -1,12 +1,8 @@
-"""Security regressions for Telegram Business recipient isolation.
-
-These fixtures model the 2026-08-24 incident exactly: the account owner sent
-an audio message inside a customer conversation and Hermes treated it as a
-bot command, then delivered the answer to the customer as a plain bot DM.
-"""
+"""Generic security regressions for Telegram Business recipient isolation."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,11 +14,11 @@ from gateway.session import SessionSource, build_session_key
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
-OWNER_ID = "617744661"
-VLAD_ID = "268754981"
-SAFE_CUSTOMER_ID = "777000123"
-BOT_ID = 8533179145
-BUSINESS_CONNECTION_ID = "FzZ5OU7SQEidHQAAxmDPRBoxdSQ"
+OWNER_ID = "700000111"
+BLOCKED_CUSTOMER_ID = "700000321"
+SAFE_CUSTOMER_ID = "700000654"
+BOT_ID = 700000999
+BUSINESS_CONNECTION_ID = "business-connection-test"
 
 
 def _adapter() -> TelegramAdapter:
@@ -46,13 +42,13 @@ def _adapter() -> TelegramAdapter:
             },
         )
     )
-    adapter._bot = SimpleNamespace(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = SimpleNamespace(id=BOT_ID, username="testhermesbot")
     return adapter
 
 
 def _business_message(
     *,
-    chat_id: str = VLAD_ID,
+    chat_id: str = BLOCKED_CUSTOMER_ID,
     from_user_id: str = OWNER_ID,
     text: str | None = None,
     voice: object | None = None,
@@ -77,12 +73,16 @@ def _business_message(
             id=int(chat_id),
             type="private",
             title=None,
-            full_name="Vlad Telegramin",
+            full_name="External Customer",
         ),
         from_user=SimpleNamespace(
             id=int(from_user_id),
             is_bot=False,
-            full_name="Evgeny Chip" if from_user_id == OWNER_ID else "Vlad Telegramin",
+            full_name=(
+                "Account Owner"
+                if from_user_id == OWNER_ID
+                else "External Customer"
+            ),
         ),
         sender_business_bot=sender_business_bot,
         business_connection_id=BUSINESS_CONNECTION_ID,
@@ -141,7 +141,7 @@ async def test_owner_text_requires_explicit_prefix_in_customer_chat() -> None:
     adapter.handle_message = AsyncMock()
     adapter._enqueue_text_event = MagicMock()
     adapter._cache_replied_media = AsyncMock()
-    message = _business_message(text="обычный личный разговор с Владом")
+    message = _business_message(text="обычный личный разговор с клиентом")
 
     await adapter._handle_text_message(_business_update(message), SimpleNamespace())
 
@@ -213,7 +213,7 @@ def test_cached_business_connections_are_isolated_by_transport_profile(
 def test_business_source_round_trip_and_connection_isolation() -> None:
     source_a = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id=VLAD_ID,
+        chat_id=BLOCKED_CUSTOMER_ID,
         chat_type="dm",
         user_id=OWNER_ID,
         business_connection_id="connection-a",
@@ -221,7 +221,7 @@ def test_business_source_round_trip_and_connection_isolation() -> None:
     )
     source_b = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id=VLAD_ID,
+        chat_id=BLOCKED_CUSTOMER_ID,
         chat_type="dm",
         user_id=OWNER_ID,
         business_connection_id="connection-b",
@@ -236,15 +236,34 @@ def test_business_source_round_trip_and_connection_isolation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plain_bot_dm_to_non_allowlisted_customer_fails_closed() -> None:
+async def test_plain_bot_dm_to_operator_denied_customer_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    registry = tmp_path / "telegram-egress-deny.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "blocked_user_ids": [BLOCKED_CUSTOMER_ID],
+                "blocked_usernames": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_FILE", str(registry))
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_REQUIRED", "1")
     adapter = _adapter()
     adapter._rich_send_disabled = True
-    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = MagicMock(id=BOT_ID, username="testhermesbot")
     adapter._bot.send_message = AsyncMock(
         return_value=SimpleNamespace(message_id=99)
     )
 
-    result = await adapter.send(VLAD_ID, "private answer", metadata={})
+    result = await adapter.send(
+        BLOCKED_CUSTOMER_ID,
+        "private answer",
+        metadata={},
+    )
 
     assert result.success is False
     assert result.error == "telegram_recipient_denied"
@@ -255,7 +274,7 @@ async def test_plain_bot_dm_to_non_allowlisted_customer_fails_closed() -> None:
 async def test_plain_bot_dm_to_non_denied_non_allowlisted_customer_fails_closed() -> None:
     adapter = _adapter()
     adapter._rich_send_disabled = True
-    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = MagicMock(id=BOT_ID, username="testhermesbot")
     adapter._bot.send_message = AsyncMock(
         return_value=SimpleNamespace(message_id=199)
     )
@@ -270,7 +289,7 @@ async def test_plain_bot_dm_to_non_denied_non_allowlisted_customer_fails_closed(
 @pytest.mark.asyncio
 async def test_send_document_denies_non_allowlisted_plain_dm_before_wire(tmp_path) -> None:
     adapter = _adapter()
-    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = MagicMock(id=BOT_ID, username="testhermesbot")
     adapter._bot.send_document = AsyncMock(
         return_value=SimpleNamespace(message_id=200)
     )
@@ -314,7 +333,7 @@ async def test_all_public_egress_surfaces_deny_nonallowlisted_plain_dm_before_wi
     surface, tmp_path, monkeypatch
 ) -> None:
     adapter = _adapter()
-    bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    bot = MagicMock(id=BOT_ID, username="testhermesbot")
     wire_methods = (
         "send_message",
         "edit_message_text",
@@ -401,8 +420,15 @@ async def test_all_public_egress_surfaces_deny_nonallowlisted_plain_dm_before_wi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked_chat_id", [VLAD_ID, f"+{VLAD_ID}", f"0{VLAD_ID}"])
-async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
+@pytest.mark.parametrize(
+    "blocked_chat_id",
+    [
+        BLOCKED_CUSTOMER_ID,
+        f"+{BLOCKED_CUSTOMER_ID}",
+        f"0{BLOCKED_CUSTOMER_ID}",
+    ],
+)
+async def test_external_registry_blocks_normalized_ids_before_wire_call(
     tmp_path, monkeypatch, blocked_chat_id
 ) -> None:
     from gateway.telegram_egress_policy import (
@@ -411,9 +437,19 @@ async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
         guard_telegram_request,
     )
 
-    monkeypatch.setenv(
-        "HERMES_TELEGRAM_EGRESS_DENY_FILE", str(tmp_path / "missing.json")
+    registry = tmp_path / "telegram-egress-deny.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "blocked_user_ids": [BLOCKED_CUSTOMER_ID],
+                "blocked_usernames": [],
+            }
+        ),
+        encoding="utf-8",
     )
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_FILE", str(registry))
+    monkeypatch.setenv("HERMES_TELEGRAM_EGRESS_DENY_REQUIRED", "1")
     monkeypatch.delenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", raising=False)
     denied_recipients.cache_clear()
     class _InnerRequest:
@@ -457,7 +493,7 @@ async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
 async def test_loose_business_flags_cannot_forge_a_route() -> None:
     adapter = _adapter()
     adapter._rich_send_disabled = True
-    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = MagicMock(id=BOT_ID, username="testhermesbot")
     adapter._bot.send_message = AsyncMock(
         return_value=SimpleNamespace(message_id=101)
     )
@@ -498,7 +534,7 @@ async def test_business_bot_echo_is_dropped_before_dispatch() -> None:
 async def test_business_send_requires_and_propagates_exact_connection() -> None:
     adapter = _adapter()
     adapter._rich_send_disabled = True
-    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot = MagicMock(id=BOT_ID, username="testhermesbot")
     adapter._bot.send_message = AsyncMock(
         return_value=SimpleNamespace(message_id=100)
     )
@@ -577,7 +613,7 @@ async def test_business_egress_surfaces_propagate_exact_connection_id(
     surface, wire_method, tmp_path, monkeypatch
 ) -> None:
     adapter = _adapter()
-    bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    bot = MagicMock(id=BOT_ID, username="testhermesbot")
     for method in {
         "send_message",
         "edit_message_text",
@@ -693,9 +729,9 @@ def test_delivery_ledger_quarantines_legacy_telegram_rows_without_route_envelope
                VALUES (?, ?, 'telegram', ?, NULL, ?, 'pending', 0, 1, 1, 999, 1)""",
             (
                 "legacy-ambiguous",
-                f"agent:main:telegram:dm:{VLAD_ID}",
-                VLAD_ID,
-                "must never be replayed to Vlad",
+                f"agent:main:telegram:dm:{BLOCKED_CUSTOMER_ID}",
+                BLOCKED_CUSTOMER_ID,
+                "must never be replayed to the customer",
             ),
         )
     conn.close()
