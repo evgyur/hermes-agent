@@ -47,7 +47,7 @@ class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
-        adapter._model_picker_state["12345"] = {
+        adapter._model_picker_state[("12345", "")] = {
             "providers": [{"slug": "provider_one", "name": "Provider One", "total_models": 1, "is_current": True}],
             "current_model": "model_1",
             "current_provider": "provider_one",
@@ -60,6 +60,7 @@ class TestTelegramModelPicker:
         query.data = "mb"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.business_connection_id = None
         query.from_user = MagicMock()
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -70,5 +71,3 @@ class TestTelegramModelPicker:
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
-
-
