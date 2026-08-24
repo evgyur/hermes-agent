@@ -11,13 +11,23 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
 
-def _make_event(text="/verbose", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
+def _make_event(
+    text="/verbose",
+    platform=Platform.TELEGRAM,
+    user_id="12345",
+    chat_id="12345",
+    *,
+    chat_type="dm",
+    business_connection_id=None,
+):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
+        chat_type=chat_type,
         user_name="testuser",
+        business_connection_id=business_connection_id,
     )
     return MessageEvent(text=text, source=source)
 
@@ -85,6 +95,35 @@ class TestVerboseCommand:
         assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event",
+        [
+            _make_event(chat_id="-100123", chat_type="group"),
+            _make_event(
+                chat_id="777",
+                chat_type="dm",
+                business_connection_id="biz-external",
+            ),
+        ],
+        ids=["public-group", "telegram-business"],
+    )
+    async def test_verbose_public_telegram_route_cannot_enable_platform_progress(
+        self, tmp_path, monkeypatch, event
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        original = "display:\n  tool_progress_command: true\n  tool_progress: all\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        await runner._handle_verbose_command(event)
+
+        assert config_path.read_text(encoding="utf-8") == original
+
+    @pytest.mark.asyncio
     async def test_quoted_false_keeps_command_disabled(self, tmp_path, monkeypatch):
         """Quoted false must not enable the /verbose gateway command."""
         hermes_home = tmp_path / "hermes"
@@ -102,5 +141,4 @@ class TestVerboseCommand:
 
         assert "not enabled" in result.lower()
         assert "tool_progress_command" in result
-
 

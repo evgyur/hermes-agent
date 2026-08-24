@@ -97,6 +97,10 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
+    # Trusted marker from the synthetic gateway startup event. This must
+    # survive the async-to-executor seam; inferring it from blank text would
+    # let ordinary empty messages acquire continuation authority.
+    startup_resume: bool = False
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
