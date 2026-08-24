@@ -108,6 +108,37 @@ def test_constructor_arg_wins_over_config(monkeypatch, tmp_path):
     assert agent.run_budget_seconds == 900.0
 
 
+def test_foreground_expiry_bypasses_provider_retry(monkeypatch, tmp_path):
+    """A Hermes-owned foreground deadline is terminal, not provider failure."""
+    from agent.conversation_loop import RUN_BUDGET_TERMINAL_RESPONSE
+    from agent.deadline import ForegroundRunBudgetExpired
+
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        platform="telegram",
+        run_budget_seconds=300,
+        stream_delta_callback=lambda _text: None,
+    )
+    calls = 0
+
+    def expire(_api_kwargs, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ForegroundRunBudgetExpired(180)
+
+    agent._interruptible_streaming_api_call = expire
+    agent._persist_session = lambda *_args, **_kwargs: None
+    agent._save_trajectory = lambda *_args, **_kwargs: None
+    agent._cleanup_task_resources = lambda *_args, **_kwargs: None
+    monkeypatch.setattr("agent.conversation_loop.time.sleep", lambda _seconds: None)
+
+    result = agent.run_conversation("read the workshop catalog")
+
+    assert calls == 1
+    assert result["final_response"] == RUN_BUDGET_TERMINAL_RESPONSE
+
+
 # ── stale-timeout deadline scaling ─────────────────────────────────────────
 
 

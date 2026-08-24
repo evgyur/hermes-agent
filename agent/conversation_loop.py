@@ -2010,6 +2010,7 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    foreground_budget_expired = False
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4433,6 +4434,20 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                # This is a Hermes-owned terminal deadline, not a provider
+                # failure. Exit both the provider-retry loop and the outer
+                # conversation loop; retries and fallback would only extend an
+                # already exhausted foreground budget.
+                if isinstance(api_error, ForegroundRunBudgetExpired):
+                    final_response = RUN_BUDGET_TERMINAL_RESPONSE
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
+                    _turn_exit_reason = "foreground_run_budget_exhausted"
+                    foreground_budget_expired = True
+                    break
+
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -6627,6 +6642,9 @@ def run_conversation(
                     # stale request.
                     break
         
+        if foreground_budget_expired:
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
