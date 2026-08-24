@@ -59,6 +59,7 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
     assert config["release_policy"]["install_scope"] == "seya-only"
     assert config["release_policy"]["require_explicit_production_approval"] is True
     assert config["config_patch"]["agent"]["run_budget_seconds"] == 300
+    assert config["config_patch"]["tools"]["tool_search"]["enabled"] == "off"
     assert config["config_patch"]["environment"]["HERMES_AGENT_NOTIFY_INTERVAL"] == "75"
     assert config["rollback"]["release"].startswith(
         "59a840eb7165c4a2d9d169e8039cbd822df650ee"

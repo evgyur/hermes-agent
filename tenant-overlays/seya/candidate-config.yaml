@@ -16,6 +16,9 @@ workspace_overlay:
 config_patch:
   agent:
     run_budget_seconds: 300
+  tools:
+    tool_search:
+      enabled: "off"
   environment:
     HERMES_AGENT_NOTIFY_INTERVAL: "75"
 
