@@ -736,6 +736,11 @@ FTS_STALE_KEY = "fts_stale"
 # Durable diagnostic for stale FTS recovery blocked across process restarts.
 FTS_REBUILD_DEFERRAL_KEY = "fts_rebuild_deferral"
 
+# Layout breadcrumb written when fail-open safely drops corrupt derived FTS
+# tables on their already-connected SQLite handle.  Reopen must recreate the
+# exact legacy/external shape (and optional trigram table) before clearing it.
+FTS_STALE_LAYOUT_KEY = "fts_stale_layout"
+
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
