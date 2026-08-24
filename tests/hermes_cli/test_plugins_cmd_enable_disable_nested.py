@@ -77,6 +77,45 @@ class TestResolvePluginKey:
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_manifest_name_prefers_user_platform_replacement(
+        self, mock_user, mock_bundled, tmp_path
+    ):
+        """A flat user platform replaces its same-name bundled transport.
+
+        The bundled platform keeps its explicit path key so an operator can
+        still address it directly, but the public manifest name must resolve
+        to the later/higher-precedence user source.
+        """
+        from hermes_cli.plugins_cmd import (
+            _resolve_plugin_key,
+            _resolve_plugin_key_and_source,
+        )
+
+        bundled = tmp_path / "bundled"
+        user = tmp_path / "user"
+        _make_category_plugin(
+            bundled,
+            "platforms",
+            "telegram",
+            {"name": "telegram-platform", "kind": "platform"},
+        )
+        _make_plugin_dir(
+            user,
+            "telegram-platform",
+            {"name": "telegram-platform", "kind": "platform"},
+        )
+        mock_bundled.return_value = bundled
+        mock_user.return_value = user
+
+        assert _resolve_plugin_key("platforms/telegram") == "platforms/telegram"
+        assert _resolve_plugin_key("telegram-platform") == "telegram-platform"
+        assert _resolve_plugin_key_and_source("telegram-platform") == (
+            "telegram-platform",
+            "user",
+        )
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable / cmd_disable — write the canonical key
