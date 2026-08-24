@@ -20,7 +20,7 @@
       "author": "NousResearch",
       "tags": ["telegram", "gateway", "approvals", "messaging"],
       "repo": "NousResearch/hermes-telegram-business",
-      "ref": "e905f3bc5eeaa5a9dab9bc5155601b3ebec75757",
+      "ref": "98c60afc00d36c885bb040ebe973b1aa908886c0",
       "homepage": "https://github.com/NousResearch/hermes-telegram-business",
       "capabilities": ["platform"],
       "api_version": 1,
