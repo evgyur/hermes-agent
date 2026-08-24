@@ -2381,9 +2381,13 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_supplied_business_connection_id(message: Any) -> Optional[str]:
         value = getattr(message, "business_connection_id", None)
         reply = getattr(message, "reply_to_message", None)
-        if not value and reply is not None:
+        if not isinstance(value, str) or not value.strip():
+            value = None
+        if value is None and reply is not None:
             value = getattr(reply, "business_connection_id", None)
-        return str(value) if value else None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
 
     def _is_business_bot_echo(self, message: Any) -> bool:
         sender_business_bot = getattr(message, "sender_business_bot", None)
@@ -10194,7 +10198,12 @@ class TelegramAdapter(BasePlatformAdapter):
         those updates, so handlers must use ``effective_message`` to avoid
         consuming channel posts without ever building a gateway event.
         """
-        return getattr(update, "effective_message", None) or getattr(update, "message", None)
+        # Prefer the concrete ``message`` attribute. Loose mocks synthesize a
+        # truthy ``effective_message`` child even when callers only populated
+        # ``message``; selecting that child silently changes the media type.
+        # Business/channel updates keep ``message`` empty and still fall back
+        # to PTB's authoritative ``effective_message`` property.
+        return getattr(update, "message", None) or getattr(update, "effective_message", None)
 
     def _telegram_transcribe_routes(self) -> List[Dict[str, Any]]:
         """Return enabled, structurally valid Telegram context routes."""

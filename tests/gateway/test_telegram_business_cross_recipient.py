@@ -102,6 +102,14 @@ def _business_update(message: SimpleNamespace) -> SimpleNamespace:
     )
 
 
+def test_unset_mock_reply_does_not_forge_business_connection() -> None:
+    """Loose MagicMock attributes must not turn an ordinary DM into Business traffic."""
+    message = MagicMock()
+    message.business_connection_id = None
+
+    assert TelegramAdapter._telegram_supplied_business_connection_id(message) is None
+
+
 @pytest.mark.asyncio
 async def test_owner_auto_transcript_in_customer_chat_is_dropped_before_dispatch() -> None:
     """The exact incident envelope must never become a Hermes turn."""
