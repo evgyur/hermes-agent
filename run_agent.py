@@ -2399,6 +2399,16 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
+                _parent_barrier_ids = {
+                    str(msg.get("_parent_task_barrier_id") or "")
+                    for msg in _batch_msgs
+                    if str(msg.get("_parent_task_barrier_id") or "")
+                }
+                if len(_parent_barrier_ids) > 1:
+                    raise RuntimeError(
+                        "one transcript flush cannot commit multiple parent-task barriers"
+                    )
+                _parent_barrier_id = next(iter(_parent_barrier_ids), None)
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
@@ -2412,6 +2422,7 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    parent_task_barrier_id=_parent_barrier_id,
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
@@ -8465,28 +8476,21 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _model_background_value,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
-        # Delegations from the top-level MODEL always run in the background —
-        # the model does not get to choose. delegate_task returns immediately
-        # with a handle (one per task) and each subagent's result re-enters the
-        # conversation as a new message when it finishes. This applies to BOTH
-        # a single task and a fan-out batch (each task becomes its own
-        # independent background subagent). The one exception:
-        #   - A delegation from an ORCHESTRATOR SUBAGENT (depth > 0) stays
-        #     synchronous: the orchestrator needs its workers' results within
-        #     its own turn to compose a summary, and a subagent doesn't own the
-        #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        # Top-level model delegations default to background execution. An
+        # explicit wait=true uses the existing synchronous aggregate path when
+        # the parent needs worker evidence before it can finalize this turn.
+        # Nested orchestrators always wait for their own workers.
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=_model_background_value(function_args, self),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

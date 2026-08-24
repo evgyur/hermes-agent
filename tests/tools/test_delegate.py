@@ -102,7 +102,6 @@ class TestDelegateRequirements(unittest.TestCase):
         # Contracts only the top-level text carries:
         for keyword in (
             "background",          # async semantics
-            "wait or poll",        # no-poll rule
             "execute_code",        # mechanical-work routing
             "cronjob",             # durable-work routing
             "/stop",               # non-durability warning
@@ -1357,6 +1356,35 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_model_wait_policy_and_live_dispatch(self):
+        """Top-level calls default detached but wait=true stays inline."""
+        import run_agent
+        from tools.delegate_tool import _model_background_value
+
+        top = _make_mock_parent(depth=0)
+        nested = _make_mock_parent(depth=1)
+
+        self.assertTrue(_model_background_value({"goal": "x"}, top))
+        self.assertTrue(_model_background_value({"goal": "x", "wait": False}, top))
+        self.assertTrue(_model_background_value({"goal": "x", "wait": "true"}, top))
+        self.assertFalse(_model_background_value({"goal": "x", "wait": True}, top))
+        self.assertFalse(_model_background_value({"goal": "x"}, nested))
+        self.assertFalse(_model_background_value({"goal": "x", "wait": True}, nested))
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(top, {"goal": "x"})
+            self.assertTrue(captured["background"])
+            run_agent.AIAgent._dispatch_delegate_task(
+                top, {"tasks": [{"goal": "a"}, {"goal": "b"}], "wait": True}
+            )
+            self.assertFalse(captured["background"])
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""

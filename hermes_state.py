@@ -11212,6 +11212,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        parent_task_barrier_id: Optional[str] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -11252,6 +11253,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    parent_task_barrier_id=parent_task_barrier_id,
                 )
             return inserted_total
 
@@ -11278,6 +11280,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            if parent_task_barrier_id:
+                changed = conn.execute(
+                    """UPDATE parent_task_barriers
+                       SET initial_persisted=1, updated_at=?
+                       WHERE barrier_id=?
+                         AND state NOT IN ('closed','cancelled','failed')""",
+                    (time.time(), str(parent_task_barrier_id)),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "parent-task transcript/barrier atomic commit failed"
+                    )
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
