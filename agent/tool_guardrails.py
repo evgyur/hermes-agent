@@ -134,6 +134,7 @@ class ToolCallGuardrailConfig:
     resume_after_no_progress_block: bool = False
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     synthesize_after_successful_tools: frozenset[str] = field(default_factory=frozenset)
+    direct_scalar_response_templates: Mapping[str, str] = field(default_factory=dict)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
 
@@ -171,6 +172,19 @@ class ToolCallGuardrailConfig:
             for tool_name in synthesize_after_successful_tools
             if isinstance(tool_name, str) and tool_name.strip()
         )
+        direct_scalar_response_templates = data.get(
+            "direct_scalar_response_templates", {}
+        )
+        if not isinstance(direct_scalar_response_templates, Mapping):
+            direct_scalar_response_templates = {}
+        direct_scalar_response_templates = {
+            tool_name.strip(): template
+            for tool_name, template in direct_scalar_response_templates.items()
+            if isinstance(tool_name, str)
+            and tool_name.strip()
+            and isinstance(template, str)
+            and "{result}" in template
+        }
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
@@ -204,6 +218,7 @@ class ToolCallGuardrailConfig:
             ),
             idempotent_tools=defaults.idempotent_tools | explicit_read_only_tools,
             synthesize_after_successful_tools=explicit_synthesis_tools,
+            direct_scalar_response_templates=direct_scalar_response_templates,
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
 

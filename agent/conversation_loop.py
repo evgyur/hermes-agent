@@ -7463,6 +7463,23 @@ def run_conversation(
                     failed = True
                     break
 
+                direct_tool_response = getattr(
+                    agent, "_direct_tool_final_response", None
+                )
+                if direct_tool_response:
+                    _turn_exit_reason = "direct_scalar_tool_response"
+                    final_response = direct_tool_response
+                    append_message(
+                        messages, {"role": "assistant", "content": final_response}
+                    )
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(final_response)
+                            agent.stream_delta_callback(None)
+                        except Exception:
+                            pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

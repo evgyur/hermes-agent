@@ -888,6 +888,7 @@ def init_agent(
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
     agent._guardrail_suppressed_tools: set[str] = set()
     agent._force_synthesis_without_tools = False
+    agent._direct_tool_final_response = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False

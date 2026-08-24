@@ -8343,6 +8343,19 @@ class AIAgent:
             in self._tool_guardrails.config.synthesize_after_successful_tools
         ):
             self._force_synthesis_without_tools = True
+        if not failed:
+            template = self._tool_guardrails.config.direct_scalar_response_templates.get(
+                tool_name
+            )
+            if template and isinstance(function_result, str):
+                try:
+                    scalar = json.loads(function_result).get("result")
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    scalar = None
+                if isinstance(scalar, (str, int, float, bool)) and len(str(scalar)) <= 64:
+                    self._direct_tool_final_response = template.replace(
+                        "{result}", str(scalar)
+                    )
         # Identical-call stall guards (agent.stall_guards): notice-only, no
         # blocking. Observed on the RAW result (before the loop-warning suffix
         # below, whose embedded count changes per call and would defeat

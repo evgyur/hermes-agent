@@ -191,7 +191,10 @@ def test_successful_scalar_read_arms_immediate_tool_free_synthesis():
         ToolCallGuardrailConfig(
             synthesize_after_successful_tools=frozenset(
                 {"mcp__seya__get_workshop_lesson_count"}
-            )
+            ),
+            direct_scalar_response_templates={
+                "mcp__seya__get_workshop_lesson_count": "Есть {result} уроков."
+            },
         )
     )
 
@@ -203,6 +206,7 @@ def test_successful_scalar_read_arms_immediate_tool_free_synthesis():
 
     assert result == '{"result": "7"}'
     assert agent._force_synthesis_without_tools is True
+    assert agent._direct_tool_final_response == "Есть 7 уроков."
 
 
 def test_config_gate_disables_notice():

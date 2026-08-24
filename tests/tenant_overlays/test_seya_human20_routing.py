@@ -76,6 +76,11 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
         "synthesize_after_successful_tools"
     ] == ["mcp__seya__get_workshop_lesson_count"]
     assert config["config_patch"]["tool_loop_guardrails"][
+        "direct_scalar_response_templates"
+    ]["mcp__seya__get_workshop_lesson_count"] == (
+        "В воркшопе Human20 Codex × Hermes — {result} уроков."
+    )
+    assert config["config_patch"]["tool_loop_guardrails"][
         "hard_stop_after"
     ]["idempotent_no_progress"] == 1
     assert config["config_patch"]["tool_loop_guardrails"][
