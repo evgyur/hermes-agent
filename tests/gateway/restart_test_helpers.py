@@ -13,13 +13,6 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
-class _EmptySessionHistoryDB:
-    """Explicit safe history source for startup-recovery unit runners."""
-
-    def get_messages(self, _session_id):
-        return []
-
-
 class RestartTestAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
@@ -165,7 +158,13 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
-    setattr(runner, "_session_db", _EmptySessionHistoryDB())
+    # Startup continuation is authorized only after a readable durable
+    # frontier.  The generic fixture models a safe user-only transcript;
+    # risk-specific tests replace this with tool-call rows.
+    runner._session_db = MagicMock()
+    runner._session_db.get_messages.return_value = [
+        {"role": "user", "content": "pending request"}
+    ]
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

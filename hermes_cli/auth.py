@@ -684,6 +684,42 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+# Known API-key prefixes per provider.  Only providers listed here get
+# prefix validation; everyone else is fail-open (unknown formats pass).
+# This exists so an obviously malformed key in .env (truncated paste, wrong
+# provider's key in the wrong var, etc.) doesn't silently shadow a valid
+# credential-pool entry and produce opaque 401s (#93593).
+KNOWN_PROVIDER_KEY_PREFIXES: Dict[str, tuple] = {
+    # All OpenRouter keys are issued as sk-or-... (currently sk-or-v1-).
+    "openrouter": ("sk-or-",),
+}
+
+
+def _secret_matches_declared_prefix(provider_id: str, value: str) -> bool:
+    """Return False only when the provider declares key prefixes and none match.
+
+    Providers without a declared prefix always pass (fail-open): we never
+    hard-reject unknown key formats, only skip values that provably don't
+    belong to a provider whose key format we know.
+    """
+    prefixes = KNOWN_PROVIDER_KEY_PREFIXES.get(provider_id)
+    if not prefixes:
+        return True
+    return any(value.startswith(p) for p in prefixes)
+
+
+def _warn_malformed_secret(provider_id: str, source: str) -> None:
+    prefixes = KNOWN_PROVIDER_KEY_PREFIXES.get(provider_id, ())
+    logger.warning(
+        "Ignoring %s for provider %r: value does not match the expected key "
+        "prefix (%s). Falling back to the next credential source. Fix or "
+        "remove the malformed key to silence this warning.",
+        source,
+        provider_id,
+        " or ".join(prefixes),
+    )
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -708,20 +744,42 @@ def _resolve_api_key_provider_secret(
         # in the user's .env file isn't shadowed by a stale shell export
         # inherited from a parent process (Codex CLI, test runners, etc.).
         val = (get_env_value_prefer_dotenv(env_var) or "").strip()
-        if has_usable_secret(val):
-            return val, env_var
+        if not has_usable_secret(val):
+            continue
+        if not _secret_matches_declared_prefix(provider_id, val):
+            # A provably malformed key (declared prefix mismatch) must not
+            # shadow a valid credential-pool entry (#93593). Warn and keep
+            # looking instead of returning it.
+            _warn_malformed_secret(provider_id, env_var)
+            continue
+        return val, env_var
 
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
         from agent.credential_pool import load_pool
         pool = load_pool(provider_id)
         if pool and pool.has_credentials():
+            # Prefer the pool's own selection (peek), but iterate the rest of
+            # the entries too so one malformed entry doesn't block a valid one.
+            candidates = []
             entry = pool.peek()
-            if entry:
+            if entry is not None:
+                candidates.append(entry)
+            try:
+                for extra in pool.entries():
+                    if extra is not None and all(extra is not c for c in candidates):
+                        candidates.append(extra)
+            except Exception:
+                pass
+            for entry in candidates:
                 key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
                 key = str(key).strip()
-                if has_usable_secret(key):
-                    return key, f"credential_pool:{provider_id}"
+                if not has_usable_secret(key):
+                    continue
+                if not _secret_matches_declared_prefix(provider_id, key):
+                    _warn_malformed_secret(provider_id, f"credential_pool:{provider_id}")
+                    continue
+                return key, f"credential_pool:{provider_id}"
     except Exception:
         pass
 
@@ -3740,76 +3798,6 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
-def _recover_legacy_codex_state(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Adopt the private-fork top-level ``codex`` mirror when canonical auth is empty.
-
-    Human20 builds predating the upstream provider schema mirrored the selected
-    Codex OAuth account at ``auth.json.codex``.  Newer runtimes use
-    ``providers.openai-codex.tokens`` and the credential pool exclusively.  A
-    pool refresh/prune during an upgrade can therefore leave a valid legacy
-    token pair stranded while the gateway reports that ``access_token`` is
-    missing.  Recover only when the canonical pair is incomplete, and require
-    both access and refresh tokens so a partial legacy record cannot mask a
-    genuine re-auth requirement.
-    """
-    state = _load_provider_state(auth_store, "openai-codex")
-    state = dict(state) if isinstance(state, dict) else {}
-    current_tokens = state.get("tokens")
-    if (
-        isinstance(current_tokens, dict)
-        and str(current_tokens.get("access_token") or "").strip()
-        and str(current_tokens.get("refresh_token") or "").strip()
-    ):
-        return state
-
-    legacy = auth_store.get("codex")
-    if not isinstance(legacy, dict):
-        return state or None
-    access_token = str(legacy.get("access_token") or "").strip()
-    refresh_token = str(legacy.get("refresh_token") or "").strip()
-    if not access_token or not refresh_token:
-        return state or None
-
-    tokens = {
-        key: legacy[key]
-        for key in (
-            "access_token",
-            "refresh_token",
-            "id_token",
-            "account_id",
-            "profile",
-            "email",
-            "plan",
-        )
-        if legacy.get(key) not in (None, "")
-    }
-    previous_tokens = current_tokens if isinstance(current_tokens, dict) else None
-    last_refresh = str(
-        legacy.get("last_refresh")
-        or auth_store.get("updated_at")
-        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    )
-    state["tokens"] = tokens
-    state["last_refresh"] = last_refresh
-    state["auth_mode"] = "chatgpt"
-    label = str(legacy.get("profile") or legacy.get("label") or "").strip()
-    if label:
-        state["label"] = label
-    state.pop("last_auth_error", None)
-    _save_provider_state(auth_store, "openai-codex", state)
-    _sync_codex_pool_entries(
-        auth_store,
-        tokens,
-        last_refresh,
-        previous_singleton_tokens=previous_tokens,
-    )
-    _save_auth_store(auth_store)
-    logger.warning(
-        "Recovered openai-codex OAuth credentials from the legacy auth.json.codex mirror."
-    )
-    return state
-
-
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -3819,10 +3807,9 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()
-            state = _recover_legacy_codex_state(auth_store)
     else:
         auth_store = _load_auth_store()
-        state = _recover_legacy_codex_state(auth_store)
+    state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",

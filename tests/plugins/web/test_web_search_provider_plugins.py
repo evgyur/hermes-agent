@@ -2,8 +2,8 @@
 
 Covers:
 
-- All nine bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai, perplexity) instantiate and self-report the expected
+- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+  tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -45,8 +45,6 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
-        "PERPLEXITY_API_KEY",
-        "PPLX_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -70,9 +68,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All nine bundled web plugins discover and register correctly."""
+    """All eight bundled web plugins discover and register correctly."""
 
-    def test_all_nine_plugins_present_in_registry(self) -> None:
+    def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import list_providers
 
@@ -84,7 +82,6 @@ class TestBundledPluginsRegister:
             "firecrawl",
             "keenable",
             "parallel",
-            "perplexity",
             "searxng",
             "tavily",
             "xai",
@@ -102,7 +99,6 @@ class TestBundledPluginsRegister:
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
-            ("perplexity", True, False),
         ],
     )
     def test_capability_flags_match_spec(
@@ -121,7 +117,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai", "perplexity"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -131,22 +127,6 @@ class TestBundledPluginsRegister:
         assert provider is not None
         assert provider.name == plugin_name
         assert provider.display_name  # any non-empty string
-
-    @pytest.mark.parametrize(
-        "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai", "perplexity"],
-    )
-    def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
-        """``get_setup_schema()`` returns a dict the picker can consume."""
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-
-        provider = get_provider(plugin_name)
-        assert provider is not None
-        schema = provider.get_setup_schema()
-        assert isinstance(schema, dict)
-        assert "name" in schema
-        assert "env_vars" in schema
 
 
 # ---------------------------------------------------------------------------
@@ -206,120 +186,6 @@ class TestIsAvailable:
         assert p.is_available() is False
         monkeypatch.setenv("PARALLEL_API_KEY", "real")
         assert p.is_available() is True
-
-    def test_perplexity_accepts_preferred_or_alias_key(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-
-        p = get_provider("perplexity")
-        assert p is not None
-        assert p.is_available() is False
-        monkeypatch.setenv("PPLX_API_KEY", "real")
-        assert p.is_available() is True
-        monkeypatch.delenv("PPLX_API_KEY", raising=False)
-        monkeypatch.setenv("PERPLEXITY_API_KEY", "real")
-        assert p.is_available() is True
-
-    def test_perplexity_search_uses_agent_api_and_typed_search_results(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-        from plugins.web.perplexity import provider as perplexity_provider
-
-        posted = {}
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                return None
-
-            def json(self):
-                return {
-                    "id": "resp_test",
-                    "output": [
-                        {
-                            "type": "search_results",
-                            "queries": ["test"],
-                            "results": [
-                                {
-                                    "title": "Source",
-                                    "url": "https://example.com/source",
-                                    "snippet": "grounded snippet",
-                                }
-                            ],
-                        },
-                        {
-                            "type": "message",
-                            "content": [{"type": "output_text", "text": "answer"}],
-                        },
-                    ],
-                    "usage": {"cost": {"total_cost": 0.004}},
-                }
-
-        def fake_post(url, *, headers, json, timeout):
-            posted["url"] = url
-            posted["headers"] = headers
-            posted["json"] = json
-            posted["timeout"] = timeout
-            return FakeResponse()
-
-        monkeypatch.setenv("PPLX_API_KEY", "real")
-        monkeypatch.setattr(perplexity_provider.requests, "post", fake_post)
-        p = get_provider("perplexity")
-        assert p is not None
-
-        result = p.search("test", limit=1)
-
-        assert result.get("success") is True
-        assert posted["url"] == "https://api.perplexity.ai/v1/agent"
-        assert posted["json"]["model"] == "perplexity/sonar"
-        assert posted["json"]["input"] == "test"
-        assert posted["json"]["tools"] == [
-            {"type": "web_search", "max_results": 1, "search_context_size": "low"}
-        ]
-        assert posted["json"]["max_tool_calls"] == 1
-        assert result["answer"] == "answer"
-        assert result["data"]["web"][0]["url"] == "https://example.com/source"
-        assert result["usage"]["cost"]["total_cost"] == 0.004
-        assert result["request_id"] == "resp_test"
-        assert result["grounded"] is True
-
-    def test_perplexity_does_not_fabricate_source_when_agent_returns_only_text(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-        from plugins.web.perplexity import provider as perplexity_provider
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                return None
-
-            def json(self):
-                return {
-                    "output": [
-                        {
-                            "type": "message",
-                            "content": [{"type": "output_text", "text": "answer"}],
-                        }
-                    ]
-                }
-
-        monkeypatch.setenv("PPLX_API_KEY", "real")
-        monkeypatch.setattr(
-            perplexity_provider.requests,
-            "post",
-            lambda *args, **kwargs: FakeResponse(),
-        )
-        p = get_provider("perplexity")
-        assert p is not None
-        result = p.search("test", limit=1)
-        assert result["answer"] == "answer"
-        assert result["data"]["web"] == []
-        assert result["citations"] == []
-        assert result["grounded"] is False
 
     def test_firecrawl_requires_either_key_or_url(
         self, monkeypatch: pytest.MonkeyPatch

@@ -81,8 +81,6 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         default="all",
         choices=[
             "all",
-            "installed",
-            "local",
             "official",
             "skills-sh",
             "well-known",

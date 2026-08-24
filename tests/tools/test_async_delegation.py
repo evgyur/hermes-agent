@@ -39,26 +39,55 @@ def _drain_one(timeout=5.0):
     return None
 
 
-def _drain_for(delegation_id: str, timeout=5.0):
-    """Drain completion events until the requested delegation arrives."""
+def _drain_for(delegation_id, timeout=5.0):
+    """Drain until the event for *delegation_id* appears (discarding others).
+
+    Completion events are pushed asynchronously by worker threads, so a
+    straggler from a PREVIOUS test can land after that test's teardown drain
+    and leak into the current test's queue. Matching on delegation_id makes
+    the assertion immune to that cross-test leak.
+    """
     deadline = time.monotonic() + timeout
-    deferred = []
-    try:
-        while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                event = process_registry.completion_queue.get(
-                    timeout=min(0.05, remaining)
-                )
-            except queue.Empty:
-                continue
-            if event.get("delegation_id") == delegation_id:
-                return event
-            deferred.append(event)
-        return None
-    finally:
-        for event in deferred:
-            process_registry.completion_queue.put(event)
+    while time.monotonic() < deadline:
+        if not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("delegation_id") == delegation_id:
+                return evt
+            continue
+        time.sleep(0.02)
+    return None
+
+
+def test_active_for_session_counts_every_live_delegation_state():
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "running": {
+                    "status": "running",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "stalling": {
+                    "status": "stalling",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "finalizing": {
+                    "status": "finalizing",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "completed": {
+                    "status": "completed",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "other-session": {
+                    "status": "running",
+                    "origin_ui_session_id": "other-sid",
+                },
+            }
+        )
+
+    assert ad.active_for_session("desktop-sid") == 3
+    assert ad.active_for_session("other-sid") == 1
+    assert ad.active_for_session("") == 0
 
 
 def _assert_reentry_policy_contract(text: str) -> None:
@@ -182,7 +211,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     )
     assert res["status"] == "dispatched"
 
-    evt = _drain_one()
+    evt = _drain_for(res["delegation_id"])
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt["summary"] == "the result"
@@ -294,7 +323,7 @@ def test_crashed_runner_produces_error_completion():
         session_key="", runner=boom, max_async_children=3,
     )
     assert r["status"] == "dispatched"
-    evt = _drain_one()
+    evt = _drain_for(r["delegation_id"])
     assert evt is not None
     assert evt["status"] == "error"
     text = format_process_notification(evt)
@@ -562,7 +591,7 @@ def test_in_tool_stall_uses_higher_threshold(monkeypatch):
 
     time.sleep(0.5)  # far past idle threshold, well under in-tool threshold
     assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
+    assert _drain_for(res["delegation_id"], timeout=0.05) is None
 
     gate.set()
     evt = _drain_for(res["delegation_id"], timeout=5.0)
@@ -642,7 +671,7 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
 
 
-def test_pending_retention_never_count_prunes_undelivered(tmp_path, monkeypatch):
+def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
     for index, delivery_state in enumerate(("pending", "delivered", "pending")):
@@ -654,7 +683,7 @@ def test_pending_retention_never_count_prunes_undelivered(tmp_path, monkeypatch)
             "parent_session_id": None,
             "dispatched_at": float(index + 1),
         }
-        assert ad._persist_dispatch(record)
+        ad._persist_dispatch(record)
         ad._persist_completion(
             {
                 "delegation_id": delegation_id,
@@ -669,34 +698,8 @@ def test_pending_retention_never_count_prunes_undelivered(tmp_path, monkeypatch)
     ad._prune_durable_records()
 
     assert ad.get_durable_delegation("deleg_0") is not None
-    assert ad.get_durable_delegation("deleg_1") is not None
-    assert ad.get_durable_delegation("deleg_2") is not None
-
-    for index in (3, 4):
-        delegation_id = f"deleg_{index}"
-        assert ad._persist_dispatch({
-            "delegation_id": delegation_id,
-            "session_key": "owner",
-            "origin_ui_session_id": "",
-            "parent_session_id": None,
-            "dispatched_at": float(index + 1),
-        })
-        ad._persist_completion(
-            {
-                "delegation_id": delegation_id,
-                "status": "completed",
-                "completed_at": float(index + 1),
-            },
-            {"status": "completed", "summary": delegation_id},
-        )
-        ad.mark_completion_delivered(delegation_id)
-
-    ad._prune_durable_records()
-    assert ad.get_durable_delegation("deleg_0") is not None
-    assert ad.get_durable_delegation("deleg_2") is not None
     assert ad.get_durable_delegation("deleg_1") is None
-    assert ad.get_durable_delegation("deleg_3") is not None
-    assert ad.get_durable_delegation("deleg_4") is not None
+    assert ad.get_durable_delegation("deleg_2") is not None
 
 
 def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
@@ -974,9 +977,14 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "TASK 1/3" in text and "TASK 2/3" in text and "TASK 3/3" in text
-    assert "done: complete task a" in text
-    assert "done: complete task b" in text
-    assert "done: complete task c" in text
+    assert all(
+        value in text
+        for value in (
+            "done: complete task a",
+            "done: complete task b",
+            "done: complete task c",
+        )
+    )
     _assert_reentry_policy_contract(text)
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
@@ -1184,3 +1192,67 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+def test_single_task_truncation_banner_when_max_iterations():
+    """A single async subagent that hit its iteration cap (exit_reason=
+    max_iterations) must surface a TRUNCATED marker in the formatted result,
+    even though status stays 'completed' (a summary exists)."""
+    evt = _make_async_evt(
+        status="completed",
+        summary="Did part of the work then ran out of budget.",
+        exit_reason="max_iterations",
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "TRUNCATED" in text
+    assert "max_iterations" in text
+    # The summary is still shown, just flagged.
+    assert "Did part of the work" in text
+
+
+def test_single_task_no_banner_when_clean():
+    """A cleanly-finished subagent must NOT get a truncation banner."""
+    evt = _make_async_evt(status="completed", summary="All done.", exit_reason="completed")
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "TRUNCATED" not in text
+
+
+def test_batch_truncation_banner_marks_only_truncated_task():
+    """In a batch, only the task that hit max_iterations gets the TRUNCATED
+    marker; a clean sibling keeps the normal check icon."""
+    evt = _make_async_evt(
+        is_batch=True,
+        goals=["clean task", "truncated task"],
+        results=[
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "finished cleanly",
+                "api_calls": 5,
+                "exit_reason": "completed",
+                "truncated": False,
+            },
+            {
+                "task_index": 1,
+                "status": "completed",
+                "summary": "cut off mid-work",
+                "api_calls": 250,
+                "exit_reason": "max_iterations",
+                "truncated": True,
+            },
+        ],
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "TRUNCATED" in text
+    # The clean task's summary and the truncated one's both render...
+    assert "finished cleanly" in text
+    assert "cut off mid-work" in text
+    # ...but the banner is tied to the truncated task, not the clean one.
+    trunc_pos = text.index("cut off mid-work")
+    clean_pos = text.index("finished cleanly")
+    banner_pos = text.index("TRUNCATED")
+    # The header banner for task 2 appears after task 1's summary.
+    assert banner_pos > clean_pos

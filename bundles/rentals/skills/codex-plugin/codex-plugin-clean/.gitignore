@@ -1,6 +1,0 @@
-node_modules/
-.DS_Store
-.local/
-*.tgz
-__pycache__/
-*.pyc

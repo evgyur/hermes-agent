@@ -46,7 +46,7 @@ import time
 import threading
 import uuid
 import warnings
-from typing import List, Dict, Any, Optional, Callable, Iterable
+from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -162,6 +162,7 @@ from agent.usage_pricing import normalize_usage
 from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    user_originated_turn_view,
 )
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
@@ -243,10 +244,6 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
-    # Guard-enabled completion candidates stay in the in-memory verification
-    # loop but may not become durable until turn_finalizer validates/replaces
-    # the final candidate and removes this marker.
-    "_claim_integrity_pending",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
@@ -618,16 +615,6 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
-    def configure_tool_allowlist(self, qualified_tools: Iterable[str]) -> None:
-        """Apply an exact, process-local execution allowlist.
-
-        This is narrower than toolsets and is intended for externally supervised
-        sessions whose authority may only shrink between turns.
-        """
-        names = tuple(sorted({str(name) for name in qualified_tools if str(name)}))
-        self.qualified_tool_allowlist = frozenset(names)
-        self._tool_search_scope_cache = None
-
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 
@@ -983,7 +970,15 @@ class AIAgent:
         callers. The CLI may still want compact progress hints when no callback
         owns rendering. Embedded/library callers, on the other hand, expect
         quiet mode to be truly silent.
+
+        ``suppress_status_output`` (the strict machine-readable mode used by
+        ``hermes chat -Q``) always wins: those flows neutralize the rendering
+        callbacks, and without this gate the "no callback owns rendering"
+        fallback would print ``[tool]``/``[done]`` spinner lines into the
+        captured stdout it exists to keep clean (#93220).
         """
+        if getattr(self, "suppress_status_output", False):
+            return False
         return (
             self.quiet_mode
             and not self.tool_progress_callback
@@ -1552,9 +1547,9 @@ class AIAgent:
         changes — the heuristic stays in place as future-proofing even when
         the symptom is dormant.
 
-        The active mitigation is the Codex useful-byte watchdog in
-        ``interruptible_api_call``; this helper only labels stale-timeout
-        remnants with the known backend pattern.
+        Does NOT fix the backend issue.  Only converts an opaque stale-timeout
+        into actionable text so users learn the workaround in seconds rather
+        than digging through logs.
         """
         if self.api_mode != "codex_responses":
             return None
@@ -1579,9 +1574,11 @@ class AIAgent:
             f"Codex backend appears to be silently rejecting {eff_model!r} "
             "on chatgpt.com/backend-api/codex (no stream events, no error). "
             "This is a known backend-side pattern that has affected ChatGPT "
-            "Plus accounts intermittently. Hermes will keep using the requested "
-            "model and reconnect earlier when the stream produces no useful "
-            "bytes. See hermes-agent#21444 for symptom history."
+            "Plus accounts intermittently. "
+            "Workaround: try `gpt-5.4` on the same OAuth profile, or `gpt-5.3-codex`, "
+            "or switch to a different model/provider in your fallback chain. "
+            "Some ChatGPT Codex accounts do not support `gpt-5.4-codex`. "
+            "See hermes-agent#21444 for symptom history."
         )
 
     def _is_openrouter_url(self) -> bool:
@@ -1612,11 +1609,11 @@ class AIAgent:
 
     def _is_codex_backend(self) -> bool:
         """Return True for the ChatGPT OAuth Codex Responses backend."""
+        base_url = str(getattr(self, "base_url", "") or "")
         return (
             getattr(self, "api_mode", None) == "codex_responses"
-            and getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-            and "/backend-api/codex"
-            in (getattr(self, "_base_url_lower", "") or "")
+            and base_url_hostname(base_url) == "chatgpt.com"
+            and "/backend-api/codex" in base_url.lower()
         )
 
     def _anthropic_prompt_cache_policy(
@@ -2010,6 +2007,10 @@ class AIAgent:
                     )
                 ):
                     msg["content"] = override
+                    if getattr(
+                        self, "_persist_user_message_never_replay", False
+                    ):
+                        msg.pop("api_content", None)
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
@@ -2278,6 +2279,19 @@ class AIAgent:
                 is_current_turn_user = (
                     _ov_idx == _msg_idx or msg is pending_cli_message
                 )
+                _never_replay_api_content = bool(
+                    getattr(self, "_persist_user_message_never_replay", False)
+                    or getattr(
+                        content,
+                        "_hermes_never_persist_api_content",
+                        False,
+                    )
+                    or getattr(
+                        _ov_content,
+                        "_hermes_never_persist_api_content",
+                        False,
+                    )
+                )
                 if is_current_turn_user and msg.get("role") == "user":
                     # Preflight compaction can re-anchor the override index at
                     # a message whose content was MERGED with the compaction
@@ -2298,6 +2312,8 @@ class AIAgent:
                         # the wire (#48677 divergence, closed for the cache
                         # prefix too).
                         if (
+                            not _never_replay_api_content
+                            and
                             _row_api_content is None
                             and isinstance(content, str)
                             and content != _ov_content
@@ -2306,6 +2322,8 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                    if _never_replay_api_content:
+                        _row_api_content = None
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
@@ -2376,6 +2394,7 @@ class AIAgent:
                         "hidden"
                         if (
                             msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                            and user_originated_turn_view(msg) is None
                             and (
                                 ContextCompressor.classify_summary_content(
                                     msg.get("content")
@@ -2415,6 +2434,13 @@ class AIAgent:
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    turn_lease_holder=getattr(
+                        self, "_active_session_turn_lease_holder", None
+                    ),
+                    turn_lease_ttl_seconds=getattr(
+                        self, "_active_session_turn_lease_ttl_seconds", 300.0
+                    )
+                    or 300.0,
                     parent_task_barrier_id=_parent_barrier_id,
                 )
                 for _written in _batch_msgs:
@@ -3271,7 +3297,13 @@ class AIAgent:
                 logging.warning(f"Failed to save session log: {e}")
 
 
-    def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
+    def interrupt(
+        self,
+        message: Optional[str] = None,
+        *,
+        hard_cancel: bool = False,
+        tool_reason: Optional[str] = None,
+    ) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
         
@@ -3287,6 +3319,8 @@ class AIAgent:
             hard_cancel: Mark this as an explicit stop rather than a redirect or
                          incoming-message interrupt. Compression may honor this
                          atomic signal even while ordinary interrupts are masked.
+            tool_reason: Trusted fixed category safe to expose in tool output.
+                         Arbitrary diagnostic or caller text belongs in message.
         
         Example (CLI):
             # In a separate input thread:
@@ -3322,17 +3356,28 @@ class AIAgent:
                     )
             event.set()
 
+        # Keep tool cancellation attribution separate from _interrupt_message:
+        # ordinary interrupts may carry the user's full next message, which
+        # must not be copied into tool output.
+        tool_interrupt_reason = (
+            (tool_reason or "explicit stop requested")
+            if hard_cancel
+            else ("user sent a new message" if message else "user interrupt")
+        )
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
                 self._interrupt_requested = True
                 self._interrupt_message = message
+                self._tool_interrupt_reason = tool_interrupt_reason
                 if hard_cancel:
                     _admit_hard_cancel()
                 self._pending_redirect = None
         else:
             self._interrupt_requested = True
             self._interrupt_message = message
+            self._tool_interrupt_reason = tool_interrupt_reason
             if hard_cancel:
                 _admit_hard_cancel()
             self._pending_redirect = None
@@ -3365,7 +3410,11 @@ class AIAgent:
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
         if self._execution_thread_id is not None:
-            _set_interrupt(True, self._execution_thread_id)
+            _set_interrupt(
+                True,
+                self._execution_thread_id,
+                reason=tool_interrupt_reason,
+            )
             self._interrupt_thread_signal_pending = False
         else:
             # The interrupt arrived before run_conversation() finished
@@ -3389,7 +3438,7 @@ class AIAgent:
                 _worker_tids = list(_tracker)
             for _wtid in _worker_tids:
                 try:
-                    _set_interrupt(True, _wtid)
+                    _set_interrupt(True, _wtid, reason=tool_interrupt_reason)
                 except Exception:
                     pass
         # Propagate interrupt to any running child agents (subagent delegation)
@@ -3398,7 +3447,11 @@ class AIAgent:
         for child in children_copy:
             try:
                 if hard_cancel:
-                    request_hard_interrupt(child, message)
+                    request_hard_interrupt(
+                        child,
+                        message,
+                        tool_reason=tool_interrupt_reason,
+                    )
                 else:
                     child.interrupt(message)
             except Exception as e:
@@ -3406,7 +3459,12 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
-    def hard_interrupt(self, message: Optional[str] = None) -> None:
+    def hard_interrupt(
+        self,
+        message: Optional[str] = None,
+        *,
+        tool_reason: Optional[str] = None,
+    ) -> None:
         """Request an explicit stop while preserving ``interrupt()`` ABI.
 
         Frontends can feature-detect this method and fall back to the legacy
@@ -3415,7 +3473,12 @@ class AIAgent:
         # Deliberately bypass dynamic dispatch: subclasses written against the
         # legacy interrupt(message=None) ABI may override interrupt without the
         # newer keyword-only hard_cancel argument.
-        AIAgent.interrupt(self, message, hard_cancel=True)
+        AIAgent.interrupt(
+            self,
+            message,
+            hard_cancel=True,
+            tool_reason=tool_reason,
+        )
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
@@ -3431,6 +3494,7 @@ class AIAgent:
                     return False
                 self._interrupt_requested = False
                 self._interrupt_message = None
+                self._tool_interrupt_reason = None
                 getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
                 if not preserve_redirect:
                     self._pending_redirect = None
@@ -3439,6 +3503,7 @@ class AIAgent:
                 return False
             self._interrupt_requested = False
             self._interrupt_message = None
+            self._tool_interrupt_reason = None
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
@@ -3472,13 +3537,7 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
-    def steer(
-        self,
-        text: str,
-        *,
-        receipt_id: Optional[str] = None,
-        receipt_transition: Optional[Callable[[str, str], None]] = None,
-    ) -> bool:
+    def steer(self, text: str) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3499,9 +3558,6 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _receipt = None
-        if receipt_id and callable(receipt_transition):
-            _receipt = (str(receipt_id), receipt_transition)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3509,37 +3565,13 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            if _receipt is not None:
-                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
-                pending.append(_receipt)
-                self._pending_steer_receipts = pending
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
-            if _receipt is not None:
-                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
-                pending.append(_receipt)
-                self._pending_steer_receipts = pending
         return True
-
-    def _mark_drained_steer_request_fenced(self) -> None:
-        """Fence the exact receipts whose trusted markers enter this request."""
-        receipts = list(getattr(self, "_drained_steer_receipts", []) or [])
-        self._fenced_steer_receipts = receipts
-        self._drained_steer_receipts = []
-        for receipt_id, transition in receipts:
-            transition(receipt_id, "REQUEST_FENCED")
-
-    def _mark_fenced_steer_provider_result(self, *, accepted: bool) -> None:
-        """Terminalize fenced receipts without replaying an ambiguous request."""
-        receipts = list(getattr(self, "_fenced_steer_receipts", []) or [])
-        self._fenced_steer_receipts = []
-        state = "CONSUMED_CURRENT" if accepted else "AMBIGUOUS_PROVIDER_REQUEST"
-        for receipt_id, transition in receipts:
-            transition(receipt_id, state)
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3663,18 +3695,10 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
-            self._drained_steer_receipts = list(
-                getattr(self, "_pending_steer_receipts", []) or []
-            )
-            self._pending_steer_receipts = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
-            self._drained_steer_receipts = list(
-                getattr(self, "_pending_steer_receipts", []) or []
-            )
-            self._pending_steer_receipts = []
         return text
 
     def _record_file_mutation_result(
@@ -3971,6 +3995,13 @@ class AIAgent:
                 + "an error occurred near the iteration limit before a final "
                 "answer. Check the tool output above, then send `continue`."
             )
+        if reason.startswith("repeated_outer_errors"):
+            return (
+                prefix
+                + "the turn kept failing with repeated errors and was stopped "
+                "early instead of retrying forever. Check the errors above, "
+                "then send `continue` to retry."
+            )
         if reason == "pending_tool_result":
             return (
                 prefix
@@ -4008,8 +4039,8 @@ class AIAgent:
                 return (
                     prefix
                     + "the turn was stopped because session storage was busy "
-                    "(another Hermes writer held the state database lock). "
-                    "Your message should already be saved — "
+                    "(another Hermes process was writing to the state "
+                    "database). Your message should already be saved — "
                     "please send it again in a moment."
                 )
             if cause == "corrupt":
@@ -6800,18 +6831,93 @@ class AIAgent:
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        self._latest_interim_visible_text = visible
+        if (
+            getattr(self, "start_ack_required", False)
+            and not getattr(self, "_tool_start_ack_emitted", False)
+        ):
+            # Buffer first-boundary commentary for the synchronous receipt
+            # barrier. Queueing it through the ordinary callback would not be
+            # proof of user-visible delivery and could duplicate the barrier.
+            return
+        if cb is None:
+            return
         try:
-            cb(visible, already_streamed=False)
+            callback_result = cb(visible, already_streamed=False)
+            if callback_result is False:
+                return
             self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+
+    def _emit_tool_start_ack_if_needed(
+        self, assistant_msg: Dict[str, Any]
+    ) -> Optional[bool]:
+        """Emit one gateway fallback acknowledgment before the first tool effect.
+
+        Model-authored commentary always wins. The latch is claimed before the
+        callback so a delivery timeout/failure cannot create duplicate retries.
+        """
+        if getattr(self, "_tool_start_ack_emitted", False):
+            return None
+        if not isinstance(assistant_msg, dict) or not assistant_msg.get("tool_calls"):
+            return None
+        # Claim the first tool boundary even when visible commentary already
+        # satisfied the progress contract. A later empty tool batch must never
+        # emit a misleading "starting" acknowledgment after side effects.
+        self._tool_start_ack_emitted = True
+        callback = getattr(self, "start_ack_callback", None)
+        if callback is None:
+            return False if getattr(self, "start_ack_required", False) else None
+        if (
+            not getattr(self, "start_ack_required", False)
+            and getattr(self, "_delivered_interim_texts", set())
+        ):
+            return True
+        visible = self._interim_assistant_visible_text(assistant_msg) or str(
+            getattr(self, "_latest_interim_visible_text", None) or ""
+        ).strip()
+        self._pending_start_ack_visible_text = visible or None
+        try:
+            receipt = callback()
+            from agent.start_ack import StartAckReceipt
+
+            delivered_text = (
+                receipt.text.strip()
+                if isinstance(receipt, StartAckReceipt)
+                and isinstance(receipt.text, str)
+                else ""
+            )
+            if isinstance(receipt, StartAckReceipt):
+                delivered = bool(delivered_text)
+            else:
+                # Legacy truthy callbacks remain usable only in best-effort
+                # mode. They cannot satisfy the required effect boundary or
+                # grant exact-final delivery authority.
+                delivered = bool(receipt) and not getattr(
+                    self, "start_ack_required", False
+                )
+            if delivered_text:
+                self._start_ack_receipt = receipt
+                self._record_delivered_interim_text(delivered_text)
+                # Dedicated exact delivery authority. This is deliberately
+                # distinct from the legacy response-previewed UI flag: only a
+                # settled callback receipt for this exact payload may suppress
+                # a byte-identical final send later in the turn.
+                self._start_ack_delivered_text = delivered_text
+            return delivered
+        except Exception:
+            logger.debug("start_ack_callback error", exc_info=True)
+            return False
+        finally:
+            self._pending_start_ack_visible_text = None
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6873,7 +6979,9 @@ class AIAgent:
         if cb is None:
             return
         try:
-            cb(visible, already_streamed=already_streamed)
+            callback_result = cb(visible, already_streamed=already_streamed)
+            if callback_result is False:
+                return
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)
@@ -8068,7 +8176,6 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
-        bypass_ineffective_guard: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8078,10 +8185,6 @@ class AIAgent:
         so users can bypass the summary-failure cooldown after an
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
-
-        ``bypass_ineffective_guard=True`` is narrower: critical gateway
-        hygiene may retry after the anti-thrash breaker trips, but it still
-        honors provider failure cooldowns and remains an automatic attempt.
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
@@ -8118,19 +8221,17 @@ class AIAgent:
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize the WHOLE attempt, not just fence publication. Otherwise a
-        # second attempt can replace the active fence while the first is still
-        # summarising, so hard_interrupt() cancels only the newer attempt and
-        # the older one can still commit after the surfaced stop.
+        # Serialize fence publication so a waiter cannot replace the fence of
+        # the attempt currently generating/committing a summary.
         fence_registration_lock = vars(self).setdefault(
             "_compression_commit_fence_lock", threading.RLock()
         )
-        fence_registration_lock.acquire()
-        missing_fence = object()
-        previous_fence = vars(self).get(
-            "_active_compression_commit_fence", missing_fence
-        )
-        self._active_compression_commit_fence = active_fence
+        with fence_registration_lock:
+            missing_fence = object()
+            previous_fence = vars(self).get(
+                "_active_compression_commit_fence", missing_fence
+            )
+            self._active_compression_commit_fence = active_fence
         try:
             def _run(fence=None, target_messages=None):
                 return compress_context(
@@ -8140,7 +8241,6 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
-                    bypass_ineffective_guard=bypass_ineffective_guard,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -8300,11 +8400,11 @@ class AIAgent:
                 )
             return result
         finally:
-            if previous_fence is missing_fence:
-                vars(self).pop("_active_compression_commit_fence", None)
-            else:
-                self._active_compression_commit_fence = previous_fence
-            fence_registration_lock.release()
+            with fence_registration_lock:
+                if previous_fence is missing_fence:
+                    vars(self).pop("_active_compression_commit_fence", None)
+                else:
+                    self._active_compression_commit_fence = previous_fence
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:
@@ -8316,10 +8416,12 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        tool = decision.tool_name or "a tool"
         return (
-            "I stopped retrying this step because it kept returning the same error. "
-            "I kept the results gathered before the failure; the next attempt should "
-            "use a different approach instead of repeating the same action."
+            f"I stopped retrying {tool} because it hit the tool-call guardrail "
+            f"({decision.code}) after {decision.count} repeated non-progressing "
+            "attempts. The last tool result explains the blocker; the next step is "
+            "to change strategy instead of repeating the same call."
         )
 
     def _append_guardrail_observation(
@@ -8449,6 +8551,9 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=_model_background_value(function_args, self),
+            action=function_args.get("action"),
+            subagent_id=function_args.get("subagent_id"),
+            message=function_args.get("message"),
             parent_agent=self,
         )
 

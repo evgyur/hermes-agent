@@ -398,8 +398,18 @@ def _copilot_runtime_api_mode(
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "codex_app_server", "anthropic_messages", "bedrock_converse"}
-_MINIMAX_ANTHROPIC_PROVIDERS = {"minimax", "minimax-cn", "minimax-oauth"}
+_VALID_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
+    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
+    # instead of Hermes' tool dispatch. Gated behind config key
+    # `model.openai_runtime == "codex_app_server"` AND provider in
+    # {"openai", "openai-codex"}. Default is unchanged.
+    "codex_app_server",
+}
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -566,11 +576,7 @@ def _resolve_runtime_from_pool_entry(
             # Refs #16878.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
-        elif (
-            configured_mode
-            and _provider_supports_explicit_api_mode(provider, configured_provider)
-            and not (provider in _MINIMAX_ANTHROPIC_PROVIDERS and configured_mode == "codex_responses")
-        ):
+        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
             api_mode = configured_mode
         else:
             # URL detection first (Anthropic /anthropic suffix, Kimi /coding,
@@ -1161,7 +1167,8 @@ def _resolve_named_custom_runtime(
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
+        # An explicit ``target_model`` wins (same rule as the non-pool path).
+        model_name = target_model or custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
         if isinstance(custom_provider.get("max_output_tokens"), int):
@@ -1222,7 +1229,13 @@ def _resolve_named_custom_runtime(
     }
     # Propagate the model name so callers can override self.model when the
     # provider name differs from the actual model string the API expects.
-    if custom_provider.get("model"):
+    # An explicit ``target_model`` wins over the provider's configured
+    # default (regression: auxiliary slots / background-review resolve a
+    # concrete model for a custom provider and must not silently fall back
+    # to ``default_model``).
+    if target_model:
+        result["model"] = target_model
+    elif custom_provider.get("model"):
         result["model"] = custom_provider["model"]
     if isinstance(custom_provider.get("max_output_tokens"), int):
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
@@ -1733,11 +1746,7 @@ def _resolve_explicit_runtime(
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if (
-                configured_mode
-                and _provider_supports_explicit_api_mode(provider, configured_provider)
-                and not (provider in _MINIMAX_ANTHROPIC_PROVIDERS and configured_mode == "codex_responses")
-            ):
+            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
             else:
                 # URL detection first, then the provider's declared transport

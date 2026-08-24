@@ -75,60 +75,6 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
-async def test_status_command_reports_running_agent_without_interrupt(monkeypatch):
-    session_entry = SessionEntry(
-        session_key=build_session_key(_make_source()),
-        session_id="sess-1",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        total_tokens=321,
-    )
-    runner = _make_runner(session_entry)
-    # Token total comes from the SQLite SessionDB, not SessionEntry.
-    runner._session_db._db.get_session.return_value = {
-        "input_tokens": 200,
-        "output_tokens": 121,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "reasoning_tokens": 0,
-    }
-    running_agent = MagicMock()
-    runner._running_agents[build_session_key(_make_source())] = running_agent
-
-    result = await runner._handle_message(_make_event("/status"))
-
-    assert "🪽 **Hermes" in result
-    assert "🆔 Session ID: `sess-1`" in result
-    assert "🧮 Tokens: 200 in / 121 out · total 321" in result
-    assert "Agent: running ⚡" in result
-    assert "My titled session" not in result
-    running_agent.interrupt.assert_not_called()
-    assert runner._pending_messages == {}
-
-
-@pytest.mark.asyncio
-async def test_status_command_includes_session_title_when_present():
-    session_entry = SessionEntry(
-        session_key=build_session_key(_make_source()),
-        session_id="sess-1",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        total_tokens=321,
-    )
-    runner = _make_runner(session_entry)
-    runner._session_db._db.get_session_title.return_value = "My titled session"
-
-    result = await runner._handle_message(_make_event("/status"))
-
-    assert "🆔 Session ID: `sess-1`" in result
-    assert "My titled session" in result
-
-
-@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
@@ -154,29 +100,7 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
-    assert "🗄️ Cache: 33% hit · 500 cached, 100 new" in result
-
-
-@pytest.mark.asyncio
-async def test_status_command_tokens_zero_when_session_db_row_missing():
-    """When the SessionDB has no row for the current session yet (fresh
-    session, no agent calls), /status reports 0 without raising."""
-    session_entry = SessionEntry(
-        session_key=build_session_key(_make_source()),
-        session_id="sess-1",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        total_tokens=999,  # This should be ignored.
-    )
-    runner = _make_runner(session_entry)
-    runner._session_db._db.get_session.return_value = None
-
-    result = await runner._handle_message(_make_event("/status"))
-
-    assert "🧮 Tokens: 0 in / 0 out · total 0" in result
+    assert "**Lifetime tokens billed:** 1,900" in result
 
 
 @pytest.mark.asyncio
@@ -214,7 +138,7 @@ async def test_status_command_includes_live_agent_model_and_context():
 
     assert "**Model:** `openai/gpt-test` (openai)" in result
     assert "**Context:** 12,345 / 100,000 (12%)" in result
-    assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
+    assert "**Lifetime tokens billed:** 1,250" in result
 
 
 @pytest.mark.asyncio
@@ -665,4 +589,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-

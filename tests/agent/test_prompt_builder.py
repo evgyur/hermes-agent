@@ -38,6 +38,23 @@ from agent.prompt_builder import (
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
+@pytest.fixture(autouse=True)
+def _drain_truncation_warnings():
+    """Leave no truncation warnings in the shared thread context.
+
+    Truncation warnings ride a ContextVar; under plain ``pytest`` (no
+    per-file subprocess isolation) anything this file records leaks into
+    later files' contexts and breaks their assertions/ordering.
+
+    Drain on both sides: before, so warnings leaked by earlier files can't
+    pollute this file's assertions, and after, so this file leaves the
+    ContextVar clean for later files.
+    """
+    drain_truncation_warnings()
+    yield
+    drain_truncation_warnings()
+
+
 # =========================================================================
 # Guidance constants
 # =========================================================================
@@ -293,20 +310,6 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
-
-    def test_skill_maintenance_cannot_expand_completed_task(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "tools" / "sample"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: sample\ndescription: Sample skill\n---\n"
-        )
-
-        result = build_skills_system_prompt()
-
-        assert "blocks the current requested outcome" in result
-        assert "do not expand a completed task into skill maintenance" in result
-        assert "update it before finishing" not in result
 
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(

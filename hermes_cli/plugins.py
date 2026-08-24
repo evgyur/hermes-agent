@@ -1183,6 +1183,13 @@ class PluginRegistration:
     key: str
     release: Callable[[], None]
     plugin_key: str = ""
+    # Process-global host infrastructure (e.g. dashboard-auth providers) whose
+    # lifetime is the server, not this per-home manager: kept out of
+    # ``_registration_order`` so a routine unload-all cannot dispose it
+    # (#91701), but still disposed by a *targeted* unload (plugin disable/
+    # uninstall) and evicted on force re-discovery when the plugin no longer
+    # re-registers it.
+    persistent: bool = False
     _disposed: bool = field(default=False, init=False, repr=False)
     _on_dispose: Optional[Callable[["PluginRegistration"], None]] = field(
         default=None, init=False, repr=False
@@ -1399,17 +1406,156 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
-        self._retained_work: Any = None
+        self._state: PluginState | None = None
+        # Lazy-built capability-gated platform action facade (#64176).
+        self._platform_actions: Any = None
+
+    @property
+    def plugin_id(self) -> str:
+        """Return the effective registry id used for this plugin's namespaces."""
+        return self.manifest.key or self.manifest.name
+
+    def has_plugin(self, plugin_id: str) -> bool:
+        """Return True when another plugin is loaded and enabled (#64165).
+
+        Companion to the advisory ``requires_plugins`` manifest field: a
+        missing dependency never blocks load, so plugins probe availability
+        at runtime with this. Matches on registry key or manifest name.
+        """
+        for key, loaded in self._manager._plugins.items():
+            if not loaded.enabled:
+                continue
+            if key == plugin_id or loaded.manifest.name == plugin_id:
+                return True
+        return False
+
+    # -- namespaced config and durable state --------------------------------
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Read ``plugins.entries.<plugin_id>.settings.<key>``.
+
+        ``key`` is always plugin-relative.  For migration compatibility, a
+        missing canonical value falls back to the former ``config`` subtree;
+        no global config paths are exposed.
+        """
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        plugins = config.get("plugins") if isinstance(config, Mapping) else None
+        entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+        entry = entries.get(self.plugin_id) if isinstance(entries, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return default
+        missing = object()
+        value = _nested_plugin_value(entry.get("settings"), segments, missing)
+        if value is not missing:
+            return value
+        return _nested_plugin_value(entry.get("config"), segments, default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        """Atomically write one value in this plugin's ``settings`` subtree."""
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli import config as config_mod
+
+        if config_mod.is_managed():
+            raise PermissionError(
+                "Plugin settings cannot be changed in a managed install"
+            )
+        from hermes_cli import managed_scope
+
+        dotted_path = ".".join((
+            "plugins",
+            "entries",
+            self.plugin_id,
+            "settings",
+            *segments,
+        ))
+        if managed_scope.is_key_managed(dotted_path):
+            raise PermissionError(
+                f"Plugin setting {dotted_path!r} is administrator-managed"
+            )
+        partial = {
+            "plugins": {
+                "entries": {
+                    self.plugin_id: {
+                        "settings": _nested_plugin_mapping(segments, value),
+                    }
+                }
+            }
+        }
+        full_path = ("plugins", "entries", self.plugin_id, "settings", *segments)
+        # The lock covers the merge read plus atomic save, preventing sibling
+        # plugin writes from racing between those two steps.
+        # Serialize bridge-to-bridge writes across processes as well as
+        # threads. Other Hermes config writers still retain their existing
+        # atomic-replace semantics; this lock specifically prevents two
+        # plugin read/merge/write transactions from dropping siblings.
+        with _locked_plugin_state(config_mod.get_config_path()):
+            with config_mod._CONFIG_LOCK:
+                # Fail closed on malformed YAML. save_config's raw-cache reader
+                # intentionally degrades parse failures to {}, which is safe for
+                # reads but destructive for read-modify-write.
+                config_mod.read_user_config_raw()
+                config_mod.save_config(
+                    partial,
+                    preserve_keys={full_path},
+                    merge_existing=True,
+                )
+
+    @property
+    def state(self) -> PluginState:
+        """Return this plugin's profile-scoped durable JSON state facade."""
+        if self._state is None:
+            self._state = PluginState(self.plugin_id, self.manifest.skill_namespace)
+        return self._state
+
+    @property
+    def platform_actions(self):
+        """Capability-gated platform action facade (#64176, v1).
+
+        Minimal verb set (``add_reaction``, ``set_thread_title``) routed
+        through the live gateway adapter registry. Every call re-checks the
+        ``gateway.platform_actions`` capability (legacy gate:
+        ``plugins.entries.<id>.allow_platform_actions``, default OFF) and
+        returns a structured ``{"ok": bool, ...}`` dict — verbs never raise
+        into hook dispatch. No adapter handles or raw SDK objects are exposed.
+        """
+        if self._platform_actions is None:
+            from hermes_cli.platform_actions import PlatformActions
+
+            self._platform_actions = PlatformActions(self.plugin_id)
+        return self._platform_actions
 
     def _track(
         self,
         kind: str,
         key: str,
         release: Callable[[], None],
+        *,
+        persistent: bool = False,
     ) -> PluginRegistration:
-        """Record host-owned cleanup for a successful registration."""
+        """Record host-owned cleanup for a successful registration.
+
+        ``persistent`` registrations are returned as live handles but kept
+        out of the manager's reverse-order teardown, so a routine per-home
+        manager unload does not dispose them (see
+        :meth:`PluginManager._track_registration`).
+        """
         return self._manager._track_registration(
-            self.manifest, kind, key, release
+            self.manifest, kind, key, release, persistent=persistent
         )
 
     def _track_replacement(
@@ -1469,16 +1615,6 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
-
-    @property
-    def retained_work(self) -> Any:
-        """Return a plugin-bound native durable background-work facade."""
-        if self._retained_work is None:
-            from agent.plugin_retained_work import PluginRetainedWorkServiceV1
-
-            plugin_id = self.manifest.key or self.manifest.name
-            self._retained_work = PluginRetainedWorkServiceV1(plugin_id)
-        return self._retained_work
 
     # -- profile awareness --------------------------------------------------
 
@@ -2261,12 +2397,11 @@ class PluginContext:
         cannot crash the host. Same convention as
         ``register_image_gen_provider``.
         """
-        from hermes_cli.dashboard_auth import (
-            DashboardAuthProvider,
-            register_provider,
+        from hermes_cli.dashboard_auth import DashboardAuthProvider
+        from hermes_cli.dashboard_auth.registry import (
+            register_global_provider,
+            unregister_global_provider,
         )
-        from hermes_cli.dashboard_auth.registry import restore_registration
-        from hermes_cli.dashboard_auth.registry import snapshot_registration
 
         if not isinstance(provider, DashboardAuthProvider):
             logger.warning(
@@ -2276,10 +2411,19 @@ class PluginContext:
             )
             return
         registry_name = provider.name
-        scope = self._manager.scope_key
-        previous = snapshot_registration(registry_name, scope=scope)
+        # The dashboard auth registry is process-global — its lifetime is the
+        # web server, not this per-home plugin manager. A per-home manager is
+        # torn down routinely (profile-scoped dashboard activity, force
+        # re-discovery), and disposing this registration on that teardown
+        # emptied the auth registry for the WHOLE process, permanently
+        # disabling sign-in until restart (#91701). So register it in the
+        # global slot (upsert) and, crucially, keep it OUT of the manager's
+        # reverse-order teardown (``persistent=True``): a per-home unload can
+        # no longer clear it. The handle still disposes explicitly (identity-
+        # conditional), and a forced re-discovery rotates the provider in
+        # place via the upsert.
         try:
-            register_provider(provider, scope=scope)
+            register_global_provider(provider)
         except (TypeError, ValueError) as e:
             logger.warning(
                 "Plugin '%s' failed to register dashboard-auth provider "
@@ -2287,18 +2431,11 @@ class PluginContext:
                 self.manifest.name, getattr(provider, "name", "?"), e,
             )
             return
-        registered = snapshot_registration(registry_name, scope=scope)
-        if registered is not provider:
-            return None
-        handle = self._track_replacement(
+        handle = self._track(
             "dashboard_auth_provider",
             registry_name,
-            slot=("dashboard_auth_provider", scope, registry_name),
-            current=provider,
-            previous=previous,
-            restore=lambda replacement: restore_registration(
-                registry_name, provider, replacement, scope=scope
-            ),
+            lambda: unregister_global_provider(registry_name, provider),
+            persistent=True,
         )
         logger.info(
             "Plugin '%s' registered dashboard-auth provider: %s (%s)",
@@ -3338,6 +3475,13 @@ class PluginManager:
         # symmetric force-reload lands.
         self._ownership_ledger: Dict[str, List[PluginRegistration]] = {}
         self._registration_order: List[PluginRegistration] = []
+        # Persistent (process-global) registrations that survived an
+        # unload-all. Force re-discovery drains this via
+        # _evict_stale_persistent_registrations(): entries whose plugin
+        # re-registered the same (kind, key) are kept (the upsert rotated
+        # them in place), the rest are disposed so a disabled/removed auth
+        # plugin's provider does not outlive its plugin (#91701 follow-up).
+        self._persistent_carryover: List[PluginRegistration] = []
         # Deferred platform plugins whose client tools were registered at
         # discovery time (see _register_deferred_platform_tools). Keyed by
         # plugin id: the already-imported package module, so materializing the
@@ -3357,21 +3501,75 @@ class PluginManager:
         kind: str,
         key: str,
         release: Callable[[], None],
+        *,
+        persistent: bool = False,
     ) -> PluginRegistration:
-        """Record one successful registration under its canonical plugin key."""
+        """Record one successful registration under its canonical plugin key.
+
+        ``persistent`` registrations (process-global host infrastructure such
+        as dashboard-auth providers, whose lifetime is the server rather than
+        a per-home plugin manager) are still tracked in the ownership ledger
+        for attribution, but are NOT enrolled in ``_registration_order`` — so
+        a routine per-home manager unload cannot dispose them (#91701). The
+        returned handle still releases on explicit ``dispose()``.
+        """
         plugin_key = manifest.key or manifest.name
         registration = PluginRegistration(
             kind=kind,
             key=key,
             release=release,
             plugin_key=plugin_key,
+            persistent=persistent,
         )
         registration._on_dispose = lambda disposed: self._forget_registrations(
             [disposed]
         )
         self._ownership_ledger.setdefault(plugin_key, []).append(registration)
-        self._registration_order.append(registration)
+        if not persistent:
+            self._registration_order.append(registration)
         return registration
+
+    def _evict_stale_persistent_registrations(self) -> None:
+        """Dispose carried-over persistent registrations not re-registered.
+
+        Persistent registrations (process-global host infrastructure such as
+        dashboard-auth providers) survive an unload-all by design (#91701);
+        ``_unload_scoped`` parks their handles in ``_persistent_carryover``.
+        After a re-discovery pass, three cases exist for each parked handle:
+
+        - the plugin re-registered the same ``(kind, key)`` → the upsert
+          rotated the entry in place. The old handle is superseded; drop it
+          WITHOUT disposing (a plugin that re-registered the *same object*
+          would otherwise pass the identity check and evict the live entry).
+        - the plugin did not come back (disabled, uninstalled, omitted) →
+          dispose, releasing the process-global registration.
+        - the handle was already disposed elsewhere (targeted unload) → drop.
+        """
+        if not self._persistent_carryover:
+            return
+        parked = self._persistent_carryover
+        self._persistent_carryover = []
+        current = {
+            (registration.kind, registration.key)
+            for owned in self._ownership_ledger.values()
+            for registration in owned
+            if registration.persistent and registration.active
+        }
+        stale = [
+            registration
+            for registration in parked
+            if registration.active
+            and (registration.kind, registration.key) not in current
+        ]
+        for registration in stale:
+            logger.info(
+                "Evicting persistent registration %s/%s: plugin '%s' no "
+                "longer supplies it after re-discovery",
+                registration.kind,
+                registration.key,
+                registration.plugin_key,
+            )
+        self._dispose_registrations(stale)
 
     @staticmethod
     def _remove_identity(values: list, target: Any) -> bool:
@@ -3542,6 +3740,18 @@ class PluginManager:
                 for registration in self._registration_order
                 if registration.plugin_key in target_keys
             ]
+            # Persistent registrations (process-global host infrastructure,
+            # e.g. dashboard-auth providers) are deliberately absent from
+            # _registration_order so an unload-all cannot dispose them
+            # (#91701). A *targeted* unload is different: it is the plugin
+            # disable/uninstall path, and a disabled auth plugin's provider
+            # must NOT stay live process-wide. Gather them from the ledger.
+            registrations.extend(
+                registration
+                for key in target_keys
+                for registration in self._ownership_ledger.get(key, [])
+                if registration.persistent and registration.active
+            )
 
         found = bool(target_keys or registrations)
         self._dispose_registrations(registrations)
@@ -3595,6 +3805,21 @@ class PluginManager:
                                 tool_name,
                                 exc,
                             )
+            # Persistent registrations survive this unload-all by design
+            # (#91701) but must not be orphaned by the ledger clear below:
+            # carry them over so a force re-discovery can evict the ones
+            # whose plugin does not come back (disabled/removed/omitted).
+            carryover_ids = {
+                id(registration) for registration in self._persistent_carryover
+            }
+            self._persistent_carryover.extend(
+                registration
+                for owned in self._ownership_ledger.values()
+                for registration in owned
+                if registration.persistent
+                and registration.active
+                and id(registration) not in carryover_ids
+            )
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
@@ -3676,6 +3901,13 @@ class PluginManager:
             self._discovered = True
             try:
                 self._discover_and_load_inner()
+                # Persistent registrations deliberately survived the
+                # unload-all above (#91701). Now that plugins have had their
+                # chance to re-register, dispose the ones whose plugin did
+                # not come back (disabled, removed, or omitted from this
+                # discovery pass) so e.g. a disabled auth plugin's provider
+                # does not stay live process-wide until restart.
+                self._evict_stale_persistent_registrations()
                 # Plugin secret sources register during discover; the initial
                 # load_hermes_dotenv() already ran at import time. Re-pull so the
                 # first process sees plugin backends (tracking #64177).
@@ -5564,6 +5796,18 @@ def _reset_plugin_managers_for_tests() -> None:
                 logger.debug("test plugin-manager unload failed", exc_info=True)
         _plugin_managers_by_home.clear()
         _plugin_manager = None
+    # Dashboard-auth providers are persistent host-owned registrations that
+    # deliberately survive a routine manager unload (#91701), so the "clean
+    # slate" reset must drop the process-global auth registry explicitly —
+    # otherwise a provider auto-registered during one test leaks into the next.
+    try:
+        from hermes_cli.dashboard_auth.registry import (
+            clear_providers as _clear_dashboard_auth_providers,
+        )
+
+        _clear_dashboard_auth_providers()
+    except Exception:
+        logger.debug("dashboard-auth registry clear failed", exc_info=True)
 
 
 def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:

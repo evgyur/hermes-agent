@@ -133,10 +133,7 @@ def _find_session_id(
     # Primary: state.db
     try:
         from hermes_state import SessionDB
-        # Keep SQLite and the legacy sessions index in the same Hermes home.
-        # This also prevents a patched/embedded index from accidentally
-        # consulting another profile's process-global default database.
-        db = SessionDB(db_path=_SESSIONS_INDEX.parent.parent / "state.db")
+        db = SessionDB()
         try:
             finder = getattr(db, "find_session_by_origin", None)
             if callable(finder):

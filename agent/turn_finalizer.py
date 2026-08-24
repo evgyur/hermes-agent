@@ -119,45 +119,6 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
-def _rewrite_current_turn_final_assistant(messages, old_text, new_text, agent) -> None:
-    """Resolve one guarded candidate and drop older unverified candidates."""
-
-    turn_start = -1
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        if any(message.get(flag) for flag in _VERIFICATION_CONTINUATION_FLAGS):
-            continue
-        turn_start = index
-
-    resolved_index = None
-    for index in range(len(messages) - 1, turn_start, -1):
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        if message.get("content") == old_text:
-            resolved_index = index
-            break
-
-    rebuilt = list(messages[: turn_start + 1])
-    for index in range(turn_start + 1, len(messages)):
-        message = messages[index]
-        is_pending = isinstance(message, dict) and message.get("_claim_integrity_pending")
-        if is_pending and index != resolved_index:
-            continue
-        if index == resolved_index and isinstance(message, dict):
-            message["content"] = new_text
-            message.pop("_claim_integrity_pending", None)
-            message.pop("_db_persisted", None)
-        rebuilt.append(message)
-
-    if resolved_index is None:
-        rebuilt.append({"role": "assistant", "content": new_text})
-
-    messages[:] = rebuilt
-    agent._db_flush_scan_prefix = None
-
-
 def finalize_turn(
     agent,
     *,
@@ -303,48 +264,6 @@ def finalize_turn(
         )
         if callable(_rollback_fn):
             _rollback_fn(_preflight_snapshot)
-
-    # Apply the proof boundary before trajectory/session persistence. The same
-    # guard runs again after output-transform plugins below, but this first pass
-    # ensures an unsupported model answer never becomes durable history.
-    # Interrupted turns can still carry a model-authored final candidate, so
-    # interruption is not an exemption from verification.
-    _response_transformed = False
-    if final_response:
-        _claim_original = final_response
-        try:
-            from agent.claim_integrity import (
-                claim_integrity_enabled as _claim_integrity_enabled,
-                enforce_claim_integrity as _enforce_claim_integrity,
-            )
-            if _claim_integrity_enabled():
-                final_response, _claim_blocked, _claim_reason = (
-                    _enforce_claim_integrity(final_response, messages)
-                )
-                if _claim_blocked:
-                    logger.warning(
-                        "claim-integrity guard blocked unsupported pre-persist response: %s",
-                        _claim_reason,
-                    )
-                    _response_transformed = True
-                _rewrite_current_turn_final_assistant(
-                    messages, _claim_original, final_response, agent
-                )
-        except Exception as exc:
-            logger.critical(
-                "claim-integrity pre-persist guard failed closed: %s",
-                exc,
-                exc_info=True,
-            )
-            final_response = (
-                "⚠️ **Ответ заблокирован: защита доказательности дала ошибку.**\n\n"
-                "Исходное утверждение не отправлено, потому что его проверка не "
-                "завершилась. Результат нельзя считать подтверждённым."
-            )
-            _rewrite_current_turn_final_assistant(
-                messages, _claim_original, final_response, agent
-            )
-            _response_transformed = True
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -612,6 +531,20 @@ def finalize_turn(
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
+        # Persistence failure is the authoritative terminal reason even when
+        # the loop had already selected a narrower failure (for example a
+        # required start-ACK rejection).  Reporting the narrower reason would
+        # conceal that the final paired transcript was not durably committed.
+        _turn_exit_reason = "session_persistence_failed"
+        failed = True
+        try:
+            from hermes_state import classify_persistence_error
+
+            agent._last_persistence_error_cause = classify_persistence_error(
+                _persist_err
+            )
+        except Exception:
+            agent._last_persistence_error_cause = "unknown"
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
@@ -749,6 +682,7 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
+    _response_transformed = False
     _pre_transform_response = None
 
     # Plugin hook: transform_llm_output
@@ -777,40 +711,6 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
-
-    # Deterministic claim-integrity guard. This runs after output-transform
-    # plugins so no later wording rewrite can smuggle an unsupported completion
-    # or live-state claim into the user-visible response. When enabled it is
-    # fail-closed for the claim, not for the whole turn: the unsafe wording is
-    # replaced by a transparent evidence status.
-    if final_response and not interrupted:
-        try:
-            from agent.claim_integrity import (
-                claim_integrity_enabled as _claim_integrity_enabled,
-                enforce_claim_integrity as _enforce_claim_integrity,
-            )
-
-            if _claim_integrity_enabled():
-                _guarded_response, _claim_blocked, _claim_reason = (
-                    _enforce_claim_integrity(final_response, messages)
-                )
-                if _claim_blocked:
-                    logger.warning(
-                        "claim-integrity guard blocked unsupported final response: %s",
-                        _claim_reason,
-                    )
-                    final_response = _guarded_response
-                    _response_transformed = True
-        except Exception as exc:
-            # The integrity layer itself is part of the proof boundary. If it
-            # breaks, do not leak the unverified wording it was meant to check.
-            logger.critical("claim-integrity guard failed closed: %s", exc, exc_info=True)
-            final_response = (
-                "⚠️ **Ответ заблокирован: защита доказательности дала ошибку.**\n\n"
-                "Исходное утверждение не отправлено, потому что его проверка не "
-                "завершилась. Результат нельзя считать подтверждённым."
-            )
-            _response_transformed = True
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -894,6 +794,32 @@ def finalize_turn(
         final_response = _sanitize_surrogates(final_response)
 
     # Build result with interrupt info if applicable
+    _response_previewed = bool(getattr(agent, "_response_was_previewed", False))
+    _ack_delivered_text = str(
+        getattr(agent, "_start_ack_delivered_text", None) or ""
+    ).strip()
+    _response_already_delivered = bool(
+        _ack_delivered_text
+        and isinstance(final_response, str)
+        and final_response.strip() == _ack_delivered_text
+    )
+    _ack_receipt = getattr(agent, "_start_ack_receipt", None)
+    _ack_receipt_payload = None
+    if _ack_receipt is not None:
+        _ack_receipt_payload = {
+            "text": str(getattr(_ack_receipt, "text", "") or ""),
+            "message_id": (
+                str(getattr(_ack_receipt, "message_id", "") or "") or None
+            ),
+            "message_ids": [
+                str(mid)
+                for mid in (getattr(_ack_receipt, "message_ids", ()) or ())
+                if mid not in (None, "")
+            ],
+            "transport_identity": str(
+                getattr(_ack_receipt, "transport_identity", "") or ""
+            ),
+        }
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
@@ -906,7 +832,11 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
-        "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "response_previewed": _response_previewed,
+        # Exact delivery receipt for gateway callers that distinguish an
+        # already-visible final from generic streaming UI state.
+        "response_already_delivered": _response_already_delivered,
+        "start_ack_delivery_receipt": _ack_receipt_payload,
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,

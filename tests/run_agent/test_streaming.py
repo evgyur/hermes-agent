@@ -1468,65 +1468,6 @@ class TestCopilotACPStreamingDecision:
 
         assert _use_streaming is True
 
-class TestLocalCustomGatewayStreamingDecision:
-    def test_h20_local_gateway_keeps_streaming_enabled(self):
-        """Human20 gateway now supports OpenAI-compatible SSE streaming."""
-        from agent.conversation_loop import _should_use_streaming_api
-
-        agent = SimpleNamespace(
-            _disable_streaming=False,
-            provider="custom",
-            base_url="http://127.0.0.1:18741/v1",
-            client=object(),
-            _has_stream_consumers=lambda: True,
-        )
-
-        assert _should_use_streaming_api(agent) is True
-
-    def test_provider_config_can_disable_streaming_for_buffered_model(self):
-        from agent.conversation_loop import _should_use_streaming_api
-        from run_agent import AIAgent
-
-        cfg = {
-            "providers": {
-                "human20-keys": {
-                    "supports_streaming": False,
-                    "models": {
-                        "h20-fusion": {
-                            "supports_streaming": False,
-                        },
-                    },
-                },
-            },
-        }
-
-        with patch("hermes_cli.config.load_config", return_value=cfg):
-            agent = AIAgent(
-                api_key="test-key",
-                provider="human20-keys",
-                base_url="http://127.0.0.1:18750/v1",
-                model="h20-fusion",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-                stream_delta_callback=lambda text: None,
-            )
-
-        assert getattr(agent, "_disable_streaming", False) is True
-        assert _should_use_streaming_api(agent) is False
-
-    def test_other_custom_gateway_keeps_streaming_enabled(self):
-        from agent.conversation_loop import _should_use_streaming_api
-
-        agent = SimpleNamespace(
-            _disable_streaming=False,
-            provider="custom",
-            base_url="https://example.test/v1",
-            client=object(),
-            _has_stream_consumers=lambda: True,
-        )
-
-        assert _should_use_streaming_api(agent) is True
 
 class TestBedrockIamStreamingFallback:
     """bedrock_converse streaming branch: IAM denial of

@@ -474,7 +474,6 @@ from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.context import build_context_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
@@ -573,17 +572,9 @@ def _apply_profile_override() -> None:
     # 1. Check for explicit -p / --profile flag. Historically this worked even
     # after the subcommand (`hermes chat -p coder`), so keep scanning broadly.
     # The exception is command-argv passthrough regions such as `mcp add --args`.
-    value_flags = {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        "--in",
-    }
-    optional_value_flags = {"-c", "--continue"}
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    value_flags, optional_value_flags = top_level_value_flag_sets()
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -694,15 +685,30 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
-# ``context audit --local`` is a strict diagnostic boundary. Dispatch it before
-# dotenv loading, file logging, plugin/hook/MCP discovery, or AIAgent creation.
-# The exact two-token match avoids stealing similarly named chat prompts.
-if len(sys.argv) >= 3 and sys.argv[1:3] == ["context", "audit"]:
-    sys.dont_write_bytecode = True
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    from hermes_cli.context_audit import early_cli_main as _context_audit_main
+# Windows launcher self-heal — the ``hermes`` command users run is a COPY of
+# the venv console script, staged into the managed binary dir (the default
+# Hermes root's ``bin``, next to the managed uv) by install.ps1. That dir
+# lives OUTSIDE the git checkout precisely because an earlier layout staged
+# the copies at ``<checkout>\bin``, where ``hermes update``'s autostash
+# (``git stash push --include-untracked``) swept them off disk; with the
+# desktop updater's ``--keep-stash`` nothing restored them and ``hermes``
+# stopped resolving in every new terminal (venv\Scripts itself must stay off
+# PATH — it shadows the user's ``python``, #83797). Re-staging at process
+# start reaches already-broken installs through the one channel that still
+# works there: the desktop app spawning its backend via
+# ``python -m hermes_cli.main``. Costs a few stat calls when healthy; gates
+# fail toward inaction so source checkouts are untouched. Sits AFTER the
+# profile override on purpose — no hermes module may be imported before
+# profiles resolve. The launcher dir itself is per-machine (the helper
+# anchors on the DEFAULT root, not HERMES_HOME), so profile sessions heal
+# the same shared dir.
+if sys.platform == "win32":
+    try:
+        from hermes_cli import _install_repair as _install_repair_mod
 
-    raise SystemExit(_context_audit_main(sys.argv[3:]))
+        _install_repair_mod.ensure_windows_bin_launchers(_bootstrap_root)
+    except Exception:
+        pass
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -3549,15 +3555,10 @@ def cmd_whatsapp_cloud(args):
 
 
 def cmd_setup(args):
-    """Interactive setup wizard, with deterministic Powerpack setup routing."""
-    if getattr(args, "section", None) == "power":
-        from hermes_cli.power import run_power_setup
-
-        return run_power_setup(args)
-
+    """Interactive setup wizard."""
     from hermes_cli.setup import run_setup_wizard
 
-    return run_setup_wizard(args)
+    run_setup_wizard(args)
 
 
 def cmd_model(args):
@@ -3570,7 +3571,13 @@ def cmd_model(args):
             print("  Cleared model picker cache.")
         except Exception:
             pass
-    select_provider_and_model(args=args)
+    from hermes_cli.setup import run_setup_action_with_navigation
+
+    run_setup_action_with_navigation(
+        "Model & Provider",
+        lambda: select_provider_and_model(args=args),
+        cancelled_message="No change.",
+    )
 
 
 def _is_profile_api_key_provider(provider_id: str) -> bool:
@@ -4093,6 +4100,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
+    ("review", "Review", "/review reviewer subagent"),
     ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("skills_hub", "Skills hub", "skills search/install"),
@@ -4893,6 +4901,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_ensure_fhs_path_guard",
         "_ensure_uv_for_termux",
         "_finish_dashboard_update_cleanup",
+        "_fleet_probe_expected_runtimes",
         "_for_each_systemd_gateway_unit",
         "_format_concurrent_instances_message",
         "_format_time_ago",
@@ -7759,26 +7768,29 @@ def _detect_linux_password_store() -> str | None:
     return None
 
 
-def _desktop_launch_options() -> tuple[list[str], str, str]:
+def _desktop_launch_options() -> tuple[list[str], str, str, str]:
     """Read `desktop.*` launch options from config.yaml.
 
-    Returns ``(electron_flags, disable_gpu, password_store)`` where
+    Returns ``(electron_flags, disable_gpu, password_store, ozone_hint)`` where
     ``electron_flags`` is a list of extra Electron CLI flags, ``disable_gpu``
     is one of "auto"/"1"/"0" (normalized for the HERMES_DESKTOP_DISABLE_GPU
-    env var the Electron app reads), and ``password_store`` is "auto" or one
+    env var the Electron app reads), ``password_store`` is "auto" or one
     of the Chromium password-store backends (unknown values normalize to
-    "auto"). Best-effort: any config error yields the safe defaults
-    ``([], "auto", "auto")`` so a malformed config never blocks the launch.
+    "auto"), and ``ozone_hint`` is one of "auto"/"x11"/"wayland" (normalized
+    for ``ELECTRON_OZONE_PLATFORM_HINT``). Best-effort: any config error
+    yields the safe defaults ``([], "auto", "auto", "auto")`` so a malformed
+    config never blocks the launch.
     """
     flags: list[str] = []
     disable_gpu = "auto"
     password_store = "auto"
+    ozone_hint = "auto"
     try:
         from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu, password_store
+        return flags, disable_gpu, password_store, ozone_hint
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -7803,7 +7815,13 @@ def _desktop_launch_options() -> tuple[list[str], str, str]:
         low_store = raw_store.strip().lower()
         if low_store in _LINUX_PASSWORD_STORES:
             password_store = low_store
-    return flags, disable_gpu, password_store
+
+    raw_ozone = desktop_cfg.get("ozone_platform_hint", "auto")
+    if isinstance(raw_ozone, str):
+        low_ozone = raw_ozone.strip().lower()
+        if low_ozone in ("auto", "x11", "wayland"):
+            ozone_hint = low_ozone
+    return flags, disable_gpu, password_store, ozone_hint
 
 
 def _register_linux_desktop_entry() -> None:
@@ -7854,12 +7872,18 @@ def cmd_gui(args: argparse.Namespace):
         env["HERMES_DESKTOP_CWD"] = os.getcwd()
 
     # Desktop launch options from config.yaml (`desktop.electron_flags`,
-    # `desktop.disable_gpu`). The GPU policy is bridged to the env var the
-    # Electron app already reads; an explicit env var still wins over config so
-    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` keeps working.
-    config_electron_flags, config_disable_gpu, config_password_store = _desktop_launch_options()
+    # `desktop.disable_gpu`, `desktop.ozone_platform_hint`). The GPU policy
+    # and ozone hint are bridged to env vars the Electron/Chromium process
+    # already reads; an explicit env var still wins over config so
+    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` and
+    # `ELECTRON_OZONE_PLATFORM_HINT=... hermes desktop` keep working.
+    config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint = (
+        _desktop_launch_options()
+    )
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+    if config_ozone_hint != "auto" and "ELECTRON_OZONE_PLATFORM_HINT" not in os.environ:
+        env["ELECTRON_OZONE_PLATFORM_HINT"] = config_ozone_hint
 
     # Linux keychain backend for safeStorage (`desktop.password_store`).
     # Chromium needs the --password-store switch to pick the right keychain;
@@ -10369,6 +10393,10 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
+    # Exit code for the Windows hand-off child's hard exit (see finally).
+    # None = not a SystemExit-shaped outcome; real exceptions keep the
+    # normal raise path so their traceback still prints.
+    _update_handoff_exit_code: int | None = None
     try:
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
     except SystemExit as _update_exit:
@@ -10385,6 +10413,9 @@ def cmd_update(args):
             finalize_pending_update_receipt(_code, f"sys.exit({_code})")
         except Exception:
             pass
+        _update_handoff_exit_code = (
+            _update_exit.code if isinstance(_update_exit.code, int) else 0
+        )
         raise
     except BaseException as _update_exc:
         try:
@@ -10403,9 +10434,29 @@ def cmd_update(args):
             finalize_pending_update_receipt(0, "completed at command boundary")
         except Exception:
             pass
+        _update_handoff_exit_code = 0
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
+        # Windows hand-off child (#93581): the re-exec'd venv child cannot
+        # rely on graceful interpreter shutdown — a leftover non-daemon
+        # thread from the update tail keeps the console busy long after
+        # the receipt is durable (success, exit 0, "completed at command
+        # boundary"), freezing the PowerShell window for minutes. By this
+        # point every durable step is done (receipt finalized above, lock
+        # released, stdio restored), so on the hand-off path only, flush
+        # and exit hard instead of waiting for the interpreter to unwind
+        # — the same treatment #79040's cron workaround applies. No-op on
+        # every non-hand-off invocation: the marker env is set solely by
+        # _reexec_dependency_sync_off_windows_shim when it spawns the child.
+        if _update_handoff_exit_code is not None and os.environ.get(_UPDATE_REEXEC_ENV) == "1":
+            logger.debug(
+                "Update hand-off child %s exiting via os._exit(%s)",
+                os.getpid(), _update_handoff_exit_code,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(_update_handoff_exit_code)
 
 
 def _coalesce_session_name_args(argv: list) -> list:
@@ -11205,28 +11256,29 @@ def _dashboard_listening(host: str, port: int) -> bool:
 
 
 def _maybe_setup_dashboard_auth_interactively(args) -> None:
-    """Offer to configure dashboard auth when a non-loopback bind has none.
+    """Offer to configure dashboard auth when the gate engages and none exists.
 
     Called from ``cmd_dashboard`` just before ``start_server``. The auth
     gate engages on every non-loopback bind (``--insecure`` is a no-op since
-    the June 2026 hardening), and ``start_server`` fails closed when no
+    the June 2026 hardening) and whenever ``dashboard.public_url`` declares a
+    non-loopback browser-facing hostname. ``start_server`` fails closed when no
     ``DashboardAuthProvider`` is registered. Rather than greet an interactive
-    operator with that hard error, prompt them to set up the bundled
-    username/password provider on the spot — or point them at
-    ``hermes dashboard register`` for OAuth.
+    operator with that hard error, prompt them to set up the bundled password
+    provider on the spot — or point them at ``hermes dashboard register`` for
+    OAuth.
 
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
-      * the bind is loopback (gate never engages), or
+      * neither the bind nor configured public URL engages the gate, or
       * a provider is already registered, or
       * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
     """
     host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
 
     try:
-        from hermes_cli.web_server import should_require_auth
-        if not should_require_auth(host):
-            return  # loopback bind — gate never engages
+        from hermes_cli.web_server import should_require_dashboard_auth
+        if not should_require_dashboard_auth(host):
+            return  # local-only bind and URL — gate does not engage
     except Exception:
         return  # if we can't tell, defer to start_server's own gate
 
@@ -11243,13 +11295,10 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
         return
 
     print()
+    print(f"⚠ Dashboard authentication is required for this configuration ({host}).")
     print(
-        f"⚠ The dashboard is binding to a non-loopback address ({host}) and "
-        f"needs an auth provider."
-    )
-    print(
-        "  Non-loopback binds always require authentication "
-        "(--insecure no longer bypasses this)."
+        "  Non-loopback binds and configured external dashboard.public_url "
+        "values require authentication (--insecure does not bypass this)."
     )
     print()
     print("  How do you want to authenticate the dashboard?")
@@ -11880,7 +11929,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
-        "prompt-size", "context",
+        "prompt-size",
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
@@ -11890,33 +11939,6 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
         "help",
-    }
-)
-
-
-# Top-level flags that take a value. Needed by ``_first_positional_argv``
-# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
-# flag value rather than misclassified as a subcommand. Kept in sync with
-# the top-level flags declared in ``hermes_cli/_parser.py``.
-#
-# Correctness-safe either way: missing an entry here only makes the
-# fast-path bail out too eagerly (we run plugin discovery when we didn't
-# need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        "--in",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
     }
 )
 
@@ -11933,6 +11955,10 @@ def _first_positional_argv() -> str | None:
     bar`` flags degrade gracefully (``bar`` may be wrongly classified as
     a positional, which at worst forces a one-time plugin discovery).
     """
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    required_value_flags, optional_value_flags = top_level_value_flag_sets()
+    value_flags = required_value_flags | optional_value_flags
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -11947,7 +11973,7 @@ def _first_positional_argv() -> str | None:
             if "=" in tok:
                 i += 1
                 continue
-            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
+            if tok in value_flags and i + 1 < len(argv):
                 i += 2
                 continue
             i += 1
@@ -12944,11 +12970,6 @@ def main():
     # setup command  (parser built in hermes_cli/subcommands/setup.py)
     # =========================================================================
     build_setup_parser(subparsers, cmd_setup=cmd_setup)
-
-    # Powerpack-owned setup and diagnostics surface.
-    from hermes_cli.power import add_power_parser as _add_power_parser
-
-    _add_power_parser(subparsers)
 
 
     # =========================================================================
@@ -14117,10 +14138,6 @@ def main():
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)
     # =========================================================================
     build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
-
-    # ``context audit`` executes via the strict pre-bootstrap dispatch above;
-    # registration here keeps top-level help and parser introspection complete.
-    build_context_parser(subparsers)
 
     # =========================================================================
     # Parse and execute

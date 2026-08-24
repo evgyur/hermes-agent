@@ -170,7 +170,7 @@ WEIXIN_GROUP_ALLOWED_USERS=group_id_1,group_id_2
 适配器接收用户发送的媒体附件，从微信 CDN 下载并解密，然后在本地缓存供代理处理：
 
 | 类型 | 处理方式 |
-|------|-----------------|
+|------|-----------------| 
 | **图片** | 下载、AES 解密后缓存为 JPEG。 |
 | **视频** | 下载、AES 解密后缓存为 MP4。 |
 | **文件** | 下载、AES 解密后缓存，保留原始文件名。 |
@@ -193,7 +193,7 @@ WEIXIN_GROUP_ALLOWED_USERS=group_id_1,group_id_2
 
 | 方法 | 发送内容 |
 |--------|--------------|
-| `send` | 带 Markdown 格式的文本消息 |
+| `send` | 带 Markdown 格式的文本消息 | 
 | `send_image` / `send_image_file` | 原生图片消息（通过 CDN 上传） |
 | `send_document` | 文件附件（通过 CDN 上传） |
 | `send_video` | 视频消息（通过 CDN 上传） |

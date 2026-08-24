@@ -2261,7 +2261,6 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
-    bypass_ineffective_guard: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2281,10 +2280,6 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
-        bypass_ineffective_guard: If True, bypass only the durable
-            anti-thrash/ineffective breaker. Active provider-failure cooldowns
-            remain authoritative. Used by critical gateway hygiene when the
-            transcript has reached the model-window safety boundary.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -2375,44 +2370,14 @@ def compress_context(
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.
-    def _automatic_guard_blocks() -> bool:
-        """Evaluate the auto guard with a narrow critical-recovery escape.
-
-        Manual ``force`` retains its historical meaning and bypasses every
-        guard. Critical gateway hygiene is intentionally weaker: it may escape
-        an indefinite ``ineffective`` latch, but must not hammer a provider
-        while a transient-failure cooldown is active.
-        """
+    if not force:
         _refresh_persisted_compression_guards(agent.context_compressor)
         blocked = getattr(
             type(agent.context_compressor),
             "_automatic_compression_blocked",
             None,
         )
-        if not callable(blocked) or not blocked(agent.context_compressor):
-            return False
-        if bypass_ineffective_guard:
-            reason_fn = getattr(
-                type(agent.context_compressor),
-                "_compression_block_reason",
-                None,
-            )
-            reason = (
-                reason_fn(agent.context_compressor)
-                if callable(reason_fn)
-                else None
-            )
-            if reason == "ineffective":
-                logger.warning(
-                    "critical compression recovery bypassing ineffective "
-                    "breaker for session=%s",
-                    agent.session_id or "none",
-                )
-                return False
-        return True
-
-    if not force:
-        if _automatic_guard_blocks():
+        if callable(blocked) and blocked(agent.context_compressor):
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -2850,7 +2815,16 @@ def compress_context(
     # stale snapshot loaded by bind_session_state().
     if not force:
         compressor = agent.context_compressor
-        if _automatic_guard_blocks():
+        _refresh_persisted_compression_guards(
+            compressor,
+            include_cooldown=False,
+        )
+        blocked = getattr(
+            type(compressor),
+            "_automatic_compression_blocked",
+            None,
+        )
+        if callable(blocked) and blocked(compressor):
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -3318,10 +3292,64 @@ def compress_context(
 
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
-            # Continuity state is system-owned metadata. Never merge or append
-            # it as user-role text: chat surfaces can otherwise render or log
-            # the snapshot as though the operator authored it.
-            compressed.append({"role": "system", "content": todo_snapshot})
+            # Retention parity (#84718): the snapshot below re-injects the
+            # imperative verbatim. If this same boundary pruned skill bodies
+            # to [SKILL_PRUNED: ...] markers, the policy that governed those
+            # tasks is gone — couple a reload instruction to the snapshot so
+            # the imperative never crosses the boundary alone. Appended after
+            # TODO_INJECTION_HEADER, so the stale-snapshot strip removes both
+            # together at the next boundary.
+            _reload_notice = _pruned_skill_reload_notice(compressed)
+            if _reload_notice:
+                todo_snapshot = f"{todo_snapshot}\n\n{_reload_notice}"
+            # Fold the snapshot into a trailing REAL user message so
+            # compression never introduces a synthetic user/user pair. Any
+            # snapshot merged at an earlier boundary is stripped first so
+            # repeated compactions refresh rather than accumulate todo state
+            # (#26981). Scaffolding tails (continuation marker, summary
+            # handoff, a bare stale snapshot row) must never absorb the
+            # snapshot: merging would upgrade them to "real user" evidence
+            # and break zero-user provenance (#69292), so those keep the
+            # flagged standalone append and the real-user preservation pass
+            # continues to see todo scaffolding, not human intent.
+            from agent.context_compressor import _append_text_to_content
+
+            merged = False
+            _tail = (
+                compressed[-1]
+                if compressed and isinstance(compressed[-1], dict)
+                else None
+            )
+            if _tail is not None and _tail.get("role") == "user":
+                _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
+                _probe = {
+                    key: value for key, value in _tail.items() if key != "content"
+                }
+                _probe["content"] = _stripped
+                if _is_real_user_message(_probe):
+                    _snapshot_text = (
+                        f"\n\n{todo_snapshot}"
+                        if isinstance(_stripped, str) and _stripped
+                        else todo_snapshot
+                    )
+                    _tail["content"] = _append_text_to_content(
+                        _stripped, _snapshot_text
+                    )
+                    merged = True
+                elif _stripped != _tail.get("content") and not _message_text(
+                    {"role": "user", "content": _stripped}
+                ).strip():
+                    # The tail was nothing but an earlier snapshot row —
+                    # refresh it in place instead of stacking a duplicate.
+                    _tail["content"] = todo_snapshot
+                    _tail["_todo_snapshot_synthetic"] = True
+                    merged = True
+            if not merged:
+                compressed.append({
+                    "role": "user",
+                    "content": todo_snapshot,
+                    "_todo_snapshot_synthetic": True,
+                })
         _ensure_compressed_has_user_turn(messages, compressed)
 
         cached_system_prompt = agent._cached_system_prompt

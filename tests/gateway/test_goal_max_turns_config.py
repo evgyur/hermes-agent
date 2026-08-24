@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+import asyncio
+import time
 
 import pytest
 
@@ -31,17 +32,9 @@ def _make_runner() -> GatewayRunner:
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
-    adapter = MagicMock()
-    adapter._pending_messages = {}
-    runner.adapters = {Platform.DISCORD: adapter}
+    runner.adapters = {}
     runner._queued_events = {}
-    runner._record_gateway_ledger_received = MagicMock(
-        side_effect=lambda kickoff, **_kwargs: (
-            setattr(kickoff, "_hermes_gateway_ledger_id", 1) or 1
-        )
-    )
-    runner._set_gateway_ledger_deferred = MagicMock(return_value=True)
-    runner._update_gateway_ledger = MagicMock(return_value=True)
+    return runner
 
 
 def _make_goal_event() -> MessageEvent:

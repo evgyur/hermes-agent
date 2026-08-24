@@ -33,9 +33,6 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
-    # Render terminal tool progress as fenced code blocks on markdown-capable
-    # platforms. Disable per platform to restore compact one-line previews.
-    "tool_progress_code_blocks": True,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -55,6 +52,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Disable when the platform should steer silently (the text still lands in
     # the active run; only the confirmation echo is suppressed).
     "busy_steer_ack_enabled": True,
+    # Optional deterministic acknowledgment sent before the first tool batch
+    # when the model produced no visible interim commentary. Empty by default
+    # so deployments choose their own language and wording.
+    "start_ack_text": "",
+    # "best_effort" preserves availability when the platform send fails;
+    # "required" refuses the first tool effect without a delivery receipt.
+    "start_ack_mode": "best_effort",
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -128,8 +132,8 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # assistant commentary (interim_assistant_messages) and DO send periodic
     # heartbeats (long_running_notifications) so the user has signal between
     # turn start and final answer. Otherwise it looks like "typing..." for
-    # 30 minutes with nothing happening. Opt out per profile when final-only
-    # delivery is preferred.
+    # 30 minutes with nothing happening. Opt in to verbose iteration detail
+    # via display.platforms.telegram.busy_ack_detail / tool_progress.
     "telegram":    {
         **_TIER_HIGH,
         "tool_progress": "off",
@@ -185,6 +189,43 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
 # Canonical set of per-platform overrideable keys (for validation).
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
+
+
+def validate_start_ack_configuration(config: dict[str, Any]) -> None:
+    """Reject strict/unknown start-ack policy before gateway startup."""
+    display = config.get("display") if isinstance(config, dict) else None
+    if not isinstance(display, dict):
+        display = {}
+    scopes: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+        ("display", display, {})
+    ]
+    platforms = display.get("platforms")
+    if isinstance(platforms, dict):
+        scopes.extend(
+            (f"display.platforms.{name}", value, display)
+            for name, value in platforms.items()
+            if isinstance(value, dict)
+        )
+    for scope, values, inherited in scopes:
+        if "start_ack_mode" not in values and "start_ack_text" not in values:
+            continue
+        mode = str(
+            values.get(
+                "start_ack_mode", inherited.get("start_ack_mode", "best_effort")
+            )
+            or ""
+        ).strip().lower()
+        if mode not in {"best_effort", "required"}:
+            raise ValueError(
+                f"{scope}.start_ack_mode must be 'best_effort' or 'required'"
+            )
+        text = str(
+            values.get("start_ack_text", inherited.get("start_ack_text", "")) or ""
+        ).strip()
+        if mode == "required" and not text:
+            raise ValueError(
+                f"{scope}.start_ack_text must be non-empty when start_ack_mode=required"
+            )
 
 
 def resolve_display_setting(
@@ -277,7 +318,6 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
-        "tool_progress_code_blocks",
     }:
         if isinstance(value, str):
             val = value.strip().lower()

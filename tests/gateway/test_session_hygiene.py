@@ -9,7 +9,6 @@ so CLI and messaging platforms behave identically.
 """
 
 import asyncio
-from contextvars import ContextVar
 import importlib
 import sys
 import threading
@@ -84,18 +83,6 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
-
-
-def test_hygiene_default_timeout_covers_auxiliary_compression_budget():
-    """Gateway must not abandon a healthy summary worker before its own deadline."""
-    gateway_run = importlib.import_module("gateway.run")
-    from agent.auxiliary_client import _COMPRESSION_TIMEOUT_FLOOR_SECONDS
-
-    assert (
-        gateway_run._HYG_COMPRESSION_TIMEOUT_SECS_DEFAULT
-        >= _COMPRESSION_TIMEOUT_FLOOR_SECONDS
-    )
-
 
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.
@@ -317,7 +304,6 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
             user_id="12345",
         ),
         message_id="1",
-        internal=True,
     )
 
     # Pre-load a failure streak so we can prove the recovery gate is WIRED UP,
@@ -452,12 +438,6 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._resolve_session_agent_runtime = MagicMock(
-        return_value=(
-            "test-model",
-            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
-        )
-    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -471,8 +451,8 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length_async",
-        AsyncMock(return_value=100),
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
 
@@ -486,7 +466,6 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
             user_id="12345",
         ),
         message_id="1",
-        internal=True,
     )
 
     result = await runner._handle_message(event)
@@ -688,10 +667,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         ),
     )
 
-    profile_scope: ContextVar[str | None] = ContextVar(
-        "test_hygiene_profile_scope", default=None
-    )
-
     class FakeInPlaceCompressAgent:
         last_instance = None
 
@@ -714,20 +689,12 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
-            assert profile_scope.get() == "default-profile"
             assert self.compression_in_place is True
             assert self._session_db is fake_db
-            # At >=95% of the model context, hygiene must bypass a stale
-            # anti-thrash/fallback breaker. Otherwise a persisted fallback
-            # streak can strand the session until the next API request exceeds
-            # the model window (regression: 398,608-token Telegram context).
-            assert _kwargs.get("force") is not True
-            assert _kwargs.get("bypass_ineffective_guard") is True
+            assert self.platform == "gateway_hygiene"
+            assert self._cached_system_prompt == stored_system_prompt
             self._last_compaction_in_place = True
-            # Persisted compaction happened, but the remaining payload is still
-            # above the 95% safety boundary; gateway must apply its bounded
-            # retry cooldown instead of compressing again on the next turn.
-            return ([{"role": "assistant", "content": "x" * 500}], None)
+            return ([{"role": "assistant", "content": "compressed in place"}], None)
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
@@ -763,15 +730,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._session_db = async_session_db
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    # Force the real hygiene branch to be eligible. The old regression only
-    # patched a legacy global resolver, so it could pass without ever invoking
-    # the helper agent (and therefore never exercised its ``force`` assertion).
-    runner._resolve_session_agent_runtime = MagicMock(
-        return_value=(
-            "test-model",
-            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
-        )
-    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -787,8 +745,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length_async",
-        AsyncMock(return_value=100),
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
     )
 
     event = MessageEvent(
@@ -814,18 +772,13 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
     )
 
-    scope_token = profile_scope.set("default-profile")
-    try:
-        result = await runner._handle_message(event)
-    finally:
-        profile_scope.reset(scope_token)
+    result = await runner._handle_message(event)
 
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
-    assert agent._last_compaction_in_place is True
+    async_session_db.get_session.assert_awaited_once_with("sess-1")
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
-    assert fake_db.record_compression_failure_cooldown.called
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
@@ -944,7 +897,6 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
             user_id="12345",
         ),
         message_id="1",
-        internal=True,
     )
 
     result = await runner._handle_message(event)
@@ -1219,10 +1171,6 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         runner2, _adapter2, event2 = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-        # This is a new inbound turn after restart, not a redelivery of the
-        # first message. Give it a distinct durable ingress identity so the
-        # gateway ledger correctly allows the cooldown assertion to run.
-        event2.message_id = "restart-followup-2"
         assert await runner2._handle_message(event2) == "ok"
         assert ShouldNotRunAgent.instances == 0, (
             "REGRESSION (#74136): a fresh GatewayRunner on the same state DB "

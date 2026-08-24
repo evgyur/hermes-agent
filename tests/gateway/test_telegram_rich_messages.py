@@ -408,37 +408,6 @@ def test_prefers_fresh_final_streaming_for_dm_topic_tables():
     ) is True
 
 
-def test_prefers_fresh_final_streaming_honors_rich_opt_out():
-    adapter = _make_adapter(extra={"rich_messages": False})
-    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
-
-
-def test_prefers_fresh_final_streaming_honors_private_chat_gate():
-    adapter = _make_adapter(extra={"rich_message_chats": '["-1003747790806"]'})
-
-    assert (
-        adapter.prefers_fresh_final_streaming(
-            RICH_CONTENT,
-            metadata={"thread_id": "1535"},
-            chat_id="-1003971448755",
-        )
-        is False
-    )
-    assert (
-        adapter.prefers_fresh_final_streaming(
-            RICH_CONTENT,
-            metadata={"thread_id": "1"},
-            chat_id="-1003747790806",
-        )
-        is True
-    )
-
-
-def test_prefers_fresh_final_streaming_requires_chat_id_when_private_gate_set():
-    adapter = _make_adapter(extra={"rich_message_chats": '["-1003747790806"]'})
-
-    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
-
 @pytest.mark.asyncio
 async def test_legacy_draft_stream_finalizes_with_persistent_rich_message():
     """A plain draft must not force the persistent final to MarkdownV2."""
@@ -670,64 +639,6 @@ def test_streaming_overflow_limit_none_when_rich_latched_off():
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
     assert adapter.streaming_overflow_limit() is None
-
-
-def test_private_rich_chat_ids_parse_json_string_from_config_set():
-    adapter = _make_adapter(extra={"rich_message_chats": '["-1003747790806"]'})
-
-    assert adapter._rich_message_chat_ids == {"-1003747790806"}
-
-
-def test_private_chipline_sections_convert_to_rich_markdown_headings():
-    adapter = _make_adapter(extra={"rich_message_chats": ["-1003747790806"]})
-
-    assert (
-        adapter._rich_markdown_from_content("Вердикт.\n\n➊ Лучший отель\n┈ цена")
-        == "Вердикт.\n\n## Лучший отель\n┈ цена"
-    )
-
-
-def test_private_rich_payload_uses_chipline_heading_conversion():
-    adapter = _make_adapter(extra={"rich_message_chats": ["-1003747790806"]})
-
-    payload = adapter._rich_message_payload("➊ Лучший отель\n┈ цена")
-
-    assert payload["markdown"] == "## Лучший отель\n┈ цена"
-
-
-@pytest.mark.asyncio
-async def test_private_finalize_edit_routes_configured_report_to_rich_edit(monkeypatch):
-    adapter = _make_adapter(extra={"rich_message_chats": ["-1003747790806"]})
-    calls = []
-
-    async def fake_edit_rich(chat_id, message_id, content, *, metadata=None):
-        calls.append((chat_id, message_id, content))
-        return SendResult(success=True, message_id=message_id, raw_response={"rich_message": True})
-
-    monkeypatch.setattr(adapter, "_edit_rich_message", fake_edit_rich)
-
-    result = await adapter.edit_message(
-        "-1003747790806",
-        "777",
-        "Подборка.\n\n➊ Отель\n┈ $120",
-        finalize=True,
-    )
-
-    assert result.success is True
-    assert calls == [("-1003747790806", "777", "Подборка.\n\n➊ Отель\n┈ $120")]
-
-
-@pytest.mark.asyncio
-async def test_rich_draft_opt_out_uses_legacy():
-    adapter = _make_adapter(extra={"rich_messages": False})
-
-    result = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
-
-    assert result.success is True
-    bot = adapter._bot
-    assert bot is not None
-    bot.do_api_request.assert_not_called()
-    bot.send_message_draft.assert_awaited_once()
 
 
 # ----------------------------------------------------------------------------

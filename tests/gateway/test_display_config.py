@@ -34,66 +34,175 @@ class TestResolveDisplaySetting:
         }
         assert resolve_display_setting(config, "telegram", "tool_progress") == "new"
 
-    def test_platform_default_when_no_user_config(self):
-        """Falls back to built-in platform default."""
+    def test_start_ack_text_is_empty_by_default_and_overrideable_per_platform(self):
         from gateway.display_config import resolve_display_setting
 
-        # Empty config — should get built-in defaults
-        config = {}
-        # Telegram keeps tool breadcrumbs quiet but retains liveness signals.
-        assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
-        assert resolve_display_setting(config, "telegram", "interim_assistant_messages") is True
-        assert resolve_display_setting(config, "telegram", "long_running_notifications") is True
-        # Email defaults to tier_minimal → "off"
-        assert resolve_display_setting(config, "email", "tool_progress") == "off"
-
-    def test_global_default_for_unknown_platform(self):
-        """Unknown platforms get the global defaults."""
-        from gateway.display_config import resolve_display_setting
-
-        config = {}
-        # Unknown platform, no config → global default "all"
-        assert resolve_display_setting(config, "unknown_platform", "tool_progress") == "all"
-
-    def test_tool_progress_boolean_like_strings_normalise(self):
-        """Quoted YAML booleans should not unexpectedly enable progress."""
-        from gateway.display_config import resolve_display_setting
-
-        assert resolve_display_setting({"display": {"tool_progress": "false"}}, "telegram", "tool_progress") == "off"
-        assert resolve_display_setting({"display": {"tool_progress": "0"}}, "telegram", "tool_progress") == "off"
-        assert resolve_display_setting({"display": {"tool_progress": "no"}}, "telegram", "tool_progress") == "off"
-        assert resolve_display_setting({"display": {"tool_progress": "true"}}, "telegram", "tool_progress") == "all"
-
-    def test_busy_steer_ack_enabled_string_false_normalises(self):
-        from gateway.display_config import resolve_display_setting
-
-        config = {"display": {"platforms": {"telegram": {"busy_steer_ack_enabled": "false"}}}}
-
-        assert resolve_display_setting(config, "telegram", "busy_steer_ack_enabled", True) is False
-
-    def test_tool_progress_code_blocks_can_be_disabled_per_platform(self):
-        from gateway.display_config import resolve_display_setting
-
+        assert resolve_display_setting({}, "telegram", "start_ack_text") == ""
+        assert (
+            resolve_display_setting({}, "telegram", "start_ack_mode")
+            == "best_effort"
+        )
         config = {
             "display": {
                 "platforms": {
-                    "telegram": {"tool_progress_code_blocks": False},
+                    "telegram": {
+                        "start_ack_text": "↳ Принял. Начинаю проверку."
+                    }
                 }
             }
         }
+        assert (
+            resolve_display_setting(config, "telegram", "start_ack_text")
+            == "↳ Принял. Начинаю проверку."
+        )
 
-        assert resolve_display_setting(
-            config, "telegram", "tool_progress_code_blocks"
-        ) is False
+    def test_required_start_ack_rejects_blank_global_text(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
 
-    def test_fallback_parameter_used_last(self):
-        """Explicit fallback is used when nothing else matches."""
-        from gateway.display_config import resolve_display_setting
+        with pytest.raises(ValueError, match="must be non-empty"):
+            validate_start_ack_configuration(
+                {"display": {"start_ack_mode": "required", "start_ack_text": " "}}
+            )
 
-        config = {}
-        # "nonexistent_key" isn't in any defaults
-        result = resolve_display_setting(config, "telegram", "nonexistent_key", "my_fallback")
-        assert result == "my_fallback"
+    def test_required_start_ack_rejects_blank_platform_text(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
+
+        with pytest.raises(ValueError, match="platforms.telegram"):
+            validate_start_ack_configuration(
+                {
+                    "display": {
+                        "platforms": {
+                            "telegram": {
+                                "start_ack_mode": "required",
+                                "start_ack_text": "",
+                            }
+                        }
+                    }
+                }
+            )
+
+    def test_start_ack_rejects_unknown_mode(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
+
+        with pytest.raises(ValueError, match="best_effort.*required"):
+            validate_start_ack_configuration(
+                {"display": {"start_ack_mode": "sometimes"}}
+            )
+
+    def test_platform_required_mode_can_inherit_global_text(self):
+        from gateway.display_config import validate_start_ack_configuration
+
+        validate_start_ack_configuration(
+            {
+                "display": {
+                    "start_ack_text": "configured",
+                    "platforms": {
+                        "telegram": {"start_ack_mode": "required"}
+                    },
+                }
+            }
+        )
+
+    def test_gateway_startup_rejects_invalid_required_policy(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        invalid = {
+            "display": {"start_ack_mode": "required", "start_ack_text": ""}
+        }
+        with (
+            patch(
+                "gateway.run.load_gateway_config_for_runner",
+                return_value=GatewayConfig(),
+            ),
+            patch("hermes_cli.config.load_config", return_value=invalid),
+            pytest.raises(ValueError, match="must be non-empty"),
+        ):
+            GatewayRunner()
+
+    def test_explicit_gateway_config_cannot_bypass_ack_validation(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig()
+        invalid = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": " ",
+                    }
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=invalid),
+            pytest.raises(ValueError, match="platforms.telegram"),
+        ):
+            GatewayRunner(injected)
+
+    def test_valid_explicit_gateway_config_keeps_transport_precedence(self):
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig()
+        valid = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": "configured",
+                    }
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=valid):
+            runner = GatewayRunner(injected)
+
+        assert runner.config is injected
+
+    def test_required_unsupported_runtime_fails_before_runner_readiness(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")
+            }
+        )
+        strict = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": "ack",
+                    }
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict),
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={
+                    "api_mode": "codex_app_server",
+                    "provider": "openai-codex",
+                },
+            ),
+            pytest.raises(ValueError, match="codex_app_server"),
+        ):
+            GatewayRunner(injected)
+
 
     def test_platform_override_only_affects_that_platform(self):
         """Other platforms are unaffected by a specific platform override."""
@@ -183,13 +292,11 @@ class TestPlatformDefaults:
     """Built-in defaults reflect platform capability tiers."""
 
     def test_high_tier_platforms(self):
-        """Discord defaults to 'all'; Telegram keeps tool progress quiet."""
+        """Discord defaults to 'all'; Telegram defaults quiet for mobile."""
         from gateway.display_config import resolve_display_setting
 
         # Telegram: tier_high transport, but quiet mobile default.
         assert resolve_display_setting({}, "telegram", "tool_progress") == "off"
-        assert resolve_display_setting({}, "telegram", "interim_assistant_messages") is True
-        assert resolve_display_setting({}, "telegram", "long_running_notifications") is True
         # Discord: pure tier_high.
         assert resolve_display_setting({}, "discord", "tool_progress") == "all"
 
@@ -203,10 +310,15 @@ class TestPlatformDefaults:
 
 
     def test_telegram_mobile_chatter_defaults(self):
-        """Telegram retains interim commentary and heartbeats by default."""
+        """Telegram keeps real mid-turn signal (interim commentary + heartbeats)
+        but skips the verbose busy-ack iteration counter by default."""
         from gateway.display_config import resolve_display_setting
 
+        # Real model voice — keep on. Without this, Telegram users see
+        # "typing..." for the entire turn duration with no feedback.
         assert resolve_display_setting({}, "telegram", "interim_assistant_messages") is True
+        # Periodic "Working — N min" heartbeat — keep on. Otherwise long
+        # turns appear completely silent.
         assert resolve_display_setting({}, "telegram", "long_running_notifications") is True
         # Verbose iteration counter in busy-ack and heartbeat — off by
         # default on Telegram (mobile chat is cramped enough without
@@ -224,25 +336,6 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "slack", "tool_progress") == "off"
         assert resolve_display_setting({}, "slack", "long_running_notifications") is False
         assert resolve_display_setting({}, "slack", "busy_ack_detail") is False
-
-    def test_telegram_mobile_chatter_can_opt_out(self):
-        """Per-platform config can select final-answer-first explicitly."""
-        from gateway.display_config import resolve_display_setting
-
-        config = {
-            "display": {
-                "platforms": {
-                    "telegram": {
-                        "interim_assistant_messages": True,
-                        "long_running_notifications": True,
-                        "busy_ack_detail": "on",
-                    }
-                }
-            }
-        }
-        assert resolve_display_setting(config, "telegram", "interim_assistant_messages") is True
-        assert resolve_display_setting(config, "telegram", "long_running_notifications") is True
-        assert resolve_display_setting(config, "telegram", "busy_ack_detail") is True
 
 
 # ---------------------------------------------------------------------------
@@ -376,5 +469,3 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
-

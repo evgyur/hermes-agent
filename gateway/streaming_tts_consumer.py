@@ -323,6 +323,19 @@ class StreamingTTSConsumer:
         if not cleaned or not cleaned.strip():
             return
 
+        # Redact after arbitrary deltas have been accumulated into the exact
+        # provider clause. Per-delta filtering misses split credentials.
+        # Failure is fail-closed before synthesis; the gateway may then use its
+        # separately redacted whole-file fallback when nothing was audible.
+        try:
+            from agent.redact import redact_sensitive_text
+
+            cleaned = redact_sensitive_text(cleaned, force=True)
+        except Exception as exc:
+            raise RuntimeError("streaming TTS redaction failed") from exc
+        if not cleaned or not cleaned.strip():
+            return
+
         if self._streamer is None:
             return
 

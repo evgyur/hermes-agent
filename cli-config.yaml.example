@@ -879,6 +879,19 @@ max_concurrent_sessions: null
 # explicitly want one shared "room brain" per group/channel.
 group_sessions_per_user: true
 
+# Startup sweep of session rows orphaned by a dead gateway process.
+# The normal disconnect cleanup runs on an in-process grace timer, so a
+# gateway restart (update, crash, systemd) leaves those rows permanently
+# "active". On every gateway boot — stdio TUI *and* the desktop/dashboard
+# WS sidecar — tui/desktop/subagent rows whose start time AND newest
+# message are both older than the session TTL (HERMES_TUI_SESSION_TTL_S,
+# default 6h) are closed with end_reason "startup_orphan_reap".
+# Messaging-platform sessions (Telegram, Discord, ...) are never touched;
+# live in-memory sessions are excluded; swept sessions stay resumable.
+#
+# dashboard:
+#   startup_orphan_sweep: true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API Server — per-client model routing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1564,6 +1577,18 @@ display:
   #   true:  Keep/send mid-turn assistant updates (default)
   #   false: Only keep/send the final response
   interim_assistant_messages: true
+
+  # Optional gateway fallback shown before the first tool call when the model
+  # produced no visible interim commentary. Empty by default: configure text
+  # per platform so its language matches the audience. User turns only;
+  # webhook, startup-resume, and internal/background deliveries stay silent.
+  # Example:
+  #   platforms:
+  #     telegram:
+  #       start_ack_text: "↳ Принял. Начинаю проверку."
+  #       start_ack_mode: required  # no tool effect without ack receipt
+  start_ack_text: ""
+  start_ack_mode: best_effort  # best_effort | required
 
   # Gateway-only long-running status heartbeats.
   # When false, the platform does not receive periodic "⏳ Working — N min"

@@ -1717,8 +1717,6 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
                     bridged["exclusive_bot_mentions"] = platform_cfg["exclusive_bot_mentions"]
-                if plat == Platform.TELEGRAM and "ignore_other_bot_replies_chats" in platform_cfg:
-                    bridged["ignore_other_bot_replies_chats"] = platform_cfg["ignore_other_bot_replies_chats"]
                 if plat == Platform.TELEGRAM and "observe_unmentioned_group_messages" in platform_cfg:
                     bridged["observe_unmentioned_group_messages"] = platform_cfg["observe_unmentioned_group_messages"]
                 if "dm_policy" in platform_cfg:
@@ -1751,12 +1749,6 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
-                if plat == Platform.TELEGRAM and "auto_skill_routes" in platform_cfg:
-                    bridged["auto_skill_routes"] = platform_cfg["auto_skill_routes"]
-                if plat == Platform.TELEGRAM and "transcribe_routes" in platform_cfg:
-                    bridged["transcribe_routes"] = platform_cfg["transcribe_routes"]
-                if plat == Platform.TELEGRAM and "inline_preview_guard" in platform_cfg:
-                    bridged["inline_preview_guard"] = platform_cfg["inline_preview_guard"]
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:
@@ -1862,32 +1854,6 @@ def load_gateway_config() -> GatewayConfig:
                     # block exists — can't cover the no-telegram-block case (#3979).
                     if not os.getenv("TELEGRAM_REQUIRE_MENTION"):
                         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_tl_require_mention).lower()
-
-            telegram_cfg = yaml_cfg.get("telegram") or {}
-            if isinstance(telegram_cfg, dict):
-                for config_key, env_name in (
-                    ("require_mention_chats", "TELEGRAM_REQUIRE_MENTION_CHATS"),
-                    ("require_mention_topics", "TELEGRAM_REQUIRE_MENTION_TOPICS"),
-                    ("ignore_other_bot_replies_chats", "TELEGRAM_IGNORE_OTHER_BOT_REPLIES_CHATS"),
-                    ("private_chats", "TELEGRAM_PRIVATE_CHATS"),
-                    ("public_chats", "TELEGRAM_PUBLIC_CHATS"),
-                ):
-                    raw_ids = telegram_cfg.get(config_key)
-                    if raw_ids and not os.getenv(env_name):
-                        if not isinstance(raw_ids, (list, tuple, set)):
-                            raw_ids = [raw_ids]
-                        os.environ[env_name] = ",".join(str(item) for item in raw_ids)
-                    if raw_ids:
-                        tg_platform = platforms_data.setdefault(
-                            Platform.TELEGRAM.value, {}
-                        )
-                        tg_extra = tg_platform.setdefault("extra", {})
-                        tg_extra.setdefault(
-                            config_key,
-                            list(raw_ids)
-                            if isinstance(raw_ids, (tuple, set))
-                            else raw_ids,
-                        )
 
             # Telegram settings → env vars / extra: migrated to the telegram
             # plugin's apply_yaml_config_fn hook

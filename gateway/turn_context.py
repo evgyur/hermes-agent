@@ -59,6 +59,7 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _start_ack_receipt: Any = None
 
     # --- progress threading metadata (assigned after construction, before
     #     send_progress_messages is scheduled) ----------------------------
@@ -91,15 +92,22 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
-    # DB-only presentation metadata for self-injected turns; never sent to
-    # the provider payload.
+    # display_kind stamped on the persisted user row at turn start when this
+    # turn was self-injected (MessageEvent.internal), e.g.
+    # "internal_notification" for async-delegation/background notifications
+    # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
-    startup_resume: bool = False
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    # Legacy/manual contexts that set ``enabled=True`` expect raw delivery;
+    # the real gateway always overwrites this with off|raw|generic per turn.
+    interim_assistant_messages_mode: str = "raw"
+    start_ack_text: str = ""
+    start_ack_required: bool = False
+    start_ack_timeout_s: float = 3.0
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
@@ -130,6 +138,7 @@ class TurnContext:
     #     the sibling closures) ---------------------------------------------
     progress_callback: Optional[Callable] = None
     voice_ack_callback: Optional[Callable] = None
+    start_ack_callback: Optional[Callable] = None
     _step_callback_sync: Optional[Callable] = None
     _event_callback_sync: Optional[Callable] = None
     _status_callback_sync: Optional[Callable] = None

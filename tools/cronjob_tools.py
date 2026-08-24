@@ -50,7 +50,6 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
-    trigger_job_if_active,
     update_job,
 )
 
@@ -1224,6 +1223,39 @@ def _apply_continuity(
     return refs or None
 
 
+def _gateway_liveness_notice(plural: bool = False) -> dict:
+    """Build the ``gateway_running``/``warning`` payload for tool results.
+
+    Thin adapter over the shared CLI helper ``hermes_cli.cron._builtin_gateway_liveness``
+    (#87033) so the CLI and this tool can never disagree about what "scheduler
+    active" means. Returns ``{"gateway_running": False, "warning": ...}`` when
+    the builtin ticker has no gateway process to run it, ``{"gateway_running":
+    None}`` when the probe failed, and ``{"gateway_running": True}`` when the
+    scheduler is active. ``plural`` rewords the warning for multi-job results
+    (the ``list`` action).
+    """
+    try:
+        from hermes_cli.cron import _builtin_gateway_liveness
+
+        _gw = _builtin_gateway_liveness()
+    except Exception:
+        return {"gateway_running": None}
+    subject = "these jobs are saved" if plural else "this job is saved"
+    if _gw is False:
+        return {
+            "gateway_running": False,
+            "warning": (
+                f"The Hermes gateway is not running — {subject} "
+                "but will NOT fire until the gateway is started "
+                "(hermes gateway install / hermes gateway start). "
+                "Tell the user the task is scheduled but not active yet."
+            ),
+        }
+    if _gw is None:
+        return {"gateway_running": None}
+    return {"gateway_running": True}
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -1253,11 +1285,7 @@ def cronjob(
     session_id: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
-    # Model/tool invocations carry a task_id.  Keep that signal so a manual
-    # cron run can be queued without blocking the parent agent turn for the
-    # entire duration of the spawned cron agent.  Direct CLI/Python callers do
-    # not carry a task_id and retain the historical immediate/waiting behavior.
-    agent_invocation = bool(task_id)
+    del task_id  # unused but kept for handler signature compatibility
 
     try:
         normalized = (action or "").strip().lower()
@@ -1373,26 +1401,37 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
-            return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
-                indent=2,
-            )
+            # Gateway liveness surfacing (#87033): the builtin scheduler's
+            # ticker lives in the gateway process, so a job created with no
+            # gateway running is stored but will never fire. Tell the model
+            # here — the CLI already warns, but the agent path saw only a
+            # clean success and confidently told the user it was scheduled.
+            _result = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "message": _create_message,
+                **_gateway_liveness_notice(),
+            }
+            return json.dumps(_result, indent=2)
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
-            return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+            _result = {"success": True, "count": len(jobs), "jobs": jobs}
+            # Same silent-inert-job class as create (#87033): an agent
+            # inspecting existing jobs in a gateway-less environment must
+            # learn they are not firing, not just see a clean list. An empty
+            # list has nothing inert — stay quiet (and skip the probe).
+            if jobs:
+                _result.update(_gateway_liveness_notice(plural=True))
+            return json.dumps(_result, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
@@ -1422,7 +1461,7 @@ def cronjob(
                 indent=2,
             )
         # Resolve to canonical ID (supports name-based lookup)
-        job_id = str(job["id"])
+        job_id = job["id"]
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -1453,39 +1492,7 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            if agent_invocation:
-                # A cron agent can legitimately run for minutes.  Executing it
-                # inline here wedges the calling chat's tool invocation and
-                # trips the gateway inactivity watchdog.  Queue it for the
-                # scheduler instead; the gateway ticker dispatches due jobs on
-                # its persistent worker pool without blocking this turn.
-                queued_job, queue_status = trigger_job_if_active(job_id)
-                if queue_status == "paused":
-                    result = _format_job(queued_job or job)
-                    result["executed"] = False
-                    result["execution_state"] = "skipped"
-                    result["execution_success"] = False
-                    result["execution_skipped"] = (
-                        "Job is paused/disabled; resume it before running."
-                    )
-                    return json.dumps({"success": True, "job": result}, indent=2)
-                if queue_status == "missing" or not queued_job:
-                    return tool_error(
-                        f"Failed to queue cron job '{job_id}' for execution.",
-                        success=False,
-                    )
-                _notify_provider_jobs_changed_safe()
-                result = _format_job(queued_job)
-                result["executed"] = False
-                result["execution_state"] = "queued"
-                result["execution_success"] = None
-                result["message"] = (
-                    "Queued for the next scheduler tick; execution continues "
-                    "asynchronously. Inspect the job later with action='list'."
-                )
-                return json.dumps({"success": True, "job": result}, indent=2)
-
-# Per-run context (#57331, salvaged from #57342/@liuhao1024 and
+            # Per-run context (#57331, salvaged from #57342/@liuhao1024 and
             # #57360/@ghedeselmabot): `prompt` on the run action is transient
             # context appended to the stored prompt for THIS fire only, never
             # persisted. It goes through the same strict injection scan as
@@ -1563,7 +1570,11 @@ def cronjob(
                 if scan_error:
                     return tool_error(scan_error, success=False)
                 updates["prompt"] = prompt
-            if name is not None:
+            if name is not None and name.strip():
+                # Blank name is a no-op, not a clear. The `is not None` sentinel
+                # treats every supplied field as an explicit edit, and a model
+                # that re-sends the whole schema with type-default empties ("", [], 0)
+                # then wipes fields it never meant to touch.
                 updates["name"] = name
             if deliver is not None:
                 bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
@@ -1721,8 +1732,6 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
-Agent-triggered `run` is non-blocking: it returns after queueing the job for the
-next scheduler tick. Use `list` later to inspect completion status/output.
 
 action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
 

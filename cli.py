@@ -776,8 +776,6 @@ def load_cli_config() -> Dict[str, Any]:
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
     if isinstance(sessions_config, dict):
-        if "trigram_fts" in sessions_config:
-            os.environ["HERMES_TRIGRAM_FTS"] = str(sessions_config["trigram_fts"])
         if "cjk_fts" in sessions_config:
             os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
         if "search_slow_ms" in sessions_config:
@@ -10176,6 +10174,118 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"       Resume the live session with: hermes --resume {self.session_id}")
         except Exception as e:
             print(f"(x_x) Failed to save: {e}")
+
+    def _rewind_persisted_user_turn(
+        self,
+        *,
+        warm_history: List[Dict[str, Any]],
+        user_ordinal: int,
+        warm_live_view: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """Bind one warm user ordinal to a durable row and rewind it atomically."""
+        if self._session_db is None or not self.session_id:
+            raise RuntimeError("session database is unavailable")
+
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            split_user_originated_turn,
+            user_originated_turn_view,
+        )
+        from agent.memory_manager import sanitize_context
+        from agent.tool_dispatch_helpers import (
+            _is_multimodal_tool_result,
+            _multimodal_text_summary,
+        )
+        from run_agent import _is_ephemeral_scaffolding
+
+        def _persistence_content(content: Any) -> Any:
+            """Project warm content exactly as the session DB flush does."""
+            if _is_multimodal_tool_result(content):
+                return _multimodal_text_summary(content)
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                    elif isinstance(part, dict) and part.get("type") in {
+                        "image",
+                        "image_url",
+                        "input_image",
+                    }:
+                        text_parts.append("[screenshot]")
+                return "\n".join(text_parts) if text_parts else None
+            return content
+
+        def _comparison_content(message: Dict[str, Any]) -> Any:
+            content = _persistence_content(message.get("content"))
+            if message.get("role") in {"user", "assistant"} and isinstance(
+                content, str
+            ):
+                return sanitize_context(content).strip()
+            return content
+
+        expected_active_ids = self._session_db.get_active_message_ids(
+            self.session_id
+        )
+        durable = self._session_db.get_messages_as_conversation(
+            self.session_id,
+            include_row_ids=True,
+        )
+        warm_persistence_history = [
+            message
+            for message in warm_history
+            if not _is_ephemeral_scaffolding(message)
+        ]
+        warm_user_indices = [
+            index
+            for index, message in enumerate(warm_persistence_history)
+            if user_originated_turn_view(message) is not None
+        ]
+        durable_user_indices = [
+            index
+            for index, message in enumerate(durable)
+            if user_originated_turn_view(message) is not None
+        ]
+        if len(durable_user_indices) != len(warm_user_indices):
+            raise RuntimeError(
+                "session history changed before the rewind could be persisted"
+            )
+        if user_ordinal < 0 or user_ordinal >= len(durable_user_indices):
+            raise RuntimeError("persisted rewind target is no longer available")
+
+        warm_prefix, _ = history_before_user_originated_turn(
+            warm_persistence_history, warm_user_indices[user_ordinal]
+        )
+        durable_target_index = durable_user_indices[user_ordinal]
+        durable_target = durable[durable_target_index]
+        durable_prefix, durable_live_view = history_before_user_originated_turn(
+            durable, durable_target_index
+        )
+        if _comparison_content(durable_live_view) != _comparison_content(
+            warm_live_view
+        ):
+            raise RuntimeError(
+                "session history changed before the rewind could be persisted"
+            )
+        target_row_id = durable_target.get("_row_id")
+        if not isinstance(target_row_id, int):
+            raise RuntimeError("persisted rewind target has no row identity")
+        scaffold, _ = split_user_originated_turn(durable_target)
+        result = self._session_db.rewind_to_message(
+            self.session_id,
+            target_row_id,
+            preserve_compaction_handoff=scaffold is not None,
+            expected_active_ids=expected_active_ids,
+            expected_target_content=durable_live_view.get("content"),
+        )
+        if scaffold is not None:
+            replacement_id = result.get("replacement_message_id")
+            if not isinstance(replacement_id, int) or not durable_prefix:
+                raise RuntimeError("rewind did not retain its compaction handoff")
+            durable_prefix[-1]["_row_id"] = replacement_id
+            durable_prefix[-1]["_db_persisted"] = True
+            warm_prefix[-1] = durable_prefix[-1]
+        return warm_prefix, durable_live_view, result
     
     def retry_last(self):
         """Retry the last user message by removing the last exchange and re-sending.
@@ -10190,25 +10300,71 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         
         # Walk backwards to the last *real* user message. Timeline bookkeeping
         # rows (display_kind set) are role=user but are not user turns — match
-        # CLI resume counting and list_recent_user_messages. Compaction
+        # CLI resume counting and user_originated_turn_view. Compaction
         # handoffs are excluded too (durable role=user, sometimes without
         # display_kind on legacy sessions; #80622).
-        from agent.context_compressor import is_user_originated_turn
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            retryable_user_text,
+            user_originated_turn_view,
+        )
+        from agent.memory_manager import sanitize_context
+        from run_agent import _is_ephemeral_scaffolding
 
-        last_user_idx = None
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            msg = self.conversation_history[i]
-            if is_user_originated_turn(msg):
-                last_user_idx = i
-                break
+        warm_history = list(self.conversation_history)
+
+        user_indices = [
+            index
+            for index, message in enumerate(warm_history)
+            if not _is_ephemeral_scaffolding(message)
+            and user_originated_turn_view(message) is not None
+        ]
         
-        if last_user_idx is None:
+        if not user_indices:
             print("(._.) No user message found to retry.")
             return None
+        last_user_idx = user_indices[-1]
         
-        # Extract the message text and remove everything from that point forward
-        last_message = self.conversation_history[last_user_idx].get("content", "")
-        self.conversation_history = self.conversation_history[:last_user_idx]
+        # Resolve a lossless live payload before touching either persistence or
+        # memory. A force-user-leading compaction row is one physical carrier:
+        # its historical handoff remains in the prefix while only the embedded
+        # human ask is retried. Media cannot be replayed by /retry, so fail
+        # closed before archiving anything.
+        try:
+            truncated, live_view = history_before_user_originated_turn(
+                warm_history, last_user_idx
+            )
+            live_content = live_view.get("content")
+            if isinstance(live_content, str):
+                live_content = sanitize_context(live_content).strip()
+            last_message = retryable_user_text(live_content)
+        except ValueError as exc:
+            print(f"(._.) Cannot retry that message safely: {exc}")
+            return None
+
+        # Persist the rewind before publishing the shorter in-memory view.
+        # The DB owns the physical carrier split so the archived original and
+        # retained scaffold are committed atomically. A plain user row keeps
+        # the legacy rewind shape (no replacement scaffold).
+        if self._session_db is not None and self.session_id:
+            try:
+                truncated, _, _ = self._rewind_persisted_user_turn(
+                    warm_history=warm_history,
+                    user_ordinal=len(user_indices) - 1,
+                    warm_live_view=live_view,
+                )
+            except Exception as exc:
+                print(f"(x_x) Retry rewind failed; history was not changed: {exc}")
+                return None
+
+        self.conversation_history = truncated
+        if self.agent is not None:
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                self.agent._last_flushed_db_idx = len(self.conversation_history)
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
         
         print(f"(^_^)b Retrying: \"{last_message[:60]}{'...' if len(last_message) > 60 else ''}\"")
         return last_message
@@ -10245,61 +10401,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Walk backwards collecting the indices of the last N *real* user
         # messages (exclude display_kind timeline rows and compaction
-        # handoffs — same predicate as list_recent_user_messages, resume
+        # handoffs — same predicate as user_originated_turn_view, resume
         # turn counting, and /retry; #80622).
-        from agent.context_compressor import is_user_originated_turn
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            user_originated_turn_view,
+        )
+        from run_agent import _is_ephemeral_scaffolding
 
-        user_indices = []
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            msg = self.conversation_history[i]
-            if is_user_originated_turn(msg):
-                user_indices.append(i)
-                if len(user_indices) >= n:
-                    break
+        warm_history = list(self.conversation_history)
+
+        user_indices = [
+            index
+            for index, message in enumerate(warm_history)
+            if not _is_ephemeral_scaffolding(message)
+            and user_originated_turn_view(message) is not None
+        ]
 
         if not user_indices:
             print("(._.) No user message found to undo.")
             return
 
-        # The oldest of the collected user messages is our truncation point.
-        cut_idx = user_indices[-1]
-        turns_undone = len(user_indices)
+        turns_undone = min(n, len(user_indices))
+        target_ordinal = len(user_indices) - turns_undone
+        cut_idx = user_indices[target_ordinal]
 
-        removed_count = len(self.conversation_history) - cut_idx
-        removed_msg = self.conversation_history[cut_idx].get("content", "")
-        removed_text = self._undo_content_to_text(removed_msg)
-
-        # Truncate the in-memory history to before that user message.
-        self.conversation_history = self.conversation_history[:cut_idx]
+        removed_count = len(warm_history) - cut_idx
+        truncated, live_view = history_before_user_originated_turn(
+            warm_history, cut_idx
+        )
+        removed_text = self._undo_content_to_text(live_view.get("content"))
 
         # Soft-delete the truncated rows on disk so re-prompts and search
         # see the clean transcript while the rows survive for audit.
         rewound_rows = 0
         if self._session_db is not None and self.session_id:
             try:
-                recents = self._session_db.list_recent_user_messages(
-                    self.session_id, limit=max(turns_undone, 10)
+                truncated, durable_live_view, result = (
+                    self._rewind_persisted_user_turn(
+                        warm_history=warm_history,
+                        user_ordinal=target_ordinal,
+                        warm_live_view=live_view,
+                    )
                 )
-                if recents:
-                    target_idx = min(turns_undone - 1, len(recents) - 1)
-                    target_id = recents[target_idx]["id"]
-                    result = self._session_db.rewind_to_message(
-                        self.session_id, target_id
-                    )
-                    rewound_rows = result.get("rewound_count", 0)
-                    # Prefer the DB's decoded target text for the prefill —
-                    # it's the canonical persisted copy.
-                    db_text = self._undo_content_to_text(
-                        (result.get("target_message") or {}).get("content")
-                    )
-                    if db_text:
-                        removed_text = db_text
-            except ValueError as e:
-                # Non-user target / cross-session — keep the in-memory undo
-                # but skip the soft-delete; surface a debug-level note.
-                logger.debug("undo: soft-delete skipped: %s", e)
+                # Canonicalize the editable prefill before mutation. The raw
+                # physical carrier contains the reference summary wrapper.
+                durable_text = self._undo_content_to_text(
+                    durable_live_view.get("content")
+                )
+                if durable_text:
+                    removed_text = durable_text
+                rewound_rows = result.get("rewound_count", 0)
             except Exception as e:
-                logger.debug("undo: soft-delete failed: %s", e)
+                logger.debug("undo: durable rewind failed: %s", e)
+                print(f"(x_x) Undo failed; history was not changed: {e}")
+                return
+
+        # Publish only after the durable rewind succeeds (or no store exists).
+        self.conversation_history = truncated
 
         # Agent surgery: invalidate the system-prompt cache and reset the
         # flush index so the next turn re-flushes from the truncated head.
@@ -10314,6 +10473,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.agent._last_flushed_db_idx = len(self.conversation_history)
                 except Exception:
                     pass
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
             # Notify memory providers — same hook /branch fires, with the
             # rewound flag so per-turn document caches invalidate (#6672, #21910).
             try:
@@ -12316,6 +12479,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_heartbeat_command(cmd_original)
         elif canonical == "refine":
             self._handle_refine_command(cmd_original)
+        elif canonical == "review":
+            self._handle_review_command(cmd_original)
         elif canonical == "loop":
             self._handle_loop_command(cmd_original)
         elif canonical == "moa":
@@ -12375,27 +12540,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
-                    import shlex
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
-                        user_args = cmd_original[len(base_cmd):].strip()
-                        env = os.environ.copy()
-                        env["HERMES_COMMAND_NAME"] = base_cmd.lstrip("/")
-                        env["HERMES_COMMAND_ARGS"] = user_args
-                        if qcmd.get("append_args") and user_args:
-                            try:
-                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
-                            except ValueError:
-                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the CLI process which
                             # has all API keys in os.environ.
-                            from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(env)
+                            from tools.environments.local import build_subprocess_env
+                            sanitized_env = build_subprocess_env()
                             from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
@@ -12996,11 +13151,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         try:
             from hermes_cli.goals import gather_background_processes as _gather_bg
-            # Standalone CLI tool calls use the conversation session_id as the
-            # terminal process-registry session_key/task owner. Restrict the
-            # judge snapshot to that exact owner so another CLI session cannot
-            # authorize WAIT.
-            _bg_procs = _gather_bg(session_key=mgr.session_id)
+            _bg_procs = _gather_bg()
         except Exception:
             _bg_procs = None
 
@@ -15722,14 +15873,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
+                           allow_session: bool = True,
                            smart_denied: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
         with choices: once / session / always / deny. Smart DENY owner
-        overrides show only once / deny. When allow_permanent is False for
-        another reason (for example tirith), only 'always' is hidden.
+        overrides show only once / deny, as do gates that re-ask every time
+        (allow_session=False). When allow_permanent is False for another
+        reason (for example tirith), only 'always' is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -15749,6 +15902,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "choices": self._approval_choices(
                     command,
                     allow_permanent=allow_permanent,
+                    allow_session=allow_session,
                     smart_denied=smart_denied,
                 ),
                 "selected": 0,
@@ -15800,9 +15954,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
+                          allow_session: bool = True,
                           smart_denied: bool = False) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        if smart_denied:
+        if smart_denied or not allow_session:
             choices = ["once", "deny"]
         else:
             choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
@@ -16157,39 +16312,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
-        skill_runtime_requested = False
-        if isinstance(message, str):
-            try:
-                from agent.skill_commands import writing_skill_runtime_config
-
-                skill_runtime_requested = (
-                    writing_skill_runtime_config(message) is not None
-                )
-            except Exception as exc:
-                logging.debug("Writing-skill runtime check failed: %s", exc)
-
-        # Refresh the current session provider only when the turn does not carry
-        # its own fail-closed skill route. /sco resolves OpenRouter independently.
-        if not skill_runtime_requested and not self._ensure_runtime_credentials():
+        # Refresh provider credentials if needed (handles key rotation transparently)
+        if not self._ensure_runtime_credentials():
             return None
 
-        skill_reasoning_override = None
-        if isinstance(message, str):
-            try:
-                from agent.skill_commands import writing_skill_reasoning_config
-
-                skill_reasoning_override = writing_skill_reasoning_config(message)
-                if skill_reasoning_override is not None:
-                    self.reasoning_config = skill_reasoning_override
-            except Exception as exc:
-                logging.debug("Writing-skill reasoning override check failed: %s", exc)
-
-        try:
-            turn_route = self._resolve_turn_agent_config(message)
-        except Exception as exc:
-            logging.error("Writing-skill runtime resolution failed: %s", exc)
-            _cprint(f"  ✗ Required skill model route failed: {exc}")
-            return None
+        turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -16200,14 +16327,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
-            disable_fallbacks=turn_route.get("disable_fallbacks", False),
         ):
             return None
         agent = self.agent
         if agent is None:
             return None
-        if skill_reasoning_override is not None:
-            agent.reasoning_config = dict(skill_reasoning_override)
 
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -16223,16 +16347,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 from hermes_cli.config import load_config
 
-                _active_agent = self.agent
+                _img_model, _img_provider = "", ""
+                if isinstance(self.model, dict):
+                    _img_model, _ = _split_model_config_default(self.model)
+                else:
+                    _img_model = str(self.model or "")
+                if isinstance(self.provider, dict):
+                    _, _img_provider = _split_model_config_default(self.provider)
+                else:
+                    _img_provider = str(self.provider or "")
                 _img_mode = decide_image_input_mode(
-                    (getattr(_active_agent, "provider", None) or self.provider or "").strip(),
-                    (getattr(_active_agent, "model", None) or self.model or "").strip(),
+                    _img_provider.strip(),
+                    _img_model.strip(),
                     load_config(),
-                    requested_provider=(
-                        getattr(_active_agent, "requested_provider", None)
-                        or self.requested_provider
-                        or ""
-                    ).strip(),
+                    requested_provider=(self.requested_provider or "").strip(),
                 )
             except Exception as _img_exc:
                 logging.debug("image_routing decision failed, defaulting to text: %s", _img_exc)
@@ -21418,9 +21546,25 @@ def main(
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays
                         # machine-readable (no styled "Hermes" box, no tool-gen
-                        # status lines).  The response is printed once below.
+                        # status lines, no reasoning box).  The response is
+                        # printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.reasoning_callback = None
+                        # Inline-diff and progress callbacks print directly to
+                        # stdout and are gated by NEITHER quiet_mode nor
+                        # tool_progress_mode: _on_tool_complete renders full
+                        # file diffs via render_edit_diff_with_delta, and
+                        # _on_tool_progress prints MoA reference blocks before
+                        # its mode check. Neutralize them too so -Q stdout
+                        # carries only the final response (#93220).
+                        cli.agent.tool_progress_callback = None
+                        cli.agent.tool_start_callback = None
+                        cli.agent.tool_complete_callback = None
+                        # Belt-and-braces for the executor's direct prints
+                        # (they check agent.tool_progress_mode, initialized
+                        # from display.tool_progress at construction).
+                        cli.agent.tool_progress_mode = "off"
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,

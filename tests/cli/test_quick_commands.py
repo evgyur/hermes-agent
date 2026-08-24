@@ -1,9 +1,17 @@
 """Tests for user-defined quick commands that bypass the agent loop."""
 import os
+import shlex
 import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 from rich.text import Text
 import pytest
+
+
+def _portable_command(*args):
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)
 
 
 # ── CLI tests ──────────────────────────────────────────────────────────────
@@ -38,14 +46,6 @@ class TestCLIQuickCommands:
         cli.console.print.assert_called_once()
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "daily-note"
-
-    def test_exec_command_can_append_user_args(self):
-        cli = self._make_cli({"chart": {"type": "exec", "command": "printf '%s'", "append_args": True}})
-        result = cli.process_command("/chart 2h")
-        assert result is True
-        cli.console.print.assert_called_once()
-        printed = self._printed_plain(cli.console.print.call_args[0][0])
-        assert printed == "2h"
 
     def test_exec_command_uses_chat_console_when_tui_is_live(self):
         cli = self._make_cli({"dn": {"type": "exec", "command": "echo daily-note"}})
@@ -112,20 +112,7 @@ class TestGatewayQuickCommands:
         assert result == "ok"
 
     @pytest.mark.asyncio
-    async def test_exec_command_can_append_user_args(self):
-        from gateway.run import GatewayRunner
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"chart": {"type": "exec", "command": "printf '%s'", "append_args": True}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
-
-        event = self._make_event("chart", "2h")
-        result = await runner._handle_message(event)
-        assert result == "2h"
-
-    @pytest.mark.asyncio
-    async def test_exec_command_receives_message_origin(self):
+    async def test_exec_command_preserves_args_and_exact_origin(self):
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
@@ -133,12 +120,17 @@ class TestGatewayQuickCommands:
             "quick_commands": {
                 "where": {
                     "type": "exec",
-                    "command": (
-                        "printf '%s|%s|%s' "
-                        '"$HERMES_ORIGIN_PLATFORM" '
-                        '"$HERMES_ORIGIN_CHAT_ID" '
-                        '"$HERMES_ORIGIN_THREAD_ID"'
+                    "command": _portable_command(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os; print('|'.join(os.environ.get(key, '') for key in "
+                            "('HERMES_COMMAND_NAME','HERMES_COMMAND_ARGS',"
+                            "'HERMES_ORIGIN_PLATFORM','HERMES_ORIGIN_CHAT_ID',"
+                            "'HERMES_ORIGIN_THREAD_ID')), end='')"
+                        ),
                     ),
+                    "append_args": False,
                 }
             }
         }
@@ -146,23 +138,28 @@ class TestGatewayQuickCommands:
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-        event = self._make_event("where")
-        event.source.thread_id = "456"
+        event = self._make_event("where", "wallet HYPE")
+        event.source.chat_id = "-1003958174857"
+        event.source.thread_id = "3822"
         result = await runner._handle_message(event)
 
-        assert result == "telegram|123|456"
+        assert result == "where|wallet HYPE|telegram|-1003958174857|3822"
 
     @pytest.mark.asyncio
-    async def test_exec_command_allowed_origins_allows_exact_origin(self):
+    async def test_exec_command_appends_user_args(self):
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = {
             "quick_commands": {
-                "private": {
+                "chart": {
                     "type": "exec",
-                    "command": "echo private-ok",
-                    "allowed_origins": ["telegram:123"],
+                    "command": _portable_command(
+                        sys.executable,
+                        "-c",
+                        "import sys; print(sys.argv[1], end='')",
+                    ),
+                    "append_args": True,
                 }
             }
         }
@@ -170,120 +167,48 @@ class TestGatewayQuickCommands:
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-        result = await runner._handle_message(self._make_event("private"))
+        result = await runner._handle_message(self._make_event("chart", "2h"))
 
-        assert result == "private-ok"
+        assert result == "2h"
 
     @pytest.mark.asyncio
-    async def test_exec_command_allowed_origins_denies_other_chat_before_execution(self):
+    async def test_exec_command_does_not_leak_credentials(self):
+        """Quick command exec must sanitize env — API keys must not appear in output."""
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {
-            "quick_commands": {
-                "private": {
-                    "type": "exec",
-                    "command": "echo must-not-run",
-                    "allowed_origins": ["telegram:999"],
-                }
-            }
-        }
+        runner.config = {"quick_commands": {"leak": {"type": "exec", "command": "env"}}}
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-        result = await runner._handle_message(self._make_event("private"))
+        event = self._make_event("leak")
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-secret-12345"}):
+            result = await runner._handle_message(event)
 
-        assert result == "This command is not available in this chat."
-        assert "must-not-run" not in result
+        assert "sk-or-secret-12345" not in result, \
+            "Quick command leaked OPENROUTER_API_KEY — exec runs without env sanitization"
 
     @pytest.mark.asyncio
-    async def test_exec_command_allowed_origins_invalid_shape_fails_closed(self):
+    async def test_exec_command_output_is_redacted(self, monkeypatch):
+        """Quick command output must redact sensitive patterns before returning."""
         from gateway.run import GatewayRunner
 
+        # Ensure redaction is active regardless of host HERMES_REDACT_SECRETS state
+        # or test ordering
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
         runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"token": {"type": "exec", "command": "echo sk-ant-api03-supersecretkey1234567890"}}}
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-        invalid_values = (
-            {"telegram:123": True},
-            [],
-            ["telegram:123", 7],
-            ["telegram:"],
-            [":123"],
-            [" telegram:123"],
-            ["telegram:123", "telegram:123"],
-        )
-        for allowed_origins in invalid_values:
-            runner.config = {
-                "quick_commands": {
-                    "private": {
-                        "type": "exec",
-                        "command": "echo must-not-run",
-                        "allowed_origins": allowed_origins,
-                    }
-                }
-            }
-            result = await runner._handle_message(self._make_event("private"))
-            assert result == "This command is not available in this chat."
-
-    @pytest.mark.asyncio
-    async def test_exec_command_allowed_origins_rejects_prefix_and_platform_mismatch(self):
-        from gateway.run import GatewayRunner
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {
-            "quick_commands": {
-                "private": {
-                    "type": "exec",
-                    "command": "echo must-not-run",
-                    "allowed_origins": ["telegram:123"],
-                }
-            }
-        }
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
-
-        prefix_event = self._make_event("private")
-        prefix_event.source.chat_id = "1234"
-        platform_event = self._make_event("private")
-        platform_event.source.platform.value = "discord"
-        chat_whitespace_event = self._make_event("private")
-        chat_whitespace_event.source.chat_id = " 123"
-        platform_whitespace_event = self._make_event("private")
-        platform_whitespace_event.source.platform.value = "telegram "
-
-        assert await runner._handle_message(prefix_event) == "This command is not available in this chat."
-        assert await runner._handle_message(platform_event) == "This command is not available in this chat."
-        assert await runner._handle_message(chat_whitespace_event) == "This command is not available in this chat."
-        assert await runner._handle_message(platform_whitespace_event) == "This command is not available in this chat."
-
-    @pytest.mark.asyncio
-    async def test_alias_allowed_origins_denial_does_not_rewrite_event(self):
-        from gateway.run import GatewayRunner
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {
-            "quick_commands": {
-                "private": {
-                    "type": "alias",
-                    "target": "/usage",
-                    "allowed_origins": ["telegram:999"],
-                }
-            }
-        }
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
-        event = self._make_event("private", "sensitive")
-        original_text = event.text
-
+        event = self._make_event("token")
         result = await runner._handle_message(event)
 
-        assert result == "This command is not available in this chat."
-        assert event.text == original_text
+        assert "supersecretkey1234567890" not in result, \
+            "Quick command output not redacted — raw API key returned to user"
 
 
     @pytest.mark.asyncio

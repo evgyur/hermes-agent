@@ -116,29 +116,6 @@ class TestSessionHasCompressionInFlight:
 
 class TestBusyHandlerDemotesInterruptForCompression:
     @pytest.mark.asyncio
-    async def test_queues_during_preflight_before_durable_lock_exists(self) -> None:
-        """The in-memory commit fence closes the lock-acquisition race window."""
-        runner = _make_runner()
-        adapter = _make_adapter()
-        event = _make_event(text="follow up during compression preflight")
-        sk = build_session_key(event.source)
-        parent = _make_parent_no_subagents()
-        parent._active_compression_commit_fence = object()
-        runner._running_agents[sk] = parent
-        runner.adapters[event.source.platform] = adapter
-        runner._session_db._db.get_compression_lock_holder.return_value = None
-
-        handled = await runner._handle_active_session_busy_message(event, sk)
-
-        assert handled is True
-        parent.redirect.assert_not_called()
-        parent.interrupt.assert_not_called()
-        assert adapter._pending_messages.get(sk) is event
-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Compressing context" in content
-        assert "queued" in content.lower()
-
-    @pytest.mark.asyncio
     async def test_does_not_interrupt_when_compression_in_flight(self) -> None:
         runner = _make_runner()
         adapter = _make_adapter()

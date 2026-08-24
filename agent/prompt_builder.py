@@ -24,9 +24,11 @@ from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
+    EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
     ORG_MIRROR_DIR_NAME,
     ORG_PROVENANCE_FILE,
+    SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
@@ -223,11 +225,11 @@ SESSION_SEARCH_GUIDANCE = (
 # subscription OAuth token, not an sk-ant-api… key, which does not hit the
 # filter.
 SKILLS_GUIDANCE = (
-    "Skill maintenance never extends the current assignment after its requested "
-    "outcome is complete. If a loaded skill is materially wrong and blocks that "
-    "outcome, patch only the smallest necessary correction with "
-    "skill_manage(action='patch'). Otherwise report the issue separately and "
-    "wait for a separate user request before creating or updating a skill.\n"
+    "When you work out a non-trivial workflow, record it with skill_manage "
+    "for future reuse.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, "
+    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
+    "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
@@ -1589,9 +1591,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v3: catalog iteration gained archive/embedded-package pruning and generic
-# frontmatter-name collision deduplication; v2 snapshots may contain stale noise.
-_SKILLS_SNAPSHOT_VERSION = 3
+# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
+# org-shared skills; older snapshots are discarded and rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1610,35 +1612,47 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """Build the index manifest through the canonical catalog iterator."""
+    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
+
+    Org mirrors (M2): only the ACTIVE org's mirror participates, and the
+    ``.active_org`` marker itself is included — so switching/leaving an org
+    invalidates the snapshot even when no SKILL.md changed.
+    """
     manifest: dict[str, list[int]] = {}
-    marker_path = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+    skills_dir_str = str(skills_dir)
+    base = os.path.join(skills_dir_str, "")
+    prefix_len = len(base)
+    active_org = read_active_org_id(skills_dir)
+    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
+    marker_path = os.path.join(org_root, ORG_ACTIVE_MARKER)
     try:
-        stat = marker_path.stat()
-        manifest[f"{ORG_MIRROR_DIR_NAME}/{ORG_ACTIVE_MARKER}"] = [
-            stat.st_mtime_ns,
-            stat.st_size,
+        st = os.stat(marker_path)
+        manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
+            int(st.st_mtime), int(st.st_size),
         ]
     except OSError:
         pass
-
-    scan_roots = [skills_dir]
-    active_org_id = read_active_org_id(skills_dir)
-    if active_org_id:
-        active_org_root = skills_dir / ORG_MIRROR_DIR_NAME / active_org_id
-        if active_org_root.is_dir():
-            scan_roots.append(active_org_root)
-
-    for scan_root in scan_roots:
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        has_skill_md = "SKILL.md" in files
+        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+            dirs.remove(ORG_MIRROR_DIR_NAME)
+        elif root == org_root:
+            dirs[:] = [d for d in dirs if d == active_org]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in EXCLUDED_SKILL_DIRS
+            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+        ]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
-            for index_path in iter_skill_index_files(scan_root, filename):
-                skill_path = Path(index_path)
-                try:
-                    stat = skill_path.stat()
-                    relative = skill_path.relative_to(skills_dir).as_posix()
-                except (OSError, ValueError):
-                    continue
-                manifest[relative] = [stat.st_mtime_ns, stat.st_size]
+            if filename not in files:
+                continue
+            path = os.path.join(root, filename)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
     return manifest
 
 
@@ -1816,15 +1830,8 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
-    *,
-    persist_snapshot: bool = True,
-    routing_policy: str = "conservative",
-    protected_boundaries: "tuple[str, ...] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
-
-    ``persist_snapshot=False`` is reserved for strict read-only diagnostics. It
-    may consume an existing valid snapshot, but a cold scan never writes one.
 
     Two-layer cache:
       1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
@@ -1844,28 +1851,28 @@ def build_skills_system_prompt(
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
     """
-    from agent.skill_routing import normalize_routing_policy
-
+    # Home resolution is EXPLICIT when a caller passes skills_dir_override
+    # (the agent knows its own profile home from its session_db path). This
+    # avoids the ContextVar-on-a-thread trap: build threads that didn't bind
+    # HERMES_HOME would otherwise fall back to the launch (default) home and
+    # leak the default profile's skills into a bot's prompt (confirmed: a
+    # no-override thread builds default's full index). Snapshot + external
+    # dirs are scoped to the same home so nothing reads ambient state.
     if skills_dir_override is not None:
         skills_dir = Path(skills_dir_override)
-        home_token = set_hermes_home_override(str(skills_dir.parent))
+        _home_token = set_hermes_home_override(str(skills_dir.parent))
     else:
         skills_dir = get_skills_dir()
-        home_token = None
-    effective_routing_policy = normalize_routing_policy(routing_policy)
-    effective_protected_boundaries = tuple(
-        sorted(
-            str(value).strip().lower().replace("-", "_")
-            for value in (protected_boundaries or ())
-            if str(value).strip()
-        )
-    )
-
+        _home_token = None
     try:
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
+        # the git root) — highest-precedence tier, scanned before local.
+        # Resolved once here; cwd and trust are stable for the session, so
+        # the index (and the system prompt) stays byte-stable.
         from agent.skill_utils import get_project_skills_dirs
-
         project_dirs = get_project_skills_dirs()
+
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
 
@@ -1876,13 +1883,10 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
-            persist_snapshot=persist_snapshot,
-            effective_routing_policy=effective_routing_policy,
-            effective_protected_boundaries=effective_protected_boundaries,
         )
     finally:
-        if home_token is not None:
-            reset_hermes_home_override(home_token)
+        if _home_token is not None:
+            reset_hermes_home_override(_home_token)
 
 
 def _build_skills_system_prompt_inner(
@@ -1892,13 +1896,7 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
-    *,
-    persist_snapshot: bool = True,
-    effective_routing_policy: str = "conservative",
-    effective_protected_boundaries: "tuple[str, ...]" = (),
 ) -> str:
-    from agent.skill_routing import protected_boundary_guidance, skill_routing_guidance
-
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
@@ -1913,9 +1911,6 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
-        bool(persist_snapshot),
-        effective_routing_policy,
-        effective_protected_boundaries,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1975,34 +1970,80 @@ def _build_skills_system_prompt_inner(
                 continue
             visible_entries.append(entry)
 
-    # ── Provenance labels + fail-closed generic name collisions ──────────
-    # One frontmatter name gets one catalog line. Multiple physical candidates
-    # collapse to a synthetic collision entry; bare skill_view remains blocked
-    # by its independent multi-candidate resolver.
-    entries_by_name: dict[str, list[dict]] = {}
+    # ── Project-local skills (highest precedence) ──────────────────────
+    # Scanned before the local/org pass; names claimed here shadow same-named
+    # profile-local skills below (that's the feature — vendored repo skills
+    # win inside their repo). Each entry is tagged so the model and the user
+    # can see where it came from.
+    project_names: set[str] = set()
+    if project_dirs:
+        from agent.skill_utils import iter_project_skill_files
+
+        for proj_dir in project_dirs:
+            if not proj_dir.exists():
+                continue
+            for skill_file in iter_project_skill_files(proj_dir):
+                try:
+                    is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                    if not is_compatible:
+                        continue
+                    entry = _build_snapshot_entry(skill_file, proj_dir, frontmatter, desc)
+                    fm_name = entry["frontmatter_name"]
+                    if fm_name in project_names:
+                        continue
+                    if fm_name in disabled or entry["skill_name"] in disabled:
+                        continue
+                    if not _skill_should_show(
+                        extract_skill_conditions(frontmatter),
+                        available_tools,
+                        available_toolsets,
+                    ):
+                        continue
+                    project_names.add(fm_name)
+                    skills_by_category.setdefault(entry["category"], []).append(
+                        (fm_name, f"[project] {entry['description']}".strip())
+                    )
+                except Exception as e:
+                    logger.debug("Error reading project skill %s: %s", skill_file, e)
+
+    if project_names:
+        # Drop profile-local entries shadowed by a project skill BEFORE the
+        # org-labeling pass so collision flags don't fire on intentional
+        # project-over-local overrides.
+        visible_entries = [
+            e
+            for e in visible_entries
+            if (e.get("frontmatter_name") or e.get("skill_name") or "")
+            not in project_names
+        ]
+
+    # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
+    # An org skill lists with an explicit provenance tag. When a personal and
+    # an org skill share a name, NEITHER silently wins: both list qualified
+    # (personal keeps the bare name is the wrong default — silent divergence
+    # from the org set; org winning silently shadows the user's own work) —
+    # so both entries carry a [name collision] flag and skill_view refuses
+    # the ambiguous bare name (its existing multi-candidate guard).
+    name_owners: dict[str, set[str]] = {}
     for entry in visible_entries:
-        frontmatter_name = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        entries_by_name.setdefault(frontmatter_name, []).append(entry)
-
-    collision_counts: dict[str, int] = {}
-    for frontmatter_name, entries in entries_by_name.items():
-        if len(entries) > 1:
-            collision_counts[frontmatter_name] = len(entries)
-            continue
-
-        entry = entries[0]
-        description = entry.get("description", "")
+        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        kind = "org" if entry.get("org_id") else "personal"
+        name_owners.setdefault(fm, set()).add(kind)
+    for entry in visible_entries:
+        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        desc = entry.get("description", "")
         org_id = entry.get("org_id")
+        collided = len(name_owners.get(fm, set())) > 1
         if org_id:
             author = entry.get("org_author") or ""
             tag = f"[org-shared{': by ' + author if author else ''}]"
-            description = f"{tag} {description}".strip()
+            desc = f"{tag} {desc}".strip()
             category = f"org:{org_id}"
         else:
             category = entry.get("category") or "general"
-        skills_by_category.setdefault(category, []).append(
-            (frontmatter_name, description)
-        )
+        if collided:
+            desc = f"[name collision — also exists {'personally' if org_id else 'in your org'}; load via category path] {desc}".strip()
+        skills_by_category.setdefault(category, []).append((fm, desc))
 
     if snapshot is None:
         # (continuation of the cold path below: category descriptions + write)
@@ -2020,19 +2061,18 @@ def _build_skills_system_prompt_inner(
             except Exception as e:
                 logger.debug("Could not read skill description %s: %s", desc_file, e)
 
-        if persist_snapshot:
-            _write_skills_snapshot(
-                skills_dir,
-                _build_skills_manifest(skills_dir),
-                skill_entries,
-                category_descriptions,
-            )
+        _write_skills_snapshot(
+            skills_dir,
+            _build_skills_manifest(skills_dir),
+            skill_entries,
+            category_descriptions,
+        )
 
     # ── External skill directories ─────────────────────────────────────
     # Scan external dirs directly (no snapshot caching — they're read-only
     # and typically small).  Local skills already in skills_by_category take
     # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set(collision_counts)
+    seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
@@ -2049,7 +2089,6 @@ def _build_skills_system_prompt_inner(
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
-                    collision_counts[frontmatter_name] = collision_counts.get(frontmatter_name, 1) + 1
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
                     continue
@@ -2079,21 +2118,6 @@ def _build_skills_system_prompt_inner(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
-
-    if collision_counts:
-        for category, entries in list(skills_by_category.items()):
-            filtered = [entry for entry in entries if entry[0] not in collision_counts]
-            if filtered:
-                skills_by_category[category] = filtered
-            else:
-                skills_by_category.pop(category, None)
-        for name, count in sorted(collision_counts.items()):
-            skills_by_category.setdefault("collisions", []).append(
-                (
-                    name,
-                    f"[name collision — {count} candidates; bare skill_view is blocked; load via category-qualified path]",
-                )
-            )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -2143,19 +2167,26 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            skill_routing_guidance(effective_routing_policy)
-            + protected_boundary_guidance(effective_protected_boundaries)
-            + "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "## Skills (mandatory)\n"
+            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "Err on the side of loading — it is always better to have context you don't need "
+            "than to miss critical steps, pitfalls, or established workflows. "
+            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+            "and proven workflows that outperform general-purpose approaches. Load the skill "
+            "even if you think you could handle the task with basic tools like web_search or terminal. "
+            "Skills also encode the user's preferred approach, conventions, and quality standards "
+            "for tasks like code review, planning, and testing — load them even for tasks you "
+            "already know how to do, because the skill defines how it should be done here.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a loaded skill is materially wrong in a way that blocks the current "
-            "requested outcome, patch only the smallest necessary correction with "
-            "skill_manage(action='patch'). Otherwise report the issue separately; "
-            "do not expand a completed task into skill maintenance.\n"
-            "After difficult/iterative tasks, you may offer to save the workflow as a "
-            "skill, but creating or updating it requires a separate user request.\n"
+            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+            "After difficult/iterative tasks, offer to save as a skill. "
+            "If a skill you loaded was missing steps, had wrong commands, or needed "
+            "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"

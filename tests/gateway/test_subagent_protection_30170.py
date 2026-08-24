@@ -35,23 +35,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # ──────────────────────────────────────────────────────────────────────
-# Minimal fallback stubs so gateway imports cleanly when the optional Telegram
-# dependency is absent (mirrors test_busy_session_ack). Prefer the real module
-# when installed so this module-level fallback cannot poison later tests.
+# Minimal stubs so gateway imports cleanly (mirrors test_busy_session_ack)
 # ──────────────────────────────────────────────────────────────────────
-try:
-    import telegram as _tg  # noqa: F401
-except ImportError:
-    _tg = types.ModuleType("telegram")
-    _tg.constants = types.ModuleType("telegram.constants")
-    _ct = MagicMock()
-    _ct.SUPERGROUP = "supergroup"
-    _ct.GROUP = "group"
-    _ct.PRIVATE = "private"
-    _tg.constants.ChatType = _ct
-    sys.modules.setdefault("telegram", _tg)
-    sys.modules.setdefault("telegram.constants", _tg.constants)
-    sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
+_tg = types.ModuleType("telegram")
+_tg.constants = types.ModuleType("telegram.constants")
+_ct = MagicMock()
+_ct.SUPERGROUP = "supergroup"
+_ct.GROUP = "group"
+_ct.PRIVATE = "private"
+_tg.constants.ChatType = _ct
+sys.modules.setdefault("telegram", _tg)
+sys.modules.setdefault("telegram.constants", _tg.constants)
+sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (  # noqa: E402
     MessageEvent,
@@ -220,7 +215,7 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert "Subagent" not in content
 
     @pytest.mark.asyncio
-    async def test_delegate_teardown_steers(self):
+    async def test_delegate_teardown_window_is_queued_not_interrupted(self) -> None:
         runner = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -235,9 +230,8 @@ class TestBusyHandlerDemotesInterruptForSubagents:
             await runner._handle_active_session_busy_message(event, sk)
 
         parent.interrupt.assert_not_called()
-        assert parent.steer.call_args.args == ("follow-up during delegate teardown",)
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Accepted for the current run" in content
+        assert "Subagent working" in content
 
     @pytest.mark.asyncio
     async def test_queue_mode_unchanged_with_subagents(self) -> None:
@@ -283,29 +277,5 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         with patch("gateway.run.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
-        assert parent.steer.call_args.args == ("course-correct",)
+        parent.steer.assert_called_once_with("course-correct")
         parent.interrupt.assert_not_called()
-    @pytest.mark.asyncio
-    async def test_interrupt_mode_steers_parent_without_cancelling_children(self) -> None:
-        runner = _make_runner()
-        runner._busy_input_mode = "interrupt"
-        runner._busy_text_mode = "interrupt"
-        runner._session_run_generation = {}
-        runner._session_db = None
-        runner._session_has_compression_in_flight = AsyncMock(return_value=False)
-        adapter = _make_adapter()
-        event = _make_event(text="change the active approach")
-        sk = build_session_key(event.source)
-        parent = _make_parent_with_subagents()
-        parent.steer = MagicMock(return_value=True)
-        runner._running_agents[sk] = parent
-        runner.adapters[event.source.platform] = adapter
-
-        await runner._handle_active_session_busy_message(event, sk)
-
-        assert parent.steer.call_args.args == ("change the active approach",)
-        parent.interrupt.assert_not_called()
-        assert adapter._pending_messages == {}
-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Accepted for the current run" in content
-

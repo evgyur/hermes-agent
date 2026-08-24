@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -87,30 +87,6 @@ def test_barrier_readbacks_tolerate_absent_storage(monkeypatch, tmp_path):
     assert barrier.barrier_for_child("missing") is None
     assert barrier.has_active_barrier(origin_session="missing") is False
     assert barrier.barrier_snapshot("missing") is None
-
-
-def test_barrier_read_open_error_propagates_fail_closed(monkeypatch):
-    def broken_connect(*_args, **_kwargs):
-        raise sqlite3.OperationalError("disk I/O error")
-
-    monkeypatch.setattr(barrier.sqlite3, "connect", broken_connect)
-    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
-        barrier.has_active_barrier(origin_session="must-defer")
-
-
-@pytest.mark.asyncio
-async def test_barrier_initializer_failure_prevents_gateway_intake():
-    from gateway.run import GatewayRunner
-
-    runner = object.__new__(GatewayRunner)
-    runner._create_adapter = MagicMock()
-    with patch(
-        "tools.parent_task_barrier.initialize_storage",
-        side_effect=sqlite3.OperationalError("disk I/O error"),
-    ):
-        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
-            await runner.start()
-    runner._create_adapter.assert_not_called()
 
 
 @pytest.mark.asyncio

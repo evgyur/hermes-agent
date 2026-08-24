@@ -1060,6 +1060,19 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _format_interrupted_output(stdout_text: str) -> str:
+    """Append an interruption marker without guessing who caused it."""
+    from tools.interrupt import get_interrupt_reason
+
+    reason = get_interrupt_reason()
+    marker = (
+        f"[execution interrupted — {reason}]"
+        if reason
+        else "[execution interrupted]"
+    )
+    return f"{stdout_text}\n{marker}" if stdout_text else marker
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1238,9 +1251,7 @@ def _execute_remote(
             duration, timeout, tool_call_counter[0],
         )
     elif status == "interrupted":
-        result["output"] = (
-            stdout_text + "\n[execution interrupted — user sent a new message]"
-        )
+        result["output"] = _format_interrupted_output(stdout_text)
     elif exit_code != 0:
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
@@ -1285,6 +1296,23 @@ def execute_code(
             "parameter containing Python source. To run shell commands, use "
             "terminal(command=...) instead."
         )
+
+    # Hard-block gateway-lifecycle commands, mirroring the terminal_tool
+    # guard (#68289): without this, execute_code is a straight bypass — the
+    # terminal() path refuses `launchctl bootout ai.hermes.gateway`, but the
+    # identical command inside `os.system(...)` / `subprocess.run([...])`
+    # here sailed through and SIGTERM'd the gateway mid-task. Gated on
+    # PID-file ownership, not the inherited env marker (#92560).
+    from tools.process_registry import _is_supervised_gateway_process
+    if _is_supervised_gateway_process():
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+        if contains_gateway_lifecycle_command(code):
+            return tool_error(
+                "Blocked: cannot restart or stop the gateway from inside the "
+                "gateway process. The gateway would kill this script before "
+                "it could complete (SIGTERM propagates to child processes). "
+                "Run the lifecycle command from a shell outside the gateway."
+            )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1476,6 +1504,41 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
+        # ``hermes_tools.py`` always lives in the staging directory, so that
+        # directory must be importable even when project mode changes CWD.
+        # Hermes's own package root is useful too, but only when the child
+        # uses the same Python environment. Project mode can select an
+        # external venv; exposing Hermes's site-packages to that interpreter
+        # can mix incompatible compiled extensions (for example, Python 3.12
+        # NumPy with a Python 3.9 project interpreter).
+        #
+        # Before re-injecting PYTHONPATH, strip Hermes-owned entries that
+        # leaked through _scrub_child_env (PYTHONPATH is in _SAFE_ENV_PREFIXES
+        # so it passes the scrub).  They are redundant for same-Hermes-
+        # environment children and may be incompatible with external
+        # interpreters (project mode can select a different venv), so they
+        # must not shadow or poison the child's sys.path (#74817).
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+        _strip_hermes_owned_pythonpath(child_env)
+        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _existing_pp = child_env.get("PYTHONPATH", "")
+        _pp_parts = [tmpdir]
+        if _uses_hermes_python_environment(_child_python):
+            _pp_parts.append(_hermes_root)
+        elif _child_python not in _external_env_logged:
+            # Import behavior changes silently otherwise — surface it (once
+            # per interpreter path) so "import hermes_constants suddenly
+            # fails" reports are diagnosable without log spam.
+            _external_env_logged.add(_child_python)
+            logger.info(
+                "execute_code: child interpreter %s is outside the Hermes "
+                "environment; hermes root omitted from PYTHONPATH",
+                _child_python,
+            )
+        if _existing_pp:
+            _pp_parts.append(_existing_pp)
+        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+
         from subprocess_limits import bounded_child_kwargs
 
         proc = subprocess.Popen(
@@ -1661,7 +1724,7 @@ def execute_code(
                 duration, timeout, tool_call_counter[0],
             )
         elif status == "interrupted":
-            result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+            result["output"] = _format_interrupted_output(stdout_text)
         elif exit_code != 0:
             result["status"] = "error"
             result["error"] = stderr_text or f"Script exited with code {exit_code}"

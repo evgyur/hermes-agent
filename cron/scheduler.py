@@ -1431,19 +1431,16 @@ def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     shutdown signal: the ``concurrent.futures`` module-global flag can be set
     a hair before ``sys.is_finalizing()`` flips, so matching the error text is
     a safe fallback for that race.
+
+    Thin wrapper — the predicate itself lives in
+    ``tools.interpreter_shutdown.interpreter_shutting_down`` (shared with the
+    conversation loop and the concurrent tool executor) so the shutdown-race
+    bug class is fixed in one place. Kept as a module symbol because tests
+    and callers throughout this file reference it by this name.
     """
-    if sys.is_finalizing():
-        return True
-    if exc is not None:
-        # Match the SHORT prefix deliberately: CPython emits two shutdown
-        # variants — "cannot schedule new futures after interpreter shutdown"
-        # (asyncio.run_coroutine_threadsafe / a torn-down default executor) and
-        # "cannot schedule new futures after shutdown" (a plain
-        # ThreadPoolExecutor). Both are documented in #58720. The common prefix
-        # catches both; the sibling agent/tool_executor._is_interpreter_shutdown_submit_error
-        # matches only the fuller "...after interpreter shutdown" form.
-        return "cannot schedule new futures" in str(exc).lower()
-    return False
+    from tools.interpreter_shutdown import interpreter_shutting_down
+
+    return interpreter_shutting_down(exc)
 
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
@@ -3929,6 +3926,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    invocation_context: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4059,6 +4057,16 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if invocation_context:
+            safe_context = {
+                "HERMES_CRON_JOB_ID": str(invocation_context.get("job_id") or ""),
+                "HERMES_CRON_SCHEDULED_AT": str(invocation_context.get("scheduled_at") or ""),
+                "HERMES_CRON_TIMEZONE": str(invocation_context.get("timezone") or ""),
+                "HERMES_CRON_INVOCATION_KIND": str(invocation_context.get("invocation_kind") or ""),
+            }
+            if not all(safe_context.values()):
+                return False, "Blocked: incomplete cron invocation context for pre-run script"
+            env.update(safe_context)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4136,6 +4144,27 @@ def _run_job_script_with_claim_heartbeat(
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
     schedule = job.get("schedule")
+    scheduled_at = str(job.get("next_run_at") or "")
+    cron_now = _hermes_now()
+    cron_tz = cron_now.tzinfo
+    timezone_name = str(
+        job.get("timezone")
+        or getattr(cron_tz, "key", "")
+        or cron_now.tzname()
+        or "UTC"
+    )
+    try:
+        due_or_past = bool(scheduled_at) and datetime.fromisoformat(
+            scheduled_at.replace("Z", "+00:00")
+        ) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        due_or_past = False
+    invocation_context = {
+        "job_id": str(job.get("id") or ""),
+        "scheduled_at": scheduled_at,
+        "timezone": timezone_name,
+        "invocation_kind": "scheduled" if due_or_past else "manual_unbound",
+    }
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (
@@ -4143,7 +4172,10 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4174,10 +4206,16 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            invocation_context=invocation_context,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -4587,6 +4625,36 @@ def _guard_job_credential_exfil(job: dict) -> None:
             job_id, err,
         )
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
+
+
+def _block_and_pause_job(
+    job_id: str, job_name: str, reason: str
+) -> tuple[bool, str, str, Optional[str]]:
+    """Fail a run closed and pause the job so it stops being scheduled.
+
+    Used for job shapes that can never run (a5e29e688dc0). Returning an error
+    alone is not enough — an unrunnable job that stays enabled re-fires on
+    every tick forever. Pausing writes ``paused_at``/``paused_reason``, giving
+    an auditable record of why the scheduler stopped it.
+    """
+    from cron.jobs import pause_job
+
+    logger.error("Job '%s': %s", job_id, reason)
+    try:
+        pause_job(job_id, f"Auto-paused by scheduler: {reason}")
+    except Exception:
+        logger.exception("Job '%s': failed to auto-pause unrunnable job", job_id)
+
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        f"**Status:** blocked (unrunnable job) — auto-paused\n\n"
+        f"{reason}\n"
+    )
+    alert = f"⚠ Cron job '{job_name}' was auto-paused\n\n{reason}"
+    return False, doc, alert, reason
 
 
 # Marker prefix stamped into the error string returned by ``run_job`` when the
@@ -5099,10 +5167,17 @@ def run_job(
             )
 
         script_path = job.get("script")
-        if not script_path:
-            err = "no_agent=True but no script is set for this job"
-            logger.error("Job '%s': %s", job_id, err)
-            return False, "", "", err
+        # Legacy/hand-edited records can still carry no_agent with a missing or
+        # whitespace-only script. Erroring alone left the job enabled, so it
+        # re-fired every tick — pause it instead (a5e29e688dc0).
+        if not str(script_path or "").strip():
+            from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
+
+            return _block_and_pause_job(
+                job_id,
+                job_name,
+                NO_AGENT_WITHOUT_SCRIPT_ERROR,
+            )
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is passed as the subprocess cwd so the
@@ -5182,6 +5257,23 @@ def run_job(
             f"{output}\n"
         )
         return True, doc, output, None
+
+    # ---------------------------------------------------------------
+    # Fail-closed guard for legacy / hand-edited agent jobs that have nothing
+    # to run: blank prompt, no script, no skills (a5e29e688dc0). create_job /
+    # update_job now reject this shape, but jobs.json records written before
+    # that guard — or edited by hand since — can still reach here and would
+    # otherwise wake the LLM with an empty instruction on every fire. Pause
+    # the job so it stops being scheduled, and never construct the agent.
+    # ---------------------------------------------------------------
+    from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
+
+    if job_payload_is_empty(job):
+        return _block_and_pause_job(
+            job_id,
+            job_name,
+            EMPTY_PAYLOAD_ERROR,
+        )
 
     # ---------------------------------------------------------------
     # Monitor gate — hash-suppressed change detection (see cron/monitor.py).
@@ -5799,14 +5891,6 @@ def run_job(
                 # below, which already passes its fb_model.
                 "target_model": model,
             }
-            try:
-                import inspect
-                if "target_model" in inspect.signature(resolve_runtime_provider).parameters:
-                    runtime_kwargs["target_model"] = model
-            except (TypeError, ValueError):
-                # Some tests/plugins monkeypatch this resolver with a minimal
-                # callable; keep the cron path backward-compatible.
-                pass
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
@@ -6549,6 +6633,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
+        consecutive_errors = 0
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
@@ -6559,14 +6644,17 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     )
                     return
                 last_confirmed = time.monotonic()
+                consecutive_errors = 0
             except Exception:
+                consecutive_errors += 1
                 logger.debug(
                     "Job '%s': fire_claim heartbeat failed",
                     job_id,
                     exc_info=True,
                 )
                 if (
-                    time.monotonic() - last_confirmed
+                    consecutive_errors >= 2
+                    and time.monotonic() - last_confirmed
                     >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
                 ):
                     lost_ownership.set()

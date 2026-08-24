@@ -754,7 +754,15 @@ display:
       # Or quiet them entirely
       interim_assistant_messages: false
       long_running_notifications: false
+      # Optional deterministic fallback when a tool turn has no commentary
+      start_ack_text: "↳ Принял. Начинаю проверку."
+      start_ack_mode: required
 ```
+
+`start_ack_text` is empty by default. When configured, it is sent once before
+the first tool effect only if the model has not already emitted visible
+commentary. It retains the triggering chat/topic/reply metadata and remains
+separate from busy-steering acknowledgments and long-running heartbeats.
 
 ### Progress bubble cleanup (opt-in)
 

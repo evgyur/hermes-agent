@@ -6,7 +6,11 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+import contextlib
+import logging
 import os
+import sys
+import time
 from typing import Any
 
 from agent.skill_commands import (
@@ -201,6 +205,25 @@ _RESET_END_REASONS = (
 )
 _RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASONS)
 
+# Accidental end reasons that recovery treats as resumable (see
+# docs/session-lifecycle.md "recoverable accidental reasons"). Interpolated
+# into the recovery SQL below AND exposed as SessionDB.RECOVERABLE_END_REASONS
+# so the tuple is the single source of truth — literals cannot drift.
+_RECOVERABLE_END_REASONS = (
+    "agent_close",
+    "ws_orphan_reap",
+    # A stale sentinel-parked runtime quietly superseded by a fresh
+    # session.resume of the same stored session (no reclaimed broadcast);
+    # the stored session stays resumable like any accidental end.
+    "superseded_by_resume",
+    # Startup sweep of rows orphaned by a dead gateway process (#65194):
+    # the in-process ws-orphan grace timer died with the process, so the
+    # row was closed at the next boot instead. Same accident class as
+    # ws_orphan_reap — kept distinct for forensics — and equally resumable.
+    "startup_orphan_reap",
+)
+_RECOVERABLE_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RECOVERABLE_END_REASONS)
+
 
 def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
     """Pre-marker reset-continuation heuristic.
@@ -323,26 +346,14 @@ FTS_STORAGE_VERSION = 1
 MAX_FTS5_QUERY_CHARS = 2_048
 
 
-_FTS_BASE_TRIGGERS = (
+_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
-)
-
-_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
-
-_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
-
-
-def trigram_fts_config_enabled() -> bool:
-    """Return whether the rebuildable trigram derivative should be served."""
-    return os.getenv("HERMES_TRIGRAM_FTS", "1").strip().lower() not in (
-        "0", "false", "off", "no",
-    )
 
 
 SCHEMA_SQL = """
@@ -477,43 +488,9 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
-CREATE TABLE IF NOT EXISTS gateway_message_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lookup_key TEXT UNIQUE,
-    platform TEXT,
-    chat_id TEXT,
-    thread_id TEXT,
-    message_id TEXT,
-    user_id TEXT,
-    session_key TEXT,
-    session_id TEXT,
-    status TEXT NOT NULL DEFAULT 'received',
-    origin_type TEXT NOT NULL DEFAULT 'real_user',
-    received_at REAL NOT NULL,
-    dispatch_started_at REAL,
-    completed_at REAL,
-    drained_at REAL,
-    failed_at REAL,
-    updated_at REAL NOT NULL,
-    reason TEXT,
-    metadata TEXT,
-    snippet TEXT
-);
-
-CREATE TABLE IF NOT EXISTS gateway_steer_receipts (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    receipt_id TEXT NOT NULL UNIQUE,
-    session_key TEXT NOT NULL,
-    session_id TEXT,
-    generation INTEGER NOT NULL,
-    ingress_ledger_id INTEGER,
-    payload_json TEXT NOT NULL,
-    state TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    request_fenced_at REAL,
-    terminal_at REAL,
-    UNIQUE (session_key, generation, ingress_ledger_id)
+CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
+    session_key TEXT PRIMARY KEY,
+    failure_streak INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (
@@ -551,47 +528,12 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
-CREATE TABLE IF NOT EXISTS durable_continuations (
-    continuation_id TEXT PRIMARY KEY,
-    session_key TEXT NOT NULL,
-    session_id TEXT,
-    origin_turn_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    generation INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN (
-        'pending', 'claimed', 'waiting_unknown_effect', 'completed',
-        'cancelled', 'superseded', 'failed_terminal'
-    )),
-    input_digest TEXT NOT NULL,
-    descriptor_json TEXT NOT NULL DEFAULT '{}',
-    claim_token TEXT,
-    claim_owner TEXT,
-    lease_expires_at REAL,
-    effect_fence TEXT,
-    effect_started_at REAL,
-    outcome_digest TEXT,
-    outcome_descriptor_json TEXT,
-    superseded_by_continuation_id TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    completed_at REAL,
-    UNIQUE (session_key, origin_turn_id, kind, generation)
-);
-
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup ON gateway_message_ledger(lookup_key);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session ON gateway_message_ledger(session_key, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_platform ON gateway_message_ledger(platform, chat_id, thread_id, message_id);
-CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status ON gateway_message_ledger(status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_session
-    ON gateway_steer_receipts(session_key, sequence);
-CREATE INDEX IF NOT EXISTS idx_gateway_steer_receipts_state
-    ON gateway_steer_receipts(state, sequence);
 -- Partial index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of
@@ -606,13 +548,6 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_continuations_one_active
-    ON durable_continuations(session_key, kind)
-    WHERE state IN ('pending', 'claimed', 'waiting_unknown_effect');
-CREATE INDEX IF NOT EXISTS idx_durable_continuations_state_lease
-    ON durable_continuations(state, lease_expires_at);
-CREATE INDEX IF NOT EXISTS idx_durable_continuations_session
-    ON durable_continuations(session_key, kind, generation DESC);
 """
 
 
@@ -798,6 +733,14 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # them would preserve an unknown index gap.
 FTS_STALE_KEY = "fts_stale"
 
+# Durable diagnostic for stale FTS recovery blocked across process restarts.
+FTS_REBUILD_DEFERRAL_KEY = "fts_rebuild_deferral"
+
+# Layout breadcrumb written when fail-open safely drops corrupt derived FTS
+# tables on their already-connected SQLite handle.  Reopen must recreate the
+# exact legacy/external shape (and optional trigram table) before clearing it.
+FTS_STALE_LAYOUT_KEY = "fts_stale_layout"
+
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
@@ -863,3 +806,116 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+# ── Cross-process full-FTS-rebuild admission (single authority) ──────────────
+#
+# Several independent Hermes processes routinely share one state.db (gateway
+# service, the Desktop app's `hermes serve` backend, interactive CLI sessions,
+# the TUI slash worker). A full structural FTS rebuild — the FTS5 'rebuild'
+# command or the drop/recreate script in `_recover_stale_fts` — must only ever
+# run in ONE of them at a time: two concurrent rebuilds collide on write and
+# have structurally corrupted state.db in production (PR #93200; the
+# 2026-08-15 / 2026-08-23 incidents and issues #89293 / #90950).
+#
+# This is the single admission authority for every full structural rebuild
+# entry point: `SessionSearchMixin.rebuild_fts()`,
+# `SessionSchemaMixin._rebuild_fts_indexes()` (via `_init_schema`), and
+# `SessionSchemaMixin._recover_stale_fts()`. The chunked deferred backfill
+# (`fts_rebuild_step`) is deliberately NOT routed through it — it claims
+# progress under `_execute_write`'s SQLite transaction authority and is
+# intentionally multi-process.
+#
+# Semantics mirror `hermes_state._cross_process_repair_lock` (the schema-
+# surgery authority): portable (msvcrt on Windows, flock elsewhere), bounded
+# wait, and FAIL CLOSED — a caller that cannot acquire the lock must NOT
+# rebuild. The kernel drops both lock types when the holder dies, so a crashed
+# rebuilder cannot wedge future rebuilds. It lives here (not hermes_state)
+# because the search/schema mixins cannot import hermes_state (cycle).
+#
+# The lock file is `<db>.fts_rebuild.lock`, distinct from `<db>.repair.lock`:
+# schema surgery runs on an EXCLUSIVE offline connection and can legitimately
+# take minutes in VACUUM, while runtime rebuilds run on live connections. The
+# timeout is sized for a full 'rebuild' of both indexes on a large DB.
+
+logger = logging.getLogger("hermes_state")
+
+_FTS_REBUILD_LOCK_TIMEOUT_SECONDS = 120.0
+_FTS_REBUILD_LOCK_POLL_SECONDS = 0.1
+_IS_WINDOWS = sys.platform == "win32"
+
+
+@contextlib.contextmanager
+def fts_rebuild_admission(db_path):
+    """Serialize full structural FTS rebuilds on *db_path* across processes.
+
+    Yields True when this process holds the rebuild authority, False when the
+    bounded acquire timed out. A caller that gets False must NOT perform a
+    full rebuild — proceeding is exactly the concurrent-rebuild interleaving
+    this lock exists to prevent (fail closed). The deferred/stale breadcrumb
+    machinery already guarantees a skipped rebuild is retried later.
+
+    ``db_path`` may be a str or Path; None (in-memory DB / tests without a
+    file path) yields True — a private in-memory DB has no cross-process
+    surface.
+    """
+    if db_path is None:
+        yield True
+        return
+    lock_path = f"{db_path}.fts_rebuild.lock"
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError as exc:
+        # Read-only dir, exhausted fds, exotic filesystem: fall back to the
+        # pre-lock behaviour rather than refusing a rebuild we could run.
+        logger.warning(
+            "Could not open FTS rebuild lock %s (%s) — proceeding with "
+            "in-process serialisation only.", lock_path, exc,
+        )
+        yield True
+        return
+
+    acquired = False
+    try:
+        deadline = time.monotonic() + _FTS_REBUILD_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_FTS_REBUILD_LOCK_POLL_SECONDS)
+        if not acquired:
+            logger.warning(
+                "FTS rebuild lock %s held by another process for more than "
+                "%.0fs — deferring this rebuild to avoid racing the holder "
+                "(the stale-FTS breadcrumb keeps it retryable).",
+                lock_path, _FTS_REBUILD_LOCK_TIMEOUT_SECONDS,
+            )
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best effort release
+            pass
+        finally:
+            handle.close()
