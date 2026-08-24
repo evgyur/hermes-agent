@@ -51,6 +51,7 @@ from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
 )
+from tests.gateway.test_gateway_silence_tokens import _runner as make_agent_runner
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +638,173 @@ async def test_drain_timeout_marks_resume_pending():
 
 
 @pytest.mark.asyncio
+async def test_startup_scheduler_is_admission_only_and_never_reads_transcript(
+    monkeypatch,
+):
+    """The scheduler may claim a route, but cannot mint replay capability."""
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(message_id="restart-message-1")
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-admission-only",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-admission-only",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._startup_resume_history_rows = MagicMock(
+        side_effect=AssertionError("scheduler read transcript")
+    )
+    runner._analyze_startup_resume_rows = MagicMock(
+        side_effect=AssertionError("scheduler analyzed transcript")
+    )
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+    runner._startup_resume_history_rows.assert_not_called()
+    runner._analyze_startup_resume_rows.assert_not_called()
+    event = runner._run_startup_resume_event.await_args.args[1]
+    assert event.metadata["startup_safe_dangling_calls"] == []
+    assert event.metadata["startup_resume_effect_fence"] == {}
+
+
+def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
+    runner = make_agent_runner(monkeypatch, tmp_path)
+    source = replace(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            user_id="12345",
+        ),
+        message_id="msg-42",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:group:-1001:12345",
+            session_id="sess-startup-lease",
+            created_at=datetime.now(),
+            updated_at=datetime.now() + timedelta(microseconds=1),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-startup-lease",
+        )
+    )
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.load_transcript.return_value = history
+    event = runner._build_startup_resume_event(entry, source)
+    return runner, event, source, entry
+
+
+@pytest.mark.asyncio
+async def test_leased_startup_handler_analyzes_once_and_passes_exact_fence(
+    monkeypatch,
+    tmp_path,
+):
+    """Only the post-lease snapshot can authorize startup replay effects."""
+    history = [
+        {
+            "role": "user",
+            "content": "finish this",
+            "platform_message_id": "msg-42",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"echo done"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "done",
+            "effect_disposition": "completed",
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+    analyzer = MagicMock(wraps=runner._analyze_startup_resume_rows)
+    runner._analyze_startup_resume_rows = analyzer
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "done",
+            "messages": history + [{"role": "assistant", "content": "done"}],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+        }
+    )
+
+    await runner._handle_message_with_agent(event, source, entry.session_key, 1)
+
+    analyzer.assert_called_once_with(history, source_message_id="msg-42")
+    fence = runner._run_agent.await_args.kwargs["startup_resume_effect_fence"]
+    assert fence == {
+        ("terminal", '{"command":"echo done"}'): "completed_effect_receipt"
+    }
+    assert event.metadata["startup_resume_effect_fence"] == fence
+
+
+@pytest.mark.asyncio
+async def test_leased_startup_handler_rejects_later_human_before_agent(
+    monkeypatch,
+    tmp_path,
+):
+    """A human message appended before lease acquisition owns the route."""
+    history = [
+        {
+            "role": "user",
+            "content": "old task",
+            "platform_message_id": "msg-42",
+        },
+        {
+            "role": "user",
+            "content": "new task",
+            "platform_message_id": "msg-43",
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+    analyzer = MagicMock(wraps=runner._analyze_startup_resume_rows)
+    runner._analyze_startup_resume_rows = analyzer
+    runner._run_agent = AsyncMock()
+
+    await runner._handle_message_with_agent(event, source, entry.session_key, 1)
+
+    analyzer.assert_called_once_with(history, source_message_id="msg-42")
+    runner._run_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_skips_unauthorized_owner():
     """A resume-pending session whose owner is no longer authorized under the
     current allowlist must not receive a synthesized agent turn on restart.
@@ -866,7 +1034,8 @@ async def test_startup_auto_resume_uses_snapshot_transport_adapter(monkeypatch):
         platform=Platform.TELEGRAM,
         chat_id="recipient-B",
         chat_type="dm",
-        user_id="owner-B",
+        user_id="recipient-B",
+        message_id="restart-message-1",
         transport_profile="transport-B",
     )
     entry = bind_restart_origin_snapshot(SessionEntry(
@@ -930,7 +1099,10 @@ async def test_multiplex_default_profile_origin_still_auto_resumes(monkeypatch):
     monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
     runner, _adapter = make_restart_runner()
     runner.config.multiplex_profiles = True
-    source = make_restart_source(chat_id="recipient-default")
+    source = make_restart_source(
+        chat_id="recipient-default",
+        message_id="restart-message-1",
+    )
     entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:recipient-default",
         session_id="sid-default-profile",
@@ -959,7 +1131,10 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     runner._startup_restore_queue = []
     runner._startup_restore_tasks = []
 
-    source = make_restart_source(chat_id="restore-chat")
+    source = make_restart_source(
+        chat_id="restore-chat",
+        message_id="restart-message-1",
+    )
     pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:restore-chat",
         session_id="sid",
@@ -1120,7 +1295,10 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
     occupied.
     """
     runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="race-chat")
+    source = make_restart_source(
+        chat_id="race-chat",
+        message_id="restart-message-1",
+    )
     pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:race-chat",
         session_id="sid",
@@ -1189,7 +1367,10 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     the fix targets).
     """
     runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="full-path-chat")
+    source = make_restart_source(
+        chat_id="full-path-chat",
+        message_id="restart-message-1",
+    )
     session_key = runner._session_key_for_source(source)
     pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key=session_key,

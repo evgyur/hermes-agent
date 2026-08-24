@@ -2036,24 +2036,33 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(
+                messages,
+                conversation_history,
+            )
+            if (
+                self._session_db is not None
+                and not getattr(self, "_persist_disabled", False)
+                and persisted is not True
+            ):
+                raise RuntimeError("session transcript persistence failed")
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2386,6 +2395,7 @@ class AIAgent:
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    "platform_message_id": msg.get("platform_message_id"),
                     # Standalone reference handoffs are always hidden, even
                     # when the summarized transcript contained a user turn —
                     # otherwise they occupy the active user slot in
@@ -8694,6 +8704,8 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
+        after_user_row_commit: Optional[callable] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -9068,6 +9080,8 @@ class AIAgent:
                         stream_callback,
                         persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
+                        persist_user_message_id=persist_user_message_id,
+                        after_user_row_commit=after_user_row_commit,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,

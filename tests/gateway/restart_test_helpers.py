@@ -18,6 +18,9 @@ from gateway.session import (
 )
 
 
+RESTART_MESSAGE_ID = "restart-message-1"
+
+
 class RestartTestAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
@@ -46,6 +49,7 @@ def make_restart_source(
     chat_id: str = "123456",
     chat_type: str = "dm",
     thread_id: str | None = None,
+    message_id: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -53,6 +57,7 @@ def make_restart_source(
         chat_type=chat_type,
         user_id=chat_id,
         thread_id=thread_id,
+        message_id=message_id,
     )
 
 
@@ -187,7 +192,11 @@ def make_restart_runner(
     # risk-specific tests replace this with tool-call rows.
     runner._session_db = MagicMock()
     runner._session_db.get_messages.return_value = [
-        {"role": "user", "content": "pending request"}
+        {
+            "role": "user",
+            "content": "pending request",
+            "platform_message_id": RESTART_MESSAGE_ID,
+        }
     ]
     runner.delivery_router = MagicMock()
 

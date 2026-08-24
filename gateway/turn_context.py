@@ -92,6 +92,13 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    # Exact external message id stamped on the current durable user row. A
+    # startup recovery note intentionally leaves this unset because the
+    # original triggering row already owns the platform identity.
+    persist_user_message_id: Optional[str] = None
+    # One-shot sync bridge invoked only after that user dict is durably marked.
+    # It commits the active-turn origin snapshot on the gateway event loop.
+    after_user_row_commit: Optional[Callable[[], bool]] = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications
@@ -101,6 +108,7 @@ class TurnContext:
     # survive the async-to-executor seam; inferring it from blank text would
     # let ordinary empty messages acquire continuation authority.
     startup_resume: bool = False
+    startup_resume_effect_fence: dict = field(default_factory=dict)
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

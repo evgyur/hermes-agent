@@ -29,7 +29,7 @@ def _runner(*, primary=None, profile_adapters=None):
     return runner
 
 
-def _row(*, route_envelope, chat_id: str = "268754981") -> dict:
+def _row(*, route_envelope, chat_id: str = "700000321") -> dict:
     runtime_profile = (
         str(route_envelope.get("runtime_profile") or "runtime-a")
         if isinstance(route_envelope, dict)
@@ -38,9 +38,9 @@ def _row(*, route_envelope, chat_id: str = "268754981") -> dict:
     route = route_envelope if isinstance(route_envelope, dict) else {}
     source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id=str(route.get("chat_id") or "268754981"),
+        chat_id=str(route.get("chat_id") or "700000321"),
         chat_type="dm",
-        user_id=str(route.get("user_id") or "617744661"),
+        user_id=str(route.get("user_id") or "700000111"),
         thread_id=route.get("thread_id"),
         profile=runtime_profile,
         transport_profile=str(route.get("transport_profile") or "transport-b"),
@@ -66,9 +66,9 @@ def _business_route(**updates) -> dict:
         "platform": "telegram",
         "runtime_profile": "runtime-a",
         "transport_profile": "transport-b",
-        "chat_id": "268754981",
+        "chat_id": "700000321",
         "thread_id": "77",
-        "user_id": "617744661",
+        "user_id": "700000111",
         "business_connection_id": "conn-42",
         "external_safe_mode": True,
     }
@@ -94,7 +94,7 @@ async def test_business_replay_uses_exact_transport_and_full_route_metadata():
     primary.send.assert_not_awaited()
     exact.send.assert_awaited_once()
     sent = exact.send.await_args.kwargs
-    assert sent["chat_id"] == "268754981"
+    assert sent["chat_id"] == "700000321"
     assert sent["content"] == "private final"
     assert sent["metadata"]["thread_id"] == "77"
     assert sent["metadata"]["business_connection_id"] == "conn-42"
@@ -138,9 +138,9 @@ async def test_default_transport_replay_uses_only_the_default_adapter():
             "platform": "telegram",
             "runtime_profile": "runtime-a",
             # No transport_profile: replay must not guess the default bot.
-            "chat_id": "268754981",
+            "chat_id": "700000321",
             "thread_id": "77",
-            "user_id": "617744661",
+            "user_id": "700000111",
             "business_connection_id": "conn-42",
             "external_safe_mode": True,
         },
