@@ -20,6 +20,7 @@ from hermes_state_common import (
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
     FTS_STALE_KEY,
+    FTS_STALE_LAYOUT_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -437,7 +438,6 @@ class SessionSchemaMixin:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (FTS_REBUILD_DEFERRAL_KEY, json.dumps(diagnostic, sort_keys=True)),
             )
-
             escalated = (
                 attempts >= _FTS_HOLDER_ESCALATE_ATTEMPTS
                 and now - first_seen >= _FTS_HOLDER_ESCALATE_SECONDS
@@ -492,21 +492,41 @@ class SessionSchemaMixin:
         self, cursor: sqlite3.Cursor, *, legacy: bool
     ) -> bool:
         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority."""
-        try:
-            trigram_status = self._fts_table_probe(cursor, "messages_fts_trigram")
-        except sqlite3.DatabaseError:
-            # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
-            # to be included in the drop-and-recreate recovery below.
-            trigram_status = True
-        include_trigram = trigram_status is True
+        layout_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (FTS_STALE_LAYOUT_KEY,),
+        ).fetchone()
+        quarantined = False
+        if layout_row is not None:
+            try:
+                layout = json.loads(layout_row[0])
+                if layout.get("version") != 1 or not layout.get("quarantined"):
+                    raise ValueError("unsupported stale FTS layout marker")
+                legacy = bool(layout["legacy"])
+                include_trigram = bool(layout["trigram"])
+                quarantined = True
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.error("Invalid stale FTS layout marker: %s", exc)
+                return False
+        else:
+            try:
+                trigram_status = self._fts_table_probe(
+                    cursor, "messages_fts_trigram"
+                )
+            except sqlite3.DatabaseError:
+                # A corrupt vtable may fail even a LIMIT 0 probe. It still
+                # needs to be included in the drop-and-recreate recovery.
+                trigram_status = True
+            include_trigram = trigram_status is True
 
         drop_sql = "".join(
             f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS
         )
-        if include_trigram:
-            drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
-        drop_sql += "DROP VIEW IF EXISTS messages_fts_trigram_src;"
-        drop_sql += "DROP TABLE IF EXISTS messages_fts;"
+        if not quarantined:
+            if include_trigram:
+                drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
+            drop_sql += "DROP VIEW IF EXISTS messages_fts_trigram_src;"
+            drop_sql += "DROP TABLE IF EXISTS messages_fts;"
 
         if legacy:
             schema_sql = LEGACY_FTS_SQL
@@ -554,7 +574,8 @@ class SessionSchemaMixin:
             + drop_sql
             + rebuild_sql
             + "DELETE FROM state_meta WHERE key IN "
-            + f"('{FTS_STALE_KEY}', '{FTS_REBUILD_DEFERRAL_KEY}');"
+            + f"('{FTS_STALE_KEY}', '{FTS_STALE_LAYOUT_KEY}', "
+            + f"'{FTS_REBUILD_DEFERRAL_KEY}');"
             + "COMMIT;"
         )
         try:
