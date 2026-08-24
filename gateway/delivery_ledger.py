@@ -497,7 +497,8 @@ def sweep_failed_for_runtime(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid, owner_started_at,
                       resume_task_id, continuation_generation,
-                      continuation_claim_owner, continuation_claim_token
+                      continuation_claim_owner, continuation_claim_token,
+                      route_envelope_json
                FROM delivery_obligations
                WHERE state='failed' AND platform=?
                ORDER BY created_at, obligation_id""",
@@ -507,7 +508,7 @@ def sweep_failed_for_runtime(
             (oid, session_key, platform_name, chat_id, thread_id, content,
              attempts, created_at, owner_pid, owner_started_at, resume_task_id,
              continuation_generation, continuation_owner,
-             continuation_token) = row
+             continuation_token, route_envelope_json) = row
             exact_current_owner = int(owner_pid or 0) == int(pid) and (
                 owner_started_at is None
                 or started is None
@@ -534,6 +535,15 @@ def sweep_failed_for_runtime(
                 (pid, started, claim_token, now, oid, owner_pid, owner_started_at),
             ).rowcount
             if changed:
+                route_envelope = None
+                if route_envelope_json:
+                    try:
+                        decoded = json.loads(route_envelope_json)
+                        route_envelope = (
+                            decoded if isinstance(decoded, dict) else None
+                        )
+                    except Exception:
+                        route_envelope = None
                 claimed.append({
                     "obligation_id": oid,
                     "session_key": session_key,
@@ -548,6 +558,7 @@ def sweep_failed_for_runtime(
                     "continuation_generation": int(continuation_generation or 0),
                     "continuation_claim_owner": str(continuation_owner or ""),
                     "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
 

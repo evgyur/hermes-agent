@@ -428,8 +428,8 @@ class TestOwnerAlivePidProbe:
 
 
 def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
-    dl.record_obligation(
-        obligation_id="runtime-claim",
+    _record(
+        "runtime-claim",
         session_key="agent:main:telegram:dm:C1",
         platform="telegram",
         chat_id="C1",
@@ -445,6 +445,7 @@ def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
     assert len(rows) == 1
     assert rows[0]["continuation_generation"] == 3
     assert rows[0]["continuation_claim_token"] == "continuation-token"
+    assert rows[0]["route_envelope"]["transport_profile"] == "default"
     assert dl.sweep_failed_for_runtime("telegram") == []
     assert dl.settle_runtime_claim(
         "runtime-claim", rows[0]["runtime_claim_token"], delivered=True
@@ -466,6 +467,7 @@ async def test_gateway_reconnect_sends_stored_final_without_model_replay():
     )
     dl.mark_failed("runtime-send", "offline")
     adapter = MagicMock()
+    adapter._owner_profile = "default"
     adapter.send = AsyncMock(
         return_value=MagicMock(success=True, message_id="m1", error="")
     )
@@ -481,6 +483,221 @@ async def test_gateway_reconnect_sends_stored_final_without_model_replay():
     ) == 1
     assert adapter.send.await_args.kwargs["content"].endswith("stored final")
     runner._async_session_store.clear_resume_pending_exact.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_preserves_exact_business_route_envelope():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "hermesdev",
+        "transport_profile": "hermesdev",
+        "chat_id": "268754981",
+        "thread_id": "1858",
+        "user_id": "711111111",
+        "business_connection_id": "biz-42",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-business",
+        session_key="agent:hermesdev:telegram:business:biz-42:268754981:711111111:external",
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=route["thread_id"],
+        route_envelope=route,
+        content="stored business final",
+    )
+    dl.mark_failed("runtime-business", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "hermesdev"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m2", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "hermesdev": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter, runtime_profile="hermesdev"
+    ) == 1
+    kwargs = adapter.send.await_args.kwargs
+    assert kwargs["chat_id"] == route["chat_id"]
+    assert kwargs["metadata"]["business_connection_id"] == "biz-42"
+    assert kwargs["metadata"]["profile"] == "hermesdev"
+    assert kwargs["metadata"]["transport_profile"] == "hermesdev"
+    assert kwargs["metadata"]["external_safe_mode"] is True
+    assert kwargs["metadata"]["route_envelope"] == route
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_allows_distinct_runtime_and_transport_profiles():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": None,
+        "user_id": "617744661",
+        "business_connection_id": "biz-distinct",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-distinct-transport",
+        session_key=(
+            "agent:runtime-a:telegram:business:biz-distinct:"
+            "777000123:617744661:external"
+        ),
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=None,
+        route_envelope=route,
+        content="exact distinct route",
+    )
+    dl.mark_failed("runtime-distinct-transport", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m3", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 1
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["profile"] == "runtime-a"
+    assert metadata["transport_profile"] == "transport-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["chat", "thread", "user", "business"])
+async def test_gateway_reconnect_quarantines_tampered_exact_session_route(tamper):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": "1858",
+        "user_id": "617744661",
+        "business_connection_id": "biz-exact",
+        "external_safe_mode": True,
+    }
+    session_key = (
+        "agent:runtime-a:telegram:business:biz-exact:"
+        "777000123:617744661:external"
+    )
+    row_chat = route["chat_id"]
+    row_thread = route["thread_id"]
+    if tamper == "chat":
+        row_chat = "777000999"
+    elif tamper == "thread":
+        row_thread = "9999"
+    elif tamper == "user":
+        session_key = session_key.replace("617744661", "617744999")
+    elif tamper == "business":
+        session_key = session_key.replace("biz-exact", "biz-other")
+
+    oid = f"runtime-tampered-{tamper}"
+    _record(
+        oid,
+        session_key=session_key,
+        platform="telegram",
+        chat_id=row_chat,
+        thread_id=row_thread,
+        route_envelope=route,
+        content="must not send",
+    )
+    dl.mark_failed(oid, "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 0
+    adapter.send.assert_not_awaited()
+    assert _row(oid)["state"] == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing-envelope", "cross-profile"])
+async def test_gateway_reconnect_quarantines_ambiguous_telegram_route(case):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = None
+    session_key = "agent:main:telegram:dm:C1"
+    if case == "cross-profile":
+        route = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "hermesdev",
+            "transport_profile": "hermesdev",
+            "chat_id": "C1",
+            "thread_id": None,
+            "user_id": "U1",
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
+        session_key = "agent:hermesdev:telegram:dm:C1"
+    dl.record_obligation(
+        obligation_id=f"runtime-{case}",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="must not send",
+        route_envelope=route,
+    )
+    dl.mark_failed(f"runtime-{case}", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter
+    ) == 0
+    adapter.send.assert_not_awaited()
+    assert _row(f"runtime-{case}")["state"] == "abandoned"
 
 
 @pytest.mark.asyncio

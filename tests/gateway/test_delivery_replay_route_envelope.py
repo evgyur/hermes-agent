@@ -7,6 +7,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource, build_session_key
 
 
 def _adapter(*, owner_profile: str | None):
@@ -29,9 +30,26 @@ def _runner(*, primary=None, profile_adapters=None):
 
 
 def _row(*, route_envelope, chat_id: str = "268754981") -> dict:
+    runtime_profile = (
+        str(route_envelope.get("runtime_profile") or "runtime-a")
+        if isinstance(route_envelope, dict)
+        else "runtime-a"
+    )
+    route = route_envelope if isinstance(route_envelope, dict) else {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=str(route.get("chat_id") or "268754981"),
+        chat_type="dm",
+        user_id=str(route.get("user_id") or "617744661"),
+        thread_id=route.get("thread_id"),
+        profile=runtime_profile,
+        transport_profile=str(route.get("transport_profile") or "transport-b"),
+        business_connection_id=route.get("business_connection_id"),
+        external_safe_mode=bool(route.get("external_safe_mode")),
+    )
     return {
         "obligation_id": "business-replay",
-        "session_key": "agent:runtime-a:telegram:business:conn-42:268754981:617744661:external",
+        "session_key": build_session_key(source),
         "platform": "telegram",
         "chat_id": chat_id,
         "thread_id": "77",

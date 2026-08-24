@@ -4152,6 +4152,19 @@ class GatewaySlashCommandsMixin:
         if not gate_enabled:
             return t("gateway.verbose.not_enabled")
 
+        # ``/verbose`` persists a platform-wide setting.  A Telegram group,
+        # channel, topic, or Business-customer route must never be able to
+        # change what every other Telegram conversation sees.  Keep the
+        # existing command for the bot owner's ordinary private chat only.
+        source = event.source
+        if source.platform == Platform.TELEGRAM and (
+            source.chat_type != "dm"
+            or bool(source.business_connection_id)
+            or not source.user_id
+            or str(source.user_id) != str(source.chat_id)
+        ):
+            return "Tool progress can only be changed from the bot owner's plain Telegram DM."
+
         # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {

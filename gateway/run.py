@@ -1519,6 +1519,7 @@ def _prepare_resume_pending_message(
     message: Optional[str],
     *,
     interactive: bool = True,
+    startup_resume: bool = False,
 ) -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
@@ -1532,7 +1533,10 @@ def _prepare_resume_pending_message(
     non-empty row never trips the sanitizer.
     """
     recovery_message = build_resume_recovery_note(
-        reason, message or "", interactive=interactive,
+        reason,
+        message or "",
+        interactive=interactive,
+        startup_resume=startup_resume,
     )
     persist_message = (
         message if isinstance(message, str) and message.strip() else recovery_message
@@ -6864,7 +6868,10 @@ class TurnRunner:
                 getattr(_resume_adapter, "interactive_resume", True)
             )
             ctx.message, _persist_user_message_override = _prepare_resume_pending_message(
-                _reason, ctx.message, interactive=_interactive_resume,
+                _reason,
+                ctx.message,
+                interactive=_interactive_resume,
+                startup_resume=ctx.startup_resume,
             )
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
@@ -6912,6 +6919,7 @@ class TurnRunner:
                 interactive=bool(
                     getattr(_sn_adapter, "interactive_resume", True)
                 ),
+                startup_resume=ctx.startup_resume,
             )
 
         _approval_session_key = ctx.session_key or ""
@@ -12939,7 +12947,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return claimed_all
 
     @staticmethod
-    def _telegram_replay_source(row: Dict[str, Any]) -> SessionSource:
+    def _telegram_replay_source(
+        row: Dict[str, Any],
+        *,
+        expected_runtime_profile: Optional[str] = None,
+    ) -> SessionSource:
         """Rebuild one exact Telegram route or reject it as ambiguous."""
         from gateway.telegram_egress_policy import (
             canonical_route_envelope,
@@ -12972,6 +12984,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("ambiguous_route_envelope")
 
         route = canonical_route_envelope(raw_route)
+        expected_profile = str(expected_runtime_profile or "").strip()
+        if expected_profile and route["runtime_profile"] != expected_profile:
+            raise ValueError("ambiguous_route_envelope")
         expected_thread = (
             str(row["thread_id"]) if row.get("thread_id") is not None else None
         )
@@ -12982,7 +12997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             raise ValueError("ambiguous_route_envelope")
 
-        return SessionSource(
+        source = SessionSource(
             platform=Platform.TELEGRAM,
             chat_id=route["chat_id"],
             chat_type=(
@@ -12995,6 +13010,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             business_connection_id=route["business_connection_id"],
             external_safe_mode=route["external_safe_mode"],
         )
+        session_key = str(row.get("session_key") or "")
+        if not session_key or build_session_key(source) != session_key:
+            raise ValueError("ambiguous_route_envelope")
+        return source
 
     def _adapter_for_delivery_replay(self, source: SessionSource):
         """Resolve the adapter named by durable transport provenance."""
@@ -13063,7 +13082,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ).get(ledger_profile, {})
             if platform == Platform.TELEGRAM:
                 try:
-                    source = self._telegram_replay_source(row)
+                    source = self._telegram_replay_source(
+                        row,
+                        expected_runtime_profile=ledger_profile or None,
+                    )
                 except Exception:
                     logger.warning(
                         "obligation %s: quarantined ambiguous Telegram route",
@@ -15678,12 +15700,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
         *,
         adapter=None,
+        runtime_profile: Optional[str] = None,
     ) -> int:
         """Redeliver already-generated finals after a live adapter reconnect."""
         from types import SimpleNamespace
 
         from gateway.delivery_ledger import (
             RECOVERED_MARKER,
+            mark_abandoned,
             settle_runtime_claim,
             settle_with_retry,
             sweep_failed_for_runtime,
@@ -15702,14 +15726,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if row.get("needs_marker")
                 else str(row.get("content") or "")
             )
-            metadata = (
-                {"thread_id": str(row["thread_id"])}
-                if row.get("thread_id")
-                else None
-            )
+            send_chat_id = str(row.get("chat_id") or "")
+            metadata = None
+            if platform == Platform.TELEGRAM:
+                try:
+                    source = self._telegram_replay_source(
+                        row,
+                        expected_runtime_profile=(
+                            str(runtime_profile).strip()
+                            if runtime_profile is not None
+                            else None
+                        ),
+                    )
+                    if self._adapter_for_delivery_replay(source) is not target_adapter:
+                        raise ValueError("delivery_route_unavailable")
+                    from gateway.platforms.base import (
+                        _thread_metadata_for_source as _route_metadata_for_source,
+                    )
+
+                    send_chat_id = str(source.chat_id)
+                    metadata = _route_metadata_for_source(source)
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        mark_abandoned,
+                        str(row["obligation_id"]),
+                        str(exc) or "ambiguous_route_envelope",
+                    )
+                    continue
+            elif row.get("thread_id"):
+                metadata = {"thread_id": str(row["thread_id"])}
             try:
                 result = await target_adapter.send(
-                    chat_id=str(row.get("chat_id") or ""),
+                    chat_id=send_chat_id,
                     content=content,
                     metadata=metadata,
                 )
@@ -15887,7 +15935,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
                         await self._redeliver_failed_obligations_for_platform(
-                            platform, adapter=adapter
+                            platform,
+                            adapter=adapter,
+                            runtime_profile="default",
                         )
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
@@ -17119,7 +17169,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             self._sync_voice_mode_state_to_adapter(adapter)
                             with _profile_runtime_scope(profile_home):
                                 await self._redeliver_failed_obligations_for_platform(
-                                    platform, adapter=adapter
+                                    platform,
+                                    adapter=adapter,
+                                    runtime_profile=profile_name,
                                 )
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
@@ -24446,7 +24498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [(Path(p).resolve().as_uri(), "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -30884,6 +30936,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        from gateway.config import Platform
+        # Telegram Business is an external-customer lane.  Platform-wide
+        # owner-facing verbosity must not leak tool names/arguments into it,
+        # even when the Telegram default is explicitly set to verbose.
+        if (
+            source.platform == Platform.TELEGRAM
+            and source.business_connection_id
+        ):
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -30929,7 +30990,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
-        from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
@@ -31103,6 +31163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            startup_resume=startup_resume,
         )
         if trusted_restart_wake is not None:
             setattr(turn_ctx, "_trusted_restart_wake", trusted_restart_wake)

@@ -326,6 +326,19 @@ class TestResumePendingSystemNote:
         assert persisted == message
         assert persisted != ""
 
+    def test_interactive_startup_resume_continues_instead_of_asking(self):
+        message, persisted = _prepare_resume_pending_message(
+            "restart_timeout",
+            "",
+            interactive=True,
+            startup_resume=True,
+        )
+
+        assert "synthetic startup continuation" in message
+        assert "ask what they would like to do next" not in message
+        assert "skip any unfinished work" not in message
+        assert persisted == message
+
     def test_whitespace_only_message_also_persists_the_note(self):
         """A whitespace-only startup event is as blank as an empty one —
         persisting it verbatim would recreate the sanitizer loop (#86580)."""
