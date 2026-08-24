@@ -206,8 +206,9 @@ async def test_plain_bot_dm_to_non_allowlisted_customer_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_chat_id", [VLAD_ID, f"+{VLAD_ID}", f"0{VLAD_ID}"])
 async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, blocked_chat_id
 ) -> None:
     from gateway.telegram_egress_policy import (
         TelegramEgressDenied,
@@ -246,7 +247,7 @@ async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
     inner = _InnerRequest()
     guarded = guard_telegram_request(inner)
     request_data = SimpleNamespace(
-        parameters=[SimpleNamespace(name="chat_id", value=VLAD_ID)]
+        parameters=[SimpleNamespace(name="chat_id", value=blocked_chat_id)]
     )
     with pytest.raises(TelegramEgressDenied, match="telegram_recipient_denied"):
         await guarded.post(
