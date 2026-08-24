@@ -10,6 +10,8 @@ from gateway.session import SessionSource
 
 def _make_adapter(
     require_mention=None,
+    require_mention_chats=None,
+    require_mention_topics=None,
     free_response_chats=None,
     free_response_topics=None,
     mention_patterns=None,
@@ -29,6 +31,14 @@ def _make_adapter(
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
+    if require_mention_chats is not None:
+        extra["require_mention_chats"] = require_mention_chats
+    else:
+        extra["require_mention_chats"] = []
+    if require_mention_topics is not None:
+        extra["require_mention_topics"] = require_mention_topics
+    else:
+        extra["require_mention_topics"] = []
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
@@ -332,6 +342,44 @@ def test_group_messages_can_require_direct_trigger_via_config():
     # And commands still pass unconditionally when require_mention is disabled
     adapter_no_mention = _make_adapter(require_mention=False)
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
+
+
+def test_scoped_mention_gates_normalize_config_and_cover_observe_path():
+    adapter = _make_adapter(
+        require_mention=False,
+        require_mention_chats=" -200, -201 ",
+        require_mention_topics="-202:31, -202:32",
+        allowed_chats=["-200", "-201", "-202"],
+        group_allowed_chats=["-200", "-201", "-202"],
+        observe_unmentioned_group_messages=True,
+    )
+
+    chat_gated = _group_message("ordinary", chat_id=-200)
+    topic_gated = _group_message("ordinary", chat_id=-202, thread_id=31)
+    topic_open = _group_message("ordinary", chat_id=-202, thread_id=33)
+
+    assert adapter._should_process_message(chat_gated) is False
+    assert adapter._should_observe_unmentioned_group_message(chat_gated) is True
+    assert adapter._should_process_message(topic_gated) is False
+    assert adapter._should_observe_unmentioned_group_message(topic_gated) is True
+    assert adapter._should_process_message(topic_open) is True
+    assert adapter._should_observe_unmentioned_group_message(topic_open) is False
+
+
+def test_scoped_mention_gates_fall_back_to_profile_scoped_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION_CHATS", "-300, -301")
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION_TOPICS", "-302:41")
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra.pop("require_mention_chats")
+    adapter.config.extra.pop("require_mention_topics")
+
+    assert adapter._should_process_message(_group_message("ordinary", chat_id=-300)) is False
+    assert adapter._should_process_message(
+        _group_message("ordinary", chat_id=-302, thread_id=41)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("ordinary", chat_id=-302, thread_id=42)
+    ) is True
 
 
 def test_explicit_multi_bot_mentions_route_only_to_named_bots():
