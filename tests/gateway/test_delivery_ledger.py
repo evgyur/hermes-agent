@@ -761,8 +761,8 @@ class TestOwnerAlivePidProbe:
 
 
 def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
-    dl.record_obligation(
-        obligation_id="runtime-claim",
+    _record(
+        "runtime-claim",
         session_key="agent:main:telegram:dm:C1",
         platform="telegram",
         chat_id="C1",
@@ -799,6 +799,7 @@ async def test_gateway_reconnect_sends_stored_final_without_model_replay():
     )
     dl.mark_failed("runtime-send", "send_path_degraded")
     adapter = MagicMock()
+    adapter._owner_profile = None
     adapter.send = AsyncMock(
         return_value=MagicMock(success=True, message_id="m1", error="")
     )

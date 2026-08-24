@@ -415,6 +415,39 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         )
 
 
+def _route_envelope_for_replay(
+    platform: str,
+    chat_id: Any,
+    thread_id: Any,
+    route_envelope_json: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Decode and validate durable recipient provenance before replay."""
+    if platform == "telegram":
+        if not route_envelope_json:
+            raise ValueError("ambiguous_route_envelope")
+        from gateway.telegram_egress_policy import (
+            assert_recipient_allowed,
+            canonical_route_envelope,
+        )
+
+        route_envelope = canonical_route_envelope(
+            json.loads(route_envelope_json)
+        )
+        if (
+            route_envelope["chat_id"] != str(chat_id)
+            or route_envelope["platform"] != str(platform)
+            or route_envelope["thread_id"]
+            != (str(thread_id) if thread_id is not None else None)
+        ):
+            raise ValueError("ambiguous_route_envelope")
+        assert_recipient_allowed(chat_id)
+        return route_envelope
+    if not route_envelope_json:
+        return None
+    decoded = json.loads(route_envelope_json)
+    return decoded if isinstance(decoded, dict) else None
+
+
 def sweep_recoverable(
     now: Optional[float] = None,
     *,
@@ -482,27 +515,12 @@ def sweep_recoverable(
             ):
                 continue
             route_envelope = None
-            if platform == "telegram":
-                try:
-                    if not route_envelope_json:
-                        raise ValueError("ambiguous_route_envelope")
-                    from gateway.telegram_egress_policy import (
-                        assert_recipient_allowed,
-                        canonical_route_envelope,
-                    )
-
-                    route_envelope = canonical_route_envelope(
-                        json.loads(route_envelope_json)
-                    )
-                    if (
-                        route_envelope["chat_id"] != str(chat_id)
-                        or route_envelope["platform"] != str(platform)
-                        or route_envelope["thread_id"]
-                        != (str(thread_id) if thread_id is not None else None)
-                    ):
-                        raise ValueError("ambiguous_route_envelope")
-                    assert_recipient_allowed(chat_id)
-                except Exception as exc:
+            try:
+                route_envelope = _route_envelope_for_replay(
+                    platform, chat_id, thread_id, route_envelope_json
+                )
+            except Exception as exc:
+                if platform == "telegram":
                     error = str(exc) or "ambiguous_route_envelope"
                     if "denied" not in error:
                         error = "ambiguous_route_envelope"
@@ -513,12 +531,7 @@ def sweep_recoverable(
                         (now, error, oid),
                     )
                     continue
-            elif route_envelope_json:
-                try:
-                    decoded = json.loads(route_envelope_json)
-                    route_envelope = decoded if isinstance(decoded, dict) else None
-                except (TypeError, ValueError):
-                    route_envelope = None
+                route_envelope = None
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
@@ -589,7 +602,8 @@ def sweep_failed_for_runtime(
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile,
                       resume_task_id, continuation_generation,
-                      continuation_claim_owner, continuation_claim_token
+                      continuation_claim_owner, continuation_claim_token,
+                      route_envelope_json
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""",
             (platform,),
@@ -611,6 +625,7 @@ def sweep_failed_for_runtime(
             continuation_generation,
             continuation_owner,
             continuation_token,
+            route_envelope_json,
         ) in rows:
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
@@ -631,6 +646,22 @@ def sweep_failed_for_runtime(
                        WHERE obligation_id=? AND state='failed'
                          AND owner_pid IS ? AND owner_started_at IS ?""",
                     (now, *owner_guard),
+                )
+                continue
+            try:
+                route_envelope = _route_envelope_for_replay(
+                    row_platform, chat_id, thread_id, route_envelope_json
+                )
+            except Exception as exc:
+                error = str(exc) or "ambiguous_route_envelope"
+                if "denied" not in error:
+                    error = "ambiguous_route_envelope"
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?, last_error=?
+                       WHERE obligation_id=? AND state='failed'
+                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                    (now, error, oid, owner_pid, owner_started_at),
                 )
                 continue
             claim_token = uuid.uuid4().hex
@@ -660,6 +691,7 @@ def sweep_failed_for_runtime(
                     "continuation_generation": int(continuation_generation or 0),
                     "continuation_claim_owner": str(continuation_owner or ""),
                     "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
 
