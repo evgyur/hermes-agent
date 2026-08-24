@@ -5926,6 +5926,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # vendor-namespaced keys (`com.example.mcp/...`) pass through —
             # their semantics belong to the server.
             structured = mcp_field(result, "structured_content", "structuredContent")
+            # FastMCP mirrors scalar return values as both model-facing text
+            # and ``structuredContent={"result": <same scalar>}``. Keep the
+            # text once instead of expanding a one-byte answer into a nested
+            # envelope that is harder for models to consume.
+            if (
+                text_result
+                and isinstance(structured, dict)
+                and set(structured) == {"result"}
+                and str(structured["result"]) == text_result
+            ):
+                structured = None
             # Cap structuredContent too — a malicious server could flood
             # context via a multi-MB JSON payload (#56059). When the
             # serialized form exceeds the hard cap, replace it with the

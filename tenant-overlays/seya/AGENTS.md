@@ -24,8 +24,10 @@ source.
 
 Workshop metadata fast path:
 
-- For a lesson-count question, call mcp__seya__get_workshop_summary once and answer
-  immediately from its top-level `lessonCount` field, naming the workshop.
+- For a lesson-count question that does not name a workshop, call
+  mcp__seya__get_workshop_lesson_count once with
+  `workshop_id="human20-codex-hermes"` and answer immediately from its
+  returned decimal count, naming the workshop.
 - Do not load human20-helper for workshop metadata already exposed by MCP. Do
   not call get_section or search for a count, and never repeat the same MCP read.
 

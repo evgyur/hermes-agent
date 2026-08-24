@@ -22,6 +22,7 @@ config_patch:
       idempotent_no_progress: 1
     additional_idempotent_tools:
       - mcp__seya__list_resources
+      - mcp__seya__get_workshop_lesson_count
       - mcp__seya__get_workshop_summary
       - mcp__seya__get_workshop
       - mcp__seya__get_section

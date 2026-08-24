@@ -38,8 +38,9 @@ def test_complete_mcp_result_forbids_external_research(tmp_path: Path) -> None:
 def test_workshop_count_uses_one_metadata_read_and_answers_immediately(tmp_path: Path) -> None:
     prompt = _render_overlay(tmp_path)
 
-    assert "lessonCount" in prompt
-    assert "call mcp__seya__get_workshop_summary once" in prompt
+    assert "returned decimal count" in prompt
+    assert "call mcp__seya__get_workshop_lesson_count once" in prompt
+    assert 'workshop_id="human20-codex-hermes"' in prompt
     assert "Do not load human20-helper" in prompt
     assert "Do not call get_section or search for a count" in prompt
 
@@ -78,6 +79,7 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
         "additional_idempotent_tools"
     ] == [
         "mcp__seya__list_resources",
+        "mcp__seya__get_workshop_lesson_count",
         "mcp__seya__get_workshop_summary",
         "mcp__seya__get_workshop",
         "mcp__seya__get_section",

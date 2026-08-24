@@ -95,6 +95,21 @@ class TestStructuredContentPreservation:
         data = json.loads(raw)
         assert data == {"result": "done"}
 
+    def test_redundant_fastmcp_scalar_structured_content_collapses_to_text(self, _patch_mcp_server):
+        """FastMCP mirrors scalar text under structuredContent.result; do not duplicate it."""
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock("7")],
+                structuredContent={"result": "7"},
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        raw = handler({})
+
+        assert json.loads(raw) == {"result": "7"}
+        assert len(raw) < 32
+
     def test_empty_text_with_structured_content(self, _patch_mcp_server):
         """When content blocks are empty but structuredContent exists."""
         session = _patch_mcp_server
