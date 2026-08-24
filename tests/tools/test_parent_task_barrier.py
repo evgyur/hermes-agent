@@ -854,3 +854,22 @@ def test_retention_prune_cascades_terminal_children(monkeypatch, tmp_path):
     ).fetchone()[0]
     conn.close()
     assert count == 0
+
+
+def test_finalization_policy_fails_closed_when_existing_storage_cannot_open(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    path.touch()
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    def cannot_open(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(barrier.sqlite3, "connect", cannot_open)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        barrier.finalization_policy(
+            parent_session_id="parent-with-durable-state",
+            root_turn_id="turn-with-required-child",
+        )

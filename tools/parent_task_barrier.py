@@ -78,7 +78,9 @@ def _connect() -> sqlite3.Connection:
 
 
 @contextmanager
-def _read_connection() -> Iterator[Optional[sqlite3.Connection]]:
+def _read_connection(
+    *, fail_on_open_error: bool = False
+) -> Iterator[Optional[sqlite3.Connection]]:
     """Open initialized barrier storage without creating files or write locks."""
 
     path = _db_path()
@@ -88,6 +90,8 @@ def _read_connection() -> Iterator[Optional[sqlite3.Connection]]:
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     except sqlite3.OperationalError:
+        if fail_on_open_error:
+            raise
         yield None
         return
     conn.row_factory = sqlite3.Row
@@ -549,7 +553,7 @@ def finalization_policy(
     # gateway startup has installed the optional barrier schema.  No initialized
     # storage means no durable barrier can exist, so keep this read-only and
     # deliver normally instead of creating a database from the finalizer path.
-    with _read_connection() as conn:
+    with _read_connection(fail_on_open_error=True) as conn:
         if conn is None:
             return {"action": "deliver"}
     now = time.time()
