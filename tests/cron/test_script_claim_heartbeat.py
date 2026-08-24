@@ -567,6 +567,45 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     assert calls >= 3
 
 
+def test_single_late_heartbeat_error_can_recover(monkeypatch):
+    """A delayed transient store error is not proof that claim ownership was lost."""
+    import cron.scheduler as scheduler
+
+    calls = 0
+    recovered = threading.Event()
+
+    def heartbeat(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("transient store error")
+        if calls == 3:
+            recovered.set()
+        return True
+
+    def run_body(_job, **kwargs):
+        assert recovered.wait(timeout=0.5)
+        assert not kwargs["fire_claim_lost"].is_set()
+        return True
+
+    job = {
+        "id": "heartbeat-recovers",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
+    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(
+        scheduler.time,
+        "monotonic",
+        MagicMock(side_effect=[0.0, 1.0, 1.0]),
+    )
+
+    assert scheduler.run_one_job(job) is True
+    assert calls == 3
+
+
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     """A replacement owner cannot leave the stale ledger recorded as success."""
     import cron.scheduler as scheduler
