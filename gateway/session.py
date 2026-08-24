@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import json
@@ -333,6 +334,113 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+
+
+_RESUME_ORIGIN_SNAPSHOT_VERSION = 1
+
+
+def _snapshot_text(value: Any) -> Optional[str]:
+    """Normalize a persisted origin scalar without truthiness shortcuts."""
+    return None if value is None else str(value)
+
+
+def _snapshot_optional_text(value: Any) -> Optional[str]:
+    """Mirror SessionSource fields that are omitted when an empty string."""
+    return None if value is None or str(value) == "" else str(value)
+
+
+def canonical_resume_origin(source: SessionSource) -> Dict[str, Any]:
+    """Return the complete, JSON-safe origin authority for restart recovery.
+
+    Session keys intentionally omit several delivery and trust dimensions.
+    This payload does not: it captures the exact live source that owned the
+    active turn, including the Telegram credential owner and Business route.
+    Ephemeral authorization grants (relay delivery and role checks) are not
+    persisted; startup must re-authorize through current policy instead.
+    """
+    platform = (
+        source.platform.value
+        if isinstance(source.platform, Platform)
+        else str(source.platform)
+    )
+    transport_profile = _snapshot_optional_text(source.transport_profile)
+    transport_owner = transport_profile
+    if platform == Platform.TELEGRAM.value and not transport_owner:
+        transport_owner = "default"
+    scope_id = source.scope_id if source.scope_id is not None else source.guild_id
+    return {
+        "platform": platform,
+        "chat_id": str(source.chat_id),
+        "chat_name": _snapshot_text(source.chat_name),
+        "chat_type": str(source.chat_type or "dm"),
+        "user_id": _snapshot_text(source.user_id),
+        "user_name": _snapshot_text(source.user_name),
+        "thread_id": _snapshot_text(source.thread_id),
+        "chat_topic": _snapshot_text(source.chat_topic),
+        "user_id_alt": _snapshot_optional_text(source.user_id_alt),
+        "chat_id_alt": _snapshot_optional_text(source.chat_id_alt),
+        "scope_id": _snapshot_optional_text(scope_id),
+        "parent_chat_id": _snapshot_optional_text(source.parent_chat_id),
+        "message_id": _snapshot_optional_text(source.message_id),
+        "profile": _snapshot_optional_text(source.profile),
+        "transport_profile": transport_profile,
+        "transport_owner": transport_owner,
+        "business_connection_id": _snapshot_optional_text(
+            source.business_connection_id
+        ),
+        "external_safe_mode": bool(source.external_safe_mode),
+        "auto_thread_created": bool(source.auto_thread_created),
+        "auto_thread_initial_name": _snapshot_optional_text(
+            source.auto_thread_initial_name
+        ),
+        "prospective_thread_id": _snapshot_optional_text(
+            source.prospective_thread_id
+        ),
+    }
+
+
+def _resume_origin_digest(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_from_canonical_resume_origin(
+    payload: Dict[str, Any],
+) -> Optional[SessionSource]:
+    """Rebuild a source only when *payload* is already canonical."""
+    if not isinstance(payload, dict):
+        return None
+    try:
+        source = SessionSource(
+            platform=Platform(payload["platform"]),
+            chat_id=str(payload["chat_id"]),
+            chat_name=payload.get("chat_name"),
+            chat_type=str(payload.get("chat_type") or "dm"),
+            user_id=payload.get("user_id"),
+            user_name=payload.get("user_name"),
+            thread_id=payload.get("thread_id"),
+            chat_topic=payload.get("chat_topic"),
+            user_id_alt=payload.get("user_id_alt"),
+            chat_id_alt=payload.get("chat_id_alt"),
+            scope_id=payload.get("scope_id"),
+            parent_chat_id=payload.get("parent_chat_id"),
+            message_id=payload.get("message_id"),
+            profile=payload.get("profile"),
+            transport_profile=payload.get("transport_profile"),
+            business_connection_id=payload.get("business_connection_id"),
+            external_safe_mode=payload.get("external_safe_mode") is True,
+            auto_thread_created=payload.get("auto_thread_created") is True,
+            auto_thread_initial_name=payload.get("auto_thread_initial_name"),
+            prospective_thread_id=payload.get("prospective_thread_id"),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return source if canonical_resume_origin(source) == payload else None
     
 
 
@@ -890,6 +998,15 @@ class SessionEntry:
     # exact interrupted session instead of guessing from ``updated_at``.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    # Exact live source captured atomically with ``active_turn_token``.  The
+    # routing key alone is insufficient authority: Telegram transport,
+    # Business connection, sender, and safe-mode dimensions can all change
+    # without changing the key.
+    active_turn_origin_snapshot: Optional[Dict[str, Any]] = None
+    # The same source rebound to the immutable continuation CAS tuple when a
+    # live turn becomes restart work. Startup accepts no synthesized turn
+    # without this proof.
+    resume_origin_snapshot: Optional[Dict[str, Any]] = None
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -937,6 +1054,8 @@ class SessionEntry:
                 if self.active_turn_started_at
                 else None
             ),
+            "active_turn_origin_snapshot": self.active_turn_origin_snapshot,
+            "resume_origin_snapshot": self.resume_origin_snapshot,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -985,6 +1104,13 @@ class SessionEntry:
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+
+        active_turn_origin_snapshot = data.get("active_turn_origin_snapshot")
+        if not isinstance(active_turn_origin_snapshot, dict):
+            active_turn_origin_snapshot = None
+        resume_origin_snapshot = data.get("resume_origin_snapshot")
+        if not isinstance(resume_origin_snapshot, dict):
+            resume_origin_snapshot = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -1040,6 +1166,8 @@ class SessionEntry:
             ),
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            active_turn_origin_snapshot=active_turn_origin_snapshot,
+            resume_origin_snapshot=resume_origin_snapshot,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -1047,6 +1175,95 @@ class SessionEntry:
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
+
+
+def resume_origin_from_snapshot(entry: SessionEntry) -> Optional[SessionSource]:
+    """Verify and restore the exact origin bound to this continuation.
+
+    The snapshot is useful only when its digest and complete continuation CAS
+    tuple match the live entry. Missing legacy data fails closed: a human
+    message may still continue the preserved transcript, but startup cannot
+    synthesize an effect-bearing turn from an unproven route.
+    """
+    if not entry.resume_pending or entry.suspended:
+        return None
+    snapshot = entry.resume_origin_snapshot
+    if not isinstance(snapshot, dict):
+        return None
+    expected_identity = {
+        "resume_task_id": str(entry.resume_task_id or ""),
+        "continuation_generation": int(entry.continuation_generation or 0),
+        "continuation_claim_owner": str(entry.continuation_claim_owner or ""),
+        "continuation_claim_token": str(entry.continuation_claim_token or ""),
+    }
+    if not all(expected_identity.values()):
+        return None
+    if snapshot.get("version") != _RESUME_ORIGIN_SNAPSHOT_VERSION:
+        return None
+    if (
+        snapshot.get("session_key") != entry.session_key
+        or snapshot.get("session_id") != entry.session_id
+    ):
+        return None
+    if any(snapshot.get(key) != value for key, value in expected_identity.items()):
+        return None
+    payload = snapshot.get("source")
+    digest = snapshot.get("source_sha256")
+    if not isinstance(payload, dict) or not isinstance(digest, str):
+        return None
+    if not hmac.compare_digest(_resume_origin_digest(payload), digest):
+        return None
+    source = _source_from_canonical_resume_origin(payload)
+    if source is None:
+        return None
+    # ``origin`` is a mutable routing/display field used elsewhere.  It must
+    # still match the turn-owned authority; silently preferring either copy
+    # would hide corruption or a same-key route swap.
+    if entry.origin is None or canonical_resume_origin(entry.origin) != payload:
+        return None
+    return source
+
+
+def _active_origin_payload(entry: SessionEntry) -> Optional[Dict[str, Any]]:
+    snapshot = entry.active_turn_origin_snapshot
+    if not isinstance(snapshot, dict):
+        return None
+    token = str(entry.active_turn_token or "")
+    if (
+        not token
+        or snapshot.get("version") != _RESUME_ORIGIN_SNAPSHOT_VERSION
+        or snapshot.get("active_turn_token") != token
+        or snapshot.get("session_key") != entry.session_key
+        or snapshot.get("session_id") != entry.session_id
+    ):
+        return None
+    payload = snapshot.get("source")
+    digest = snapshot.get("source_sha256")
+    if not isinstance(payload, dict) or not isinstance(digest, str):
+        return None
+    if not hmac.compare_digest(_resume_origin_digest(payload), digest):
+        return None
+    return payload if _source_from_canonical_resume_origin(payload) else None
+
+
+def _bind_resume_origin_snapshot(
+    entry: SessionEntry,
+    payload: Optional[Dict[str, Any]],
+) -> None:
+    if payload is None:
+        entry.resume_origin_snapshot = None
+        return
+    entry.resume_origin_snapshot = {
+        "version": _RESUME_ORIGIN_SNAPSHOT_VERSION,
+        "session_key": entry.session_key,
+        "session_id": entry.session_id,
+        "resume_task_id": str(entry.resume_task_id or ""),
+        "continuation_generation": int(entry.continuation_generation or 0),
+        "continuation_claim_owner": str(entry.continuation_claim_owner or ""),
+        "continuation_claim_token": str(entry.continuation_claim_token or ""),
+        "source": dict(payload),
+        "source_sha256": _resume_origin_digest(payload),
+    }
 
 
 def build_channel_continuity_note(
@@ -3224,7 +3441,11 @@ class SessionStore:
                 return True
         return False
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(
+        self,
+        session_key: str,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
         The opaque token is returned to the caller and must be supplied to
@@ -3238,9 +3459,35 @@ class SessionStore:
             if entry is None:
                 return None
             now = _now()
+            live_source = source if source is not None else entry.origin
+            origin_payload = (
+                canonical_resume_origin(live_source)
+                if live_source is not None
+                else None
+            )
+            snapshot_source = (
+                _source_from_canonical_resume_origin(origin_payload)
+                if origin_payload is not None
+                else None
+            )
+            origin_snapshot = (
+                {
+                    "version": _RESUME_ORIGIN_SNAPSHOT_VERSION,
+                    "session_key": entry.session_key,
+                    "session_id": entry.session_id,
+                    "active_turn_token": token,
+                    "source": origin_payload,
+                    "source_sha256": _resume_origin_digest(origin_payload),
+                }
+                if origin_payload is not None
+                else None
+            )
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            candidate["active_turn_origin_snapshot"] = origin_snapshot
+            if snapshot_source is not None:
+                candidate["origin"] = snapshot_source.to_dict()
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -3255,6 +3502,9 @@ class SessionStore:
             )
             entry.active_turn_token = token
             entry.active_turn_started_at = now
+            entry.active_turn_origin_snapshot = origin_snapshot
+            if snapshot_source is not None:
+                entry.origin = replace(snapshot_source)
             entry.updated_at = now
         return token
 
@@ -3271,6 +3521,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = None
             candidate["active_turn_started_at"] = None
+            candidate["active_turn_origin_snapshot"] = None
 
             # Keep the live token until the clear is durable.  A failed write
             # therefore remains retryable instead of becoming a false mismatch.
@@ -3281,6 +3532,7 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_origin_snapshot = None
         return True
 
     def recover_interrupted_turns(
@@ -3322,6 +3574,7 @@ class SessionStore:
 
                 if not marker_is_stale and not entry.suspended:
                     interrupted_token = str(entry.active_turn_token or "")
+                    origin_payload = _active_origin_payload(entry)
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
@@ -3331,6 +3584,7 @@ class SessionStore:
                             self._stamp_resume_identity(
                                 entry, task_id=interrupted_token
                             )
+                        _bind_resume_origin_snapshot(entry, origin_payload)
                     else:
                         entry.resume_pending = True
                         entry.resume_reason = "restart_interrupted"
@@ -3340,10 +3594,12 @@ class SessionStore:
                         self._stamp_resume_identity(
                             entry, task_id=interrupted_token
                         )
+                        _bind_resume_origin_snapshot(entry, origin_payload)
                         promoted += 1
 
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.active_turn_origin_snapshot = None
                 changed = True
 
             if changed:
@@ -3359,10 +3615,15 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
-                if not entry.active_turn_token and entry.active_turn_started_at is None:
+                if (
+                    not entry.active_turn_token
+                    and entry.active_turn_started_at is None
+                    and entry.active_turn_origin_snapshot is None
+                ):
                     continue
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.active_turn_origin_snapshot = None
                 cleared += 1
             if cleared:
                 self._save()
@@ -3393,10 +3654,12 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                origin_payload = _active_origin_payload(entry)
                 self._stamp_resume_identity(
                     entry,
                     task_id=str(entry.active_turn_token or ""),
                 )
+                _bind_resume_origin_snapshot(entry, origin_payload)
                 self._save()
                 return True
         return False
@@ -3415,10 +3678,12 @@ class SessionStore:
             entry.resume_pending = True
             entry.resume_reason = reason
             entry.last_resume_marked_at = _now()
+            origin_payload = _active_origin_payload(entry)
             self._stamp_resume_identity(
                 entry,
                 task_id=str(entry.active_turn_token or ""),
             )
+            _bind_resume_origin_snapshot(entry, origin_payload)
             receipt = {
                 "resume_task_id": str(entry.resume_task_id or ""),
                 "continuation_generation": int(entry.continuation_generation or 0),
@@ -3458,6 +3723,7 @@ class SessionStore:
             entry.continuation_generation = 0
             entry.continuation_claim_owner = ""
             entry.continuation_claim_token = ""
+            entry.resume_origin_snapshot = None
             self._save()
             return True
 
@@ -3507,6 +3773,7 @@ class SessionStore:
             entry.continuation_generation = 0
             entry.continuation_claim_owner = ""
             entry.continuation_claim_token = ""
+            entry.resume_origin_snapshot = None
             for key in (
                 "resume_task_id",
                 "continuation_generation",

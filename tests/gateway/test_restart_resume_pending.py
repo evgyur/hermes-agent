@@ -27,6 +27,7 @@ PRs #9850, #9934, #7536):
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,6 +47,7 @@ from gateway.run import (
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
+    bind_restart_origin_snapshot,
     make_restart_runner,
     make_restart_source,
 )
@@ -337,7 +339,18 @@ class TestResumePendingSystemNote:
         assert "synthetic startup continuation" in message
         assert "ask what they would like to do next" not in message
         assert "skip any unfinished work" not in message
-        assert persisted == message
+        assert persisted != message
+        assert persisted == "[Internal continuation marker: startup recovery turn.]"
+        assert "synthetic startup continuation" not in persisted
+
+    def test_startup_resume_allows_safe_postcondition_check_without_replay(self):
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True, startup_resume=True
+        )
+
+        assert "do NOT re-execute or verify it" not in note
+        assert "do not re-run or re-execute" in note.lower()
+        assert "establish its outcome" in note.lower()
 
     def test_whitespace_only_message_also_persists_the_note(self):
         """A whitespace-only startup event is as blank as an empty one —
@@ -673,7 +686,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
     discord_source = SessionSource(
         platform=Platform.DISCORD, chat_id="dc-chat", chat_type="dm", user_id="u1"
     )
-    tg_entry = SessionEntry(
+    tg_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:tg-chat",
         session_id="sid-tg",
         created_at=datetime.now(),
@@ -685,7 +698,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
         resume_task_id="telegram-restart-task",
-    )
+    ))
     discord_entry = SessionEntry(
         session_key="agent:main:discord:dm:dc-chat",
         session_id="sid-dc",
@@ -718,6 +731,227 @@ async def test_reconnect_reschedule_is_platform_scoped():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_rejects_session_key_origin_mismatch(monkeypatch):
+    """A persisted key for recipient A may never resume origin B."""
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, adapter = make_restart_runner()
+    origin_b = make_restart_source(chat_id="recipient-B")
+    entry = bind_restart_origin_snapshot(SessionEntry(
+        session_key="agent:main:telegram:dm:recipient-A",
+        session_id="sid-origin-mismatch",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=origin_b,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="origin-mismatch-task",
+    ))
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._persist_active_agents = MagicMock()
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    runner._persist_active_agents.assert_not_called()
+    assert entry.session_key not in runner._running_agents
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_binds_business_transport_dimension(monkeypatch):
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, adapter = make_restart_runner()
+    original = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="recipient-A",
+        chat_type="dm",
+        user_id="owner-A",
+        transport_profile="default",
+        business_connection_id="business-A",
+        external_safe_mode=True,
+    )
+    mutated = replace(original, transport_profile="transport-B")
+    entry = bind_restart_origin_snapshot(SessionEntry(
+        session_key=runner._session_key_for_source(original),
+        session_id="sid-transport-mismatch",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=original,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-transport-mismatch",
+    ))
+    entry.origin = mutated
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_not_called()
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_rejects_registered_same_key_transport_swap(
+    monkeypatch,
+):
+    from gateway import restart_loop_guard
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _default_adapter = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    transport_b = RestartTestAdapter()
+    transport_b._owner_profile = "transport-B"
+    runner._profile_adapters = {
+        "transport-B": {Platform.TELEGRAM: transport_b},
+    }
+    original = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="recipient-A",
+        chat_type="dm",
+        user_id="recipient-A",
+        transport_profile="default",
+    )
+    entry = bind_restart_origin_snapshot(SessionEntry(
+        session_key=runner._session_key_for_source(original),
+        session_id="sid-registered-transport-swap",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=original,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-registered-transport-swap",
+    ))
+    entry.origin = replace(original, transport_profile="transport-B")
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+    runner._run_startup_resume_event.assert_not_awaited()
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_uses_snapshot_transport_adapter(monkeypatch):
+    from gateway import restart_loop_guard
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, default_adapter = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    transport_b = RestartTestAdapter()
+    transport_b._owner_profile = "transport-B"
+    runner._profile_adapters = {
+        "transport-B": {Platform.TELEGRAM: transport_b},
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="recipient-B",
+        chat_type="dm",
+        user_id="owner-B",
+        transport_profile="transport-B",
+    )
+    entry = bind_restart_origin_snapshot(SessionEntry(
+        session_key=runner._session_key_for_source(source),
+        session_id="sid-transport-B",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-transport-B",
+    ))
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    selected = runner._run_startup_resume_event.await_args.args[0]
+    assert selected is transport_b
+    assert selected is not default_adapter
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_rejects_legacy_entry_without_origin_snapshot(
+    monkeypatch,
+):
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="legacy-no-snapshot")
+    entry = SessionEntry(
+        session_key=runner._session_key_for_source(source),
+        session_id="sid-legacy-no-snapshot",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-legacy-no-snapshot",
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+    runner._run_startup_resume_event.assert_not_awaited()
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_multiplex_default_profile_origin_still_auto_resumes(monkeypatch):
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _adapter = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    source = make_restart_source(chat_id="recipient-default")
+    entry = bind_restart_origin_snapshot(SessionEntry(
+        session_key="agent:main:telegram:dm:recipient-default",
+        session_id="sid-default-profile",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_task_id="task-default-profile",
+    ))
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_startup_restore_waits_for_resume_before_draining_inbound():
     """Queued inbound turns replay only after startup resume tasks finish."""
     runner, adapter = make_restart_runner()
@@ -726,7 +960,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     runner._startup_restore_tasks = []
 
     source = make_restart_source(chat_id="restore-chat")
-    pending_entry = SessionEntry(
+    pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:restore-chat",
         session_id="sid",
         created_at=datetime.now(),
@@ -738,7 +972,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
         resume_task_id="startup-restore-task",
-    )
+    ))
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
     resume_done = asyncio.Event()
@@ -887,7 +1121,7 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="race-chat")
-    pending_entry = SessionEntry(
+    pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key="agent:main:telegram:dm:race-chat",
         session_id="sid",
         created_at=datetime.now(),
@@ -899,7 +1133,7 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
         resume_task_id="race-restart-task",
-    )
+    ))
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
     # Slow mock: hold the task open so we can inspect _running_agents
@@ -957,7 +1191,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="full-path-chat")
     session_key = runner._session_key_for_source(source)
-    pending_entry = SessionEntry(
+    pending_entry = bind_restart_origin_snapshot(SessionEntry(
         session_key=session_key,
         session_id="sid",
         created_at=datetime.now(),
@@ -969,7 +1203,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
         resume_task_id="full-path-restart-task",
-    )
+    ))
     runner.session_store._entries = {session_key: pending_entry}
 
     # Wire the REAL runner pipeline that _handle_message depends on.

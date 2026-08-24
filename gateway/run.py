@@ -1508,7 +1508,7 @@ def build_resume_recovery_note(
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} "
+        f"run — do not re-run or re-execute it. {resume_guidance} "
         f"{tail_guidance}]"
         + (f"\n\n{message}" if message else "")
     )
@@ -1538,9 +1538,15 @@ def _prepare_resume_pending_message(
         interactive=interactive,
         startup_resume=startup_resume,
     )
-    persist_message = (
-        message if isinstance(message, str) and message.strip() else recovery_message
-    )
+    if isinstance(message, str) and message.strip():
+        persist_message = message
+    elif startup_resume:
+        # The model-only recovery scaffold contains control guidance. Persist a
+        # neutral non-empty marker instead so later turns never replay that
+        # synthetic instruction as if it were durable user text.
+        persist_message = "[Internal continuation marker: startup recovery turn.]"
+    else:
+        persist_message = recovery_message
     return recovery_message, persist_message
 
 
@@ -2868,8 +2874,10 @@ from gateway.session import (
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    canonical_resume_origin,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    resume_origin_from_snapshot,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -13370,6 +13378,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return event
 
     def _startup_resume_adapter_for_source(self, source: SessionSource):
+        if source.platform == Platform.TELEGRAM:
+            transport_profile = str(
+                getattr(source, "transport_profile", None) or "default"
+            ).strip()
+            if transport_profile == "default":
+                adapter = (getattr(self, "adapters", {}) or {}).get(
+                    Platform.TELEGRAM
+                )
+            else:
+                adapter = (
+                    (getattr(self, "_profile_adapters", {}) or {}).get(
+                        transport_profile, {}
+                    )
+                    or {}
+                ).get(Platform.TELEGRAM)
+            registered_owner = (
+                getattr(adapter, "_owner_profile", None) or "default"
+                if adapter is not None
+                else None
+            )
+            return adapter if registered_owner == transport_profile else None
         adapter = self._adapter_for_source(source)
         if adapter is not None:
             return adapter
@@ -13432,6 +13461,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
 
+        # A session key is not recipient authority: it intentionally omits
+        # several trust and delivery dimensions. Only the source captured
+        # atomically with the active-turn token and rebound to this exact
+        # continuation CAS tuple can authorize a synthesized startup turn.
+        route_valid_candidates = []
+        for entry in candidates:
+            source = resume_origin_from_snapshot(entry)
+            if source is None:
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: missing, "
+                    "corrupt, stale, or origin-mismatched durable snapshot",
+                    entry.session_key,
+                )
+                continue
+            try:
+                # Rebuild from persisted source + session policy only. Never
+                # substitute the process's ambient active profile: profile=None
+                # is the canonical persisted spelling of the default namespace.
+                persisted_profile = (
+                    str(getattr(source, "profile", "") or "").strip() or None
+                )
+                origin_session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=getattr(
+                        self.config, "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=getattr(
+                        self.config, "thread_sessions_per_user", False
+                    ),
+                    profile=persisted_profile,
+                )
+            except Exception:
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: could not rebuild "
+                    "persisted origin key",
+                    entry.session_key,
+                    exc_info=True,
+                )
+                continue
+            if origin_session_key != entry.session_key:
+                logger.warning(
+                    "Quarantining startup auto-resume origin mismatch: "
+                    "persisted_key=%s rebuilt_key=%s",
+                    entry.session_key,
+                    origin_session_key,
+                )
+                continue
+            if source.platform == Platform.TELEGRAM:
+                if self._startup_resume_adapter_for_source(source) is None:
+                    logger.warning(
+                        "Quarantining startup auto-resume for %s: exact "
+                        "persisted Telegram transport is not registered",
+                        entry.session_key,
+                    )
+                    continue
+            route_valid_candidates.append((entry, source))
+        candidates = route_valid_candidates
+
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
         # boot must not accrue toward the breaker. If too many such boots have
@@ -13459,7 +13546,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
-        for entry in candidates:
+        for entry, source in candidates:
             marker = entry.last_resume_marked_at
             if not _is_fresh_gateway_interruption(
                 marker,
@@ -13486,7 +13573,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # SessionStore writes happen in worker threads. Re-read the exact
+            # snapshot under its lock immediately before claiming the runner
+            # slot, so a newer continuation cannot inherit this route.
+            try:
+                with self.session_store._lock:  # noqa: SLF001
+                    self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                    current = self.session_store._entries.get(  # noqa: SLF001
+                        entry.session_key
+                    )
+                    current_source = (
+                        resume_origin_from_snapshot(current)
+                        if current is not None
+                        else None
+                    )
+                if (
+                    current is not entry
+                    or current_source is None
+                    or current.resume_reason not in self._AUTO_RESUME_REASONS
+                    or canonical_resume_origin(current_source)
+                    != canonical_resume_origin(source)
+                ):
+                    continue
+            except Exception:
+                logger.warning(
+                    "Skipping auto-resume for %s: durable origin recheck failed",
+                    entry.session_key,
+                    exc_info=True,
+                )
+                continue
             adapter = self._startup_resume_adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -15701,13 +15816,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         adapter=None,
         runtime_profile: Optional[str] = None,
+        transport_profile: Optional[str] = None,
     ) -> int:
         """Redeliver already-generated finals after a live adapter reconnect."""
         from types import SimpleNamespace
 
         from gateway.delivery_ledger import (
             RECOVERED_MARKER,
-            mark_abandoned,
+            abandon_runtime_claim,
             settle_runtime_claim,
             settle_with_retry,
             sweep_failed_for_runtime,
@@ -15716,8 +15832,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         target_adapter = adapter or self.adapters.get(platform)
         if target_adapter is None:
             return 0
+        effective_transport_profile = None
+        if platform == Platform.TELEGRAM:
+            adapter_owner = str(
+                getattr(target_adapter, "_owner_profile", None) or "default"
+            ).strip()
+            effective_transport_profile = str(
+                transport_profile
+                if transport_profile is not None
+                else adapter_owner
+            ).strip()
+            if (
+                not effective_transport_profile
+                or effective_transport_profile != adapter_owner
+            ):
+                return 0
         rows = await asyncio.to_thread(
-            sweep_failed_for_runtime, platform.value
+            sweep_failed_for_runtime,
+            platform.value,
+            transport_profile=effective_transport_profile,
         )
         delivered_count = 0
         for row in rows:
@@ -15747,9 +15880,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     send_chat_id = str(source.chat_id)
                     metadata = _route_metadata_for_source(source)
                 except Exception as exc:
-                    await asyncio.to_thread(
-                        mark_abandoned,
+                    await settle_with_retry(
+                        abandon_runtime_claim,
                         str(row["obligation_id"]),
+                        str(row["runtime_claim_token"]),
                         str(exc) or "ambiguous_route_envelope",
                     )
                     continue
@@ -15806,6 +15940,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             **continuation_identity,
                         )
         return delivered_count
+
+    async def _redeliver_failed_telegram_for_transport(
+        self,
+        adapter,
+        transport_profile: str,
+    ) -> int:
+        """Drain this Telegram transport across every served runtime ledger."""
+        normalized_transport = str(transport_profile or "").strip()
+        if not normalized_transport:
+            return 0
+        adapter_owner = str(
+            getattr(adapter, "_owner_profile", None) or "default"
+        ).strip()
+        if adapter_owner != normalized_transport:
+            return 0
+
+        if getattr(self.config, "multiplex_profiles", False):
+            scopes = list(_multiplex_profile_homes(self.config))
+        else:
+            scopes = [("default", Path(get_hermes_home()))]
+
+        delivered = 0
+        seen_homes: set[Path] = set()
+        for runtime_profile, runtime_home in scopes:
+            resolved_home = Path(runtime_home).resolve()
+            if resolved_home in seen_homes:
+                continue
+            seen_homes.add(resolved_home)
+            with _profile_runtime_scope(resolved_home):
+                delivered += await self._redeliver_failed_obligations_for_platform(
+                    Platform.TELEGRAM,
+                    adapter=adapter,
+                    runtime_profile=str(runtime_profile),
+                    transport_profile=normalized_transport,
+                )
+        return delivered
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
@@ -15934,11 +16104,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
-                        await self._redeliver_failed_obligations_for_platform(
-                            platform,
-                            adapter=adapter,
-                            runtime_profile="default",
-                        )
+                        if platform == Platform.TELEGRAM:
+                            await self._redeliver_failed_telegram_for_transport(
+                                adapter,
+                                str(getattr(adapter, "_owner_profile", None) or "default"),
+                            )
+                        else:
+                            await self._redeliver_failed_obligations_for_platform(
+                                platform,
+                                adapter=adapter,
+                                runtime_profile="default",
+                            )
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -17167,12 +17343,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if platform not in profile_map:
                             profile_map[platform] = adapter
                             self._sync_voice_mode_state_to_adapter(adapter)
-                            with _profile_runtime_scope(profile_home):
-                                await self._redeliver_failed_obligations_for_platform(
+                            if platform == Platform.TELEGRAM:
+                                await self._redeliver_failed_telegram_for_transport(
+                                    adapter,
+                                    profile_name,
+                                )
+                            else:
+                                with _profile_runtime_scope(profile_home):
+                                    await self._redeliver_failed_obligations_for_platform(
                                     platform,
                                     adapter=adapter,
                                     runtime_profile=profile_name,
-                                )
+                                    )
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
@@ -20503,7 +20685,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                event.source,
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",

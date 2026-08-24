@@ -487,9 +487,14 @@ def sweep_recoverable(
 def sweep_failed_for_runtime(
     platform: str,
     now: Optional[float] = None,
+    *,
+    transport_profile: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Claim failed sends after reconnect without stealing another live owner."""
     now = now if now is not None else time.time()
+    expected_transport = (
+        str(transport_profile).strip() if transport_profile is not None else None
+    )
     pid, started = _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
@@ -509,6 +514,79 @@ def sweep_failed_for_runtime(
              attempts, created_at, owner_pid, owner_started_at, resume_task_id,
              continuation_generation, continuation_owner,
              continuation_token, route_envelope_json) = row
+            route_envelope = None
+            if platform_name == "telegram":
+                # Route provenance is authority for a reconnect send. Validate
+                # it before *any* ownership, expiry, or claim mutation so a
+                # transport-specific sweep cannot steal/quarantine another
+                # transport's row merely by observing it.
+                raw_route = None
+                try:
+                    if not route_envelope_json:
+                        raise ValueError("ambiguous_route_envelope")
+                    raw_route = json.loads(route_envelope_json)
+                    required = {
+                        "version",
+                        "platform",
+                        "runtime_profile",
+                        "transport_profile",
+                        "chat_id",
+                        "thread_id",
+                        "user_id",
+                        "business_connection_id",
+                        "external_safe_mode",
+                    }
+                    if not isinstance(raw_route, dict) or not required.issubset(
+                        raw_route
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    for profile_field in ("runtime_profile", "transport_profile"):
+                        value = raw_route.get(profile_field)
+                        if (
+                            not isinstance(value, str)
+                            or not value.strip()
+                            or value != value.strip()
+                        ):
+                            raise ValueError("ambiguous_route_envelope")
+                    if type(raw_route.get("external_safe_mode")) is not bool:
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import canonical_route_envelope
+
+                    route_envelope = canonical_route_envelope(raw_route)
+                    if (
+                        route_envelope["platform"] != str(platform_name)
+                        or route_envelope["chat_id"] != str(chat_id)
+                        or route_envelope["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                except Exception:
+                    # Quarantine malformed rows only when the remaining
+                    # explicit transport field still proves this sweep owns
+                    # them. Foreign/unknown routes remain untouched.
+                    raw_transport = (
+                        raw_route.get("transport_profile")
+                        if isinstance(raw_route, dict)
+                        else None
+                    )
+                    if (
+                        expected_transport is not None
+                        and isinstance(raw_transport, str)
+                        and raw_transport == expected_transport
+                        and raw_transport.strip() == raw_transport
+                    ):
+                        conn.execute(
+                            "UPDATE delivery_obligations SET state='abandoned', "
+                            "updated_at=?, last_error='ambiguous_route_envelope' "
+                            "WHERE obligation_id=? AND state='failed'",
+                            (now, oid),
+                        )
+                    continue
+                if (
+                    expected_transport is not None
+                    and route_envelope["transport_profile"] != expected_transport
+                ):
+                    continue
             exact_current_owner = int(owner_pid or 0) == int(pid) and (
                 owner_started_at is None
                 or started is None
@@ -535,8 +613,7 @@ def sweep_failed_for_runtime(
                 (pid, started, claim_token, now, oid, owner_pid, owner_started_at),
             ).rowcount
             if changed:
-                route_envelope = None
-                if route_envelope_json:
+                if platform_name != "telegram" and route_envelope_json:
                     try:
                         decoded = json.loads(route_envelope_json)
                         route_envelope = (
@@ -561,6 +638,28 @@ def sweep_failed_for_runtime(
                     "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def abandon_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    error: str = "",
+) -> bool:
+    """Abandon only the reconnect generation represented by ``claim_token``."""
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='abandoned', runtime_claim_token='', updated_at=?,
+                   last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                time.time(),
+                str(error or "")[:500] or None,
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
 
 
 def settle_runtime_claim(
