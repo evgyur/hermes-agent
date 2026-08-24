@@ -30,6 +30,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_result import DeliveryDisposition, TurnDeliveryControl
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -276,14 +277,44 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
-
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
+    _parent_task_policy = {"action": "deliver"}
     try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+        from tools.parent_task_barrier import finalization_policy
+
+        _parent_task_policy = finalization_policy(
+            parent_session_id=str(agent.session_id or ""),
+            root_turn_id=str(turn_id or ""),
+            persist=False,
+        )
+    except Exception as _barrier_err:
+        _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
+        _parent_task_policy = {
+            "action": "error",
+            "error": str(_barrier_err),
+            "defer_goal_evaluation": True,
+        }
+        logger.error(
+            "finalize_turn: parent-task barrier policy failed closed: %s",
+            _barrier_err,
+            exc_info=True,
+        )
+
+    # Save trajectory only for a committed ordinary turn. Provisional parent
+    # text must not escape through trajectory storage before transcript policy.
+    if _parent_task_policy.get("action") == "deliver":
+        try:
+            agent._save_trajectory(
+                messages,
+                _summarize_user_message_for_log(user_message),
+                completed,
+            )
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error(
+                "finalize_turn: _save_trajectory failed: %s",
+                _save_err,
+                exc_info=True,
+            )
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -386,6 +417,55 @@ def finalize_turn(
                 # filled row is re-examined instead of skipped.
                 agent._db_flush_scan_prefix = None
 
+        # Required background children make this root turn provisional. The
+        # early policy lookup already blocked trajectory writes; at the durable
+        # transcript chokepoint retain only an empty role marker.
+        if _parent_task_policy.get("action") in {"withhold", "error"}:
+            try:
+                _barrier_id = str(_parent_task_policy.get("barrier_id") or "")
+                _turn_assistants = []
+                for _item in reversed(messages):
+                    if isinstance(_item, dict) and _item.get("role") == "user":
+                        break
+                    if isinstance(_item, dict) and _item.get("role") == "assistant":
+                        _turn_assistants.append(_item)
+                if not _turn_assistants:
+                    raise RuntimeError(
+                        "parent-task policy could not bind the provisional answer"
+                    )
+                if (
+                    _parent_task_policy.get("action") == "withhold"
+                    and not _barrier_id
+                ):
+                    raise RuntimeError(
+                        "required-child barrier could not bind the provisional answer"
+                    )
+                for _candidate in _turn_assistants:
+                    _candidate["content"] = ""
+                    for _private_text_key in (
+                        "reasoning",
+                        "reasoning_content",
+                        "analysis",
+                        "thinking",
+                    ):
+                        _candidate.pop(_private_text_key, None)
+                    _candidate.pop("_db_persisted", None)
+                _turn_assistants[0]["_parent_task_candidate"] = True
+                _turn_assistants[0]["_parent_task_barrier_id"] = _barrier_id
+                agent._db_flush_scan_prefix = None
+            except Exception as _barrier_err:
+                _cleanup_errors.append(f"parent_task_barrier: {_barrier_err}")
+                _parent_task_policy = {
+                    "action": "error",
+                    "error": str(_barrier_err),
+                    "defer_goal_evaluation": True,
+                }
+                logger.error(
+                    "finalize_turn: parent-task barrier policy failed closed: %s",
+                    _barrier_err,
+                    exc_info=True,
+                )
+
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
         # final durable snapshot and returning the continuation history. Earlier
@@ -414,6 +494,7 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    and _parent_task_policy.get("action") == "deliver"
                     # Persistence-isolated agents (background review fork)
                     # must not micro-compact: the pass burns a real aux-LLM
                     # call on a throwaway replay transcript, and if the
@@ -593,8 +674,12 @@ def finalize_turn(
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    # First hook to return a string wins; provisional text never reaches plugins.
+    if (
+        final_response
+        and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -615,9 +700,12 @@ def finalize_turn(
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
-    # Plugins can use this to persist conversation data (e.g. sync
-    # to an external memory system).
-    if final_response and not interrupted:
+    # Plugins may persist responses, so provisional text is excluded entirely.
+    if (
+        final_response
+        and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -634,33 +722,33 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
-    # Context engine observation hook: notify the active engine that this
-    # turn has finished, with the finalized transcript. Complements the
-    # per-request select_context() hook (selection before the request;
-    # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    # Context engine observation hook can persist transcript content, so it is
+    # skipped for provisional/error parent-task turns.
+    if _parent_task_policy.get("action") == "deliver":
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
+
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -727,6 +815,32 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _parent_task_policy.get("action") in {"withhold", "error"}:
+        result["suppress_delivery"] = True
+        result["delivery_suppressed"] = True
+        result["defer_goal_evaluation"] = True
+        result["completed"] = False
+        _barrier_id = str(_parent_task_policy.get("barrier_id") or "")
+        if _barrier_id:
+            result["parent_task_barrier_id"] = _barrier_id
+        if _parent_task_policy.get("action") == "error":
+            result["error"] = (
+                "parent task barrier finalization failed: "
+                + str(_parent_task_policy.get("error") or "unknown error")
+            )
+    _delivery_deferred = _parent_task_policy.get("action") in {"withhold", "error"}
+    result["delivery_control"] = TurnDeliveryControl(
+        disposition=(
+            DeliveryDisposition.DEFER
+            if _delivery_deferred
+            else DeliveryDisposition.SEND
+        ),
+        barrier_id=str(_parent_task_policy.get("barrier_id") or ""),
+        defer_goal_evaluation=bool(
+            _delivery_deferred or _parent_task_policy.get("defer_goal_evaluation")
+        ),
+        outcome_id=str(result.get("outcome_id") or ""),
+    ).to_dict()
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -776,13 +890,14 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    # External memory provider: sync only a committed user-visible turn.
+    if _parent_task_policy.get("action") == "deliver":
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -792,6 +907,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and _parent_task_policy.get("action") == "deliver"
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
