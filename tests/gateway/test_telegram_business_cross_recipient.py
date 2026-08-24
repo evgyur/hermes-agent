@@ -20,6 +20,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 
 OWNER_ID = "617744661"
 VLAD_ID = "268754981"
+SAFE_CUSTOMER_ID = "777000123"
 BOT_ID = 8533179145
 BUSINESS_CONNECTION_ID = "FzZ5OU7SQEidHQAAxmDPRBoxdSQ"
 
@@ -51,6 +52,7 @@ def _adapter() -> TelegramAdapter:
 
 def _business_message(
     *,
+    chat_id: str = VLAD_ID,
     from_user_id: str = OWNER_ID,
     text: str | None = None,
     voice: object | None = None,
@@ -72,7 +74,7 @@ def _business_message(
         venue=None,
         contact=None,
         chat=SimpleNamespace(
-            id=int(VLAD_ID),
+            id=int(chat_id),
             type="private",
             title=None,
             full_name="Vlad Telegramin",
@@ -145,14 +147,17 @@ async def test_owner_explicit_business_wake_preserves_connection_and_safe_lane()
     adapter = _adapter()
     adapter._enqueue_text_event = MagicMock()
     adapter._cache_replied_media = AsyncMock()
-    message = _business_message(text="Sigurd, проверь только этот вопрос")
+    message = _business_message(
+        chat_id=SAFE_CUSTOMER_ID,
+        text="Sigurd, проверь только этот вопрос",
+    )
 
     await adapter._handle_text_message(_business_update(message), SimpleNamespace())
 
     adapter._enqueue_text_event.assert_called_once()
     event = adapter._enqueue_text_event.call_args.args[0]
     assert event.text == "проверь только этот вопрос"
-    assert event.source.chat_id == VLAD_ID
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
     assert event.source.user_id == OWNER_ID
     assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
     assert event.source.external_safe_mode is True
@@ -196,8 +201,101 @@ async def test_plain_bot_dm_to_non_allowlisted_customer_fails_closed() -> None:
     result = await adapter.send(VLAD_ID, "private answer", metadata={})
 
     assert result.success is False
-    assert result.error == "unsafe_telegram_dm_route"
+    assert result.error == "telegram_recipient_denied"
     adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_builtin_vlad_deny_survives_missing_registry_and_blocks_wire_call(
+    tmp_path, monkeypatch
+) -> None:
+    from gateway.telegram_egress_policy import (
+        TelegramEgressDenied,
+        denied_recipients,
+        guard_telegram_request,
+    )
+
+    monkeypatch.setenv(
+        "HERMES_TELEGRAM_EGRESS_DENY_FILE", str(tmp_path / "missing.json")
+    )
+    monkeypatch.delenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", raising=False)
+    denied_recipients.cache_clear()
+    class _InnerRequest:
+        read_timeout = 5
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def initialize(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def do_request(self, **kwargs):
+            self.calls += 1
+            return 200, b"{}"
+
+        async def post(self, **kwargs):
+            self.calls += 1
+            return {}
+
+        async def retrieve(self, **kwargs):
+            return b""
+
+    inner = _InnerRequest()
+    guarded = guard_telegram_request(inner)
+    request_data = SimpleNamespace(
+        parameters=[SimpleNamespace(name="chat_id", value=VLAD_ID)]
+    )
+    with pytest.raises(TelegramEgressDenied, match="telegram_recipient_denied"):
+        await guarded.post(
+            "https://api.telegram.org/test", request_data=request_data
+        )
+
+    assert inner.calls == 0
+    denied_recipients.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_loose_business_flags_cannot_forge_a_route() -> None:
+    adapter = _adapter()
+    adapter._rich_send_disabled = True
+    adapter._bot = MagicMock(id=BOT_ID, username="chipshermesbot")
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=101)
+    )
+
+    result = await adapter.send(
+        SAFE_CUSTOMER_ID,
+        "must not escape",
+        metadata={
+            "business_connection_id": BUSINESS_CONNECTION_ID,
+            "external_safe_mode": True,
+            "telegram_business_external_contact": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.error == "unsafe_telegram_business_route"
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_bot_echo_is_dropped_before_dispatch() -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._cache_replied_media = AsyncMock()
+    message = _business_message(
+        text="own outbound echoed by Telegram",
+        sender_business_bot=SimpleNamespace(id=BOT_ID),
+    )
+
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._enqueue_text_event.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -210,12 +308,23 @@ async def test_business_send_requires_and_propagates_exact_connection() -> None:
     )
 
     result = await adapter.send(
-        VLAD_ID,
+        SAFE_CUSTOMER_ID,
         "safe scoped answer",
         metadata={
             "business_connection_id": BUSINESS_CONNECTION_ID,
             "external_safe_mode": True,
             "telegram_business_external_contact": True,
+            "route_envelope": {
+                "version": 1,
+                "platform": "telegram",
+                "runtime_profile": "default",
+                "transport_profile": "default",
+                "chat_id": SAFE_CUSTOMER_ID,
+                "thread_id": None,
+                "user_id": OWNER_ID,
+                "business_connection_id": BUSINESS_CONNECTION_ID,
+                "external_safe_mode": True,
+            },
         },
     )
 
@@ -279,7 +388,7 @@ def test_delivery_ledger_round_trips_immutable_business_route(tmp_path, monkeypa
         "platform": "telegram",
         "runtime_profile": "default",
         "transport_profile": "default",
-        "chat_id": VLAD_ID,
+        "chat_id": SAFE_CUSTOMER_ID,
         "thread_id": None,
         "user_id": OWNER_ID,
         "business_connection_id": BUSINESS_CONNECTION_ID,
@@ -290,7 +399,7 @@ def test_delivery_ledger_round_trips_immutable_business_route(tmp_path, monkeypa
         obligation_id="business-safe",
         session_key="agent:main:telegram:business:scoped",
         platform="telegram",
-        chat_id=VLAD_ID,
+        chat_id=SAFE_CUSTOMER_ID,
         thread_id=None,
         content="safe scoped answer",
         route_envelope=route_envelope,
