@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent
+from gateway.platforms.base import (
+    MAX_INBOUND_CONTEXT_NOTE_BYTES,
+    BasePlatformAdapter,
+    InboundContextNote,
+    MessageEvent,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -78,3 +83,11 @@ async def test_prepare_hook_cannot_claim_media_outside_event():
             source=source,
             history=[],
         )
+
+
+def test_inbound_context_note_rejects_oversize_instead_of_truncating():
+    exact = "x" * MAX_INBOUND_CONTEXT_NOTE_BYTES
+    assert InboundContextNote(text=exact).text == exact
+
+    with pytest.raises(ValueError, match="must not be truncated"):
+        InboundContextNote(text=f"{exact}x")

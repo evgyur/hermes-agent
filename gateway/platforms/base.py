@@ -2526,12 +2526,24 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+MAX_INBOUND_CONTEXT_NOTE_BYTES = 20 * 1024
+
+
 @dataclass(frozen=True)
 class InboundContextNote:
     """Platform-owned context with an explicit persistence contract."""
 
     text: str
     persistence: Literal["never", "replayable"] = "never"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("Inbound plugin context text must be a string")
+        if len(self.text.encode("utf-8")) > MAX_INBOUND_CONTEXT_NOTE_BYTES:
+            raise ValueError(
+                "Inbound plugin context exceeds the 20 KiB boundary and must not "
+                "be truncated"
+            )
 
 
 @dataclass
