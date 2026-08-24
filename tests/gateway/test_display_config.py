@@ -169,6 +169,40 @@ class TestResolveDisplaySetting:
 
         assert runner.config is injected
 
+    def test_required_unsupported_runtime_fails_before_runner_readiness(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")
+            }
+        )
+        strict = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": "ack",
+                    }
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict),
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={
+                    "api_mode": "codex_app_server",
+                    "provider": "openai-codex",
+                },
+            ),
+            pytest.raises(ValueError, match="codex_app_server"),
+        ):
+            GatewayRunner(injected)
+
 
     def test_platform_override_only_affects_that_platform(self):
         """Other platforms are unaffected by a specific platform override."""

@@ -1929,12 +1929,15 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _ephemeral_user_context = _ctx.ephemeral_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
     agent._tool_start_ack_emitted = False
+    agent._start_ack_delivered_text = None
+    agent._start_ack_receipt = None
     agent._latest_interim_visible_text = None
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
@@ -2009,8 +2012,31 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        if bool(getattr(agent, "start_ack_required", False)):
+            return {
+                "final_response": (
+                    "This runtime cannot safely start tools because required "
+                    "user-visible acknowledgment is unavailable."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "turn_exit_reason": "start_ack_runtime_unsupported",
+            }
+        _codex_user_message = user_message
+        if _ephemeral_user_context:
+            if not isinstance(_codex_user_message, str):
+                raise TypeError(
+                    "codex_app_server requires string input for ephemeral context"
+                )
+            _codex_user_message = (
+                f"{_codex_user_message}\n\n{_ephemeral_user_context}"
+                if _codex_user_message
+                else _ephemeral_user_context
+            )
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=_codex_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
@@ -2310,6 +2336,23 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # Private inbound context is deliberately added only to this
+                # structural API copy, after all replayable sidecar handling.
+                # It never mutates ``messages`` or becomes ``api_content``.
+                if _ephemeral_user_context:
+                    _wire_content = api_msg.get("content")
+                    if isinstance(_wire_content, str):
+                        api_msg["content"] = (
+                            f"{_wire_content}\n\n{_ephemeral_user_context}"
+                            if _wire_content
+                            else _ephemeral_user_context
+                        )
+                    elif isinstance(_wire_content, list):
+                        _wire_blocks = list(_wire_content)
+                        _wire_blocks.append(
+                            {"type": "text", "text": _ephemeral_user_context}
+                        )
+                        api_msg["content"] = _wire_blocks
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2988,6 +3031,9 @@ def run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
+                        reject_provider_executed_tools=bool(
+                            getattr(agent, "start_ack_required", False)
+                        ),
                     )
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
@@ -3182,6 +3228,9 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                            reject_provider_executed_tools=bool(
+                                getattr(agent, "start_ack_required", False)
+                            ),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(

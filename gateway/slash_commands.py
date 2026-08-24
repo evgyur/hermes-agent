@@ -1636,6 +1636,13 @@ class GatewaySlashCommandsMixin:
                 "chat_id": event.source.chat_id,
                 "chat_type": event.source.chat_type,
             }
+            if event.source.business_connection_id:
+                notify_data["business_connection_id"] = str(
+                    event.source.business_connection_id
+                )
+                notify_data["external_safe_mode"] = bool(
+                    event.source.external_safe_mode
+                )
             if event.source.delivered_via_upstream_relay is True:
                 notify_data["delivered_via_upstream_relay"] = True
                 if event.source.user_id:
@@ -3339,7 +3346,11 @@ class GatewaySlashCommandsMixin:
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
-        voice_key = self._voice_key(platform, chat_id)
+        voice_key = self._voice_key(
+            platform,
+            chat_id,
+            business_connection_id=event.source.business_connection_id,
+        )
 
         adapter = self.adapters.get(platform)
 
@@ -3347,19 +3358,34 @@ class GatewaySlashCommandsMixin:
             self._voice_mode[voice_key] = "voice_only"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(
+                    adapter,
+                    chat_id,
+                    enabled=True,
+                    business_connection_id=event.source.business_connection_id,
+                )
             return t("gateway.voice.enabled_voice_only")
         elif args in {"off", "disable"}:
             self._voice_mode[voice_key] = "off"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+                self._set_adapter_auto_tts_disabled(
+                    adapter,
+                    chat_id,
+                    disabled=True,
+                    business_connection_id=event.source.business_connection_id,
+                )
             return t("gateway.voice.disabled_text")
         elif args == "tts":
             self._voice_mode[voice_key] = "all"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(
+                    adapter,
+                    chat_id,
+                    enabled=True,
+                    business_connection_id=event.source.business_connection_id,
+                )
             return t("gateway.voice.tts_enabled")
         elif args in {"channel", "join"}:
             return await self._handle_voice_channel_join(event)
@@ -3395,13 +3421,23 @@ class GatewaySlashCommandsMixin:
                 self._voice_mode[voice_key] = "voice_only"
                 self._save_voice_modes()
                 if adapter:
-                    self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                    self._set_adapter_auto_tts_enabled(
+                        adapter,
+                        chat_id,
+                        enabled=True,
+                        business_connection_id=event.source.business_connection_id,
+                    )
                 toggle_line = t("gateway.voice.enabled_short")
             else:
                 self._voice_mode[voice_key] = "off"
                 self._save_voice_modes()
                 if adapter:
-                    self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+                    self._set_adapter_auto_tts_disabled(
+                        adapter,
+                        chat_id,
+                        disabled=True,
+                        business_connection_id=event.source.business_connection_id,
+                    )
                 toggle_line = t("gateway.voice.disabled_short")
             # Bare /voice still toggles, but append an explainer so users
             # discover the on/off/tts/status subcommands (and, on Discord,
@@ -5881,7 +5917,10 @@ class GatewaySlashCommandsMixin:
         # Resume typing indicator — agent is about to continue processing.
         _adapter = self.adapters.get(source.platform)
         if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
+            _adapter.resume_typing_for_chat(
+                source.chat_id,
+                metadata=self._thread_metadata_for_source(source),
+            )
 
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         plural = "plural" if count > 1 else "singular"
@@ -5963,7 +6002,10 @@ class GatewaySlashCommandsMixin:
         # Resume typing indicator — agent continues (with BLOCKED result).
         _adapter = self.adapters.get(source.platform)
         if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
+            _adapter.resume_typing_for_chat(
+                source.chat_id,
+                metadata=self._thread_metadata_for_source(source),
+            )
 
         logger.info(
             "User denied %d dangerous command(s) via /deny%s",
@@ -6103,6 +6145,13 @@ class GatewaySlashCommandsMixin:
             "session_key": session_key,
             "timestamp": datetime.now().isoformat(),
         }
+        if event.source.business_connection_id:
+            pending["business_connection_id"] = str(
+                event.source.business_connection_id
+            )
+            pending["external_safe_mode"] = bool(
+                event.source.external_safe_mode
+            )
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id
         if event.message_id:

@@ -494,9 +494,8 @@ class TestResumePendingSystemNote:
         assert "pending tool outputs" in result
         assert "Do NOT re-execute" in result
 
-    def test_legacy_history_without_timestamps_still_injects(self):
-        """Transcripts predating timestamp persistence must keep the old
-        behaviour — freshness unknown → treat as fresh."""
+    def test_legacy_history_without_timestamps_fails_closed(self):
+        """Unknown freshness cannot authorize synthetic continuation."""
         history = [
             {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
@@ -504,9 +503,7 @@ class TestResumePendingSystemNote:
             {"role": "tool", "tool_call_id": "c1", "content": "result"},
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
-        assert "[System note:" in result
-        assert "pending tool outputs" in result
-        assert "Do NOT re-execute" in result
+        assert result == "ping"
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +636,7 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
         resume_pending=True,
         resume_reason="restart_timeout",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="restart-timeout-task",
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
     adapter.handle_message = AsyncMock()
@@ -673,6 +671,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="telegram-restart-task",
     )
     discord_entry = SessionEntry(
         session_key="agent:main:discord:dm:dc-chat",
@@ -685,6 +684,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="discord-restart-task",
     )
     runner.session_store._entries = {
         tg_entry.session_key: tg_entry,
@@ -724,6 +724,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="startup-restore-task",
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
@@ -884,6 +885,7 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="race-restart-task",
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
@@ -953,6 +955,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_task_id="full-path-restart-task",
     )
     runner.session_store._entries = {session_key: pending_entry}
 
@@ -1164,5 +1167,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
-

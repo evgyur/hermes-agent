@@ -24,6 +24,11 @@ from hermes_cli.plugin_index import (
 )
 
 
+TELEGRAM_BUSINESS_FAIL_CLOSED_REF = (
+    "98c60afc00d36c885bb040ebe973b1aa908886c0"
+)
+
+
 def _entry(name, repo="owner/repo", **kw):
     return PluginIndexEntry(name=name, repo=repo, **kw)
 
@@ -133,6 +138,16 @@ class TestParsing:
             assert e.repo.count("/") == 1
             assert e.ref, f"seed entry {e.name} must pin a ref"
             assert len(e.ref) == 40, f"seed entry {e.name} must pin a commit SHA"
+
+    def test_bundled_telegram_business_pin_is_fail_closed_revision(self):
+        raw = json.loads(plugin_index.SEED_INDEX_PATH.read_text(encoding="utf-8"))
+        entries = _parse_entries(raw)
+        business = next(
+            entry
+            for entry in entries
+            if entry.name == "hermes-telegram-business"
+        )
+        assert business.ref == TELEGRAM_BUSINESS_FAIL_CLOSED_REF
 
 
 # ---------------------------------------------------------------------------

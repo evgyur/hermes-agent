@@ -182,12 +182,47 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
     can never replay a stale note on a later turn.
     """
     notes = getattr(agent, "_gateway_turn_context_notes", "") or ""
+    # Typed never-persist notes use the separate consumer below.  Leave the
+    # value in place so the next one-shot read can move it into the API-only
+    # TurnContext lane without ever touching a message dict.
+    if getattr(notes, "persistence", None) == "never":
+        return ""
     if hasattr(agent, "_gateway_turn_context_notes"):
         try:
             agent._gateway_turn_context_notes = ""
         except Exception:
             pass
     return notes if isinstance(notes, str) else ""
+
+
+def consume_gateway_ephemeral_turn_context_notes(agent: Any) -> str:
+    """Pop private current-request context without creating replay state."""
+    parts: list[str] = []
+    staged = getattr(agent, "_gateway_ephemeral_turn_context_notes", "") or ""
+    if isinstance(staged, str) and staged:
+        parts.append(staged)
+    elif getattr(staged, "persistence", None) == "never":
+        text = getattr(staged, "text", "")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    if hasattr(agent, "_gateway_ephemeral_turn_context_notes"):
+        try:
+            agent._gateway_ephemeral_turn_context_notes = ""
+        except Exception:
+            pass
+
+    # Compatibility for callers that staged the newly typed note on the old
+    # replayable attribute before this split contract existed.
+    legacy = getattr(agent, "_gateway_turn_context_notes", None)
+    if getattr(legacy, "persistence", None) == "never":
+        text = getattr(legacy, "text", "")
+        if isinstance(text, str) and text:
+            parts.append(text)
+        try:
+            agent._gateway_turn_context_notes = ""
+        except Exception:
+            pass
+    return "\n\n".join(parts)
 
 
 def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
@@ -225,7 +260,12 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
 _UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
 
 
-def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
+def _maybe_title_session_at_turn_start(
+    agent: Any,
+    messages: List[Any],
+    *,
+    clean_user_message: Any = None,
+) -> None:
     """Kick off auto-titling for this session's first user message.
 
     Called from the turn prologue, so every surface a human reads (CLI, gateway,
@@ -252,6 +292,18 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 user_text = flatten_message_text(msg.get("content")).strip()
                 break
+        title_history = messages
+        if clean_user_message is not None:
+            user_text = flatten_message_text(clean_user_message).strip()
+            title_history = [
+                dict(item) if isinstance(item, dict) else item
+                for item in (messages or [])
+            ]
+            for item in reversed(title_history):
+                if isinstance(item, dict) and item.get("role") == "user":
+                    item["content"] = clean_user_message
+                    item.pop("api_content", None)
+                    break
         if not user_text:
             return
 
@@ -275,7 +327,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
             session_db,
             session_id,
             user_text,
-            conversation_history=messages,
+            conversation_history=title_history,
             failure_callback=(
                 getattr(agent, "_title_failure_callback", None)
                 or getattr(agent, "_emit_auxiliary_failure", None)
@@ -487,6 +539,8 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # Current-request-only context; never stamped into messages/api_content.
+    ephemeral_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
@@ -604,6 +658,18 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
+    # Preserve the typed privacy policy before string sanitization returns a
+    # plain ``str``.  Short-approval antecedents are API-only context: the real
+    # user text is persisted, but the copied history window is never replayed.
+    _never_persist_api_content = bool(
+        getattr(user_message, "_hermes_never_persist_api_content", False)
+        or getattr(
+            persist_user_message,
+            "_hermes_never_persist_api_content",
+            False,
+        )
+    )
+
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
@@ -615,6 +681,7 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._persist_user_message_never_replay = _never_persist_api_content
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
@@ -1386,6 +1453,7 @@ def build_turn_context(
                 if plugin_user_context
                 else _gateway_notes
             )
+    ephemeral_user_context = consume_gateway_ephemeral_turn_context_notes(agent)
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
@@ -1537,7 +1605,15 @@ def build_turn_context(
     # turn failed before producing one). Fire-and-forget on a daemon thread,
     # a no-op once the session has a title, and shared by every surface
     # because every surface enters the turn through this prologue.
-    _maybe_title_session_at_turn_start(agent, messages)
+    _maybe_title_session_at_turn_start(
+        agent,
+        messages,
+        clean_user_message=(
+            persist_user_message
+            if _never_persist_api_content
+            else None
+        ),
+    )
 
     return TurnContext(
         user_message=user_message,
@@ -1550,6 +1626,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        ephemeral_user_context=ephemeral_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )
