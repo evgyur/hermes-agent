@@ -39,7 +39,7 @@ def test_workshop_count_uses_one_metadata_read_and_answers_immediately(tmp_path:
     prompt = _render_overlay(tmp_path)
 
     assert "lessonCount" in prompt
-    assert "call mcp__seya__get_workshop once" in prompt
+    assert "call mcp__seya__get_workshop_summary once" in prompt
     assert "Do not load human20-helper" in prompt
     assert "Do not call get_section or search for a count" in prompt
 
@@ -78,6 +78,7 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
         "additional_idempotent_tools"
     ] == [
         "mcp__seya__list_resources",
+        "mcp__seya__get_workshop_summary",
         "mcp__seya__get_workshop",
         "mcp__seya__get_section",
         "mcp__seya__get_content_detail",
