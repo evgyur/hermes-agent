@@ -3815,6 +3815,38 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        # Remove stale continuity state unconditionally. If every task was
+        # completed since the previous boundary, retaining the old snapshot
+        # would resurrect finished work even though there is nothing fresh to
+        # append. System rows are canonical standalone snapshots; legacy user
+        # snapshots were suffix-merged and must preserve preceding human text.
+        compressed = [
+            row
+            for row in compressed
+            if not (
+                isinstance(row, dict)
+                and row.get("role") == "system"
+                and _message_text(row).lstrip().startswith(
+                    TODO_INJECTION_HEADER
+                )
+            )
+        ]
+        _tail = (
+            compressed[-1]
+            if compressed and isinstance(compressed[-1], dict)
+            else None
+        )
+        if _tail is not None and _tail.get("role") == "user":
+            _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
+            if _stripped != _tail.get("content"):
+                if _message_text({"role": "user", "content": _stripped}).strip():
+                    _tail["content"] = _stripped
+                    _tail.pop("_todo_snapshot_synthetic", None)
+                else:
+                    compressed.pop()
+
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             # Retention parity (#84718): the snapshot below re-injects the
@@ -3827,23 +3859,6 @@ def compress_context(
             _reload_notice = _pruned_skill_reload_notice(compressed)
             if _reload_notice:
                 todo_snapshot = f"{todo_snapshot}\n\n{_reload_notice}"
-            # A previous upstream boundary may have merged its snapshot into
-            # the trailing user turn. Remove only that stale suffix before
-            # writing the fresh system-owned row, preserving any real human
-            # text that preceded it.
-            _tail = (
-                compressed[-1]
-                if compressed and isinstance(compressed[-1], dict)
-                else None
-            )
-            if _tail is not None and _tail.get("role") == "user":
-                _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
-                if _stripped != _tail.get("content"):
-                    if _message_text({"role": "user", "content": _stripped}).strip():
-                        _tail["content"] = _stripped
-                        _tail.pop("_todo_snapshot_synthetic", None)
-                    else:
-                        compressed.pop()
             # Continuity state is system-owned metadata. Never merge or append
             # it as user-role text: chat surfaces and downstream audit paths
             # can otherwise render or reason about it as though the operator

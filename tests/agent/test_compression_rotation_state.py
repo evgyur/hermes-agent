@@ -1427,8 +1427,8 @@ class TestCooldownPersistFailureIsNotAClearedRow:
         assert compressor._ineffective_compression_count == 0
 
 
-class TestTodoSnapshotMergedNotDuplicated:
-    """Todo snapshots preserve tail content without duplicate user turns."""
+class TestTodoSnapshotSystemOwnedNotDuplicated:
+    """Todo snapshots preserve user tails as a separate protected system row."""
 
     def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -1452,10 +1452,11 @@ class TestTodoSnapshotMergedNotDuplicated:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        assert len(compressed) == 3
+        assert len(compressed) == 4
+        assert compressed[-2]["role"] == "user"
+        assert compressed[-2]["content"] == "tail"
         tail = compressed[-1]
-        assert tail["role"] == "user"
-        assert "tail" in tail["content"]
+        assert tail["role"] == "system"
         assert "task A" in tail["content"]
         assert not any(
             previous.get("role") == current.get("role") == "user"
@@ -1505,28 +1506,26 @@ class TestTodoSnapshotMergedNotDuplicated:
             input_msgs, "sys", approx_tokens=120_000
         )
 
-        assert len(compressed) == 3
+        assert len(compressed) == 4
+        user_tail = compressed[-2]
+        assert user_tail["role"] == "user"
+        assert isinstance(user_tail["content"], list)
+        assert user_tail["content"] == original_parts
         tail = compressed[-1]
-        assert tail["role"] == "user"
-        assert isinstance(tail["content"], list)
-        assert tail["content"][: len(original_parts)] == original_parts
-        assert any(
-            isinstance(part, dict) and "inspect image" in (part.get("text") or "")
-            for part in tail["content"]
-        )
+        assert tail["role"] == "system"
+        assert "inspect image" in tail["content"]
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
         )
 
         db_msgs = db.get_messages(agent.session_id)
+        persisted_user_tail = db_msgs[-2]
+        assert persisted_user_tail["role"] == "user"
+        assert persisted_user_tail["content"] == original_parts
         persisted_tail = db_msgs[-1]
-        assert persisted_tail["role"] == "user"
-        assert persisted_tail["content"][: len(original_parts)] == original_parts
-        assert any(
-            isinstance(part, dict) and "inspect image" in (part.get("text") or "")
-            for part in persisted_tail["content"]
-        )
+        assert persisted_tail["role"] == "system"
+        assert "inspect image" in persisted_tail["content"]
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(db_msgs, db_msgs[1:])
@@ -1573,12 +1572,28 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        tail = compressed[-1]
-        assert tail["role"] == "user"
-        assert "please fix the login bug" in tail["content"]
-        assert "task A" in tail["content"]
-        assert "old finished task" not in tail["content"]
-        assert tail["content"].count(TODO_INJECTION_HEADER) == 1
+        human = next(
+            row
+            for row in compressed
+            if row.get("role") == "user"
+            and "please fix the login bug" in str(row.get("content") or "")
+        )
+        snapshot = next(
+            row
+            for row in compressed
+            if row.get("role") == "system"
+            and TODO_INJECTION_HEADER in str(row.get("content") or "")
+        )
+        full_text = "\n".join(str(row.get("content") or "") for row in compressed)
+        assert TODO_INJECTION_HEADER not in human["content"]
+        assert "task A" in snapshot["content"]
+        assert "old finished task" not in full_text
+        assert full_text.count(TODO_INJECTION_HEADER) == 1
+        assert not any(
+            row.get("role") == "user"
+            and TODO_INJECTION_HEADER in str(row.get("content") or "")
+            for row in compressed
+        )
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
