@@ -80,6 +80,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_REBUILD_DEFERRAL_KEY,
     FTS_SQL,
     FTS_STALE_KEY,
+    FTS_STALE_LAYOUT_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
@@ -5666,39 +5667,98 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
             return False
 
+        def _mark_stale(cursor: sqlite3.Cursor) -> None:
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (FTS_STALE_KEY,),
+            )
+            cjk_triggers_present = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                "LIMIT 1",
+                _FTS_CJK_TRIGGERS,
+            ).fetchone()
+            if cjk_triggers_present:
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (FTS_CJK_STALE_KEY,),
+                )
+
+        quarantine_error: Optional[sqlite3.Error] = None
         try:
             with self._lock:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    self._conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    cursor = self._conn.cursor()
+                    _mark_stale(cursor)
+                    legacy = self._db_has_legacy_inline_fts(cursor)
+                    trigram = cursor.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+                    ).fetchone() is not None
+                    cursor.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
+                        (
+                            FTS_STALE_LAYOUT_KEY,
+                            json.dumps(
+                                {
+                                    "version": 1,
+                                    "quarantined": True,
+                                    "legacy": legacy,
+                                    "trigram": trigram,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        ),
                     )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
-                        self._conn.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
-                        )
-                    self._drop_all_fts_triggers(self._conn.cursor())
+                    self._drop_all_fts_triggers(cursor)
+                    if trigram:
+                        cursor.execute("DROP TABLE messages_fts_trigram")
+                    cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+                    cursor.execute("DROP TABLE messages_fts")
                     self._conn.commit()
                 except BaseException:
                     self._conn.rollback()
                     raise
-        except sqlite3.Error as detach_exc:
-            logger.error(
-                "Could not detach corrupt FTS indexes; canonical write still "
-                "cannot proceed: %s",
-                detach_exc,
+        except sqlite3.Error as exc_quarantine:
+            quarantine_error = exc_quarantine
+
+        if quarantine_error is not None:
+            # Some SQLite builds cannot xDestroy the corrupt vtable even on
+            # the already-connected handle. Preserve the previous fail-open
+            # behavior: atomically mark stale and detach triggers, leaving
+            # structural recovery for a later/offline path.
+            logger.warning(
+                "Could not quarantine corrupt FTS tables (%s); falling back "
+                "to trigger-only detachment.",
+                quarantine_error,
             )
-            return False
+            try:
+                with self._lock:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        cursor = self._conn.cursor()
+                        _mark_stale(cursor)
+                        cursor.execute(
+                            "DELETE FROM state_meta WHERE key = ?",
+                            (FTS_STALE_LAYOUT_KEY,),
+                        )
+                        self._drop_all_fts_triggers(cursor)
+                        self._conn.commit()
+                    except BaseException:
+                        self._conn.rollback()
+                        raise
+            except sqlite3.Error as detach_exc:
+                logger.error(
+                    "Could not detach corrupt FTS indexes; canonical write "
+                    "still cannot proceed: %s",
+                    detach_exc,
+                )
+                return False
 
         self._fts_stale = True
         self._fts_enabled = False
