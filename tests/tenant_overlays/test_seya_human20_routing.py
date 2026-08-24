@@ -73,6 +73,9 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
         "resume_after_no_progress_block"
     ] is True
     assert config["config_patch"]["tool_loop_guardrails"][
+        "synthesize_after_successful_tools"
+    ] == ["mcp__seya__get_workshop_lesson_count"]
+    assert config["config_patch"]["tool_loop_guardrails"][
         "hard_stop_after"
     ]["idempotent_no_progress"] == 1
     assert config["config_patch"]["tool_loop_guardrails"][

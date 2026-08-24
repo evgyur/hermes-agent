@@ -17,6 +17,8 @@ config_patch:
   agent:
     run_budget_seconds: 300
   tool_loop_guardrails:
+    synthesize_after_successful_tools:
+      - mcp__seya__get_workshop_lesson_count
     resume_after_no_progress_block: true
     hard_stop_after:
       idempotent_no_progress: 1

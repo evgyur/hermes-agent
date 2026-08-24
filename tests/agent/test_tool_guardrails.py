@@ -94,6 +94,15 @@ def test_config_adds_explicit_read_only_mcp_tools_to_idempotent_guardrails():
     assert blocked.code == "idempotent_no_progress_block"
 
 
+def test_config_parses_successful_tools_that_require_immediate_synthesis():
+    tool_name = "mcp__seya__get_workshop_lesson_count"
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"synthesize_after_successful_tools": [tool_name, "", 7, None]}
+    )
+
+    assert cfg.synthesize_after_successful_tools == frozenset({tool_name})
+
+
 def test_config_can_block_repeated_read_without_halting_the_turn():
     tool_name = "mcp__seya__list_resources"
     cfg = ToolCallGuardrailConfig.from_mapping(
@@ -264,7 +273,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

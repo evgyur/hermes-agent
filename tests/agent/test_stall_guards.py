@@ -183,6 +183,28 @@ def test_nonhalting_read_block_arms_one_tool_free_synthesis_call():
     assert agent._tool_guardrail_halt_decision is None
 
 
+def test_successful_scalar_read_arms_immediate_tool_free_synthesis():
+    from agent.tool_guardrails import ToolCallGuardrailConfig
+
+    agent = _fake_agent()
+    agent._tool_guardrails = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            synthesize_after_successful_tools=frozenset(
+                {"mcp__seya__get_workshop_lesson_count"}
+            )
+        )
+    )
+
+    result = agent._append(
+        "mcp__seya__get_workshop_lesson_count",
+        {"workshop_id": "human20-codex-hermes"},
+        '{"result": "7"}',
+    )
+
+    assert result == '{"result": "7"}'
+    assert agent._force_synthesis_without_tools is True
+
+
 def test_config_gate_disables_notice():
     agent = _fake_agent(stall_guards=False)
     args = {"query": "hermes"}

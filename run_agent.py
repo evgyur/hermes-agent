@@ -8337,6 +8337,12 @@ class AIAgent:
             function_result,
             failed=failed,
         )
+        if (
+            not failed
+            and tool_name
+            in self._tool_guardrails.config.synthesize_after_successful_tools
+        ):
+            self._force_synthesis_without_tools = True
         # Identical-call stall guards (agent.stall_guards): notice-only, no
         # blocking. Observed on the RAW result (before the loop-warning suffix
         # below, whose embedded count changes per call and would defeat

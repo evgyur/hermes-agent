@@ -133,6 +133,7 @@ class ToolCallGuardrailConfig:
     no_progress_block_after: int = 5
     resume_after_no_progress_block: bool = False
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
+    synthesize_after_successful_tools: frozenset[str] = field(default_factory=frozenset)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
 
@@ -156,6 +157,18 @@ class ToolCallGuardrailConfig:
         explicit_read_only_tools = frozenset(
             tool_name.strip()
             for tool_name in additional_idempotent_tools
+            if isinstance(tool_name, str) and tool_name.strip()
+        )
+        synthesize_after_successful_tools = data.get(
+            "synthesize_after_successful_tools", ()
+        )
+        if not isinstance(
+            synthesize_after_successful_tools, (list, tuple, set, frozenset)
+        ):
+            synthesize_after_successful_tools = ()
+        explicit_synthesis_tools = frozenset(
+            tool_name.strip()
+            for tool_name in synthesize_after_successful_tools
             if isinstance(tool_name, str) and tool_name.strip()
         )
         return cls(
@@ -190,6 +203,7 @@ class ToolCallGuardrailConfig:
                 defaults.resume_after_no_progress_block,
             ),
             idempotent_tools=defaults.idempotent_tools | explicit_read_only_tools,
+            synthesize_after_successful_tools=explicit_synthesis_tools,
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
 
