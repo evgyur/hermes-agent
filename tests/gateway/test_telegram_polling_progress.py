@@ -447,10 +447,10 @@ async def test_general_request_success_cannot_record_polling_progress(monkeypatc
     _, progress = adapter._begin_polling_generation()
 
     assert await adapter.connect() is False
-    assert builder.general_request is _ControlledRequest.instances[0]
+    assert builder.general_request.inner_request is _ControlledRequest.instances[0]
     assert builder.polling_request is _ControlledRequest.instances[1]
 
-    builder.general_request.result = (200, b'{"ok":true}')
+    builder.general_request.inner_request.result = (200, b'{"ok":true}')
     result = await builder.general_request.do_request("https://api.telegram.org/sendMessage")
 
     assert result == (200, b'{"ok":true}')

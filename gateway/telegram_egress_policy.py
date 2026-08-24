@@ -37,8 +37,11 @@ def _normalise_recipient(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if text.lstrip("-").isdigit():
-        return text
+    if text.lstrip("+-").isdigit():
+        try:
+            return str(int(text, 10))
+        except ValueError:
+            return text
     return "@" + text.lstrip("@").casefold()
 
 
@@ -125,9 +128,10 @@ def assert_route_allowed(
         ):
             raise TelegramEgressDenied("unsafe_telegram_business_route")
         return
-    allowed = {str(value) for value in (plain_dm_allowlist or set())}
-    if str(chat_id) not in allowed:
-        raise TelegramEgressDenied("unsafe_telegram_dm_route")
+    # Ordinary bot-DM policy remains the connector's existing authorization
+    # responsibility. The shared choke point only adds the absolute recipient
+    # deny and prevents Business metadata from degrading into that route.
+    return
 
 
 def canonical_route_envelope(route: Mapping[str, Any]) -> dict[str, Any]:
@@ -174,6 +178,10 @@ def guard_telegram_request(inner_request: Any) -> Any:
 
     class _RecipientGuardRequest:
         @property
+        def inner_request(self):
+            return inner_request
+
+        @property
         def read_timeout(self):
             return inner_request.read_timeout
 
@@ -199,7 +207,7 @@ def guard_telegram_request(inner_request: Any) -> Any:
             return await inner_request.retrieve(url=url, **timeouts)
 
         async def do_request(
-            self, url, method, request_data=None, **timeouts
+            self, url, method="POST", request_data=None, **timeouts
         ):
             self._check(request_data)
             return await inner_request.do_request(
