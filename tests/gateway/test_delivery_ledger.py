@@ -35,15 +35,15 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
     chat_id = kw.get("chat_id", "C1")
     thread_id = kw.get("thread_id", "171.001")
     route_envelope = kw.get("route_envelope")
-    if platform == "telegram" and "route_envelope" not in kw:
+    if platform == "telegram" and route_envelope is None:
         route_envelope = {
             "version": 1,
             "platform": "telegram",
             "runtime_profile": "default",
             "transport_profile": "default",
-            "chat_id": str(chat_id),
-            "thread_id": str(thread_id) if thread_id is not None else None,
-            "user_id": None,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": chat_id,
             "business_connection_id": None,
             "external_safe_mode": False,
         }
