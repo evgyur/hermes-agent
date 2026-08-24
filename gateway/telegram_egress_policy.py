@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -18,6 +19,11 @@ from hermes_constants import get_hermes_home
 
 class TelegramEgressDenied(RuntimeError):
     """Raised before a Telegram API call when a recipient/route is unsafe."""
+
+
+# Owner-requested, compiled fail-safe.  The external registry may add peers,
+# but removing or corrupting it can never re-enable this recipient.
+_BUILTIN_DENIED_RECIPIENTS = frozenset({"268754981", "@vladisfom"})
 
 
 def _deny_registry_path() -> Path:
@@ -29,12 +35,15 @@ def _deny_registry_path() -> Path:
 
 def _normalise_recipient(value: Any) -> str:
     text = str(value or "").strip()
-    if text.startswith("@"):  # usernames are compared case-insensitively
-        return "@" + text[1:].casefold()
-    return text
+    if not text:
+        return ""
+    if text.lstrip("-").isdigit():
+        return text
+    return "@" + text.lstrip("@").casefold()
 
 
-def denied_recipients() -> set[str]:
+@lru_cache(maxsize=1)
+def denied_recipients() -> frozenset[str]:
     """Return the union of the durable registry and emergency env fence.
 
     A malformed existing registry fails closed: allowing egress after an
@@ -43,16 +52,17 @@ def denied_recipients() -> set[str]:
     normal installations; the production pre-start guard pins its presence.
     """
 
-    denied: set[str] = {
+    denied: set[str] = set(_BUILTIN_DENIED_RECIPIENTS)
+    denied.update({
         _normalise_recipient(value)
         for value in os.getenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "").split(",")
         if _normalise_recipient(value)
-    }
+    })
     path = _deny_registry_path()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return denied
+        return frozenset(denied)
     except (OSError, ValueError, TypeError) as exc:
         raise TelegramEgressDenied("telegram_egress_deny_registry_unreadable") from exc
     if not isinstance(payload, dict) or payload.get("version") != 1:
@@ -66,7 +76,7 @@ def denied_recipients() -> set[str]:
             for value in values
             if _normalise_recipient(value)
         )
-    return denied
+    return frozenset(denied)
 
 
 def assert_recipient_allowed(chat_id: Any, *, username: Optional[str] = None) -> None:
@@ -103,11 +113,15 @@ def assert_route_allowed(
     route = metadata or {}
     business_connection_id = str(route.get("business_connection_id") or "").strip()
     if business_connection_id:
-        # Connection-scoped egress is valid only when the trust lane survives.
-        if not (
-            route.get("external_safe_mode")
-            or route.get("telegram_business_external_contact")
-            or route.get("telegram_business_send_as_account")
+        raw_envelope = route.get("route_envelope")
+        try:
+            envelope = canonical_route_envelope(raw_envelope)
+        except Exception as exc:
+            raise TelegramEgressDenied("unsafe_telegram_business_route") from exc
+        if (
+            envelope["chat_id"] != str(chat_id)
+            or envelope["business_connection_id"] != business_connection_id
+            or not envelope["external_safe_mode"]
         ):
             raise TelegramEgressDenied("unsafe_telegram_business_route")
         return
@@ -147,3 +161,52 @@ def canonical_route_envelope(route: Mapping[str, Any]) -> dict[str, Any]:
     if result["external_safe_mode"] and not result["business_connection_id"]:
         raise ValueError("ambiguous_route_envelope")
     return result
+
+
+def guard_telegram_request(inner_request: Any) -> Any:
+    """Wrap one PTB request transport with the single recipient choke point.
+
+    Every Bot API method that can send/edit/react to a chat carries ``chat_id``
+    in :class:`RequestData`; one wrapper therefore covers text, media, rich,
+    progress, callback edits, retries, and direct raw API calls without copying
+    policy checks into each feature path.
+    """
+
+    class _RecipientGuardRequest:
+        @property
+        def read_timeout(self):
+            return inner_request.read_timeout
+
+        async def initialize(self) -> None:
+            await inner_request.initialize()
+
+        async def shutdown(self) -> None:
+            await inner_request.shutdown()
+
+        @staticmethod
+        def _check(request_data: Any) -> None:
+            for parameter in getattr(request_data, "parameters", None) or ():
+                if getattr(parameter, "name", None) == "chat_id":
+                    assert_recipient_allowed(getattr(parameter, "value", None))
+
+        async def post(self, url, request_data=None, **timeouts):
+            self._check(request_data)
+            return await inner_request.post(
+                url=url, request_data=request_data, **timeouts
+            )
+
+        async def retrieve(self, url, **timeouts):
+            return await inner_request.retrieve(url=url, **timeouts)
+
+        async def do_request(
+            self, url, method, request_data=None, **timeouts
+        ):
+            self._check(request_data)
+            return await inner_request.do_request(
+                url=url,
+                method=method,
+                request_data=request_data,
+                **timeouts,
+            )
+
+    return _RecipientGuardRequest()
