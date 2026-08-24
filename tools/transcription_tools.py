@@ -722,6 +722,7 @@ def _run_command_stt(
     propagating delegated-child lineage markers when applicable.
     """
     from agent.delegation_context import delegated_child_subprocess_env
+    from subprocess_limits import bounded_child_kwargs
     from tools.environments.local import hermes_subprocess_env
 
     scrubbed = hermes_subprocess_env(inherit_credentials=False)
@@ -740,6 +741,7 @@ def _run_command_stt(
         "errors": "replace",
         "env": delegated_child_subprocess_env(scrubbed),
     }
+    popen_kwargs.update(bounded_child_kwargs())
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
