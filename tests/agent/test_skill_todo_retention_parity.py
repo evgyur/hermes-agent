@@ -315,3 +315,70 @@ class TestNoticeStripLifecycle:
         assert "fresh task" in snapshot_text
         assert "skill_view(name='hodle-design-system')" in snapshot_text
         assert "keep this human text" in full_text
+
+    def test_protected_system_snapshot_is_replaced_before_reinjection(self, tmp_path):
+        """A prior system-owned snapshot can survive compressor selection.
+
+        Refresh it rather than appending a second authoritative task list.
+        Human text around the protected tail must remain untouched.
+        """
+        summary = "[CONTEXT COMPACTION] summary"
+        stale_snapshot = (
+            TODO_INJECTION_HEADER
+            + "\n- [ ] old. OLD protected task (pending)"
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_SKILL_TODO_SYSTEM_REPLACE"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": summary},
+            {"role": "system", "content": stale_snapshot},
+            {"role": "assistant", "content": "protected human-facing tail"},
+        ]
+        agent._todo_store._items = [
+            {"id": "fresh", "content": "FRESH protected task", "status": "pending"}
+        ]
+
+        compressed, _ = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+        db.close()
+
+        full_text = "\n".join(str(row.get("content") or "") for row in compressed)
+        snapshot_rows = [
+            row
+            for row in compressed
+            if TODO_INJECTION_HEADER in str(row.get("content") or "")
+        ]
+        assert len(snapshot_rows) == 1
+        assert snapshot_rows[0]["role"] == "system"
+        assert "OLD protected task" not in full_text
+        assert "FRESH protected task" in full_text
+        assert "protected human-facing tail" in full_text
+
+    def test_completed_store_removes_protected_system_snapshot(self, tmp_path):
+        stale_snapshot = (
+            TODO_INJECTION_HEADER
+            + "\n- [ ] old. OLD completed task (pending)"
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_SKILL_TODO_SYSTEM_REMOVE"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "system", "content": stale_snapshot},
+            {"role": "assistant", "content": "protected completed tail"},
+        ]
+        agent._todo_store._items = []
+
+        compressed, _ = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+        db.close()
+
+        full_text = "\n".join(str(row.get("content") or "") for row in compressed)
+        assert TODO_INJECTION_HEADER not in full_text
+        assert "OLD completed task" not in full_text
+        assert "protected completed tail" in full_text
