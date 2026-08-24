@@ -41,6 +41,19 @@ def _put_result(task_id, result):
     conn.close()
 
 
+def test_finalization_policy_delivers_when_storage_is_uninitialized(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    assert barrier.finalization_policy(
+        parent_session_id="ordinary-session",
+        root_turn_id="ordinary-turn",
+    ) == {"action": "deliver"}
+    assert not path.exists()
+
+
 def _accept(claim):
     assert barrier.accept_continuation(
         claim["barrier_id"],
