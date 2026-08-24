@@ -29293,9 +29293,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         conversation.ephemeral_context_generation = int(run_generation)
 
     def _consume_pending_ephemeral_context_notes(
-        self, session_key: str, run_generation: int
+        self, session_key: str, run_generation: Optional[int]
     ) -> List[str]:
-        if not session_key:
+        if not session_key or run_generation is None:
             return []
         state = self._peek_session_state(session_key)
         if state is None:
