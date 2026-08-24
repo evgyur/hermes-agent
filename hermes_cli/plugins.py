@@ -4019,12 +4019,59 @@ class PluginManager:
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
+
+        # An enabled external platform with the same public manifest name as
+        # a bundled platform is a registered transport replacement.  Keys
+        # cannot express this relationship because bundled platforms are
+        # category-namespaced (``platforms/telegram``) while installed user
+        # plugins are commonly flat (``telegram-platform``).  Select the last
+        # enabled external manifest by normal source order, then suppress the
+        # bundled deferred owner and any lower-precedence external candidate.
+        # If no external replacement is enabled, the bundled platform keeps
+        # its normal default-on behaviour.
+        active_platform_replacements: Dict[str, PluginManifest] = {}
+        for manifest in winners.values():
+            lookup_key = manifest.key or manifest.name
+            is_enabled = (
+                enabled is not None
+                and (lookup_key in enabled or manifest.name in enabled)
+            )
+            is_disabled = lookup_key in disabled or manifest.name in disabled
+            if (
+                manifest.kind == "platform"
+                and manifest.source != "bundled"
+                and is_enabled
+                and not is_disabled
+            ):
+                active_platform_replacements[manifest.name] = manifest
         # Standalone/user plugins that pass the gates below are collected
         # here and loaded AFTER the sweep in dependency-respecting order
         # (requires_plugins topological sort, #64165).
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+
+            replacement = active_platform_replacements.get(manifest.name)
+            if manifest.kind == "platform" and replacement is not None:
+                replacement_key = replacement.key or replacement.name
+                if manifest is not replacement:
+                    # The active replacement is the only transport owner for
+                    # this public platform name.  Do not even register the
+                    # bundled deferred loader: that would create two owners
+                    # before the external module gets a chance to replace it.
+                    if manifest.source != "bundled":
+                        loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                        loaded.error = (
+                            "superseded by higher-precedence platform plugin "
+                            f"'{replacement_key}'"
+                        )
+                        self._plugins[lookup_key] = loaded
+                    logger.debug(
+                        "Skipping platform plugin '%s'; active replacement is '%s'",
+                        lookup_key,
+                        replacement_key,
+                    )
+                    continue
 
             # Relay lifecycle ownership now lives in the Hermes core. Loading
             # an old user or entry-point copy would let plugin.initialize()
