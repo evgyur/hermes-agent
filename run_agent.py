@@ -8380,6 +8380,8 @@ class AIAgent:
         return bool(getattr(self, "_stall_guards", True))
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
+        if decision.action == "block_continue":
+            self._force_synthesis_without_tools = True
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 

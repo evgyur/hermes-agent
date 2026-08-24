@@ -21,6 +21,7 @@ from agent.tool_guardrails import (
     STALL_GUARD_IDENTICAL_CALL_THRESHOLD,
     STALL_GUARD_REPEATABLE_TOOLS,
     ToolCallGuardrailController,
+    ToolGuardrailDecision,
     is_stall_guard_repeatable,
 )
 
@@ -162,6 +163,23 @@ def test_notice_appended_to_third_identical_result():
     assert "hermes note" not in r2
     assert "hermes note" in r3
     assert r3.startswith("results")  # notice appended, result preserved
+
+
+def test_nonhalting_read_block_arms_one_synthesis_only_provider_call():
+    from run_agent import AIAgent
+
+    agent = _fake_agent()
+    decision = ToolGuardrailDecision(
+        action="block_continue",
+        code="idempotent_no_progress_block",
+        tool_name="mcp__seya__list_resources",
+    )
+
+    result = AIAgent._guardrail_block_result(agent, decision)
+
+    assert "mcp__seya__list_resources" in result
+    assert agent._force_synthesis_without_tools is True
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_config_gate_disables_notice():

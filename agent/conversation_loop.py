@@ -1441,6 +1441,14 @@ def _without_tool_definition(tools, blocked_name: str):
     ]
 
 
+def _consume_forced_synthesis_tools(agent, tools):
+    """Return no tools once after a resumable no-progress read block."""
+    if not getattr(agent, "_force_synthesis_without_tools", False):
+        return tools
+    agent._force_synthesis_without_tools = False
+    return []
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -2556,6 +2564,7 @@ def run_conversation(
             if _suppress_skill_view_for_turn
             else agent.tools
         )
+        tools_for_api = _consume_forced_synthesis_tools(agent, tools_for_api)
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(

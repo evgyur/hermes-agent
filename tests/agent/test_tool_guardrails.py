@@ -1,7 +1,9 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+from types import SimpleNamespace
 
+from agent.conversation_loop import _consume_forced_synthesis_tools
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -111,6 +113,15 @@ def test_config_can_block_repeated_read_without_halting_the_turn():
     assert decision.allows_execution is False
     assert decision.should_halt is False
     assert controller.halt_decision is None
+
+
+def test_forced_synthesis_consumes_tool_suppression_once():
+    tools = [{"type": "function", "function": {"name": "mcp__seya__list_resources"}}]
+    agent = SimpleNamespace(_force_synthesis_without_tools=True)
+
+    assert _consume_forced_synthesis_tools(agent, tools) == []
+    assert agent._force_synthesis_without_tools is False
+    assert _consume_forced_synthesis_tools(agent, tools) is tools
 
 
 def test_config_rejects_invalid_additional_idempotent_tool_values():
@@ -227,7 +238,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

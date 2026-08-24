@@ -886,6 +886,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._force_synthesis_without_tools = False
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
