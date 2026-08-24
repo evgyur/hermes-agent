@@ -92,6 +92,27 @@ def test_config_adds_explicit_read_only_mcp_tools_to_idempotent_guardrails():
     assert blocked.code == "idempotent_no_progress_block"
 
 
+def test_config_can_block_repeated_read_without_halting_the_turn():
+    tool_name = "mcp__seya__list_resources"
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "hard_stop_enabled": True,
+            "no_progress_block_after": 1,
+            "additional_idempotent_tools": [tool_name],
+            "resume_after_no_progress_block": True,
+        }
+    )
+    controller = ToolCallGuardrailController(cfg)
+
+    controller.after_call(tool_name, {}, "same resources", failed=False)
+    decision = controller.before_call(tool_name, {})
+
+    assert decision.action == "block_continue"
+    assert decision.allows_execution is False
+    assert decision.should_halt is False
+    assert controller.halt_decision is None
+
+
 def test_config_rejects_invalid_additional_idempotent_tool_values():
     cfg = ToolCallGuardrailConfig.from_mapping(
         {"additional_idempotent_tools": ["mcp__seya__get_workshop", "", 7, None]}
@@ -206,7 +227,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

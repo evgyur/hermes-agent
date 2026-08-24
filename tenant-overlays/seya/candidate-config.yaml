@@ -17,6 +17,7 @@ config_patch:
   agent:
     run_budget_seconds: 300
   tool_loop_guardrails:
+    resume_after_no_progress_block: true
     additional_idempotent_tools:
       - mcp__seya__list_resources
       - mcp__seya__get_workshop

@@ -131,6 +131,7 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    resume_after_no_progress_block: bool = False
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
@@ -183,6 +184,10 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            resume_after_no_progress_block=_as_bool(
+                data.get("resume_after_no_progress_block"),
+                defaults.resume_after_no_progress_block,
             ),
             idempotent_tools=defaults.idempotent_tools | explicit_read_only_tools,
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
@@ -272,7 +277,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | block_continue | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -499,7 +504,11 @@ class ToolCallGuardrailController:
                 _result_hash, repeat_count = record
                 if repeat_count >= self.config.no_progress_block_after:
                     decision = ToolGuardrailDecision(
-                        action="block",
+                        action=(
+                            "block_continue"
+                            if self.config.resume_after_no_progress_block
+                            else "block"
+                        ),
                         code="idempotent_no_progress_block",
                         message=(
                             f"Blocked {tool_name}: this read-only call returned the same "
@@ -510,7 +519,8 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
+                    if decision.should_halt:
+                        self._halt_decision = decision
                     return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
