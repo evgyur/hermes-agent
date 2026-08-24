@@ -101,6 +101,9 @@ class TurnContext:
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    start_ack_text: str = ""
+    start_ack_required: bool = False
+    start_ack_timeout_s: float = 3.0
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
@@ -131,6 +134,7 @@ class TurnContext:
     #     the sibling closures) ---------------------------------------------
     progress_callback: Optional[Callable] = None
     voice_ack_callback: Optional[Callable] = None
+    start_ack_callback: Optional[Callable] = None
     _step_callback_sync: Optional[Callable] = None
     _event_callback_sync: Optional[Callable] = None
     _status_callback_sync: Optional[Callable] = None

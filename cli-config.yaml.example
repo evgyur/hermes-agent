@@ -1578,6 +1578,18 @@ display:
   #   false: Only keep/send the final response
   interim_assistant_messages: true
 
+  # Optional gateway fallback shown before the first tool call when the model
+  # produced no visible interim commentary. Empty by default: configure text
+  # per platform so its language matches the audience. User turns only;
+  # webhook, startup-resume, and internal/background deliveries stay silent.
+  # Example:
+  #   platforms:
+  #     telegram:
+  #       start_ack_text: "↳ Принял. Начинаю проверку."
+  #       start_ack_mode: required  # no tool effect without ack receipt
+  start_ack_text: ""
+  start_ack_mode: best_effort  # best_effort | required
+
   # Gateway-only long-running status heartbeats.
   # When false, the platform does not receive periodic "⏳ Working — N min"
   # notifications even if agent.gateway_notify_interval is non-zero. The
