@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -700,6 +701,15 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     env = _scrub_delegated_child_kanban_env(env)
 
     return env
+
+
+def gateway_tool_subprocess_kwargs() -> dict[str, Any]:
+    """Descriptor and resource policy for host tools spawned by Hermes."""
+    from subprocess_limits import bounded_child_kwargs
+
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return {"close_fds": True, "pass_fds": ()}
+    return bounded_child_kwargs()
 
 
 def build_subprocess_env(
