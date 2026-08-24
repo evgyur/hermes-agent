@@ -316,6 +316,34 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         }
 
 
+def test_recurring_script_invocation_uses_runtime_timezone_when_job_omits_it(monkeypatch):
+    """Legacy recurring jobs still receive a complete pre-run context."""
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 8, 23, 23, 24, 30, tzinfo=timezone(timedelta(hours=3), "MSK"))
+    captured = {}
+
+    def _capture(_script_path: str, **kwargs):
+        captured.update(kwargs["invocation_context"])
+        return True, ""
+
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "_run_job_script", _capture)
+
+    job = {
+        "id": "legacy-recurring-script",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "next_run_at": "2026-08-23T23:24:29+03:00",
+    }
+    assert scheduler._run_job_script_with_claim_heartbeat(job, "watchdog.py") == (True, "")
+    assert captured == {
+        "job_id": "legacy-recurring-script",
+        "scheduled_at": "2026-08-23T23:24:29+03:00",
+        "timezone": "MSK",
+        "invocation_kind": "scheduled",
+    }
+
+
 def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch):
     """The shared execute/save/deliver body keeps its durable fire claim alive."""
     import cron.jobs as jobs
