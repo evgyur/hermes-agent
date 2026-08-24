@@ -75,9 +75,10 @@ async def test_voice_message_still_transcribed():
         )
 
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg", None, "gateway")
-    # The transcript passes through as a plain quoted line — no "voice message"
-    # meta-commentary in the LLM-visible prompt.
-    assert "hello world" in result
+    # A voice note is semantically the same user input as typed text.  Wrapping
+    # it in quotes makes the model treat an imperative as quoted material to
+    # translate, edit, or comment on instead of an instruction to execute.
+    assert result == "hello world"
 
 
 # ---------------------------------------------------------------------------
@@ -124,4 +125,3 @@ async def test_audio_attachment_context_note_format():
 # ---------------------------------------------------------------------------
 # 4. Telegram gateway: msg.audio → MessageType.AUDIO (not VOICE)
 # ---------------------------------------------------------------------------
-

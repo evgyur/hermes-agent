@@ -25916,13 +25916,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "to resend or type it out.]"
                         )
                         continue
+                    transcript = transcript.strip()
                     successful_transcripts.append(transcript)
-                    # Pass the transcript through as a plain quoted line. The
-                    # earlier wording ("The user sent a voice message~ Here's
-                    # what they said: ...") read as a meta-instruction and made
-                    # the LLM volunteer commentary about voice mode rather than
-                    # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    # A successful voice transcript is user input, not quoted
+                    # reference material.  Preserve the same LLM-visible shape
+                    # as typed text so imperatives are executed instead of
+                    # being translated, edited, or merely repeated.  The old
+                    # prose wrapper was correctly removed for the same reason;
+                    # quote characters have the same meta-content effect.
+                    enriched_parts.append(transcript)
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
