@@ -6426,6 +6426,14 @@ def run_conversation(
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
+                    _summary_lower = str(_final_summary).lower()
+                    _is_codex_no_byte_watchdog = (
+                        "chatgpt.com/backend-api/codex" in _summary_lower
+                        and (
+                            "codex stream produced no useful bytes" in _summary_lower
+                            or "codex stream produced no bytes" in _summary_lower
+                        )
+                    )
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
                         if classified.billing_unverified:
@@ -6450,6 +6458,16 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                             unverified=classified.billing_unverified,
+                        )
+                    elif _is_codex_no_byte_watchdog:
+                        # The TTFB watchdog already emitted a bounded reconnect
+                        # status. If all retries fail, retain the diagnostic in
+                        # logs but do not turn transport plumbing into a scary
+                        # final Telegram message.
+                        agent._vprint(
+                            f"{agent.log_prefix}   ⚠️ Codex no-byte watchdog "
+                            "exhausted retries; suppressing chat delivery.",
+                            force=True,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -6570,6 +6588,8 @@ def run_conversation(
                             _provider, _base, _model, _billing_guidance,
                             unverified=_billing_unverified,
                         )
+                    elif _is_codex_no_byte_watchdog:
+                        _final_response = ""
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -6602,7 +6622,8 @@ def run_conversation(
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": _final_summary,
+                        "error": "" if _is_codex_no_byte_watchdog else _final_summary,
+                        "suppress_delivery": bool(_is_codex_no_byte_watchdog),
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a

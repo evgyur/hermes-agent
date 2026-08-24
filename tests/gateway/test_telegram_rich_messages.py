@@ -832,3 +832,54 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert event.reply_to_message_id == "678"
     assert event.reply_to_text == "Your morning briefing: CI is green."
+
+
+@pytest.mark.asyncio
+async def test_legacy_send_records_visible_text_for_business_reply_recovery(
+    monkeypatch, tmp_path
+):
+    """MarkdownV2 fallback sends must populate the same durable reply index."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway import rich_sent_store
+
+    adapter = _make_adapter({"rich_messages": False})
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=679)
+    )
+
+    result = await adapter.send(
+        "12345",
+        "Legacy answer: CI is green.",
+        metadata={
+            "business_connection_id": "biz-1",
+            "external_safe_mode": True,
+            "telegram_business_external_contact": True,
+            "route_envelope": {
+                "version": 1,
+                "platform": "telegram",
+                "runtime_profile": "default",
+                "transport_profile": "default",
+                "chat_id": "12345",
+                "thread_id": None,
+                "user_id": "42",
+                "business_connection_id": "biz-1",
+                "external_safe_mode": True,
+            },
+        },
+    )
+
+    assert result.success is True
+    assert rich_sent_store.lookup_scoped(
+        platform="telegram",
+        transport_profile="default",
+        business_connection_id="biz-1",
+        chat_id="12345",
+        message_id="679",
+    ) == "Legacy answer: CI is green."
+    assert rich_sent_store.lookup_scoped(
+        platform="telegram",
+        transport_profile="other-profile",
+        business_connection_id="biz-1",
+        chat_id="12345",
+        message_id="679",
+    ) is None

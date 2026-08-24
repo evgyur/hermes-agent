@@ -2546,6 +2546,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     business_connection_id=(metadata or {}).get(
                         "business_connection_id"
                     ),
+                    platform="telegram",
+                    transport_profile=getattr(self, "_owner_profile", None)
+                    or "default",
                 )
             except Exception:
                 pass
@@ -2637,6 +2640,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 business_connection_id=(metadata or {}).get(
                     "business_connection_id"
                 ),
+                platform="telegram",
+                transport_profile=getattr(self, "_owner_profile", None)
+                or "default",
             )
         except Exception:
             pass
@@ -5790,7 +5796,24 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                message_id = str(msg.message_id)
+                message_ids.append(message_id)
+                try:
+                    from gateway import rich_sent_store
+
+                    rich_sent_store.record(
+                        str(chat_id),
+                        message_id,
+                        _strip_mdv2(chunk),
+                        business_connection_id=(metadata or {}).get(
+                            "business_connection_id"
+                        ),
+                        platform="telegram",
+                        transport_profile=getattr(self, "_owner_profile", None)
+                        or "default",
+                    )
+                except Exception:
+                    pass
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,

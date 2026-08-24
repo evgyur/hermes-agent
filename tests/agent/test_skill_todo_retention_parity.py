@@ -249,9 +249,10 @@ class TestSkillGuidanceSurvivesWithTodos:
         assert len(snapshot_rows) == 1
         row = snapshot_rows[0]
         assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(row["content"])
-        assert row.get("_todo_snapshot_synthetic") is True
+        assert row.get("role") == "system"
+        assert not row.get("_todo_snapshot_synthetic")
         assert not _is_real_user_message(row)
-        assert ContextCompressor._is_synthetic_compression_user_turn(row)
+        assert not ContextCompressor._transcript_has_real_user_turn([row])
 
 
 class TestNoticeStripLifecycle:
@@ -299,11 +300,18 @@ class TestNoticeStripLifecycle:
             _msgs(), "sys", approx_tokens=120_000
         )
         db.close()
-        tail_text = str(compressed[-1]["content"])
-        assert tail_text.count(TODO_INJECTION_HEADER) == 1
-        assert tail_text.count(_PRUNED_SKILL_RELOAD_NOTICE_HEADER) == 1
-        assert "stale task" not in tail_text
-        assert "stale-skill" not in tail_text
-        assert "fresh task" in tail_text
-        assert "skill_view(name='hodle-design-system')" in tail_text
-        assert "keep this human text" in tail_text
+        full_text = "\n".join(str(row.get("content") or "") for row in compressed)
+        snapshot = next(
+            row
+            for row in compressed
+            if row.get("role") == "system"
+            and TODO_INJECTION_HEADER in str(row.get("content") or "")
+        )
+        snapshot_text = str(snapshot["content"])
+        assert full_text.count(TODO_INJECTION_HEADER) == 1
+        assert full_text.count(_PRUNED_SKILL_RELOAD_NOTICE_HEADER) == 1
+        assert "stale task" not in full_text
+        assert "stale-skill" not in full_text
+        assert "fresh task" in snapshot_text
+        assert "skill_view(name='hodle-design-system')" in snapshot_text
+        assert "keep this human text" in full_text
