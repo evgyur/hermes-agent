@@ -1164,9 +1164,10 @@ def build_session_key(
         if source.platform == Platform.SLACK and source.scope_id
         else None
     )
-    if source.platform == Platform.TELEGRAM and source.business_connection_id:
+    business_connection_id = getattr(source, "business_connection_id", None)
+    if source.platform == Platform.TELEGRAM and business_connection_id:
         trust_lane = "external" if source.external_safe_mode else "trusted"
-        connection_id = quote(str(source.business_connection_id), safe="")
+        connection_id = quote(str(business_connection_id), safe="")
         return ":".join(
             str(part) for part in (
                 ns,
