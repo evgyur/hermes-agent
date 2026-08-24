@@ -75,6 +75,20 @@ from agent.turn_result import (
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
+
+def _get_declared_adapter_hook(adapter: Any, name: str):
+    """Return an explicitly installed adapter hook without dynamic invention.
+
+    ``MagicMock`` and other ``__getattr__`` proxies fabricate arbitrary
+    attributes.  Gateway capability seams must only call methods that exist in
+    the instance dictionary or class hierarchy.
+    """
+    try:
+        inspect.getattr_static(adapter, name)
+    except AttributeError:
+        return None
+    return getattr(adapter, name, None)
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -19837,8 +19851,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # platform plugin.
         _inbound_adapter = self._adapter_for_source(source)
         if _inbound_adapter is not None:
-            _plugin_prepare = getattr(
-                _inbound_adapter, "prepare_inbound_message_text", None
+            # Resolve the capability statically. Dynamic test doubles (notably
+            # MagicMock) manufacture arbitrary attributes through __getattr__;
+            # treating one of those as an installed async hook makes the core
+            # await a plain mock. Real adapters declare this method on their
+            # class, while instance-installed hooks remain supported through
+            # the instance dictionary.
+            _plugin_prepare = _get_declared_adapter_hook(
+                _inbound_adapter, "prepare_inbound_message_text"
             )
             # Product adapters inherit the explicit no-op contract from
             # BasePlatformAdapter.  Keep lightweight third-party/test adapter
@@ -21913,8 +21933,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if context_adapter is not None:
             from gateway.platforms.base import InboundContextNote
 
-            context_note_builder = getattr(
-                context_adapter, "build_ephemeral_context_note", None
+            context_note_builder = _get_declared_adapter_hook(
+                context_adapter, "build_ephemeral_context_note"
             )
             context_note = (
                 context_note_builder(event)
