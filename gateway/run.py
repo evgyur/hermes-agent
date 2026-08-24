@@ -18157,13 +18157,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        if qcmd.get("append_args") and user_args:
+                            try:
+                                exec_cmd = f"{exec_cmd} {shlex.join(shlex.split(user_args))}"
+                            except ValueError:
+                                exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                         try:
-                            # Sanitize env to prevent credential leakage —
-                            # quick commands run in the gateway process which
-                            # has all API keys in os.environ.
+                            # Start from the sanitized child environment, then add
+                            # only non-secret command/origin metadata required by
+                            # fail-closed quick-command policies and notifiers.
                             from subprocess_limits import bounded_child_kwargs
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
+                            sanitized_env["HERMES_COMMAND_NAME"] = command
+                            sanitized_env["HERMES_COMMAND_ARGS"] = user_args
+                            source_platform = getattr(source, "platform", "")
+                            origin_platform = getattr(
+                                source_platform, "value", source_platform
+                            )
+                            sanitized_env["HERMES_ORIGIN_PLATFORM"] = str(
+                                origin_platform or ""
+                            )
+                            sanitized_env["HERMES_ORIGIN_CHAT_ID"] = str(
+                                getattr(source, "chat_id", "") or ""
+                            )
+                            origin_thread_id = getattr(source, "thread_id", None)
+                            if origin_thread_id is not None:
+                                sanitized_env["HERMES_ORIGIN_THREAD_ID"] = str(
+                                    origin_thread_id
+                                )
+                            else:
+                                sanitized_env.pop("HERMES_ORIGIN_THREAD_ID", None)
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,

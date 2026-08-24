@@ -104,6 +104,58 @@ class TestGatewayQuickCommands:
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_exec_command_preserves_args_and_exact_origin(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "where": {
+                    "type": "exec",
+                    "command": (
+                        "printf '%s|%s|%s|%s|%s' "
+                        '"$HERMES_COMMAND_NAME" "$HERMES_COMMAND_ARGS" '
+                        '"$HERMES_ORIGIN_PLATFORM" "$HERMES_ORIGIN_CHAT_ID" '
+                        '"$HERMES_ORIGIN_THREAD_ID"'
+                    ),
+                    "append_args": False,
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("where", "wallet HYPE")
+        event.source.chat_id = "-1003958174857"
+        event.source.thread_id = "3822"
+        result = await runner._handle_message(event)
+
+        assert result == "where|wallet HYPE|telegram|-1003958174857|3822"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_appends_user_args(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "chart": {
+                    "type": "exec",
+                    "command": "printf '%s'",
+                    "append_args": True,
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        result = await runner._handle_message(self._make_event("chart", "2h"))
+
+        assert result == "2h"
+
+    @pytest.mark.asyncio
     async def test_exec_command_does_not_leak_credentials(self):
         """Quick command exec must sanitize env — API keys must not appear in output."""
         from gateway.run import GatewayRunner
