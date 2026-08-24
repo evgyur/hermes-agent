@@ -35,6 +35,15 @@ def test_complete_mcp_result_forbids_external_research(tmp_path: Path) -> None:
     assert "a request that MCP fully answers stops after MCP" in prompt
 
 
+def test_workshop_count_uses_one_metadata_read_and_answers_immediately(tmp_path: Path) -> None:
+    prompt = _render_overlay(tmp_path)
+
+    assert "lessonCount" in prompt
+    assert "call mcp__seya__get_workshop once" in prompt
+    assert "Do not load human20-helper" in prompt
+    assert "Do not call get_section or search for a count" in prompt
+
+
 def test_missing_external_fact_keeps_one_bounded_fallback(tmp_path: Path) -> None:
     prompt = _render_overlay(tmp_path)
 
@@ -62,6 +71,9 @@ def test_candidate_config_is_seya_only_and_has_exact_deadlines() -> None:
     assert config["config_patch"]["tool_loop_guardrails"][
         "resume_after_no_progress_block"
     ] is True
+    assert config["config_patch"]["tool_loop_guardrails"][
+        "hard_stop_after"
+    ]["idempotent_no_progress"] == 1
     assert config["config_patch"]["tool_loop_guardrails"][
         "additional_idempotent_tools"
     ] == [

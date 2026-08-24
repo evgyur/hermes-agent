@@ -22,6 +22,13 @@ source.
 - The installed `human20-helper` skill documents the same Human20 surface and
   may be used for its supported flows; it must not store or reveal bearer tokens.
 
+Workshop metadata fast path:
+
+- For a lesson-count question, call mcp__seya__get_workshop once and answer
+  immediately from its top-level `lessonCount` field, naming the workshop.
+- Do not load human20-helper for workshop metadata already exposed by MCP. Do
+  not call get_section or search for a count, and never repeat the same MCP read.
+
 Representative routing:
 
 - a workshop, lesson, meeting, transcript, digest, progress, or homework request

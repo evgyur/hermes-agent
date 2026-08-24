@@ -130,6 +130,26 @@ def test_guardrail_suppresses_only_the_blocked_tool_for_the_rest_of_the_turn():
     assert agent._guardrail_suppressed_tools == {blocked}
 
 
+def test_repeated_successful_read_forces_one_tool_free_synthesis_call():
+    blocked = "mcp__seya__get_section"
+    tools = [
+        {"type": "function", "function": {"name": blocked}},
+        {"type": "function", "function": {"name": "mcp__seya__get_workshop"}},
+        {"type": "function", "function": {"name": "mcp__seya__search"}},
+    ]
+    agent = SimpleNamespace(
+        _guardrail_suppressed_tools={blocked},
+        _force_synthesis_without_tools=True,
+    )
+
+    assert _without_guardrail_suppressed_tool_definitions(agent, tools) == []
+    assert agent._force_synthesis_without_tools is False
+    assert [
+        tool["function"]["name"]
+        for tool in _without_guardrail_suppressed_tool_definitions(agent, tools)
+    ] == ["mcp__seya__get_workshop", "mcp__seya__search"]
+
+
 def test_config_rejects_invalid_additional_idempotent_tool_values():
     cfg = ToolCallGuardrailConfig.from_mapping(
         {"additional_idempotent_tools": ["mcp__seya__get_workshop", "", 7, None]}
@@ -244,7 +264,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

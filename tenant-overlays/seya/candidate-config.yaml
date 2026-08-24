@@ -11,13 +11,15 @@ release_policy:
 workspace_overlay:
   source: tenant-overlays/seya/AGENTS.md
   destination: /home/milolika/workspace/AGENTS.md
-  expected_sha256: c501f321cc13f5d28a838a4ae559d575949ff024cdfd2f10336efd3fe873e79c
+  expected_sha256: f1185d1e0c7d8d84c3117357400f4b07c51b460083b429c092f3ae6c41b7f1e8
 
 config_patch:
   agent:
     run_budget_seconds: 300
   tool_loop_guardrails:
     resume_after_no_progress_block: true
+    hard_stop_after:
+      idempotent_no_progress: 1
     additional_idempotent_tools:
       - mcp__seya__list_resources
       - mcp__seya__get_workshop

@@ -1442,7 +1442,10 @@ def _without_tool_definition(tools, blocked_name: str):
 
 
 def _without_guardrail_suppressed_tool_definitions(agent, tools):
-    """Hide only tools already blocked for no progress in this turn."""
+    """Force one synthesis call, then hide reads blocked earlier this turn."""
+    if getattr(agent, "_force_synthesis_without_tools", False):
+        agent._force_synthesis_without_tools = False
+        return []
     suppressed = getattr(agent, "_guardrail_suppressed_tools", set())
     if not suppressed:
         return tools

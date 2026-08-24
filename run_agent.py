@@ -8381,6 +8381,7 @@ class AIAgent:
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         if decision.action == "block_continue" and decision.tool_name:
+            self._force_synthesis_without_tools = True
             suppressed = getattr(self, "_guardrail_suppressed_tools", None)
             if not isinstance(suppressed, set):
                 suppressed = set()
