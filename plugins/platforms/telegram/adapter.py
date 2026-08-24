@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import hashlib
 import os
 import html as _html
 import re
@@ -20,6 +21,7 @@ import time
 import tempfile
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -227,6 +229,36 @@ from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _BUSINESS_CONNECTION_STORE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _business_connection_store_file_lock(path: _Path):
+    """Cross-process lock for the Business route read/merge/replace cycle."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _BUSINESS_CONNECTION_STORE_LOCK:
+        with open(f"{path}.lock", "a+b") as lock_file:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 # Max seconds a send/edit coroutine may sleep inline on a Telegram
 # flood-control RetryAfter. Longer server penalties fail closed with a
@@ -1826,6 +1858,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
+        policy_error = self._egress_policy_error(
+            send_kwargs.get("chat_id"), metadata
+        )
+        if policy_error:
+            raise ValueError(policy_error)
+        send_kwargs = dict(send_kwargs)
+        send_kwargs.update(self._business_connection_kwargs(metadata))
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
@@ -2310,16 +2349,32 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return get_hermes_home() / "state" / "telegram_business_connections.json"
 
+    def _business_connection_store_key(self, chat_id: Any) -> str:
+        profile = str(getattr(self, "_owner_profile", None) or "default")
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        if bot_id is not None:
+            bot_identity = f"id:{bot_id}"
+        else:
+            token = str(getattr(getattr(self, "config", None), "token", "") or "")
+            bot_identity = "token:" + hashlib.sha256(
+                token.encode("utf-8", "replace")
+            ).hexdigest()[:24]
+        return "scope:v1:" + json.dumps(
+            (profile, bot_identity, str(chat_id)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     def _known_business_connection_id(self, chat_id: Any) -> Optional[str]:
+        path = self._business_connection_store_path()
         try:
-            payload = json.loads(
-                self._business_connection_store_path().read_text(encoding="utf-8")
-            )
+            with _business_connection_store_file_lock(path):
+                payload = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, TypeError, ValueError):
             return None
         if not isinstance(payload, dict):
             return None
-        exact = payload.get(str(chat_id))
+        exact = payload.get(self._business_connection_store_key(chat_id))
         return str(exact) if exact else None
 
     def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
@@ -2328,24 +2383,40 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id is None or not connection_id:
             return
         path = self._business_connection_store_path()
-        temp_path = path.with_name(
-            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
+        temp_path: Optional[_Path] = None
         try:
-            with _BUSINESS_CONNECTION_STORE_LOCK:
-                path.parent.mkdir(parents=True, exist_ok=True)
+            with _business_connection_store_file_lock(path):
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (FileNotFoundError, OSError, TypeError, ValueError):
                     payload = {}
                 if not isinstance(payload, dict):
                     payload = {}
-                payload[str(chat_id)] = str(connection_id)
-                temp_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    encoding="utf-8",
+                payload[self._business_connection_store_key(chat_id)] = str(
+                    connection_id
                 )
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.{os.getpid()}.",
+                    suffix=".tmp",
+                    dir=path.parent,
+                )
+                temp_path = _Path(temp_name)
+                with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+                    json.dump(
+                        payload,
+                        temp_file,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
                 os.replace(temp_path, path)
+                if os.name != "nt":
+                    dir_fd = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to persist Telegram Business route for chat %s: %s",
@@ -2355,7 +2426,8 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         finally:
             try:
-                temp_path.unlink(missing_ok=True)
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -2369,7 +2441,16 @@ class TelegramAdapter(BasePlatformAdapter):
         values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
         return {str(value).strip() for value in values if str(value).strip()}
 
-    def _plain_dm_allowlist(self) -> set[str]:
+    def _plain_dm_allowlist(self) -> Optional[set[str]]:
+        extra = (getattr(getattr(self, "config", None), "extra", {}) or {})
+        business = extra.get("business")
+        # Preserve upstream/default behavior when no recipient allowlist was
+        # configured.  A configured (even explicitly empty) allowlist remains
+        # fail-closed; this is what the HEL1 owner-only profile relies on.
+        if "allow_from" not in extra and not (
+            isinstance(business, dict) and "owner_user_ids" in business
+        ):
+            return None
         return self._business_owner_ids()
 
     def _business_blocked_chat_ids(self) -> set[str]:
@@ -2493,6 +2574,68 @@ class TelegramAdapter(BasePlatformAdapter):
             return str(exc) or "unsafe_telegram_route"
         return None
 
+    def _egress_policy_result(
+        self, chat_id: Any, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[SendResult]:
+        """Return one uniform pre-wire denial for public egress surfaces."""
+        policy_error = self._egress_policy_error(chat_id, metadata)
+        if not policy_error:
+            return None
+        logger.error(
+            "[%s] Telegram egress denied for chat %s: %s",
+            self.name,
+            chat_id,
+            policy_error,
+        )
+        return SendResult(
+            success=False,
+            error=policy_error,
+            retryable=False,
+        )
+
+    def _record_sent_reply_text(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Persist reply text; Business ownership receipts are mandatory."""
+        business_connection_id = (metadata or {}).get("business_connection_id")
+        try:
+            from gateway import rich_sent_store
+
+            if business_connection_id:
+                return bool(
+                    rich_sent_store.record_scoped(
+                        platform="telegram",
+                        transport_profile=(
+                            getattr(self, "_owner_profile", None) or "default"
+                        ),
+                        business_connection_id=business_connection_id,
+                        chat_id=str(chat_id),
+                        message_id=str(message_id),
+                        text=content,
+                    )
+                )
+            # Ordinary bot chats retain the legacy best-effort reply index.
+            rich_sent_store.record(str(chat_id), str(message_id), content)
+            return True
+        except Exception:
+            return not bool(business_connection_id)
+
+    @staticmethod
+    def _business_receipt_failure() -> SendResult:
+        # The wire effect already happened.  Mark this non-retryable so a
+        # caller cannot duplicate the delivered message while surfacing that
+        # future reply ownership could not be proven.
+        return SendResult(
+            success=False,
+            error="telegram_business_receipt_persist_failed",
+            retryable=False,
+            error_kind="permanent",
+        )
+
     async def _try_send_rich(
         self,
         chat_id: str,
@@ -2592,21 +2735,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
-            try:
-                from gateway import rich_sent_store
-                rich_sent_store.record(
-                    str(chat_id),
-                    str(message_id),
-                    content,
-                    business_connection_id=(metadata or {}).get(
-                        "business_connection_id"
-                    ),
-                    platform="telegram",
-                    transport_profile=getattr(self, "_owner_profile", None)
-                    or "default",
-                )
-            except Exception:
-                pass
+            if not self._record_sent_reply_text(
+                str(chat_id), str(message_id), content, metadata
+            ):
+                return self._business_receipt_failure()
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
@@ -2686,21 +2818,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # first rich send, so mirror the fresh-send index here too: a streamed
         # final finalized via editMessageText is otherwise never recorded, and
         # replies to it would have no native echo to recover from.
-        try:
-            from gateway import rich_sent_store
-            rich_sent_store.record(
-                str(chat_id),
-                str(message_id),
-                content,
-                business_connection_id=(metadata or {}).get(
-                    "business_connection_id"
-                ),
-                platform="telegram",
-                transport_profile=getattr(self, "_owner_profile", None)
-                or "default",
-            )
-        except Exception:
-            pass
+        if not self._record_sent_reply_text(
+            str(chat_id), str(message_id), content, metadata
+        ):
+            return self._business_receipt_failure()
         return SendResult(success=True, message_id=message_id)
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -5581,10 +5702,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not self._bot:
                 return SendResult(success=False, error="Not connected", retryable=True)
 
-        policy_error = self._egress_policy_error(chat_id, metadata)
-        if policy_error:
-            logger.error("[%s] Telegram egress denied for chat %s: %s", self.name, chat_id, policy_error)
-            return SendResult(success=False, error=policy_error, retryable=False)
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -5875,22 +5995,10 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_id = str(msg.message_id)
                 message_ids.append(message_id)
-                try:
-                    from gateway import rich_sent_store
-
-                    rich_sent_store.record(
-                        str(chat_id),
-                        message_id,
-                        _strip_mdv2(chunk),
-                        business_connection_id=(metadata or {}).get(
-                            "business_connection_id"
-                        ),
-                        platform="telegram",
-                        transport_profile=getattr(self, "_owner_profile", None)
-                        or "default",
-                    )
-                except Exception:
-                    pass
+                if not self._record_sent_reply_text(
+                    str(chat_id), message_id, _strip_mdv2(chunk), metadata
+                ):
+                    return self._business_receipt_failure()
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -6006,6 +6114,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
         try:
             business_kwargs = self._business_connection_kwargs(metadata)
         except ValueError as exc:
@@ -6441,6 +6552,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return False
+        if self._egress_policy_result(chat_id, metadata) is not None:
+            return False
         try:
             business_kwargs = self._business_connection_kwargs(metadata)
             if business_kwargs:
@@ -6521,6 +6634,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final
@@ -6651,6 +6767,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
         try:
             default_hint = f" (default: {default})" if default else ""
             text = self.format_message(f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}")
@@ -6707,6 +6826,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             text = self._format_exec_approval(command, description, smart_denied)
@@ -6775,6 +6897,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Render a three-button slash-command confirmation prompt."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             preview = self.format_message(self._truncate_preview(message, 3800))
@@ -6838,6 +6963,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             text = f"❓ {_html.escape(question)}"
@@ -6915,6 +7043,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             from hermes_cli.providers import get_label
@@ -6991,6 +7122,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             buttons = []
@@ -7609,6 +7743,38 @@ class TelegramAdapter(BasePlatformAdapter):
             query_business_connection_id = query_business_connection_id.strip()
         query_external_safe_mode = bool(query_business_connection_id)
 
+        # Picker callbacks mutate per-session model/reasoning state. They used
+        # to dispatch before the common callback authorization boundary, so an
+        # arbitrary Telegram user could reach state lookup and mutation merely
+        # by forging callback_data. Bind authorization to the exact callback
+        # route before either picker handler sees the request.
+        picker_callback = data.startswith(
+            ("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:", "cp:")
+        )
+        if picker_callback:
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=(
+                    str(query_chat_type)
+                    if query_chat_type is not None
+                    else None
+                ),
+                thread_id=(
+                    str(query_thread_id)
+                    if query_thread_id is not None
+                    else None
+                ),
+                user_name=query_user_name,
+                business_connection_id=query_business_connection_id,
+                external_safe_mode=query_external_safe_mode,
+            ):
+                await query.answer(
+                    text="⛔ You are not authorized to use this control."
+                )
+                return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -8166,6 +8332,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
         
         try:
             if not os.path.exists(audio_path):
@@ -8325,6 +8494,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return
+        if self._egress_policy_result(chat_id, metadata) is not None:
+            return
         if not images:
             return
 
@@ -8453,6 +8624,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Telegram photo."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             if not os.path.exists(image_path):
@@ -8548,6 +8722,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             if not os.path.exists(file_path):
@@ -8602,6 +8779,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a video natively as a Telegram video message."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         try:
             if not os.path.exists(video_path):
@@ -8656,6 +8836,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
 
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
@@ -8753,6 +8936,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._egress_policy_result(chat_id, metadata)
+        if denied is not None:
+            return denied
         
         try:
             _anim_thread = self._metadata_thread_id(metadata)
@@ -8848,6 +9034,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id, metadata):
+            return
+        if self._egress_policy_result(chat_id, metadata) is not None:
             return
 
         _is_dm_topic: bool = False
@@ -11690,7 +11878,6 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
-        business_connection_id = getattr(message, "business_connection_id", None)
         if business_connection_id:
             source.business_connection_id = str(business_connection_id)
             source.external_safe_mode = True
@@ -11725,13 +11912,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not reply_to_text:
                     try:
                         from gateway import rich_sent_store
-                        reply_to_text = rich_sent_store.lookup(
-                            str(chat.id),
-                            reply_to_id,
-                            business_connection_id=getattr(
-                                message, "business_connection_id", None
-                            ),
+                        reply_business_id = getattr(
+                            message, "business_connection_id", None
                         )
+                        if reply_business_id:
+                            # Business replies are trusted only when the exact
+                            # transport route that sent the quoted message owns
+                            # the durable index entry.  Never widen to the
+                            # legacy (chat, message, business) key.
+                            reply_to_text = rich_sent_store.lookup_scoped(
+                                platform="telegram",
+                                transport_profile=(
+                                    getattr(self, "_owner_profile", None)
+                                    or "default"
+                                ),
+                                business_connection_id=reply_business_id,
+                                chat_id=str(chat.id),
+                                message_id=reply_to_id,
+                            )
+                        else:
+                            reply_to_text = rich_sent_store.lookup(
+                                str(chat.id),
+                                reply_to_id,
+                            )
                     except Exception:
                         reply_to_text = None
 

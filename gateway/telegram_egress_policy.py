@@ -128,9 +128,14 @@ def assert_route_allowed(
         ):
             raise TelegramEgressDenied("unsafe_telegram_business_route")
         return
-    # Ordinary bot-DM policy remains the connector's existing authorization
-    # responsibility. The shared choke point only adds the absolute recipient
-    # deny and prevents Business metadata from degrading into that route.
+    if plain_dm_allowlist is not None:
+        allowed = {
+            _normalise_recipient(value)
+            for value in plain_dm_allowlist
+            if _normalise_recipient(value)
+        }
+        if _normalise_recipient(chat_id) not in allowed:
+            raise TelegramEgressDenied("unsafe_plain_telegram_dm")
     return
 
 
