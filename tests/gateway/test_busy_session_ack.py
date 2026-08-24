@@ -236,7 +236,7 @@ class TestBusySessionAck:
         runner._busy_input_mode = "steer"
         runner._should_echo_stt_transcripts = MagicMock(return_value=False)
         runner._enrich_message_with_transcription = AsyncMock(
-            return_value=('"yönü teknik mimariye çevir"', ["yönü teknik mimariye çevir"])
+            return_value=("yönü teknik mimariye çevir", ["yönü teknik mimariye çevir"])
         )
         adapter = _make_adapter()
 
@@ -256,7 +256,7 @@ class TestBusySessionAck:
         runner._enrich_message_with_transcription.assert_awaited_once_with(
             "", ["/tmp/follow-up.ogg"]
         )
-        agent.steer.assert_called_once_with('"yönü teknik mimariye çevir"')
+        agent.steer.assert_called_once_with("yönü teknik mimariye çevir")
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]
@@ -469,5 +469,4 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
 
