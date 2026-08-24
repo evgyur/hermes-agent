@@ -3827,19 +3827,10 @@ def compress_context(
             _reload_notice = _pruned_skill_reload_notice(compressed)
             if _reload_notice:
                 todo_snapshot = f"{todo_snapshot}\n\n{_reload_notice}"
-            # Fold the snapshot into a trailing REAL user message so
-            # compression never introduces a synthetic user/user pair. Any
-            # snapshot merged at an earlier boundary is stripped first so
-            # repeated compactions refresh rather than accumulate todo state
-            # (#26981). Scaffolding tails (continuation marker, summary
-            # handoff, a bare stale snapshot row) must never absorb the
-            # snapshot: merging would upgrade them to "real user" evidence
-            # and break zero-user provenance (#69292), so those keep the
-            # flagged standalone append and the real-user preservation pass
-            # continues to see todo scaffolding, not human intent.
-            from agent.context_compressor import _append_text_to_content
-
-            merged = False
+            # A previous upstream boundary may have merged its snapshot into
+            # the trailing user turn. Remove only that stale suffix before
+            # writing the fresh system-owned row, preserving any real human
+            # text that preceded it.
             _tail = (
                 compressed[-1]
                 if compressed and isinstance(compressed[-1], dict)
@@ -3847,34 +3838,18 @@ def compress_context(
             )
             if _tail is not None and _tail.get("role") == "user":
                 _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
-                _probe = {
-                    key: value for key, value in _tail.items() if key != "content"
-                }
-                _probe["content"] = _stripped
-                if _is_real_user_message(_probe):
-                    _snapshot_text = (
-                        f"\n\n{todo_snapshot}"
-                        if isinstance(_stripped, str) and _stripped
-                        else todo_snapshot
-                    )
-                    _tail["content"] = _append_text_to_content(
-                        _stripped, _snapshot_text
-                    )
-                    merged = True
-                elif _stripped != _tail.get("content") and not _message_text(
-                    {"role": "user", "content": _stripped}
-                ).strip():
-                    # The tail was nothing but an earlier snapshot row —
-                    # refresh it in place instead of stacking a duplicate.
-                    _tail["content"] = todo_snapshot
-                    _tail["_todo_snapshot_synthetic"] = True
-                    merged = True
-            if not merged:
-                compressed.append({
-                    "role": "user",
-                    "content": todo_snapshot,
-                    "_todo_snapshot_synthetic": True,
-                })
+                if _stripped != _tail.get("content"):
+                    if _message_text({"role": "user", "content": _stripped}).strip():
+                        _tail["content"] = _stripped
+                        _tail.pop("_todo_snapshot_synthetic", None)
+                    else:
+                        compressed.pop()
+            # Continuity state is system-owned metadata. Never merge or append
+            # it as user-role text: chat surfaces and downstream audit paths
+            # can otherwise render or reason about it as though the operator
+            # authored the snapshot. Keeping it as a system turn also avoids
+            # converting internal plan state into a steer after compaction.
+            compressed.append({"role": "system", "content": todo_snapshot})
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
             messages, compressed
         )

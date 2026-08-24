@@ -411,6 +411,11 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert first_handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "First boundary" in first_handoff["content"]
     assert any(
+        message.get("role") == "system"
+        and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
+        for message in first
+    )
+    assert not any(
         message.get("role") == "user"
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
         for message in first
@@ -445,7 +450,6 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert "Second boundary" in handoff["content"]
     assert "User asked:" not in handoff["content"]
     db.close()
-
 
 
 
