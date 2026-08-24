@@ -176,7 +176,10 @@ def _prepare_telegram_egress(chat_id, route_envelope=None) -> dict:
     route = canonical_route_envelope(route_envelope)
     if route["chat_id"] != str(chat_id):
         raise TelegramEgressDenied("telegram_route_recipient_mismatch")
-    assert_route_allowed(chat_id, metadata=route)
+    assert_route_allowed(
+        chat_id,
+        metadata={**route, "route_envelope": route},
+    )
 
     business_connection_id = route.get("business_connection_id")
     if business_connection_id:
