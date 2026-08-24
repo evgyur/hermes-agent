@@ -44,14 +44,19 @@ def _bot_with_successful_senders() -> MagicMock:
     return bot
 
 
-def _business_route(chat_id: str, connection_id: str = "bc-exact-123") -> dict:
+def _business_route(
+    chat_id: str,
+    connection_id: str = "bc-exact-123",
+    *,
+    thread_id: str | None = None,
+) -> dict:
     return {
         "version": 1,
         "platform": "telegram",
         "runtime_profile": "default",
         "transport_profile": "default",
         "chat_id": chat_id,
-        "thread_id": None,
+        "thread_id": thread_id,
         "user_id": "owner-1",
         "business_connection_id": connection_id,
         "external_safe_mode": True,
@@ -156,7 +161,9 @@ def test_business_connection_survives_media_thread_fallback(
             "",
             media_files=[(str(media_path), False)],
             thread_id="17585",
-            route_envelope=_business_route(chat_id, connection_id),
+            route_envelope=_business_route(
+                chat_id, connection_id, thread_id="17585"
+            ),
         )
     )
 
@@ -184,6 +191,10 @@ def test_business_connection_survives_media_thread_fallback(
         (
             _business_route("987654321"),
             "telegram_route_recipient_mismatch",
+        ),
+        (
+            _business_route("123456789", thread_id="999"),
+            "telegram_route_thread_mismatch",
         ),
     ],
 )
