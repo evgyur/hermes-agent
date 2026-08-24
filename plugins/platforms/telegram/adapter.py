@@ -8841,6 +8841,38 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Chats where a direct reply, mention, or wake pattern is required."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = _scoped_gate_env("TELEGRAM_REQUIRE_MENTION_CHATS")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_require_mention_topics(self) -> set[str]:
+        """Topic gates represented as ``<chat_id>:<thread_id>``."""
+        raw = self.config.extra.get("require_mention_topics")
+        if raw is None:
+            raw = _scoped_gate_env("TELEGRAM_REQUIRE_MENTION_TOPICS")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_has_scoped_mention_gate(self, message: Message) -> bool:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not chat_id:
+            return False
+        if chat_id in self._telegram_require_mention_chats():
+            return True
+        thread_id = self._effective_message_thread_id(message)
+        topic_id = (
+            str(thread_id)
+            if thread_id is not None
+            else self._GENERAL_TOPIC_THREAD_ID
+        )
+        return f"{chat_id}:{topic_id}" in self._telegram_require_mention_topics()
+
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
 
@@ -9378,12 +9410,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
-            return False
-        if self._telegram_is_free_response_topic(message):
-            return False
-        if not self._telegram_require_mention():
-            return False
+        if not self._telegram_has_scoped_mention_gate(message):
+            if chat_id_str in self._telegram_free_response_chats():
+                return False
+            if self._telegram_is_free_response_topic(message):
+                return False
+            if not self._telegram_require_mention():
+                return False
         if self._is_reply_to_bot(message):
             return False
         if self._message_mentions_bot(message):
@@ -9789,16 +9822,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
-        _require_chats = {
-            str(value) for value in self.config.extra.get("require_mention_chats", [])
-        }
-        _require_topics = {
-            str(value) for value in self.config.extra.get("require_mention_topics", [])
-        }
-        _topic_key = (
-            f"{chat_id_str}:{thread_id}" if thread_id is not None else ""
-        )
-        if chat_id_str in _require_chats or _topic_key in _require_topics:
+        if self._telegram_has_scoped_mention_gate(message):
             return bool(
                 self._is_reply_to_bot(message)
                 or self._message_mentions_bot(message)

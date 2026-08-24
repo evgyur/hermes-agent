@@ -21930,8 +21930,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(context_note, InboundContextNote):
                 if context_note.persistence not in {"never", "replayable"}:
                     raise ValueError("Inbound plugin context persistence is invalid")
-                encoded_note = context_note.text.encode("utf-8")[: 20 * 1024]
-                bounded_note = encoded_note.decode("utf-8", errors="ignore").strip()
+                bounded_note = context_note.text.strip()
                 if bounded_note:
                     target = (
                         ephemeral_context_notes
