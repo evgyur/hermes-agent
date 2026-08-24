@@ -1539,6 +1539,8 @@ def execute_code(
             _pp_parts.append(_existing_pp)
         child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
 
+        from subprocess_limits import bounded_child_kwargs
+
         proc = subprocess.Popen(
             [_child_python, _script_path],
             cwd=_child_cwd,
@@ -1548,6 +1550,7 @@ def execute_code(
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **bounded_child_kwargs(),
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
