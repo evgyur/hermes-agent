@@ -258,6 +258,16 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
             metadata["external_safe_mode"] = external_safe
             if external_safe:
                 metadata["telegram_business_external_contact"] = True
+        profile = getattr(source, "profile", None)
+        if profile:
+            metadata["profile"] = str(profile)
+        transport_profile = getattr(source, "transport_profile", None)
+        if transport_profile:
+            metadata["transport_profile"] = str(transport_profile)
+        if business_connection_id:
+            from gateway.session import build_route_envelope
+
+            metadata["route_envelope"] = build_route_envelope(source)
     if not metadata:
         return None
     if (
@@ -6984,6 +6994,7 @@ class BasePlatformAdapter(ABC):
                                 mark_attempting,
                                 record_obligation,
                             )
+                            from gateway.session import build_route_envelope
 
                             if await asyncio.to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
@@ -7039,6 +7050,7 @@ class BasePlatformAdapter(ABC):
                                             "continuation_claim_token", ""
                                         )
                                     ),
+                                    route_envelope=build_route_envelope(event.source),
                                 )
                                 # ``None`` is the legacy/test-double success
                                 # result. Only an explicit False proves the
@@ -7893,6 +7905,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            transport_profile=getattr(self, "_owner_profile", None) or "default",
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,

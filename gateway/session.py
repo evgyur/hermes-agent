@@ -183,10 +183,18 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
-    # Telegram Business routing identity.  The connection id must survive
-    # persistence so finals/recovery use the same Business connection.  The
-    # safety flag separates trusted owner conversations from external clients.
+    # Stable credential/adapter owner used for egress after a restart.  This is
+    # intentionally distinct from ``profile``: chat routing may select a named
+    # runtime profile while the update was received by the shared/default bot.
+    transport_profile: Optional[str] = None
+    # Telegram Business is a distinct trust and delivery route.  The peer
+    # ``chat_id`` alone is never sufficient to reply: without the exact
+    # connection id Telegram falls back to an ordinary bot DM, which can send
+    # private agent output to the customer represented by that peer id.
     business_connection_id: Optional[str] = None
+    # A Business customer conversation is an external-data lane even when the
+    # account owner explicitly wakes Hermes from inside it.  Persist this flag
+    # so restarts/replays cannot silently regain the normal private-agent lane.
     external_safe_mode: bool = False
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
@@ -285,6 +293,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.transport_profile:
+            d["transport_profile"] = self.transport_profile
         if self.business_connection_id:
             d["business_connection_id"] = self.business_connection_id
         if self.external_safe_mode:
@@ -316,6 +326,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            transport_profile=data.get("transport_profile"),
             business_connection_id=data.get("business_connection_id"),
             external_safe_mode=bool(data.get("external_safe_mode", False)),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
@@ -1119,6 +1130,30 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     return f"agent:{profile}"
 
 
+def build_route_envelope(source: SessionSource) -> Dict[str, Any]:
+    """Return the immutable minimum needed to select the same egress route.
+
+    The envelope intentionally carries identity/trust fields that cannot be
+    reconstructed from ``platform + chat_id + thread_id`` after a restart.
+    """
+
+    return {
+        "version": 1,
+        "platform": source.platform.value,
+        "runtime_profile": source.profile or "default",
+        "transport_profile": source.transport_profile or "default",
+        "chat_id": str(source.chat_id),
+        "thread_id": str(source.thread_id) if source.thread_id is not None else None,
+        "user_id": str(source.user_id) if source.user_id is not None else None,
+        "business_connection_id": (
+            str(source.business_connection_id)
+            if source.business_connection_id is not None
+            else None
+        ),
+        "external_safe_mode": bool(source.external_safe_mode),
+    }
+
+
 def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
@@ -1157,7 +1192,9 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
-    ns = _session_key_namespace(profile)
+    ns = _session_key_namespace(
+        profile if profile is not None else getattr(source, "profile", None)
+    )
     platform = source.platform.value
     slack_scope_id = (
         str(source.scope_id)
@@ -1166,7 +1203,9 @@ def build_session_key(
     )
     business_connection_id = getattr(source, "business_connection_id", None)
     if source.platform == Platform.TELEGRAM and business_connection_id:
-        trust_lane = "external" if source.external_safe_mode else "trusted"
+        trust_lane = (
+            "external" if getattr(source, "external_safe_mode", False) else "trusted"
+        )
         connection_id = quote(str(business_connection_id), safe="")
         return ":".join(
             str(part) for part in (
@@ -1184,7 +1223,18 @@ def build_session_key(
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
 
-        dm_parts = [ns, platform, "dm"]
+        if source.platform == Platform.TELEGRAM and business_connection_id:
+            # Keep Business conversations outside the ordinary bot-DM keyspace
+            # and scope them to the exact Telegram-issued connection.  The
+            # connection id is opaque and may contain separators, so store a
+            # stable digest in the key while retaining the exact value in the
+            # serialized SessionSource used for delivery.
+            connection_scope = hashlib.sha256(
+                str(business_connection_id).encode("utf-8", "replace")
+            ).hexdigest()[:24]
+            dm_parts = [ns, platform, "business", connection_scope]
+        else:
+            dm_parts = [ns, platform, "dm"]
         if slack_scope_id:
             dm_parts.append(slack_scope_id)
         if dm_chat_id:

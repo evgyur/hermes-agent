@@ -15,6 +15,12 @@ import time
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
+from gateway.telegram_egress_policy import (
+    TelegramEgressDenied,
+    assert_recipient_allowed,
+    assert_route_allowed,
+    canonical_route_envelope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +161,35 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _prepare_telegram_egress(chat_id, thread_id=None, route_envelope=None) -> dict:
+    """Authorize one standalone Telegram dispatch before Bot construction.
+
+    The absolute recipient deny applies to legacy callers that do not yet
+    carry route metadata.  When an immutable route envelope is supplied, its
+    recipient and Business trust lane must also survive exactly; the returned
+    kwargs are shared by text, media, and their existing retry paths.
+    """
+    if route_envelope is None:
+        assert_recipient_allowed(chat_id)
+        return {}
+
+    route = canonical_route_envelope(route_envelope)
+    if route["chat_id"] != str(chat_id):
+        raise TelegramEgressDenied("telegram_route_recipient_mismatch")
+    requested_thread_id = str(thread_id) if thread_id is not None else None
+    if route["thread_id"] != requested_thread_id:
+        raise TelegramEgressDenied("telegram_route_thread_mismatch")
+    assert_route_allowed(
+        chat_id,
+        metadata={**route, "route_envelope": route},
+    )
+
+    business_connection_id = route.get("business_connection_id")
+    if business_connection_id:
+        return {"business_connection_id": business_connection_id}
+    return {}
+
+
 def _display_chat_id(platform_name: str, chat_id: str) -> str:
     """Return a result-safe chat identifier for tool transcripts/log consumers."""
     if platform_name == "signal" and str(chat_id).startswith("group:"):
@@ -238,6 +273,10 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "route_envelope": {
+                "type": "object",
+                "description": "Exact immutable Telegram route metadata for safe Business/continuation delivery. When present, chat_id and business_connection_id are validated and preserved; ambiguous private routes fail closed."
             }
         },
         "required": []
@@ -492,6 +531,8 @@ def _handle_send(args):
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
             send_kwargs["args"] = args
+        if "route_envelope" in args:
+            send_kwargs["route_envelope"] = args.get("route_envelope")
         result = _run_async(
             _send_to_platform(
                 platform,
@@ -922,7 +963,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    args=None,
+    route_envelope=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1004,6 +1055,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            route_envelope=route_envelope,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1331,7 +1383,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    route_envelope=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1340,6 +1401,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     instead, bypassing MarkdownV2 conversion.
     """
     try:
+        egress_kwargs = _prepare_telegram_egress(
+            chat_id, thread_id, route_envelope
+        )
+
         from telegram import Bot
         from telegram.constants import ParseMode
 
@@ -1393,7 +1458,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # rather than force-int so username home channels don't crash (#13206).
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
-        thread_kwargs = {}
+        thread_kwargs = dict(egress_kwargs)
         if thread_id is not None:
             # Reuse the gateway adapter's General-topic mapping: in Telegram
             # forum supergroups, the General topic is addressed as

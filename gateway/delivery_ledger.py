@@ -127,13 +127,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT
         )"""
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
     for name, sql_type in (
         ("resume_task_id", "TEXT NOT NULL DEFAULT ''"),
         ("continuation_generation", "INTEGER NOT NULL DEFAULT 0"),
         ("continuation_claim_owner", "TEXT NOT NULL DEFAULT ''"),
         ("continuation_claim_token", "TEXT NOT NULL DEFAULT ''"),
         ("runtime_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("route_envelope_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(
@@ -242,10 +245,23 @@ def record_obligation(
     continuation_generation: int = 0,
     continuation_claim_owner: str = "",
     continuation_claim_token: str = "",
+    route_envelope: Optional[Dict[str, Any]] = None,
 ) -> ObligationRecordResult:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
+    envelope_json = None
+    if route_envelope is not None:
+        if str(platform) == "telegram":
+            from gateway.telegram_egress_policy import canonical_route_envelope
+
+            route_envelope = canonical_route_envelope(route_envelope)
+        envelope_json = json.dumps(
+            route_envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     with _DB_LOCK, _transaction() as conn:
         if conn.in_transaction:
             conn.commit()
@@ -308,14 +324,15 @@ def record_obligation(
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, resume_task_id,
                 continuation_generation, continuation_claim_owner,
-                continuation_claim_token, runtime_claim_token)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
+                continuation_claim_token, runtime_claim_token,
+                route_envelope_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
              pid, started, str(resume_task_id or ""),
              int(continuation_generation or 0),
              str(continuation_claim_owner or ""),
-             str(continuation_claim_token or "")),
+             str(continuation_claim_token or ""), envelope_json),
         )
     _prune()
     return ObligationRecordResult("created")
@@ -377,14 +394,14 @@ def sweep_recoverable(
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, resume_task_id,
                       continuation_generation, continuation_claim_owner,
-                      continuation_claim_token
+                      continuation_claim_token, route_envelope_json
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at, resume_task_id,
              continuation_generation, continuation_owner,
-             continuation_token) in rows:
+             continuation_token, route_envelope_json) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -401,6 +418,44 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            route_envelope = None
+            if platform == "telegram":
+                try:
+                    if not route_envelope_json:
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import (
+                        assert_recipient_allowed,
+                        canonical_route_envelope,
+                    )
+
+                    route_envelope = canonical_route_envelope(
+                        json.loads(route_envelope_json)
+                    )
+                    if (
+                        route_envelope["chat_id"] != str(chat_id)
+                        or route_envelope["platform"] != str(platform)
+                        or route_envelope["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    assert_recipient_allowed(chat_id)
+                except Exception as exc:
+                    error = str(exc) or "ambiguous_route_envelope"
+                    if "denied" not in error:
+                        error = "ambiguous_route_envelope"
+                    conn.execute(
+                        """UPDATE delivery_obligations
+                           SET state='abandoned', updated_at=?, last_error=?
+                           WHERE obligation_id=?""",
+                        (now, error, oid),
+                    )
+                    continue
+            elif route_envelope_json:
+                try:
+                    decoded = json.loads(route_envelope_json)
+                    route_envelope = decoded if isinstance(decoded, dict) else None
+                except (TypeError, ValueError):
+                    route_envelope = None
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
@@ -424,6 +479,7 @@ def sweep_recoverable(
                     "continuation_generation": int(continuation_generation or 0),
                     "continuation_claim_owner": str(continuation_owner or ""),
                     "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
 
