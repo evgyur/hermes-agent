@@ -1810,6 +1810,8 @@ display:
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
   interim_assistant_messages: true  # Gateway: send natural mid-turn assistant updates as separate messages
+  start_ack_text: ""     # Gateway: optional fallback before the first tool call when model commentary is absent
+  start_ack_mode: best_effort  # best_effort | required
   show_commentary: true   # Codex models: deliver commentary-channel progress narration as visible mid-turn updates
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
   personality: ""         # Legacy cosmetic field still surfaced in some summaries
@@ -1981,6 +1983,8 @@ Platforms without an override fall back to the global `tool_progress` value. Val
 Signal is listed as a valid platform key because the setting can be saved per platform, but the current Signal adapter cannot edit sent messages and does not render tool-progress bubbles. Keep Signal `tool_progress` set to `off`; use the CLI or an editing-capable messaging platform if you need to watch each tool call live.
 
 `interim_assistant_messages` is gateway-only. When enabled, Hermes sends completed mid-turn assistant updates as separate chat messages. This is independent from `tool_progress` and does not require gateway streaming.
+
+`start_ack_text` is an optional gateway fallback for execution visibility. When a configured platform receives an ordinary user turn and the model's first tool-call response has produced no delivered commentary, Hermes sends this text and waits up to three seconds for delivery before starting the tool. A timed-out local send is cancelled so it cannot surface late. `start_ack_mode: best_effort` (default) then continues the tool turn; `required` fails the turn before the first tool effect unless commentary or the fallback has a confirmed delivery receipt. Delivered model-authored commentary suppresses the fallback. Webhook, startup-resume, trusted continuation, and internal/background turns never receive it. A foreground model decision to return `NO_REPLY` only after using tools cannot be predicted at this pre-tool boundary; callers that require silent execution must dispatch it as an internal/background turn. Configure the wording per platform (for example, `display.platforms.telegram.start_ack_text`) so Hermes does not guess the user's language. If `cleanup_progress` is enabled, a successfully delivered fallback is cleaned up with the other progress messages after a successful final response.
 
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
