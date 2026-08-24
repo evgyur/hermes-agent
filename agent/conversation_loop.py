@@ -1441,12 +1441,20 @@ def _without_tool_definition(tools, blocked_name: str):
     ]
 
 
-def _consume_forced_synthesis_tools(agent, tools):
-    """Return no tools once after a resumable no-progress read block."""
-    if not getattr(agent, "_force_synthesis_without_tools", False):
+def _without_guardrail_suppressed_tool_definitions(agent, tools):
+    """Hide only tools already blocked for no progress in this turn."""
+    suppressed = getattr(agent, "_guardrail_suppressed_tools", set())
+    if not suppressed:
         return tools
-    agent._force_synthesis_without_tools = False
-    return []
+    return [
+        tool
+        for tool in (tools or [])
+        if not (
+            isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") in suppressed
+        )
+    ]
 
 
 def _content_policy_blocked_result(
@@ -2564,7 +2572,9 @@ def run_conversation(
             if _suppress_skill_view_for_turn
             else agent.tools
         )
-        tools_for_api = _consume_forced_synthesis_tools(agent, tools_for_api)
+        tools_for_api = _without_guardrail_suppressed_tool_definitions(
+            agent, tools_for_api
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(

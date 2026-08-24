@@ -3,7 +3,7 @@
 import json
 from types import SimpleNamespace
 
-from agent.conversation_loop import _consume_forced_synthesis_tools
+from agent.conversation_loop import _without_guardrail_suppressed_tool_definitions
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -115,13 +115,19 @@ def test_config_can_block_repeated_read_without_halting_the_turn():
     assert controller.halt_decision is None
 
 
-def test_forced_synthesis_consumes_tool_suppression_once():
-    tools = [{"type": "function", "function": {"name": "mcp__seya__list_resources"}}]
-    agent = SimpleNamespace(_force_synthesis_without_tools=True)
+def test_guardrail_suppresses_only_the_blocked_tool_for_the_rest_of_the_turn():
+    blocked = "mcp__seya__get_workshop"
+    allowed = "mcp__seya__get_content_detail"
+    tools = [
+        {"type": "function", "function": {"name": blocked}},
+        {"type": "function", "function": {"name": allowed}},
+    ]
+    agent = SimpleNamespace(_guardrail_suppressed_tools={blocked})
 
-    assert _consume_forced_synthesis_tools(agent, tools) == []
-    assert agent._force_synthesis_without_tools is False
-    assert _consume_forced_synthesis_tools(agent, tools) is tools
+    filtered = _without_guardrail_suppressed_tool_definitions(agent, tools)
+
+    assert [tool["function"]["name"] for tool in filtered] == [allowed]
+    assert agent._guardrail_suppressed_tools == {blocked}
 
 
 def test_config_rejects_invalid_additional_idempotent_tool_values():
@@ -238,7 +244,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

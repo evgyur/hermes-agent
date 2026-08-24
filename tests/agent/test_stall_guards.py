@@ -165,7 +165,7 @@ def test_notice_appended_to_third_identical_result():
     assert r3.startswith("results")  # notice appended, result preserved
 
 
-def test_nonhalting_read_block_arms_one_synthesis_only_provider_call():
+def test_nonhalting_read_block_suppresses_only_that_tool_for_the_turn():
     from run_agent import AIAgent
 
     agent = _fake_agent()
@@ -178,7 +178,7 @@ def test_nonhalting_read_block_arms_one_synthesis_only_provider_call():
     result = AIAgent._guardrail_block_result(agent, decision)
 
     assert "mcp__seya__list_resources" in result
-    assert agent._force_synthesis_without_tools is True
+    assert agent._guardrail_suppressed_tools == {"mcp__seya__list_resources"}
     assert agent._tool_guardrail_halt_decision is None
 
 
