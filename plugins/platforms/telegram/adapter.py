@@ -8628,6 +8628,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return chats that require a direct reply, mention, or wake word.
+
+        This per-chat gate is additive to the global ``require_mention`` flag.
+        It lets dedicated/private rooms stay free-response while shared/public
+        rooms remain reply-or-mention only.
+        """
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = _scoped_gate_env("TELEGRAM_REQUIRE_MENTION_CHATS")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
 
@@ -9169,7 +9183,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._telegram_is_free_response_topic(message):
             return False
-        if not self._telegram_require_mention():
+        if not (
+            self._telegram_require_mention()
+            or chat_id_str in self._telegram_require_mention_chats()
+        ):
             return False
         if self._is_reply_to_bot(message):
             return False
@@ -9553,7 +9570,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if self._telegram_is_free_response_topic(message):
             return True
-        if not self._telegram_require_mention():
+        require_mention = (
+            self._telegram_require_mention()
+            or chat_id_str in self._telegram_require_mention_chats()
+        )
+        if not require_mention:
             return True
         if self._is_reply_to_bot(message):
             return True
@@ -10884,6 +10905,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
             frc = ",".join(str(v) for v in frc)
         if not _skip_env_bridge and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
             os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+    rmc = telegram_cfg.get("require_mention_chats")
+    if rmc is not None:
+        extras.setdefault("require_mention_chats", rmc)
+        if isinstance(rmc, list):
+            rmc = ",".join(str(v) for v in rmc)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS"):
+            os.environ["TELEGRAM_REQUIRE_MENTION_CHATS"] = str(rmc)
     frt = telegram_cfg.get("free_response_topics")
     if frt is not None:
         if isinstance(frt, list):
