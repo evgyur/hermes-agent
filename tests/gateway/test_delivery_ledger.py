@@ -29,12 +29,28 @@ def _fresh_db(tmp_path, monkeypatch):
 
 
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
+    platform = kw.get("platform", "slack")
+    chat_id = kw.get("chat_id", "C1")
+    thread_id = kw.get("thread_id", "171.001")
+    route_envelope = kw.get("route_envelope")
+    if platform == "telegram" and "route_envelope" not in kw:
+        route_envelope = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+            "user_id": None,
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
     dl.record_obligation(
         obligation_id=oid,
         session_key=session_key,
-        platform=kw.get("platform", "slack"),
-        chat_id=kw.get("chat_id", "C1"),
-        thread_id=kw.get("thread_id", "171.001"),
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
         content=kw.get("content", "the final answer"),
         resume_task_id=kw.get("resume_task_id", "resume-task-1"),
         continuation_generation=kw.get("continuation_generation", 1),
@@ -44,6 +60,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         continuation_claim_token=kw.get(
             "continuation_claim_token", "claim-test-1"
         ),
+        route_envelope=route_envelope,
     )
 
 

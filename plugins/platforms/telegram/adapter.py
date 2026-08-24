@@ -226,6 +226,7 @@ from plugins.platforms.telegram.telegram_network import (
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_BUSINESS_CONNECTION_STORE_LOCK = threading.Lock()
 
 # Max seconds a send/edit coroutine may sleep inline on a Telegram
 # flood-control RetryAfter. Longer server penalties fail closed with a
@@ -2236,6 +2237,203 @@ class TelegramAdapter(BasePlatformAdapter):
                 return None
         return reply_to_id, thread_kwargs
 
+    @staticmethod
+    def _truthy_config_value(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _telegram_business_config(self) -> Dict[str, Any]:
+        raw = (getattr(getattr(self, "config", None), "extra", {}) or {}).get(
+            "business"
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _business_connection_store_path() -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "state" / "telegram_business_connections.json"
+
+    def _known_business_connection_id(self, chat_id: Any) -> Optional[str]:
+        try:
+            payload = json.loads(
+                self._business_connection_store_path().read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        exact = payload.get(str(chat_id))
+        return str(exact) if exact else None
+
+    def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
+        """Persist only a Telegram-supplied peer→connection binding."""
+
+        if chat_id is None or not connection_id:
+            return
+        path = self._business_connection_store_path()
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with _BUSINESS_CONNECTION_STORE_LOCK:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload[str(chat_id)] = str(connection_id)
+                temp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+                os.replace(temp_path, path)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to persist Telegram Business route for chat %s: %s",
+                self.name,
+                chat_id,
+                _redact_telegram_error_text(exc),
+            )
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _business_owner_ids(self) -> set[str]:
+        business_cfg = self._telegram_business_config()
+        raw = business_cfg.get("owner_user_ids")
+        if raw is None:
+            raw = (getattr(getattr(self, "config", None), "extra", {}) or {}).get(
+                "allow_from", []
+            )
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        return {str(value).strip() for value in values if str(value).strip()}
+
+    def _plain_dm_allowlist(self) -> set[str]:
+        return self._business_owner_ids()
+
+    def _business_blocked_chat_ids(self) -> set[str]:
+        raw = self._telegram_business_config().get("blocked_chats", [])
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        return {str(value).strip() for value in values if str(value).strip()}
+
+    @staticmethod
+    def _telegram_supplied_business_connection_id(message: Any) -> Optional[str]:
+        value = getattr(message, "business_connection_id", None)
+        reply = getattr(message, "reply_to_message", None)
+        if not value and reply is not None:
+            value = getattr(reply, "business_connection_id", None)
+        return str(value) if value else None
+
+    def _is_business_bot_echo(self, message: Any) -> bool:
+        sender_business_bot = getattr(message, "sender_business_bot", None)
+        sender_id = getattr(sender_business_bot, "id", None)
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        return sender_id is not None and bot_id is not None and str(sender_id) == str(bot_id)
+
+    def _business_wake_words(self) -> list[str]:
+        raw = self._telegram_business_config().get("trigger_words", [])
+        if isinstance(raw, str):
+            return [part.strip() for part in re.split(r"[\n,]+", raw) if part.strip()]
+        if isinstance(raw, (list, tuple, set)):
+            return [str(part).strip() for part in raw if str(part).strip()]
+        return []
+
+    def _has_explicit_business_wake(self, message: Any) -> bool:
+        text = str(getattr(message, "text", None) or getattr(message, "caption", None) or "").lstrip()
+        return any(
+            re.match(rf"(?i)@?{re.escape(word)}(?=$|[\s,:;.!?\-—])", text)
+            for word in self._business_wake_words()
+        )
+
+    def _is_reply_to_own_outbound_text(self, message: Any) -> bool:
+        if not self._truthy_config_value(
+            self._telegram_business_config().get("allow_reply_trigger", False)
+        ):
+            return False
+        reply = getattr(message, "reply_to_message", None)
+        reply_id = getattr(reply, "message_id", None) if reply is not None else None
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if reply_id is None or chat_id is None:
+            return False
+        # Legacy unscoped rich-send records are intentionally not trusted for
+        # Business wakeups; only the scoped index API may authorize a reply.
+        try:
+            from gateway import rich_sent_store
+
+            lookup_scoped = getattr(rich_sent_store, "lookup_scoped", None)
+            if not callable(lookup_scoped):
+                return False
+            connection_id = self._telegram_supplied_business_connection_id(message)
+            if not connection_id:
+                return False
+            return lookup_scoped(
+                platform="telegram",
+                transport_profile=getattr(self, "_owner_profile", None) or "default",
+                business_connection_id=connection_id,
+                chat_id=str(chat_id),
+                message_id=str(reply_id),
+            ) is not None
+        except Exception:
+            return False
+
+    def _is_business_owner_wake_trigger(self, message: Any) -> bool:
+        if not self._truthy_config_value(
+            self._telegram_business_config().get("enabled", False)
+        ):
+            return False
+        user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        if not user_id or not chat_id or user_id == chat_id:
+            return False
+        if user_id not in self._business_owner_ids() or self._is_business_bot_echo(message):
+            return False
+        return self._has_explicit_business_wake(message) or self._is_reply_to_own_outbound_text(message)
+
+    def _strip_business_wake_trigger(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        for word in self._business_wake_words():
+            cleaned = re.sub(
+                rf"(?i)^\s*@?{re.escape(word)}(?:\s*[,\-—:;.!?]+)?\s*",
+                "",
+                text,
+                count=1,
+            ).strip()
+            if cleaned != text.strip():
+                return cleaned
+        return text
+
+    def _resolve_business_connection_id(self, message: Any, *, chat_type: str) -> Optional[str]:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        value = self._telegram_supplied_business_connection_id(message)
+        if value:
+            self._remember_business_connection_id(chat_id, value)
+            return value
+        if chat_type == "dm" and self._is_business_owner_wake_trigger(message):
+            return self._known_business_connection_id(chat_id)
+        return None
+
+    def _egress_policy_error(
+        self, chat_id: Any, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        try:
+            from gateway.telegram_egress_policy import assert_route_allowed
+
+            assert_route_allowed(
+                chat_id,
+                metadata=metadata,
+                plain_dm_allowlist=self._plain_dm_allowlist(),
+            )
+        except Exception as exc:
+            return str(exc) or "unsafe_telegram_route"
+        return None
+
     async def _try_send_rich(
         self,
         chat_id: str,
@@ -2265,6 +2463,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # which must not be sent as a stray field on the raw endpoint.
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
         payload.update(self._notification_kwargs(metadata))
+        payload.update(self._business_connection_kwargs(metadata))
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         if reply_to_id is not None:
@@ -5288,6 +5487,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        policy_error = self._egress_policy_error(chat_id, metadata)
+        if policy_error:
+            logger.error("[%s] Telegram egress denied for chat %s: %s", self.name, chat_id, policy_error)
+            return SendResult(success=False, error=policy_error, retryable=False)
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -9765,6 +9968,38 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
         if not self._is_group_chat(message):
+            chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+            user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+            try:
+                from gateway.telegram_egress_policy import assert_recipient_allowed
+
+                assert_recipient_allowed(chat_id)
+            except Exception:
+                # The same operator deny applies on ingress: a blocked peer can
+                # never create state that a later callback/replay might answer.
+                return False
+            if chat_id in self._business_blocked_chat_ids():
+                return False
+            if self._is_business_bot_echo(message):
+                return False
+            business_connection_id = self._telegram_supplied_business_connection_id(message)
+            business_enabled = self._truthy_config_value(
+                self._telegram_business_config().get("enabled", False)
+            )
+            owner_mirror_shape = bool(user_id and chat_id and user_id != chat_id)
+            if business_connection_id or (business_enabled and owner_mirror_shape):
+                if business_connection_id:
+                    self._remember_business_connection_id(chat_id, business_connection_id)
+                # Owner-authored messages in a customer conversation are human
+                # account echoes. Only an exact explicit wake may become a turn.
+                if user_id in self._business_owner_ids():
+                    return bool(
+                        self._is_business_owner_wake_trigger(message)
+                        and (business_connection_id or self._known_business_connection_id(chat_id))
+                    )
+                # Customer-authored Business traffic is not admitted into the
+                # private agent/tool lane by this connector.
+                return False
             return True
 
         thread_id = self._effective_message_thread_id(message)
@@ -10360,6 +10595,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        if getattr(event.source, "business_connection_id", None):
+            event.text = self._strip_business_wake_trigger(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         try:
@@ -10640,18 +10877,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
-        if not update.message:
+        effective_message = self._effective_update_message(update)
+        if not effective_message:
             return
-        if not self._is_user_authorized_from_message(update.message):
+        if not self._is_user_authorized_from_message(effective_message):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
-                getattr(getattr(update.message, "from_user", None), "id", None),
-                getattr(getattr(update.message, "chat", None), "id", None),
+                getattr(getattr(effective_message, "from_user", None), "id", None),
+                getattr(getattr(effective_message, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
+        if not self._should_process_message(effective_message):
+            if self._should_observe_unmentioned_group_message(effective_message):
+                _m = effective_message
                 _observe_type = self._media_message_type(_m)
                 _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
                 if _m.caption:
@@ -10662,7 +10900,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return
 
-        msg = update.message
+        msg = effective_message
 
         msg_type = self._media_message_type(msg)
 
@@ -11307,7 +11545,12 @@ class TelegramAdapter(BasePlatformAdapter):
                             break
                     break
 
-        # Build source
+        # Build source. A Telegram Business connection is part of both the
+        # trust boundary and the reply route; never infer a plain bot-DM from
+        # the peer chat id.
+        business_connection_id = self._resolve_business_connection_id(
+            message, chat_type=chat_type
+        )
         source = self.build_source(
             chat_id=str(chat.id),
             chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
