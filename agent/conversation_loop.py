@@ -92,6 +92,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
+from agent.deadline import ForegroundRunBudgetExpired
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -286,6 +287,29 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _should_use_streaming_api(agent: Any) -> bool:
+    """Return the one authoritative chat-completions streaming decision."""
+    if getattr(agent, "_disable_streaming", False):
+        return False
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    if (
+        provider == "copilot-acp"
+        or base_url.startswith("acp://copilot")
+        or base_url.startswith("acp+tcp://")
+    ):
+        return False
+    has_consumers = getattr(agent, "_has_stream_consumers", lambda: False)
+    if provider == "moa" and not has_consumers():
+        return False
+    if not has_consumers():
+        from unittest.mock import Mock
+
+        if isinstance(getattr(agent, "client", None), Mock):
+            return False
+    return True
 
 
 def _moa_client_consumes_prepared_request(client: Any) -> bool:
@@ -3123,40 +3147,7 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
-                # Provider signaled "stream not supported" on a previous
-                # attempt — switch to non-streaming for the rest of this
-                # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
-                    _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                # MoA streams only when a display/TTS consumer is present to
-                # receive the deltas. MoAChatCompletions.create() honors
-                # stream=True (runs the references, then returns the aggregator's
-                # raw token stream) and is reached here because, for provider
-                # "moa", _create_request_openai_client returns the MoA facade
-                # itself. Without consumers (quiet mode, subagents, health-check
-                # probes) we keep the complete-response path: the facade returns a
-                # whole response when stream is not requested, preserving the
-                # prior behavior for those callers.
-                elif agent.provider == "moa" and not agent._has_stream_consumers():
-                    _use_streaming = False
-                elif not agent._has_stream_consumers():
-                    # No display/TTS consumer. Still prefer streaming for
-                    # health checking, but skip for Mock clients in tests
-                    # (mocks return SimpleNamespace, not stream iterators).
-                    from unittest.mock import Mock
-                    if isinstance(getattr(agent, "client", None), Mock):
-                        _use_streaming = False
+                _use_streaming = _should_use_streaming_api(agent)
 
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
@@ -8421,6 +8412,14 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except ForegroundRunBudgetExpired:
+            final_response = RUN_BUDGET_TERMINAL_RESPONSE
+            append_message(
+                messages,
+                {"role": "assistant", "content": final_response},
+            )
+            _turn_exit_reason = "foreground_run_budget_exhausted"
+            break
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the

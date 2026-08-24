@@ -5093,6 +5093,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     while t.is_alive():
         t.join(timeout=0.3)
 
+        # The full run-budget check lives in the outer conversation loop, but
+        # that loop cannot run while this worker is blocked before its first
+        # provider chunk. Enforce the earlier finish-or-detach boundary here,
+        # close the Relay-managed stream from the polling owner, and join the
+        # worker before finalization so no physical/logical Relay scope or
+        # session resource survives behind the terminal response.
+        from agent.deadline import (
+            ForegroundRunBudgetExpired,
+            remaining_foreground_run_budget,
+        )
+
+        _foreground_remaining = remaining_foreground_run_budget(
+            agent,
+            reserve_s=5.0,
+        )
+        if _foreground_remaining is not None and _foreground_remaining <= 0:
+            _request_cancelled["value"] = True
+            _cancel_current_stream_attempt("foreground_run_budget")
+            _close_managed_stream()
+            _close_request_client_once("foreground_run_budget")
+            _join_worker_for_relay_teardown(t, label="Foreground streaming")
+            budget = float(getattr(agent, "run_budget_seconds", 0.0) or 0.0)
+            platform = str(getattr(agent, "platform", "") or "").strip().lower()
+            fraction = 0.6 if platform == "telegram" else 0.8
+            raise ForegroundRunBudgetExpired(budget * fraction)
+
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting
         # for stream chunks.  Without this, long thinking pauses (e.g.

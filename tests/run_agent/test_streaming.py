@@ -4,6 +4,7 @@ Tests the unified streaming API call, delta callbacks, tool-call
 suppression, provider fallback, and CLI streaming display.
 """
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -507,6 +508,62 @@ class TestStreamingFallback:
         mock_create.assert_called_once()
         mock_close_openai.assert_not_called()
         mock_abort_openai.assert_not_called()
+
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    def test_telegram_foreground_budget_aborts_silent_stream(
+        self, mock_create, mock_close_openai, monkeypatch
+    ):
+        """A silent local provider cannot hold Telegram past finish-or-detach."""
+        from run_agent import AIAgent
+
+        class _BlockingClosableStream:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.closed = threading.Event()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.entered.set()
+                if not self.closed.wait(timeout=10):
+                    raise TimeoutError("test stream was not closed")
+                raise RuntimeError("stream closed")
+
+            def close(self):
+                self.closed.set()
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "5")
+        stream = _BlockingClosableStream()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream
+        mock_create.return_value = mock_client
+        agent = AIAgent(
+            model="h20-gpt",
+            provider="openai",
+            api_key="test-key",
+            base_url="http://127.0.0.1:18750/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            platform="telegram",
+            run_budget_seconds=0.5,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._run_budget_started_at = time.time()
+        agent._run_budget_started_mono = time.monotonic()
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="foreground run budget"):
+            agent._interruptible_streaming_api_call(
+                {"model": agent.model, "messages": []}
+            )
+
+        assert time.monotonic() - started < 2
+        assert stream.closed.wait(timeout=1)
+        mock_close_openai.assert_not_called()
 
 
 

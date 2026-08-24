@@ -79,7 +79,9 @@ __all__ = [
     "MAX_SAFE_TIMEOUT_S",
     "BoundedResult",
     "DeadlineExpired",
+    "ForegroundRunBudgetExpired",
     "clamp_timeout",
+    "remaining_foreground_run_budget",
     "remaining_run_budget",
     "within_run_budget",
     "resolve_timeout",
@@ -116,6 +118,13 @@ class DeadlineExpired(TimeoutError):
         super().__init__(f"deadline expired after {timeout_s:.1f}s: {label}")
         self.label = label
         self.timeout_s = timeout_s
+
+
+class ForegroundRunBudgetExpired(DeadlineExpired):
+    """The foreground work portion of an agent turn exhausted its budget."""
+
+    def __init__(self, timeout_s: float):
+        super().__init__("foreground run budget", timeout_s)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -179,6 +188,28 @@ def remaining_run_budget(agent: Any, *, reserve_s: float = 0.0) -> Optional[floa
     if budget is None or not isinstance(started, (int, float)):
         return None
     return max(0.0, budget - (time.monotonic() - float(started)) - max(0.0, reserve_s))
+
+
+def remaining_foreground_run_budget(
+    agent: Any,
+    *,
+    reserve_s: float = 0.0,
+) -> Optional[float]:
+    """Return time left before the platform's finish-or-detach boundary.
+
+    Telegram reserves the final 40% of the full run budget for convergence,
+    persistence, and terminal delivery. Other platforms retain the existing
+    80% wrap-up threshold. A caller may reserve a few additional seconds for
+    worker teardown before the boundary itself.
+    """
+    budget = clamp_timeout(getattr(agent, "run_budget_seconds", None))
+    started = getattr(agent, "_run_budget_started_mono", None)
+    if budget is None or not isinstance(started, (int, float)):
+        return None
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    fraction = 0.6 if platform == "telegram" else 0.8
+    elapsed = time.monotonic() - float(started)
+    return max(0.0, budget * fraction - elapsed - max(0.0, reserve_s))
 
 
 def within_run_budget(

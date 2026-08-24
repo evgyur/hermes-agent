@@ -750,6 +750,28 @@ def init_agent(
         else:
             agent.api_mode = "chat_completions"
 
+    # Provider/model capability metadata may explicitly disable SSE for
+    # buffered OpenAI-compatible gateways. Read the raw config so this
+    # forward-compatible capability survives schema filtering.
+    agent._disable_streaming = False
+    try:
+        from hermes_cli.config import load_config as _load_streaming_cfg
+
+        _streaming_cfg = _load_streaming_cfg() or {}
+        _provider_cfg = (_streaming_cfg.get("providers") or {}).get(
+            agent.provider, {}
+        )
+        if isinstance(_provider_cfg, dict):
+            _model_cfg = (_provider_cfg.get("models") or {}).get(agent.model, {})
+            _supports_streaming = (
+                _model_cfg.get("supports_streaming")
+                if isinstance(_model_cfg, dict) and "supports_streaming" in _model_cfg
+                else _provider_cfg.get("supports_streaming")
+            )
+            agent._disable_streaming = _supports_streaming is False
+    except Exception:
+        agent._disable_streaming = False
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
