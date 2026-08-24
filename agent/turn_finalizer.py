@@ -531,6 +531,20 @@ def finalize_turn(
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
+        # Persistence failure is the authoritative terminal reason even when
+        # the loop had already selected a narrower failure (for example a
+        # required start-ACK rejection).  Reporting the narrower reason would
+        # conceal that the final paired transcript was not durably committed.
+        _turn_exit_reason = "session_persistence_failed"
+        failed = True
+        try:
+            from hermes_state import classify_persistence_error
+
+            agent._last_persistence_error_cause = classify_persistence_error(
+                _persist_err
+            )
+        except Exception:
+            agent._last_persistence_error_cause = "unknown"
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
@@ -780,6 +794,32 @@ def finalize_turn(
         final_response = _sanitize_surrogates(final_response)
 
     # Build result with interrupt info if applicable
+    _response_previewed = bool(getattr(agent, "_response_was_previewed", False))
+    _ack_delivered_text = str(
+        getattr(agent, "_start_ack_delivered_text", None) or ""
+    ).strip()
+    _response_already_delivered = bool(
+        _ack_delivered_text
+        and isinstance(final_response, str)
+        and final_response.strip() == _ack_delivered_text
+    )
+    _ack_receipt = getattr(agent, "_start_ack_receipt", None)
+    _ack_receipt_payload = None
+    if _ack_receipt is not None:
+        _ack_receipt_payload = {
+            "text": str(getattr(_ack_receipt, "text", "") or ""),
+            "message_id": (
+                str(getattr(_ack_receipt, "message_id", "") or "") or None
+            ),
+            "message_ids": [
+                str(mid)
+                for mid in (getattr(_ack_receipt, "message_ids", ()) or ())
+                if mid not in (None, "")
+            ],
+            "transport_identity": str(
+                getattr(_ack_receipt, "transport_identity", "") or ""
+            ),
+        }
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
@@ -792,7 +832,11 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
-        "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "response_previewed": _response_previewed,
+        # Exact delivery receipt for gateway callers that distinguish an
+        # already-visible final from generic streaming UI state.
+        "response_already_delivered": _response_already_delivered,
+        "start_ack_delivery_receipt": _ack_receipt_payload,
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,

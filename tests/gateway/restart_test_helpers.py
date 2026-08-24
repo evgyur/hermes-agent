@@ -158,6 +158,13 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+    # Startup continuation is authorized only after a readable durable
+    # frontier.  The generic fixture models a safe user-only transcript;
+    # risk-specific tests replace this with tool-call rows.
+    runner._session_db = MagicMock()
+    runner._session_db.get_messages.return_value = [
+        {"role": "user", "content": "pending request"}
+    ]
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

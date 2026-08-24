@@ -4,6 +4,8 @@ import copy
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.start_ack import StartAckReceipt
+from agent.transports.codex import ResponsesApiTransport
 from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
 
 
@@ -386,7 +388,7 @@ def test_required_multi_batch_delivers_later_commentary_once():
     agent.start_ack_required = True
     agent.start_ack_callback = lambda: events.append(
         ("ack", agent._pending_start_ack_visible_text)
-    ) or True
+    ) or StartAckReceipt(text=agent._pending_start_ack_visible_text)
     agent.interim_assistant_callback = (
         lambda text, **kwargs: events.append(("interim", text)) or True
     )
@@ -410,6 +412,110 @@ def test_required_multi_batch_delivers_later_commentary_once():
         ("interim", "Second commentary."),
         "tool",
     ]
+
+
+def test_ack_delivered_housekeeping_final_is_marked_already_delivered():
+    agent = _loop_agent()
+    agent.valid_tool_names.add("memory")
+    tool_call = _mock_tool_call(name="memory", call_id="memory-1")
+    final_text = "The requested result is ready."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content=final_text,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="", finish_reason="stop"),
+    ]
+    agent.start_ack_required = True
+    agent.start_ack_callback = lambda: StartAckReceipt(text=final_text)
+
+    with (
+        patch("run_agent.handle_function_call", return_value="saved"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "tools.parent_task_barrier.finalization_policy",
+            return_value={"action": "deliver"},
+        ),
+    ):
+        result = agent.run_conversation("Answer and remember it")
+
+    assert result["final_response"] == final_text
+    assert result["response_already_delivered"] is True
+
+
+def test_generic_ack_receipt_cannot_claim_raw_model_narration():
+    agent = _loop_agent()
+    agent.valid_tool_names.add("memory")
+    final_text = "Raw model narration"
+    tool_call = _mock_tool_call(name="memory", call_id="memory-generic-ack")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content=final_text,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="", finish_reason="stop"),
+    ]
+    agent.start_ack_required = True
+    agent.start_ack_callback = lambda: StartAckReceipt(
+        text="Configured generic acknowledgement"
+    )
+
+    with (
+        patch("run_agent.handle_function_call", return_value="saved"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "tools.parent_task_barrier.finalization_policy",
+            return_value={"action": "deliver"},
+        ),
+    ):
+        result = agent.run_conversation("Do the work")
+
+    assert result["final_response"].startswith(final_text)
+    assert result["response_already_delivered"] is False
+
+
+def test_housekeeping_preview_without_receipt_cannot_claim_delivery_authority():
+    agent = _loop_agent()
+    agent.valid_tool_names.add("memory")
+    agent.start_ack_required = False
+    agent.start_ack_callback = None
+    agent.interim_assistant_callback = None
+    agent.stream_delta_callback = None
+    final_text = "The requested result is ready."
+    tool_call = _mock_tool_call(name="memory", call_id="memory-no-wire")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content=final_text,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value="saved"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "tools.parent_task_barrier.finalization_policy",
+            return_value={"action": "deliver"},
+        ),
+    ):
+        result = agent.run_conversation("Answer and remember it")
+
+    assert result["final_response"] == final_text
+    assert result["response_previewed"] is True
+    assert result["response_already_delivered"] is False
 
 
 def test_conversation_with_no_tools_emits_no_start_ack():
@@ -456,3 +562,55 @@ def test_reused_agent_emits_once_for_each_user_turn():
             assert result["final_response"] == f"done {prompt}"
 
     assert callback.call_count == 2
+
+
+def test_required_ack_rejects_codex_app_server_before_runtime_effect():
+    agent = _loop_agent()
+    agent.api_mode = "codex_app_server"
+    agent.start_ack_required = True
+    agent._run_codex_app_server_turn = MagicMock(return_value={"completed": True})
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Go")
+
+    agent._run_codex_app_server_turn.assert_not_called()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "start_ack_runtime_unsupported"
+
+
+def test_required_ack_rejects_provider_executed_responses_tool_preflight():
+    transport = ResponsesApiTransport()
+    api_kwargs = {
+        "model": "gpt-test",
+        "instructions": "test",
+        "input": [{"role": "user", "content": "Go"}],
+        "tools": [{"type": "web_search"}],
+    }
+
+    try:
+        transport.preflight_kwargs(
+            api_kwargs,
+            reject_provider_executed_tools=True,
+        )
+    except RuntimeError as exc:
+        assert "provider-executed Responses tools" in str(exc)
+    else:
+        raise AssertionError("strict provider tool request did not fail closed")
+
+
+def test_best_effort_keeps_provider_executed_responses_tools_available():
+    transport = ResponsesApiTransport()
+    normalized = transport.preflight_kwargs(
+        {
+            "model": "gpt-test",
+            "instructions": "test",
+            "input": [{"role": "user", "content": "Go"}],
+            "tools": [{"type": "web_search"}],
+        },
+        reject_provider_executed_tools=False,
+    )
+
+    assert normalized["tools"] == [{"type": "web_search"}]

@@ -854,12 +854,12 @@ def init_agent(
     # Gateway-owned, per-turn fallback acknowledgment. The core invokes it
     # only before the first tool batch when no model commentary was delivered.
     agent.start_ack_callback = None
-    # Direct embedders that opt into the callback get the strict contract.
-    # Gateway wiring always overwrites this from start_ack_mode per turn.
-    agent.start_ack_required = True
+    agent.start_ack_required = False
     agent._pending_start_ack_visible_text = None
     agent._latest_interim_visible_text = None
     agent._tool_start_ack_emitted = False
+    agent._start_ack_delivered_text = None
+    agent._start_ack_receipt = None
     agent.status_callback = status_callback
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback

@@ -2007,6 +2007,10 @@ class AIAgent:
                     )
                 ):
                     msg["content"] = override
+                    if getattr(
+                        self, "_persist_user_message_never_replay", False
+                    ):
+                        msg.pop("api_content", None)
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
@@ -2275,6 +2279,19 @@ class AIAgent:
                 is_current_turn_user = (
                     _ov_idx == _msg_idx or msg is pending_cli_message
                 )
+                _never_replay_api_content = bool(
+                    getattr(self, "_persist_user_message_never_replay", False)
+                    or getattr(
+                        content,
+                        "_hermes_never_persist_api_content",
+                        False,
+                    )
+                    or getattr(
+                        _ov_content,
+                        "_hermes_never_persist_api_content",
+                        False,
+                    )
+                )
                 if is_current_turn_user and msg.get("role") == "user":
                     # Preflight compaction can re-anchor the override index at
                     # a message whose content was MERGED with the compaction
@@ -2295,6 +2312,8 @@ class AIAgent:
                         # the wire (#48677 divergence, closed for the cache
                         # prefix too).
                         if (
+                            not _never_replay_api_content
+                            and
                             _row_api_content is None
                             and isinstance(content, str)
                             and content != _ov_content
@@ -2303,6 +2322,8 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                    if _never_replay_api_content:
+                        _row_api_content = None
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
@@ -6865,9 +6886,32 @@ class AIAgent:
         ).strip()
         self._pending_start_ack_visible_text = visible or None
         try:
-            delivered = bool(callback())
-            if delivered and visible:
-                self._record_delivered_interim_text(visible)
+            receipt = callback()
+            from agent.start_ack import StartAckReceipt
+
+            delivered_text = (
+                receipt.text.strip()
+                if isinstance(receipt, StartAckReceipt)
+                and isinstance(receipt.text, str)
+                else ""
+            )
+            if isinstance(receipt, StartAckReceipt):
+                delivered = bool(delivered_text)
+            else:
+                # Legacy truthy callbacks remain usable only in best-effort
+                # mode. They cannot satisfy the required effect boundary or
+                # grant exact-final delivery authority.
+                delivered = bool(receipt) and not getattr(
+                    self, "start_ack_required", False
+                )
+            if delivered_text:
+                self._start_ack_receipt = receipt
+                self._record_delivered_interim_text(delivered_text)
+                # Dedicated exact delivery authority. This is deliberately
+                # distinct from the legacy response-previewed UI flag: only a
+                # settled callback receipt for this exact payload may suppress
+                # a byte-identical final send later in the turn.
+                self._start_ack_delivered_text = delivered_text
             return delivered
         except Exception:
             logger.debug("start_ack_callback error", exc_info=True)
