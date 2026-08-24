@@ -4881,6 +4881,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
+            # One low-level choke point covers every Bot API egress method
+            # (text/media/edit/reaction/rich/retry) without scattering the
+            # recipient deny across feature code. Incoming getUpdates remains
+            # on its dedicated unwrapped transport.
+            from gateway.telegram_egress_policy import guard_telegram_request
+
+            request = guard_telegram_request(request)
             get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()

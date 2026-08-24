@@ -264,6 +264,10 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         transport_profile = getattr(source, "transport_profile", None)
         if transport_profile:
             metadata["transport_profile"] = str(transport_profile)
+        if business_connection_id:
+            from gateway.session import build_route_envelope
+
+            metadata["route_envelope"] = build_route_envelope(source)
     if not metadata:
         return None
     if (
