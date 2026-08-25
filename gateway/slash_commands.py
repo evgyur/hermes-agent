@@ -746,6 +746,28 @@ class GatewaySlashCommandsMixin:
             base_url = configured_base_url
         if not context_total and configured_context and configured_context > 0:
             context_total = configured_context
+        if not context_total and model_name:
+            try:
+                from hermes_cli.model_switch import (
+                    resolve_display_context_length_async,
+                )
+
+                resolved_context = await resolve_display_context_length_async(
+                    model_name,
+                    provider_name,
+                    base_url=base_url,
+                    config_context_length=configured_context,
+                    configured_model=configured_model or None,
+                    configured_provider=configured_provider or None,
+                    configured_base_url=configured_base_url or None,
+                )
+                if resolved_context and resolved_context > 0:
+                    context_total = int(resolved_context)
+            except Exception:
+                logger.debug(
+                    "Could not resolve provider context window for /status",
+                    exc_info=True,
+                )
 
         model_line = ""
         if model_name:

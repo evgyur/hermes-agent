@@ -132,6 +132,48 @@ async def test_status_command_preserves_operator_grade_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_status_resolves_provider_context_when_compressor_limit_is_zero(
+    monkeypatch,
+):
+    """The cockpit must not render a known model's context window as zero."""
+    import gateway.run as gateway_run
+    from hermes_cli import model_switch
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-context-fallback",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        base_url="",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=143_189,
+            context_length=0,
+            compression_count=0,
+        ),
+        interrupt=MagicMock(),
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    resolver = AsyncMock(return_value=272_000)
+    monkeypatch.setattr(
+        model_switch,
+        "resolve_display_context_length_async",
+        resolver,
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "📚 Context: 143.2k/272k (53%)" in result
+    resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
