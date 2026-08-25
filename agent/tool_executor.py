@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import logging
 import os
@@ -54,6 +55,17 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _scoped_deferred_tool_authority(tool_name: Optional[str]):
+    if tool_name is None:
+        yield
+        return
+    from tools.tool_search import _bind_scoped_deferred_tool_authority
+
+    with _bind_scoped_deferred_tool_authority(tool_name):
+        yield
 
 
 def _pairing_tool_call_id(tool_call: Any) -> str:
@@ -1410,6 +1422,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         start_order,
     ):
         """Worker function executed in a thread."""
+        try:
+            from tools.tool_search import TOOL_CALL_NAME
+
+            deferred_authority = (
+                function_name
+                if tool_call.function.name == TOOL_CALL_NAME
+                and function_name != TOOL_CALL_NAME
+                else None
+            )
+        except Exception:
+            deferred_authority = None
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -1468,17 +1491,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    return agent._invoke_tool(
-                        function_name,
-                        next_args,
-                        effective_task_id,
-                        tool_call_id,
-                        messages=messages,
-                        pre_tool_block_checked=True,
-                        skip_tool_request_middleware=True,
-                        skip_tool_execution_middleware=True,
-                        tool_request_middleware_trace=list(middleware_trace),
-                    )
+                    with _scoped_deferred_tool_authority(deferred_authority):
+                        return agent._invoke_tool(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id,
+                            messages=messages,
+                            pre_tool_block_checked=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                        )
 
                 managed = _run_agent_tool_execution_middleware(
                     agent,
@@ -2147,6 +2171,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
         _ts_scope_block: Optional[str] = None
+        _ts_authority: Optional[str] = None
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
@@ -2172,6 +2197,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         else:
                             function_name = _underlying
                             function_args = _underlying_args
+                            _ts_authority = _underlying
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -2615,8 +2641,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 def _execute(next_args: dict) -> Any:
                     from model_tools import suppress_post_tool_call_hook
 
-                    with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                    with _scoped_deferred_tool_authority(_ts_authority):
+                        with suppress_post_tool_call_hook():
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2697,8 +2724,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 def _execute(next_args: dict) -> Any:
                     from model_tools import suppress_post_tool_call_hook
 
-                    with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                    with _scoped_deferred_tool_authority(_ts_authority):
+                        with suppress_post_tool_call_hook():
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
