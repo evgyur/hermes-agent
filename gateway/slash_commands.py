@@ -1572,6 +1572,12 @@ class GatewaySlashCommandsMixin:
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
+        # /stop revokes the whole bounded task, including durable parent
+        # continuations that are not represented by a currently running agent.
+        # Without this, the barrier watcher can revive stopped work after a
+        # gateway restart even though /stop reported that nothing was active.
+        self._cancel_session_background_work(session_key, reason="user_stop")
+
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.

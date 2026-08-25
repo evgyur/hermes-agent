@@ -18677,12 +18677,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return format_status_text()
 
+    def _cancel_session_background_work(
+        self, session_key: str, *, reason: str = "user_stop"
+    ) -> int:
+        """Cancel durable and live child work owned by one stopped route."""
+        try:
+            from tools.async_delegation import interrupt_for_session
+
+            return interrupt_for_session(
+                session_key=session_key,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "Could not cancel background work for stopped session %s",
+                session_key,
+            )
+            return 0
+
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # /stop must hard-kill the session when an agent is running.
         # A soft interrupt (agent.interrupt()) doesn't help when the agent
         # is truly hung — the executor thread is blocked and never checks
         # _interrupt_requested.  Force-clean _running_agents so the session
         # is unlocked and subsequent messages are processed normally.
+        self._cancel_session_background_work(quick_key, reason="user_stop")
         await self._interrupt_and_clear_session(
             quick_key,
             source,
