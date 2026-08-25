@@ -102,6 +102,24 @@ def _business_update(message: SimpleNamespace) -> SimpleNamespace:
     )
 
 
+def _plain_owner_dm_message(*, text: str) -> SimpleNamespace:
+    message = _business_message(
+        chat_id=OWNER_ID,
+        text=text,
+    )
+    message.business_connection_id = None
+    message.message_id = 14124
+    return message
+
+
+def _plain_update(message: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        update_id=9000,
+        effective_message=message,
+        message=message,
+    )
+
+
 def test_unset_mock_reply_does_not_forge_business_connection() -> None:
     """Loose MagicMock attributes must not turn an ordinary DM into Business traffic."""
     message = MagicMock()
@@ -151,17 +169,19 @@ async def test_owner_text_requires_explicit_prefix_in_customer_chat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_owner_message_in_business_bot_chat_routes_to_plain_owner_dm() -> None:
-    """The owner's direct bot chat must not be mistaken for a customer lane."""
+async def test_owner_business_bot_chat_mirror_is_dropped_after_plain_dm() -> None:
+    """One Telegram DM delivered through two envelopes must dispatch once."""
     adapter = _adapter()
     adapter._enqueue_text_event = MagicMock()
     adapter._cache_replied_media = AsyncMock()
-    message = _business_message(
+    plain = _plain_owner_dm_message(text="привет")
+    mirror = _business_message(
         chat_id=str(BOT_ID),
         text="привет",
     )
 
-    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+    await adapter._handle_text_message(_plain_update(plain), SimpleNamespace())
+    await adapter._handle_text_message(_business_update(mirror), SimpleNamespace())
 
     adapter._enqueue_text_event.assert_called_once()
     event = adapter._enqueue_text_event.call_args.args[0]
@@ -171,6 +191,24 @@ async def test_owner_message_in_business_bot_chat_routes_to_plain_owner_dm() -> 
     assert event.source.business_connection_id is None
     assert event.source.external_safe_mode is False
     assert ":telegram:dm:" in build_session_key(event.source)
+
+
+@pytest.mark.asyncio
+async def test_owner_new_command_business_mirror_does_not_reset_twice() -> None:
+    """Production incident: one /new must produce one reset dispatch."""
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    adapter._cache_replied_media = AsyncMock()
+    plain = _plain_owner_dm_message(text="/new")
+    mirror = _business_message(chat_id=str(BOT_ID), text="/new")
+
+    await adapter._handle_command(_plain_update(plain), SimpleNamespace())
+    await adapter._handle_command(_business_update(mirror), SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/new"
+    assert event.source.chat_id == OWNER_ID
 
 
 @pytest.mark.asyncio
