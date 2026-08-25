@@ -32,6 +32,7 @@ import time
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -107,6 +108,14 @@ logger = logging.getLogger(__name__)
 
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
+
+
+@dataclass(frozen=True)
+class GatewayUserAuthorityWrite:
+    """Outcome of sealing one exact gateway user-authority row."""
+
+    row_id: int
+    inserted: bool
 
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
@@ -11275,7 +11284,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_metadata: Optional[Dict[str, Any]] = None,
         turn_lease_holder: str,
         turn_lease_ttl_seconds: float = 300.0,
-    ) -> int:
+    ) -> GatewayUserAuthorityWrite:
         """Persist the gateway's triggering user row under its turn lease.
 
         A transport retry may revisit the exact same platform message after a
@@ -11327,7 +11336,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             if platform_message_id is not None:
                 existing = conn.execute(
-                    "SELECT id, content, display_kind FROM messages "
+                    "SELECT id, content, display_kind, display_metadata FROM messages "
                     "WHERE session_id = ? AND role = 'user' AND active = 1 "
                     "AND platform_message_id = ? ORDER BY id",
                     (session_id, platform_message_id),
@@ -11346,6 +11355,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise RuntimeError(
                             "platform message identity was reused with different provenance"
                         )
+                    if row["display_metadata"] != stored_display_metadata:
+                        raise RuntimeError(
+                            "platform message identity was reused with different semantics"
+                        )
                     tail = conn.execute(
                         "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
                         "ORDER BY id DESC LIMIT 1",
@@ -11355,7 +11368,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise RuntimeError(
                             "platform message already has durable downstream rows"
                         )
-                    return int(row["id"])
+                    return GatewayUserAuthorityWrite(
+                        row_id=int(row["id"]),
+                        inserted=False,
+                    )
 
             cursor = conn.execute(
                 "INSERT INTO messages ("
@@ -11375,7 +11391,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                 (session_id,),
             )
-            return int(cursor.lastrowid)
+            return GatewayUserAuthorityWrite(
+                row_id=int(cursor.lastrowid),
+                inserted=True,
+            )
 
         return self._execute_write(
             _do,
@@ -11424,7 +11443,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             row = conn.execute(
                 "SELECT id, role, content, active, platform_message_id, "
-                "display_kind FROM messages "
+                "display_kind, display_metadata FROM messages "
                 "WHERE id = ? AND session_id = ? LIMIT 1",
                 (row_id, session_id),
             ).fetchone()
@@ -11443,7 +11462,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 candidates = conn.execute(
                     "SELECT id, role, content, active, platform_message_id, "
-                    "display_kind FROM messages WHERE session_id = ? "
+                    "display_kind, display_metadata FROM messages WHERE session_id = ? "
                     "AND role = 'user' AND active = 1 "
                     "AND platform_message_id = ? ORDER BY id",
                     (session_id, platform_message_id),
@@ -11456,6 +11475,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if (
                     target["content"] != row["content"]
                     or target["display_kind"] != row["display_kind"]
+                    or target["display_metadata"] != row["display_metadata"]
                 ):
                     raise RuntimeError(
                         "compacted durable gateway authority provenance changed"
@@ -12059,6 +12079,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        turn_lease_holder: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -12105,6 +12127,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            # Transcript rewrite authority is checked inside this SAME
+            # BEGIN IMMEDIATE transaction as the archive/insert. A caller that
+            # omits the holder may proceed only when no live turn lease exists.
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                lock_holder,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                reject_active_turn_lease=turn_lease_holder is None,
+            )
             if lock_holder is not None:
                 lock_row = conn.execute(
                     "SELECT holder, expires_at FROM compression_locks "

@@ -83,10 +83,17 @@ logger = logging.getLogger(__name__)
 
 def _cap_compression_commit_watermark(agent, captured: int) -> int:
     """Preserve a gateway-authority tail excluded from the summary snapshot."""
+    if type(captured) is not int or captured < 0:
+        raise ValueError("compression watermark must be a non-negative integer")
     ceiling = getattr(agent, "_compression_commit_watermark_ceiling", None)
     if type(ceiling) is not int or ceiling < 0:
         return captured
     return min(captured, ceiling)
+
+
+def _has_compression_commit_watermark_ceiling(agent) -> bool:
+    ceiling = getattr(agent, "_compression_commit_watermark_ceiling", None)
+    return type(ceiling) is int and ceiling >= 0
 
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
@@ -2959,6 +2966,7 @@ def compress_context(
     # Watermark captured at compression start (#75316); None = fall back to
     # archive-everything (no concurrent-tail preservation this cycle).
     _commit_watermark: Optional[int] = None
+    _authority_watermark_failed = False
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -3078,16 +3086,30 @@ def compress_context(
                             _commit_watermark,
                         )
                     except Exception as _wm_err:
-                        # Watermark capture is safety-additive: without it the
-                        # commit falls back to archive-everything (historical
-                        # behavior), so failure here must not abort compression.
-                        logger.warning(
-                            "compression watermark capture failed for "
-                            "session=%s (%s) — concurrent appends this cycle "
-                            "will be archived with the snapshot",
-                            _lock_sid, _wm_err,
-                        )
-                        _commit_watermark = None
+                        if _has_compression_commit_watermark_ceiling(agent):
+                            # A gateway authority ceiling means the excluded
+                            # tail contains the durable authorization for this
+                            # turn. Falling back to watermark=None would archive
+                            # that row without cloning it. Latch the failure and
+                            # unwind after the lock release hook is installed.
+                            _authority_watermark_failed = True
+                            logger.error(
+                                "compression authority watermark capture failed "
+                                "for session=%s (%s) — preserving transcript",
+                                _lock_sid,
+                                _wm_err,
+                            )
+                        else:
+                            # Historical non-gateway behavior: watermark safety
+                            # is additive when no authority ceiling is active.
+                            logger.warning(
+                                "compression watermark capture failed for "
+                                "session=%s (%s) — concurrent appends this cycle "
+                                "will be archived with the snapshot",
+                                _lock_sid,
+                                _wm_err,
+                            )
+                            _commit_watermark = None
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -3233,6 +3255,21 @@ def compress_context(
     # Publish the holder-qualified release hook before a timeout can win the
     # fence. If no durable lock was acquired there is no hook to publish.
     _finish_lock_setup()
+
+    if _authority_watermark_failed:
+        agent._last_compaction_in_place = False
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="authority_watermark_unavailable",
+        )
+        _release_lock()
+        return messages, _existing_sp
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
@@ -4080,6 +4117,20 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
+                    _turn_lease_holder = getattr(
+                        agent, "_active_session_turn_lease_holder", None
+                    )
+                    _turn_lease_kwargs = {}
+                    if _turn_lease_holder is not None:
+                        _turn_lease_kwargs = {
+                            "turn_lease_holder": _turn_lease_holder,
+                            "turn_lease_ttl_seconds": getattr(
+                                agent,
+                                "_active_session_turn_lease_ttl_seconds",
+                                300.0,
+                            )
+                            or 300.0,
+                        }
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
@@ -4088,6 +4139,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        **_turn_lease_kwargs,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are

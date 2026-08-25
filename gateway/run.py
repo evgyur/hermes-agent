@@ -137,6 +137,11 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY = "gateway_raw_semantic_v1"
+_GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES = 8 * 1024
+_GATEWAY_RAW_MEDIA_REF_MAX_BYTES = 4 * 1024
+_GATEWAY_RAW_MEDIA_TYPE_MAX_BYTES = 256
+_GATEWAY_RAW_MEDIA_MAX_ITEMS = 16
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -21557,6 +21562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "lost": False,
             "released": False,
             "agent": None,
+            "handler_task": asyncio.current_task(),
             "refresh_task": None,
         }
 
@@ -21574,40 +21580,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if refreshed is True:
                             continue
-                        authority["lost"] = True
-                        agent = authority.get("agent")
-                        if agent is not None:
-                            agent.interrupt(
-                                "Session turn lease lost; stopping to protect the transcript.",
-                                hard_cancel=True,
-                            )
+                        self._stop_gateway_durable_turn_authority_owner(
+                            authority,
+                            "Session turn lease lost; stopping to protect the transcript.",
+                        )
                         return
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    authority["lost"] = True
                     logger.error(
                         "Gateway durable turn lease refresh failed for %s",
                         authority["session_id"],
                         exc_info=True,
                     )
-                    agent = authority.get("agent")
-                    if agent is not None:
-                        try:
-                            agent.interrupt(
-                                "Session turn lease refresh failed; stopping to protect the transcript.",
-                                hard_cancel=True,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not interrupt agent after turn lease loss",
-                                exc_info=True,
-                            )
+                    self._stop_gateway_durable_turn_authority_owner(
+                        authority,
+                        "Session turn lease refresh failed; stopping to protect the transcript.",
+                    )
 
             authority["refresh_task"] = asyncio.create_task(_refresh())
 
         setattr(event, "_gateway_durable_turn_authority", authority)
         return authority
+
+    @staticmethod
+    def _stop_gateway_durable_turn_authority_owner(
+        authority: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Fence the exact in-process owner immediately after lease loss."""
+        authority["lost"] = True
+        agent = authority.get("agent")
+        if agent is not None:
+            try:
+                agent.interrupt(reason, hard_cancel=True)
+            except Exception:
+                logger.debug(
+                    "Could not interrupt agent after turn lease loss",
+                    exc_info=True,
+                )
+            return
+        handler_task = authority.get("handler_task")
+        if not isinstance(handler_task, asyncio.Task) or handler_task.done():
+            return
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if handler_task is not current_task:
+            handler_task.cancel(reason)
 
     async def _release_gateway_durable_turn_authority(
         self,
@@ -21658,9 +21679,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         platform_message_id: Optional[str],
         display_kind: Optional[str],
-    ) -> Optional[int]:
+    ) -> Optional[Any]:
         """Persist or safely reuse the exact raw inbound row before hooks."""
-        row_id = await self._await_db_call(
+        display_metadata = {
+            _GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY: (
+                self._gateway_raw_semantic_envelope(event)
+            )
+        }
+        result = await self._await_db_call(
             authority["db"],
             "append_or_reuse_gateway_user_authority",
             session_entry.session_id,
@@ -21668,14 +21694,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_message_id=platform_message_id,
             timestamp=getattr(event, "timestamp", None),
             display_kind=display_kind,
+            display_metadata=display_metadata,
             turn_lease_holder=authority["holder"],
             turn_lease_ttl_seconds=authority["ttl_seconds"],
         )
-        if type(row_id) is int and row_id > 0:
-            return row_id
+        row_id = getattr(result, "row_id", None)
+        inserted = getattr(result, "inserted", None)
+        if type(row_id) is int and row_id > 0 and type(inserted) is bool:
+            return result
         if type(authority["db"]).__module__.startswith("unittest.mock"):
             return None
-        raise RuntimeError("triggering user row did not return a durable row id")
+        raise RuntimeError(
+            "triggering user row did not return an explicit durable write outcome"
+        )
+
+    @staticmethod
+    def _bounded_gateway_semantic_text(
+        value: Any,
+        *,
+        field: str,
+        max_bytes: int,
+    ) -> str:
+        if type(value) is not str:
+            raise ValueError(f"{field} must be an exact string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{field} must be non-empty")
+        encoded = normalized.encode("utf-8")
+        if len(encoded) > max_bytes:
+            raise ValueError(f"{field} exceeds its durable semantic boundary")
+        return normalized
+
+    @classmethod
+    def _gateway_raw_semantic_envelope(cls, event: "MessageEvent") -> Dict[str, Any]:
+        """Build bounded reply/media provenance before any preprocessing."""
+        message_type = getattr(event, "message_type", None)
+        if not isinstance(message_type, MessageType):
+            raise ValueError("message type must be a canonical MessageType")
+        reply = None
+        raw_quote = getattr(event, "reply_to_text", None)
+        quote = raw_quote.strip() if type(raw_quote) is str else ""
+        if quote:
+            message_id = cls._bounded_gateway_semantic_text(
+                getattr(event, "reply_to_message_id", None),
+                field="reply message id",
+                max_bytes=512,
+            )
+            is_own = getattr(event, "reply_to_is_own_message", False)
+            if type(is_own) is not bool:
+                raise ValueError("reply ownership must be an exact boolean")
+            reply = {
+                "message_id": message_id,
+                "is_own": is_own,
+                "quote": cls._bounded_gateway_semantic_text(
+                    quote,
+                    field="reply quote",
+                    max_bytes=_GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES,
+                ),
+            }
+
+        raw_refs = getattr(event, "media_urls", None) or []
+        raw_types = getattr(event, "media_types", None) or []
+        if type(raw_refs) is not list or type(raw_types) is not list:
+            raise ValueError("media provenance must use exact lists")
+        if len(raw_refs) > _GATEWAY_RAW_MEDIA_MAX_ITEMS:
+            raise ValueError("too many media references for durable authority")
+        if len(raw_types) > len(raw_refs):
+            raise ValueError("media types exceed media references")
+        media = []
+        for index, raw_ref in enumerate(raw_refs):
+            raw_type = raw_types[index] if index < len(raw_types) else None
+            if raw_type is not None:
+                if type(raw_type) is not str:
+                    raise ValueError("media type must be an exact string or null")
+                if len(raw_type.encode("utf-8")) > _GATEWAY_RAW_MEDIA_TYPE_MAX_BYTES:
+                    raise ValueError("media type exceeds its durable semantic boundary")
+            media.append(
+                {
+                    "ref": cls._bounded_gateway_semantic_text(
+                        raw_ref,
+                        field="media reference",
+                        max_bytes=_GATEWAY_RAW_MEDIA_REF_MAX_BYTES,
+                    ),
+                    "type": raw_type,
+                }
+            )
+        return {
+            "version": 1,
+            "message_type": message_type.value,
+            "reply": reply,
+            "media": media,
+        }
+
+    @staticmethod
+    def _adopt_reused_gateway_user_authority_tail(
+        history: List[Dict[str, Any]],
+        write_result: Any,
+    ) -> tuple[List[Dict[str, Any]], Optional[int]]:
+        """Remove one exact reused durable tail before inbound preprocessing."""
+        if write_result is None:
+            return history, None
+        row_id = getattr(write_result, "row_id", None)
+        inserted = getattr(write_result, "inserted", None)
+        if type(row_id) is not int or row_id <= 0 or type(inserted) is not bool:
+            raise RuntimeError("invalid gateway user-authority write outcome")
+        if inserted:
+            return history, row_id
+        matches = [
+            index
+            for index, row in enumerate(history)
+            if isinstance(row, dict) and row.get("_row_id") == row_id
+        ]
+        if matches != [len(history) - 1]:
+            raise RuntimeError(
+                "reused gateway user-authority row is not the exact loaded tail"
+            )
+        return history[:-1], row_id
 
     async def _enrich_gateway_triggering_user_row(
         self,
@@ -21801,6 +21935,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
+        if not self._restore_startup_raw_semantic_envelope(
+            event,
+            history,
+            source_message_id=sealed_message_id,
+        ):
+            logger.warning(
+                "Refusing startup continuation for %s: raw reply/media "
+                "semantics are missing, corrupt, or irretrievable",
+                session_entry.session_key,
+            )
+            return False
+
         event_metadata["startup_safe_dangling_calls"] = list(
             analysis.get("safe_dangling_calls") or []
         )
@@ -21828,6 +21974,133 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "display_kind": "internal_notification",
                 }
             )
+        return True
+
+    @classmethod
+    def _restore_startup_raw_semantic_envelope(
+        cls,
+        event: "MessageEvent",
+        history: List[Dict[str, Any]],
+        *,
+        source_message_id: str,
+    ) -> bool:
+        """Restore sealed raw reply/media semantics for one exact source row."""
+        def _matches_source_row(row: Any) -> bool:
+            if not isinstance(row, dict) or row.get("role") != "user":
+                return False
+            identities = [
+                row.get(key)
+                for key in ("platform_message_id", "message_id")
+                if row.get(key) is not None
+            ]
+            return bool(identities) and all(
+                type(value) is str and value == source_message_id
+                for value in identities
+            )
+
+        matches = [row for row in history if _matches_source_row(row)]
+        if len(matches) != 1:
+            return False
+        source_row = matches[0]
+        metadata = source_row.get("display_metadata")
+        envelope = (
+            metadata.get(_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if envelope is None:
+            return False
+        if not isinstance(envelope, dict) or set(envelope) != {
+            "version",
+            "message_type",
+            "reply",
+            "media",
+        }:
+            return False
+        if type(envelope.get("version")) is not int or envelope["version"] != 1:
+            return False
+        raw_message_type = envelope.get("message_type")
+        if type(raw_message_type) is not str:
+            return False
+        try:
+            restored_message_type = MessageType(raw_message_type)
+        except ValueError:
+            return False
+        if restored_message_type.value != raw_message_type:
+            return False
+
+        reply = envelope.get("reply")
+        if reply is not None:
+            if not isinstance(reply, dict) or set(reply) != {
+                "message_id",
+                "is_own",
+                "quote",
+            }:
+                return False
+            if type(reply.get("is_own")) is not bool:
+                return False
+            try:
+                reply_id = cls._bounded_gateway_semantic_text(
+                    reply.get("message_id"),
+                    field="reply message id",
+                    max_bytes=512,
+                )
+                quote = cls._bounded_gateway_semantic_text(
+                    reply.get("quote"),
+                    field="reply quote",
+                    max_bytes=_GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES,
+                )
+            except ValueError:
+                return False
+            if reply_id != reply.get("message_id") or quote != reply.get("quote"):
+                return False
+            event.reply_to_message_id = reply_id
+            event.reply_to_text = quote
+            event.reply_to_is_own_message = reply["is_own"]
+
+        media = envelope.get("media")
+        if type(media) is not list or len(media) > _GATEWAY_RAW_MEDIA_MAX_ITEMS:
+            return False
+        restored_refs: list[str] = []
+        restored_types: list[str] = []
+        missing_media_type = False
+        for item in media:
+            if not isinstance(item, dict) or set(item) != {"ref", "type"}:
+                return False
+            try:
+                ref = cls._bounded_gateway_semantic_text(
+                    item.get("ref"),
+                    field="media reference",
+                    max_bytes=_GATEWAY_RAW_MEDIA_REF_MAX_BYTES,
+                )
+            except ValueError:
+                return False
+            raw_media_type = item.get("type")
+            if raw_media_type is None:
+                missing_media_type = True
+                media_type = None
+            else:
+                if type(raw_media_type) is not str or missing_media_type:
+                    return False
+                if (
+                    len(raw_media_type.encode("utf-8"))
+                    > _GATEWAY_RAW_MEDIA_TYPE_MAX_BYTES
+                ):
+                    return False
+                media_type = raw_media_type
+            if ref != item.get("ref"):
+                return False
+            if not Path(ref).is_file():
+                return False
+            restored_refs.append(ref)
+            if media_type is not None:
+                restored_types.append(media_type)
+
+        event.media_urls = restored_refs
+        event.media_types = restored_types
+        event.message_type = restored_message_type
+        if not str(source_row.get("content") or "").strip() and not reply and not media:
+            return False
         return True
 
     async def _mark_durable_active_turn(
@@ -22318,7 +22591,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation=run_generation,
         )
         history = await self.async_session_store.load_transcript(
-            session_entry.session_id
+            session_entry.session_id,
+            include_row_ids=True,
         )
         if not await self._validate_and_seal_startup_resume(
             event,
@@ -22349,13 +22623,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         precommitted_user_row_id: Optional[int] = None
         if not bool(getattr(event, "startup_resume", False)):
-            precommitted_user_row_id = (
-                await self._persist_gateway_triggering_user_row(
-                    event,
-                    session_entry,
-                    durable_authority,
-                    platform_message_id=triggering_platform_message_id,
-                    display_kind=persist_user_display_kind,
+            authority_write = await self._persist_gateway_triggering_user_row(
+                event,
+                session_entry,
+                durable_authority,
+                platform_message_id=triggering_platform_message_id,
+                display_kind=persist_user_display_kind,
+            )
+            history, precommitted_user_row_id = (
+                self._adopt_reused_gateway_user_authority_tail(
+                    history,
+                    authority_write,
                 )
             )
         if not await self._mark_durable_active_turn(
@@ -22880,6 +23158,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
+                                _hyg_agent._active_session_turn_lease_holder = (
+                                    durable_authority["holder"]
+                                )
+                                _hyg_agent._active_session_turn_lease_ttl_seconds = (
+                                    durable_authority["ttl_seconds"]
+                                )
                                 if precommitted_user_row_id is not None:
                                     # Hygiene summarizes the leased pre-turn
                                     # snapshot, which intentionally excludes
@@ -22919,6 +23203,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _bind_hyg_state(
                                             _hyg_session_db,
                                             session_entry.session_id,
+                                        )
+                                    _hyg_bind_turn_lease = getattr(
+                                        getattr(_hyg_agent, "context_compressor", None),
+                                        "bind_turn_lease",
+                                        None,
+                                    )
+                                    if callable(_hyg_bind_turn_lease):
+                                        _hyg_bind_turn_lease(
+                                            durable_authority["holder"],
+                                            ttl_seconds=durable_authority["ttl_seconds"],
                                         )
                                     # It must never finalize on close() — close()
                                     # would end the live gateway session row.
