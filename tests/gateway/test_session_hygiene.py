@@ -24,6 +24,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from hermes_state import GatewayUserAuthorityWrite
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ def _isolate_hygiene_from_durable_authority(monkeypatch):
         return authority
 
     async def _persist(*_args, **_kwargs):
-        return 4242
+        return GatewayUserAuthorityWrite(row_id=4242, inserted=True)
 
     async def _enrich(_self, _entry, _authority, row_id, **_kwargs):
         return row_id
@@ -728,6 +729,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    compressor_bind_order = []
     async_session_db = SimpleNamespace(
         _db=fake_db,
         get_session=AsyncMock(
@@ -749,7 +751,16 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             self.compression_in_place = False
             self._last_compaction_in_place = False
             self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
+                bind_session_state=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "session"
+                    )
+                ),
+                bind_turn_lease=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "lease"
+                    )
+                ),
                 _last_compress_aborted=False,
                 _last_aux_model_failure_model=None,
             )
@@ -849,6 +860,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert agent is not None
     async_session_db.get_session.assert_awaited_once_with("sess-1")
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
+    assert compressor_bind_order == ["session", "lease"]
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.

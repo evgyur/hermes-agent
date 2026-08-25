@@ -8760,6 +8760,15 @@ class AIAgent:
                 with redirect_lock:
                     _clear_if_owned()
 
+        def _bind_context_compressor_turn_lease(
+            holder: Optional[str],
+            ttl_seconds: float = 300.0,
+        ) -> None:
+            engine = getattr(self, "context_compressor", None)
+            binder = getattr(engine, "bind_turn_lease", None)
+            if callable(binder):
+                binder(holder, ttl_seconds=ttl_seconds)
+
         try:
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
@@ -8812,6 +8821,10 @@ class AIAgent:
                 durable_turn_lease = _external_holder
                 self._active_session_turn_lease_holder = _external_holder
                 self._active_session_turn_lease_ttl_seconds = _external_ttl
+                _bind_context_compressor_turn_lease(
+                    _external_holder,
+                    _external_ttl,
+                )
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -8950,6 +8963,10 @@ class AIAgent:
                 durable_turn_lease_owned_here = True
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
+                _bind_context_compressor_turn_lease(
+                    _durable_holder,
+                    _lease_ttl,
+                )
                 if _lease_waited:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
@@ -9182,6 +9199,7 @@ class AIAgent:
                     ):
                         self._active_session_turn_lease_holder = None
                         self._active_session_turn_lease_ttl_seconds = None
+                        _bind_context_compressor_turn_lease(None)
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

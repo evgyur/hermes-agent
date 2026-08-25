@@ -714,6 +714,160 @@ def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
 
 
 @pytest.mark.asyncio
+async def test_leased_startup_rejects_legacy_text_without_raw_semantic_envelope(
+    monkeypatch,
+    tmp_path,
+):
+    history = [
+        {
+            "role": "user",
+            "content": "Fix",
+            "platform_message_id": "msg-42",
+            "display_metadata": None,
+        }
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+
+    assert not runner._restore_startup_raw_semantic_envelope(
+        event,
+        history,
+        source_message_id="msg-42",
+    )
+    assert not await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        history,
+    )
+
+
+@pytest.mark.asyncio
+async def test_leased_startup_restores_direct_reply_semantics_before_preprocessing(
+    monkeypatch,
+    tmp_path,
+):
+    history = [
+        {
+            "role": "user",
+            "content": "Fix",
+            "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": {
+                        "message_id": "guardian-report",
+                        "is_own": True,
+                        "quote": "Guardian report: candidate transport is stale.",
+                    },
+                    "media": [],
+                }
+            },
+        }
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        history,
+    )
+    assert event.reply_to_message_id == "guardian-report"
+    assert event.reply_to_is_own_message is True
+    assert event.reply_to_text == "Guardian report: candidate transport is stale."
+
+
+@pytest.mark.asyncio
+async def test_leased_startup_restores_existing_media_and_rejects_missing_ref(
+    monkeypatch,
+    tmp_path,
+):
+    voice = tmp_path / "voice.ogg"
+    voice.write_bytes(b"recoverable-voice")
+
+    def _history(ref, *, message_type="voice", media_type="audio/ogg"):
+        return [
+            {
+                "role": "user",
+                "content": "",
+                "platform_message_id": "msg-42",
+                "display_metadata": {
+                    "gateway_raw_semantic_v1": {
+                        "version": 1,
+                        "message_type": message_type,
+                        "reply": None,
+                        "media": [{"ref": str(ref), "type": media_type}],
+                    }
+                },
+            }
+        ]
+
+    existing = _history(voice)
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, existing
+    )
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        existing,
+    )
+    assert event.media_urls == [str(voice)]
+    assert event.media_types == ["audio/ogg"]
+    assert event.message_type.value == "voice"
+
+    unknown_mime = _history(
+        voice,
+        message_type="voice",
+        media_type=None,
+    )
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, unknown_mime
+    )
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        unknown_mime,
+    )
+    assert event.media_types == []
+    assert event.message_type.value == "voice"
+
+    audio = _history(
+        voice,
+        message_type="audio",
+        media_type="audio/mpeg",
+    )
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, audio
+    )
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        audio,
+    )
+    assert event.media_types == ["audio/mpeg"]
+    assert event.message_type.value == "audio"
+
+    missing = _history(tmp_path / "missing.ogg")
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, missing
+    )
+    assert not await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        missing,
+    )
+
+
+@pytest.mark.asyncio
 async def test_leased_startup_handler_analyzes_once_and_passes_exact_fence(
     monkeypatch,
     tmp_path,
@@ -724,6 +878,14 @@ async def test_leased_startup_handler_analyzes_once_and_passes_exact_fence(
             "role": "user",
             "content": "finish this",
             "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": None,
+                    "media": [],
+                }
+            },
         },
         {
             "role": "assistant",

@@ -2119,6 +2119,8 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._turn_lease_holder = None
+        self._turn_lease_ttl_seconds = 300.0
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -2410,6 +2412,8 @@ class ContextCompressor(ContextEngine):
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
         self._session_id = session_id or ""
+        self._turn_lease_holder = None
+        self._turn_lease_ttl_seconds = 300.0
         self._summary_failure_cooldown_until = 0.0
         self._cooldown_persist_failed = False
         self._last_summary_error = None
@@ -2424,6 +2428,26 @@ class ContextCompressor(ContextEngine):
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_proactive_prune_rearm_tokens()
+
+    def bind_turn_lease(
+        self,
+        holder: Optional[str],
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> None:
+        """Bind one holder-qualified transcript rewrite capability."""
+        if holder is not None and (
+            type(holder) is not str or not holder.strip() or holder != holder.strip()
+        ):
+            raise ValueError("turn lease holder must be an exact non-empty string")
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("turn lease ttl must be positive") from exc
+        if ttl <= 0:
+            raise ValueError("turn lease ttl must be positive")
+        self._turn_lease_holder = holder
+        self._turn_lease_ttl_seconds = ttl
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -4112,12 +4136,19 @@ class ContextCompressor(ContextEngine):
         if session_db and session_id:
             # The capability gate above guarantees archive_and_compact exists.
             try:
+                turn_lease_kwargs = {}
+                if self._turn_lease_holder is not None:
+                    turn_lease_kwargs = {
+                        "turn_lease_holder": self._turn_lease_holder,
+                        "turn_lease_ttl_seconds": self._turn_lease_ttl_seconds,
+                    }
                 session_db.archive_and_compact(
                     session_id,
                     pruned_msgs,
                     model_config_patch={
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                     },
+                    **turn_lease_kwargs,
                 )
             except Exception as exc:
                 logger.warning(
@@ -7075,7 +7106,17 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            turn_lease_kwargs = {}
+            if self._turn_lease_holder is not None:
+                turn_lease_kwargs = {
+                    "turn_lease_holder": self._turn_lease_holder,
+                    "turn_lease_ttl_seconds": self._turn_lease_ttl_seconds,
+                }
+            session_db.archive_and_compact(
+                session_id,
+                compacted_messages,
+                **turn_lease_kwargs,
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
