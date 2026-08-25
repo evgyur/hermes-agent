@@ -343,7 +343,13 @@ def _shape_message(
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _resolve_profile_db(profile: str):
+def _resolve_profile_db(
+    profile: str,
+    *,
+    query: str = "",
+    session_id: str = None,
+    around_message_id: int = None,
+):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
     The desktop's ``@session:<profile>/<id>`` links always carry the source
@@ -360,6 +366,41 @@ def _resolve_profile_db(profile: str):
 
     canon = profiles_mod.normalize_profile_name(profile)
     profiles_mod.validate_profile_name(canon)
+
+    # HEL1 Release B: the default profile is the main-history authority.
+    # Deny before both the existence probe and SessionDB construction so an
+    # unauthorized or non-query shape never touches the main database.
+    if canon == "default":
+        active_profile = profiles_mod.get_active_profile_name()
+        if active_profile != "default":
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                config = load_config_readonly() or {}
+                tools_config = config.get("tools") or {}
+                search_config = tools_config.get("session_search") or {}
+                allowed_profiles = search_config.get("read_profiles")
+            except Exception:
+                allowed_profiles = None
+
+            if (
+                active_profile != "hermesdev"
+                or not isinstance(allowed_profiles, list)
+                or canon not in {
+                    profiles_mod.normalize_profile_name(name)
+                    for name in allowed_profiles
+                    if isinstance(name, str) and name.strip()
+                }
+            ):
+                raise ValueError("main history is not allowlisted for this profile")
+            if (
+                not isinstance(query, str)
+                or not query.strip()
+                or session_id is not None
+                or around_message_id is not None
+            ):
+                raise ValueError("main history access is query-only")
+
     if not profiles_mod.profile_exists(canon):
         raise ValueError(f"profile '{canon}' does not exist")
 
@@ -919,6 +960,8 @@ def _discover(
 
     for entry in results:
         entry["link"] = _session_link(entry["session_id"], link_profile)
+        if link_profile:
+            entry["source_profile"] = str(link_profile).strip().lower()
 
     _final_payload = {
         "success": True,
@@ -980,7 +1023,12 @@ def _session_search_impl(
     # profiles, but they key off ids that won't collide, so they stay inert.
     if profile is not None and str(profile).strip():
         try:
-            profile_db = _resolve_profile_db(profile)
+            profile_db = _resolve_profile_db(
+                profile,
+                query=query,
+                session_id=session_id,
+                around_message_id=around_message_id,
+            )
         except Exception as e:
             return tool_error(f"profile '{profile}': {e}", success=False)
         if profile_db is not None:
