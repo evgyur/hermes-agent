@@ -10122,12 +10122,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
-                    # API and cron work live outside messaging's
-                    # _running_agents map. Refresh the aggregate while an
-                    # external caller polls this reversible drain state.
-                    self._persist_active_agents()
                 else:
                     self._exit_external_drain()
+                # API and cron work live outside messaging's
+                # _running_agents map and can finish without crossing a
+                # messaging turn boundary.  Refresh the aggregate on every
+                # existing watcher tick so idle runtime status cannot retain
+                # a completed cron/API run until the next chat message.
+                self._persist_active_agents()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
