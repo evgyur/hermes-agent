@@ -241,14 +241,17 @@ class TestRuntimeFtsRebuild:
         for pid in (111, 222, 333):
             fd_dir = proc_root / str(pid) / "fd"
             fd_dir.mkdir(parents=True)
-        # PID 222 holds the deleted WAL sidecar
-        os.symlink(db_path_wal + " (deleted)", str(proc_root / "222" / "fd" / "3"))
-        # PID 111 (self) holds the db — should be excluded
-        os.symlink(str(db_path), str(proc_root / "111" / "fd" / "3"))
-        # PID 333 holds an unrelated file
+        # Populate fd names; readlink targets are injected below so this
+        # Linux /proc fault-test also runs on Windows without symlink rights.
+        for pid in (111, 222, 333):
+            (proc_root / str(pid) / "fd" / "3").touch()
         other = tmp_path / "other.db"
         other.touch()
-        os.symlink(str(other), str(proc_root / "333" / "fd" / "3"))
+        targets = {
+            os.fspath(proc_root / "111" / "fd" / "3"): str(db_path),
+            os.fspath(proc_root / "222" / "fd" / "3"): db_path_wal + " (deleted)",
+            os.fspath(proc_root / "333" / "fd" / "3"): str(other),
+        }
 
         monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
         monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
@@ -259,20 +262,18 @@ class TestRuntimeFtsRebuild:
                 path = path.replace("/proc", str(proc_root))
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
-        real_readlink = os.readlink
         def _readlink(path):
             path = path.replace("/proc", str(proc_root))
-            return real_readlink(path)
+            return targets[os.path.normpath(path)]
         monkeypatch.setattr(hermes_state.os, "readlink", _readlink)
 
         holders = db._foreign_state_db_holders()
         assert holders == [(222, db_path_wal + " (deleted)")]
 
-    def test_foreign_holder_uninspectable_process_cmdline_fallback(
+    def test_foreign_holder_uninspectable_process_without_exact_db_path_is_ignored(
         self, db, tmp_path, monkeypatch
     ):
-        """A process whose fd table is unreadable (different user) is still
-        flagged when /proc/<pid>/cmdline identifies it as a Hermes process."""
+        """A Hermes-looking process is not proof that it holds this state.db."""
         db_path = tmp_path / "state.db"
 
         proc_root = tmp_path / "proc"
@@ -289,10 +290,10 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(hermes_state.sys, "platform", "linux")
         real_listdir = os.listdir
         def _listdir(path):
+            if os.fspath(path) == "/proc/222/fd":
+                raise PermissionError(path)
             if isinstance(path, str):
                 path = path.replace("/proc", str(proc_root))
-            if os.fspath(path) == os.fspath(proc_root / "222" / "fd"):
-                raise PermissionError(path)
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
         # _read_proc_cmdline opens /proc/<pid>/cmdline directly; redirect
@@ -310,13 +311,33 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(hermes_state, "_read_proc_cmdline", _fake_cmdline)
 
         holders = db._foreign_state_db_holders()
-        # Should include PID 222 with the cmdline info
-        assert len(holders) == 1
-        assert holders[0][0] == 222
-        assert "hermes_cli.main" in holders[0][1]
+        assert holders == []
 
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)
+
+    def test_sqlite_write_lock_remains_final_rebuild_barrier(
+        self, db, tmp_path
+    ):
+        """No process heuristic bypasses SQLite's own transaction authority."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "canonical before locked rebuild")
+        before = _message_rows(db_path)
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            db._conn.execute("PRAGMA busy_timeout=1")
+            assert not db._try_runtime_fts_rebuild(
+                sqlite3.DatabaseError("database disk image is malformed")
+            )
+            assert _message_rows(db_path) == before
+        finally:
+            blocker.rollback()
+            blocker.close()
 
     def test_corruption_error_classification_covers_both_sqlite_messages(self):
         """SQLite's message for a corrupt FTS index varies by version: older

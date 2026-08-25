@@ -5104,9 +5104,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sidecar reset under that holder can leave the two processes writing
         through different WAL inodes.
 
-        A scan failure is represented as an unknown holder.  Skipping optional
-        automatic maintenance is safer than assuming quiescence; canonical
-        writes continue through the stale-FTS fail-open path.
+        Only an exact open fd for this DB, WAL, or SHM proves a foreign holder.
+        Process identity alone is not DB-path evidence: an unrelated Hermes
+        instance may use a different state.db.  Whole-scan failures remain
+        fail-closed, and SQLite locking is the final rebuild barrier.
         """
         # The split-brain mechanism requires POSIX unlink semantics: Windows
         # refuses to replace SQLite sidecars while another process has them
@@ -5149,15 +5150,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     try:
                         fds = os.listdir(fd_dir)
                     except OSError:
-                        # Cannot read this process's fd table (different
-                        # user, e.g. root gateway vs user desktop).
-                        # /proc/<pid>/cmdline is world-readable by default,
-                        # so check whether this is a Hermes process —
-                        # only flag uninspectable holders that look like
-                        # another Hermes instance, not every system daemon.
-                        cmdline = _read_proc_cmdline(pid)
-                        if cmdline is not None and _looks_like_hermes(cmdline):
-                            holders.append((pid, f"uninspectable holder: {cmdline[:80]}"))
+                        # An unreadable fd table proves neither the database
+                        # path nor ownership of this specific state.db.  Do
+                        # not turn process-name heuristics into a holder; the
+                        # exact fd matches below and SQLite's own exclusive
+                        # lock probe remain the fail-closed barriers.
                         continue
                     for fd in fds:
                         try:
