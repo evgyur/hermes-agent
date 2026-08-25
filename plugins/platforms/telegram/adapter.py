@@ -10819,7 +10819,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 and not os.path.islink(parent)
                 and (
                     not hasattr(os, "getuid")
-                    or os.stat(parent).st_uid == os.getuid()
+                    or os.stat(parent).st_uid == os.getuid()  # windows-footgun: ok
                 )
             ):
                 os.rmdir(parent)
