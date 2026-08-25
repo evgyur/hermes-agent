@@ -65,7 +65,21 @@ def format_session_stall_notification(idle_seconds: float) -> str:
     mins = max(1, int(idle_seconds // 60))
     return (
         f"⚠️ Agent session appears stalled (last activity {mins} min ago). "
-        f"Try /new to reset."
+        f"Use /stop to cancel the stuck task without discarding this session."
+    )
+
+
+def format_agent_inactivity_warning(
+    elapsed_minutes: int,
+    remaining_minutes: int,
+) -> str:
+    """Return a staged warning that preserves the conversation history."""
+
+    return (
+        f"⚠️ No activity for {elapsed_minutes} min. "
+        f"If the agent does not respond soon, it will be timed out in "
+        f"{remaining_minutes} min. You can continue waiting or use /stop "
+        f"to cancel this task without discarding the session."
     )
 
 

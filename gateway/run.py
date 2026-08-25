@@ -2997,6 +2997,11 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# ``None`` is also a valid no-op active-session lease.  Keep the local
+# same-route race distinct so its caller cannot mistake "already running" for
+# a successful claim and start a second generation on the same transcript.
+_ACTIVE_SESSION_ALREADY_RUNNING = object()
+
 
 class _NeverPersistApiContentText(str):
     """API-only bound text whose expanded bytes must never become replay state."""
@@ -10856,7 +10861,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
         if self._is_session_running(session_key):
-            return None, None
+            return _ACTIVE_SESSION_ALREADY_RUNNING, None
         local_limit_message = self._active_session_limit_message(session_key)
         if local_limit_message is not None:
             return None, local_limit_message
@@ -20443,6 +20448,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _quick_key,
             source,
         )
+        if _active_session_lease is _ACTIVE_SESSION_ALREADY_RUNNING:
+            # A sibling event won the route between the earlier busy check and
+            # this final synchronous claim. Rejoin the canonical busy/FIFO path
+            # instead of overwriting its sentinel with a duplicate generation.
+            handled = await self._handle_active_session_busy_message(
+                event, _quick_key
+            )
+            if not handled:
+                self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         if _limit_message is not None:
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
@@ -21224,6 +21239,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             raise ValueError("source and event platform message ids disagree")
         return source_message_id or event_message_id
+
+    @staticmethod
+    def _turn_platform_message_timestamp(event: "MessageEvent") -> Optional[float]:
+        """Return the inbound event timestamp as a durable epoch value."""
+
+        try:
+            from hermes_time import get_timezone
+            from gateway.message_timestamps import coerce_message_timestamp
+
+            return coerce_message_timestamp(
+                getattr(event, "timestamp", None),
+                tz=get_timezone(),
+            )
+        except Exception:
+            logger.debug(
+                "Platform message timestamp coercion failed",
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     async def _await_db_call(db: Any, method_name: str, *args, **kwargs) -> Any:
@@ -23513,19 +23547,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_time import get_timezone as _get_evt_tz
             from gateway.message_timestamps import (
-                coerce_message_timestamp as _coerce_msg_ts,
                 render_user_content_with_timestamp as _render_msg_ts,
                 strip_leading_message_timestamps as _strip_msg_ts,
             )
             _evt_tz = _get_evt_tz()
-            _evt_ts = getattr(event, "timestamp", None)
             if message_text and isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
                 persist_user_message = str(
                     getattr(event, "_short_approval_raw_text", _clean_message_text)
                 )
-                _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
+                _event_epoch = self._turn_platform_message_timestamp(event)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
                 )
@@ -33443,12 +33475,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
+                                from gateway.session_stall import (
+                                    format_agent_inactivity_warning,
+                                )
+
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    format_agent_inactivity_warning(
+                                        _elapsed_warn,
+                                        _remaining_mins,
+                                    ),
                                     metadata=_interim_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:
@@ -33850,6 +33886,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_platform_message_id = None
+                next_persist_user_timestamp = None
                 next_channel_prompt = None
                 next_session_key = session_key
                 # #60671 — carry the pending event's message_type into the
@@ -33886,6 +33924,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_platform_message_id = self._turn_platform_message_id(
+                        pending_event
+                    )
+                    next_persist_user_timestamp = (
+                        self._turn_platform_message_timestamp(pending_event)
+                    )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
@@ -33942,6 +33986,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_message_id=next_platform_message_id,
+                    persist_user_timestamp=next_persist_user_timestamp,
+                    durable_turn_authority=durable_turn_authority,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
