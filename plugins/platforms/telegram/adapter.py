@@ -10698,8 +10698,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise RuntimeError("telegram-chip media redirects are not allowed")
 
         quoted_chat = urllib.parse.quote(str(chat_id), safe="")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".media") as owned_file:
-            owned_path = owned_file.name
+        owned_dir = tempfile.mkdtemp(prefix="hermes-telegram-chip-media-")
+        os.chmod(owned_dir, 0o733)
+        owned_path = os.path.join(owned_dir, "media")
         query = urllib.parse.urlencode({"output_path": owned_path})
         url = (
             f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"
@@ -10718,6 +10719,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     if declared and int(declared) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
                         raise ValueError("telegram-chip JSON body exceeds the size limit")
                     raw_payload = response.read(_TELEGRAM_CHIP_MAX_JSON_BYTES + 1)
+                    os.chmod(owned_dir, 0o700)
                     if len(raw_payload) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
                         raise ValueError("telegram-chip JSON body exceeds the size limit")
                     payload = json.loads(raw_payload.decode("utf-8"))
@@ -10777,6 +10779,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     os.unlink(owned_path)
                 except OSError:
                     pass
+                try:
+                    os.rmdir(owned_dir)
+                except OSError:
+                    pass
 
     @staticmethod
     def _bounded_telegram_chip_context(text: object, limit: int = 16 * 1024) -> str:
@@ -10785,6 +10791,28 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(encoded) <= limit:
             return raw
         raise ValueError("telegram-chip context size limit exceeded")
+
+    @staticmethod
+    def _cleanup_telegram_chip_media_path(path: str) -> None:
+        """Remove one transient media file and only its proved owned directory."""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        parent = os.path.dirname(path)
+        try:
+            if (
+                os.path.basename(path) == "media"
+                and os.path.basename(parent).startswith("hermes-telegram-chip-media-")
+                and not os.path.islink(parent)
+                and (
+                    not hasattr(os, "getuid")
+                    or os.stat(parent).st_uid == os.getuid()
+                )
+            ):
+                os.rmdir(parent)
+        except OSError:
+            pass
 
     async def _resolve_telegram_chip_context(self, event: MessageEvent) -> bool:
         """Resolve private-link/reply context before the model sees the turn.
@@ -10947,10 +10975,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         except Exception:
             for path in recovered_paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                self._cleanup_telegram_chip_media_path(path)
             event.message_type = original_type
             event.media_urls = original_urls
             event.media_types = original_types
@@ -11018,10 +11043,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except OSError:
                     pass
             for path in transient_media:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                self._cleanup_telegram_chip_media_path(path)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.

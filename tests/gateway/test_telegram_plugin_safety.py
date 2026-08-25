@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import stat
 import urllib.parse
 
 from unittest.mock import MagicMock
@@ -148,6 +149,9 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
             media_path = query["output_path"][0]
             requested_paths.append(media_path)
+            assert not Path(media_path).exists()
+            if os.name != "nt":
+                assert stat.S_IMODE(Path(media_path).parent.stat().st_mode) == 0o733
             Path(media_path).write_bytes(b"production-shaped audio")
             body = json.dumps(
                 {
@@ -166,6 +170,33 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
 
     assert returned == requested_paths[0]
     assert Path(returned).is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE(Path(returned).parent.stat().st_mode) == 0o700
+    Path(returned).unlink()
+    Path(returned).parent.rmdir()
+
+
+def test_telegram_chip_cleanup_never_removes_a_generic_temp_parent(tmp_path):
+    adapter = _adapter()
+    generic_path = tmp_path / "fallback.mp3"
+    generic_path.write_bytes(b"audio")
+
+    adapter._cleanup_telegram_chip_media_path(str(generic_path))
+
+    assert not generic_path.exists()
+    assert tmp_path.is_dir()
+
+
+def test_telegram_chip_cleanup_removes_its_owned_temp_parent(tmp_path):
+    adapter = _adapter()
+    owned_parent = tmp_path / "hermes-telegram-chip-media-test"
+    owned_parent.mkdir()
+    owned_path = owned_parent / "media"
+    owned_path.write_bytes(b"audio")
+
+    adapter._cleanup_telegram_chip_media_path(str(owned_path))
+
+    assert not owned_parent.exists()
 
 
 def test_telegram_chip_never_accepts_or_deletes_an_unowned_media_path(
@@ -257,7 +288,8 @@ def test_telegram_chip_cleans_only_its_owned_target_on_media_failure(
                     with open(owned_path, "wb") as oversized:
                         oversized.truncate(64 * 1024 * 1024 + 1)
                 else:
-                    Path(owned_path).unlink()
+                    if Path(owned_path).exists():
+                        Path(owned_path).unlink()
                     try:
                         os.symlink(symlink_target, owned_path)
                     except OSError:
@@ -277,6 +309,7 @@ def test_telegram_chip_cleans_only_its_owned_target_on_media_failure(
         adapter._telegram_chip_media_download_sync(CHAT_ID, 47266)
 
     assert requested_paths and not Path(requested_paths[0]).exists()
+    assert not Path(requested_paths[0]).parent.exists()
     assert symlink_target.read_bytes() == b"must survive"
 
 
