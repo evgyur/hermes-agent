@@ -3901,6 +3901,145 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _format_status_count(value: Any) -> str:
+    """Render an operator-facing count without losing small values."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        number = 0.0
+    sign = "-" if number < 0 else ""
+    number = abs(number)
+    if number >= 1_000_000:
+        rendered = f"{number / 1_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}m"
+    if number >= 1_000:
+        rendered = f"{number / 1_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}k"
+    return f"{sign}{int(number):,}"
+
+
+def _format_status_duration(seconds: Any) -> str:
+    """Render seconds as the compact uptime form used by ``/status``."""
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _read_system_uptime_seconds() -> Optional[float]:
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except Exception:
+        return None
+
+
+def _status_git_revision() -> str:
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _gateway_status_model_parts(
+    config: dict,
+) -> tuple[str, str, str, Optional[int]]:
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    if isinstance(model_cfg, str):
+        return model_cfg, "", "", None
+    if not isinstance(model_cfg, dict):
+        return "", "", "", None
+    try:
+        context_length = (
+            int(model_cfg["context_length"])
+            if model_cfg.get("context_length") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        context_length = None
+    return (
+        str(model_cfg.get("default") or model_cfg.get("model") or ""),
+        str(model_cfg.get("provider") or ""),
+        str(model_cfg.get("base_url") or ""),
+        context_length,
+    )
+
+
+def _gateway_status_auth_label(provider: str) -> str:
+    provider_key = (provider or "").strip().lower()
+    if provider_key == "openai-codex":
+        return "oauth (codex-cli)"
+    try:
+        from hermes_cli.providers import HERMES_PROVIDER_OVERLAYS
+
+        overlay = HERMES_PROVIDER_OVERLAYS.get(provider_key)
+        if overlay and getattr(overlay, "auth_type", ""):
+            auth_type = str(overlay.auth_type)
+            if auth_type.startswith("oauth"):
+                return "oauth"
+            if auth_type == "api_key":
+                return "api key"
+            return auth_type.replace("_", " ")
+    except Exception:
+        pass
+    return "configured" if provider_key else "unknown"
+
+
+def _gateway_status_runtime_label(provider: str, base_url: str) -> str:
+    provider_key = (provider or "").strip().lower()
+    if provider_key == "openai-codex":
+        return "OpenAI Codex"
+    if provider_key == "openrouter":
+        return "OpenRouter"
+    if provider_key == "minimax":
+        return "MiniMax"
+    if provider_key:
+        return provider_key
+    return "custom" if base_url else "unknown"
+
+
+def _gateway_status_fallbacks(chain: Any) -> str:
+    if not chain:
+        return "none"
+    if not isinstance(chain, list):
+        chain = [chain]
+    labels: list[str] = []
+    for item in chain[:4]:
+        if isinstance(item, dict):
+            provider = str(item.get("provider") or "").strip()
+            model = str(item.get("model") or item.get("default") or "").strip()
+            labels.append(
+                f"{provider}/{model}"
+                if provider and model
+                else provider or model or "fallback"
+            )
+        else:
+            labels.append(str(item))
+    if len(chain) > 4:
+        labels.append(f"+{len(chain) - 4}")
+    return " → ".join(label for label in labels if label) or "none"
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
