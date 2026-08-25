@@ -16,6 +16,7 @@ import hashlib
 import os
 import html as _html
 import re
+import subprocess
 import threading
 import time
 import tempfile
@@ -10699,7 +10700,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         quoted_chat = urllib.parse.quote(str(chat_id), safe="")
         owned_dir = tempfile.mkdtemp(prefix="hermes-telegram-chip-media-")
-        os.chmod(owned_dir, 0o733)
         owned_path = os.path.join(owned_dir, "media")
         query = urllib.parse.urlencode({"output_path": owned_path})
         url = (
@@ -10712,6 +10712,14 @@ class TelegramAdapter(BasePlatformAdapter):
         temp_path = ""
         keep_owned_path = False
         try:
+            if os.name != "nt":
+                subprocess.run(
+                    ["/usr/bin/setfacl", "-m", "u:chip:rwx", owned_dir],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                )
             with opener.open(request, timeout=20.0) as response:
                 declared = response.headers.get("Content-Length")
                 content_type = str(response.headers.get_content_type() or "")
@@ -10775,6 +10783,10 @@ class TelegramAdapter(BasePlatformAdapter):
             raise
         finally:
             if not keep_owned_path:
+                try:
+                    os.chmod(owned_dir, 0o700)
+                except OSError:
+                    pass
                 try:
                     os.unlink(owned_path)
                 except OSError:

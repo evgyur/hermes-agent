@@ -125,6 +125,15 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
 ):
     adapter = _adapter()
     requested_paths = []
+    acl_calls = []
+
+    def grant_chip_acl(command, **kwargs):
+        acl_calls.append((command, kwargs))
+        os.chmod(command[-1], 0o770)
+        return MagicMock(returncode=0)
+
+    if os.name != "nt":
+        monkeypatch.setattr("subprocess.run", grant_chip_acl)
 
     class _Headers(dict):
         def get_content_type(self):
@@ -151,7 +160,7 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
             requested_paths.append(media_path)
             assert not Path(media_path).exists()
             if os.name != "nt":
-                assert stat.S_IMODE(Path(media_path).parent.stat().st_mode) == 0o733
+                assert stat.S_IMODE(Path(media_path).parent.stat().st_mode) == 0o770
             Path(media_path).write_bytes(b"production-shaped audio")
             body = json.dumps(
                 {
@@ -171,6 +180,11 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
     assert returned == requested_paths[0]
     assert Path(returned).is_file()
     if os.name != "nt":
+        assert acl_calls and acl_calls[0][0][:3] == [
+            "/usr/bin/setfacl",
+            "-m",
+            "u:chip:rwx",
+        ]
         assert stat.S_IMODE(Path(returned).parent.stat().st_mode) == 0o700
     Path(returned).unlink()
     Path(returned).parent.rmdir()
