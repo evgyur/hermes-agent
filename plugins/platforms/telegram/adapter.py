@@ -2421,6 +2421,23 @@ class TelegramAdapter(BasePlatformAdapter):
         bot_id = getattr(getattr(self, "_bot", None), "id", None)
         return sender_id is not None and bot_id is not None and str(sender_id) == str(bot_id)
 
+    def _is_business_owner_bot_dm(self, message: Any) -> bool:
+        """Return whether the business account owner addressed this bot itself."""
+        if not self._telegram_supplied_business_connection_id(message):
+            return False
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        return bool(
+            bot_id is not None
+            and chat_id is not None
+            and user_id is not None
+            and str(chat_id) == str(bot_id)
+            and str(user_id) != str(bot_id)
+            and str(user_id) in self._business_owner_ids()
+            and not self._is_business_bot_echo(message)
+        )
+
     def _business_wake_words(self) -> list[str]:
         raw = self._telegram_business_config().get("trigger_words", [])
         if isinstance(raw, str):
@@ -10251,6 +10268,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._is_own_message(message):
             return False
 
+        owner_bot_dm = self._is_business_owner_bot_dm(message)
         business_connection_id = getattr(message, "business_connection_id", None)
         bot_id = getattr(getattr(self, "_bot", None), "id", None)
         chat_id_value = getattr(getattr(message, "chat", None), "id", None)
@@ -10258,6 +10276,7 @@ class TelegramAdapter(BasePlatformAdapter):
             business_connection_id
             and bot_id is not None
             and str(chat_id_value) == str(bot_id)
+            and not owner_bot_dm
         ):
             # Telegram mirrors owner-authored Business messages into the bot's
             # own chat.  Processing that mirror would execute the same command
@@ -10267,6 +10286,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
             user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+            if owner_bot_dm:
+                try:
+                    from gateway.telegram_egress_policy import assert_recipient_allowed
+
+                    assert_recipient_allowed(user_id)
+                except Exception:
+                    return False
+                return True
             try:
                 from gateway.telegram_egress_policy import assert_recipient_allowed
 
@@ -11778,6 +11805,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         chat = message.chat
         user = message.from_user
+        owner_bot_dm = self._is_business_owner_bot_dm(message)
+        route_chat_id = str(user.id) if owner_bot_dm and user is not None else str(chat.id)
         
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
@@ -11801,7 +11830,7 @@ class TelegramAdapter(BasePlatformAdapter):
         topic_skill = None
 
         if chat_type == "dm" and thread_id_str:
-            topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
+            topic_info = self._get_dm_topic_info(route_chat_id, thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
                 topic_skill = topic_info.get("skill")
@@ -11810,7 +11839,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if hasattr(message, "forum_topic_created") and message.forum_topic_created:
                 created_name = message.forum_topic_created.name
                 if created_name:
-                    self._cache_dm_topic_from_message(str(chat.id), thread_id_str, created_name)
+                    self._cache_dm_topic_from_message(route_chat_id, thread_id_str, created_name)
                     if not chat_topic:
                         chat_topic = created_name
 
@@ -11833,7 +11862,7 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 group_topics_iter = []
             for chat_entry in group_topics_iter:
-                if str(chat_entry.get("chat_id", "")) == str(chat.id):
+                if str(chat_entry.get("chat_id", "")) == route_chat_id:
                     topics = chat_entry.get("topics", [])
                     if not isinstance(topics, list):
                         topics = []
@@ -11850,11 +11879,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Build source. A Telegram Business connection is part of both the
         # trust boundary and the reply route; never infer a plain bot-DM from
         # the peer chat id.
-        business_connection_id = self._resolve_business_connection_id(
-            message, chat_type=chat_type
+        business_connection_id = (
+            None
+            if owner_bot_dm
+            else self._resolve_business_connection_id(message, chat_type=chat_type)
         )
         source = self.build_source(
-            chat_id=str(chat.id),
+            chat_id=route_chat_id,
             chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
             chat_type=chat_type,
             user_id=(
@@ -11910,8 +11941,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not reply_to_text:
                     try:
                         from gateway import rich_sent_store
-                        reply_business_id = getattr(
-                            message, "business_connection_id", None
+                        reply_business_id = (
+                            None
+                            if owner_bot_dm
+                            else getattr(message, "business_connection_id", None)
                         )
                         if reply_business_id:
                             # Business replies are trusted only when the exact
@@ -11928,13 +11961,13 @@ class TelegramAdapter(BasePlatformAdapter):
                                     or "default"
                                 ),
                                 business_connection_id=reply_business_id,
-                                chat_id=str(chat.id),
+                                chat_id=route_chat_id,
                                 thread_id=thread_id_str,
                                 message_id=reply_to_id,
                             )
                         else:
                             reply_to_text = rich_sent_store.lookup(
-                                str(chat.id),
+                                route_chat_id,
                                 reply_to_id,
                             )
                     except Exception:
@@ -11942,7 +11975,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
-        _chat_id_str = str(chat.id)
+        _chat_id_str = route_chat_id
         _channel_prompt = resolve_channel_prompt(
             self.config.extra,
             thread_id_str or _chat_id_str,
@@ -11955,7 +11988,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not isinstance(_route, dict):
                 continue
             _route_chats = {str(value) for value in (_route.get("chats") or [])}
-            if _route_chats and str(chat.id) not in _route_chats:
+            if _route_chats and route_chat_id not in _route_chats:
                 continue
             _match = _route.get("match") if isinstance(_route.get("match"), dict) else {}
             _url_match = bool(_match.get("urls")) and bool(

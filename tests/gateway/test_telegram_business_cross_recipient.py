@@ -151,6 +151,29 @@ async def test_owner_text_requires_explicit_prefix_in_customer_chat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owner_message_in_business_bot_chat_routes_to_plain_owner_dm() -> None:
+    """The owner's direct bot chat must not be mistaken for a customer lane."""
+    adapter = _adapter()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._cache_replied_media = AsyncMock()
+    message = _business_message(
+        chat_id=str(BOT_ID),
+        text="привет",
+    )
+
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "привет"
+    assert event.source.chat_id == OWNER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id is None
+    assert event.source.external_safe_mode is False
+    assert ":telegram:dm:" in build_session_key(event.source)
+
+
+@pytest.mark.asyncio
 async def test_owner_explicit_business_wake_preserves_connection_and_safe_lane() -> None:
     adapter = _adapter()
     adapter._enqueue_text_event = MagicMock()
