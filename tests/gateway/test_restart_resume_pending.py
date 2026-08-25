@@ -414,6 +414,20 @@ class TestResumePendingSystemNote:
         assert "do not re-run or re-execute" in note.lower()
         assert "establish its outcome" in note.lower()
 
+    def test_unknown_effect_resume_is_reconciliation_only(self):
+        note = build_resume_recovery_note(
+            "restart_timeout",
+            "",
+            interactive=True,
+            startup_resume=True,
+            reconciliation_only=True,
+        )
+
+        assert "RECONCILIATION-ONLY" in note
+        assert "Read back their external postconditions" in note
+        assert "Never replay, retry, or re-execute an UNKNOWN call" in note
+        assert "do not perform a new external effect" in note
+
     def test_whitespace_only_message_also_persists_the_note(self):
         """A whitespace-only startup event is as blank as an empty one —
         persisting it verbatim would recreate the sanitizer loop (#86580)."""
@@ -994,6 +1008,131 @@ async def test_leased_startup_handler_analyzes_once_and_passes_exact_fence(
         ("terminal", '{"command":"echo done"}'): "completed_effect_receipt"
     }
     assert event.metadata["startup_resume_effect_fence"] == fence
+
+
+@pytest.mark.asyncio
+async def test_leased_startup_unknown_effect_gets_one_reconciliation_only_turn(
+    monkeypatch,
+    tmp_path,
+):
+    """UNKNOWN pre-restart effects are read back, never silently abandoned/replayed."""
+    raw_args = '{"command":"deploy candidate"}'
+    history = [
+        {
+            "role": "user",
+            "content": "deploy it",
+            "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": None,
+                    "media": [],
+                }
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-unknown",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": raw_args,
+                    },
+                }
+            ],
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+    continuation_identity = (
+        event.resume_task_id,
+        event.continuation_generation,
+        event.continuation_claim_owner,
+        event.continuation_claim_token,
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "readback required",
+            "messages": history,
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+        }
+    )
+
+    await runner._handle_message_with_agent(event, source, entry.session_key, 1)
+
+    runner._run_agent.assert_awaited_once()
+    assert (
+        event.resume_task_id,
+        event.continuation_generation,
+        event.continuation_claim_owner,
+        event.continuation_claim_token,
+    ) == continuation_identity
+    assert event.source == source
+    assert event.message_id == "msg-42"
+    assert event.metadata["startup_resume_reconciliation_only"] is True
+    assert event.metadata["startup_resume_unknown_effects"] == [
+        {
+            "tool_call_id": "call-unknown",
+            "tool_name": "terminal",
+            "outcome": "missing_receipt",
+            "replay_identity": ("terminal", raw_args),
+        }
+    ]
+    fence = event.metadata["startup_resume_effect_fence"]
+    assert fence == {("terminal", raw_args): "unknown_pre_restart_effect"}
+    assert runner._run_agent.await_args.kwargs[
+        "startup_resume_reconciliation_only"
+    ] is True
+    assert runner._run_agent.await_args.kwargs["startup_resume_effect_fence"] == fence
+
+
+@pytest.mark.asyncio
+async def test_unknown_effect_does_not_bypass_raw_semantic_envelope_rejection(
+    monkeypatch,
+    tmp_path,
+):
+    history = [
+        {
+            "role": "user",
+            "content": "deploy it",
+            "platform_message_id": "msg-42",
+            "display_metadata": None,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-unknown",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"deploy candidate"}',
+                    },
+                }
+            ],
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+
+    assert not await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        history,
+    )
+    assert "startup_resume_reconciliation_only" not in event.metadata
 
 
 @pytest.mark.asyncio

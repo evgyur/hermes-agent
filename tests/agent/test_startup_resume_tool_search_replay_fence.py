@@ -33,7 +33,10 @@ def _tool_defs(*names: str) -> list[dict]:
 @pytest.fixture()
 def agent():
     with (
-        patch("run_agent.get_tool_definitions", return_value=_tool_defs("web_search")),
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_tool_defs("web_search", "terminal", "read_file"),
+        ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):
@@ -46,6 +49,7 @@ def agent():
         )
     value.client = MagicMock()
     value.startup_resume = True
+    value.startup_resume_reconciliation_only = False
     return value
 
 
@@ -56,6 +60,16 @@ def _wrapped_call(arguments: dict, call_id: str = "wrapped-1") -> SimpleNamespac
         function=SimpleNamespace(
             name="tool_call",
             arguments=json.dumps(raw, ensure_ascii=False),
+        ),
+    )
+
+
+def _direct_call(name: str, arguments: dict, call_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(arguments, ensure_ascii=False),
         ),
     )
 
@@ -128,3 +142,65 @@ def test_distinct_unfinished_wrapped_effect_still_dispatches(agent, mode):
     positional = invoke.call_args.args
     assert positional[:3] == ("web_search", fresh_args, "recovery-task")
     assert "fresh result" in messages[-1]["content"]
+
+
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_reconciliation_only_blocks_new_effectful_call(agent, mode):
+    agent.startup_resume_reconciliation_only = True
+    agent.startup_resume_effect_fence = {}
+    messages: list[dict] = []
+
+    with patch("run_agent.handle_function_call", return_value="MUTATED") as invoke:
+        _execute(
+            agent,
+            mode,
+            _direct_call("terminal", {"command": "touch /tmp/nope"}, "effect-1"),
+            messages,
+        )
+
+    invoke.assert_not_called()
+    result = messages[-1]["content"]
+    assert '"status": "reconciliation_effect_blocked"' in result
+    assert '"reason": "startup_reconciliation_effect_block"' in result
+
+
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_reconciliation_only_allows_no_effect_readback(agent, mode):
+    agent.startup_resume_reconciliation_only = True
+    agent.startup_resume_effect_fence = {}
+    messages: list[dict] = []
+    args = {"path": "/tmp/state.json"}
+
+    with patch("run_agent.handle_function_call", return_value="readback") as invoke:
+        _execute(
+            agent,
+            mode,
+            _direct_call("read_file", args, "read-1"),
+            messages,
+        )
+
+    invoke.assert_called_once()
+    assert invoke.call_args.args[:3] == ("read_file", args, "recovery-task")
+    assert "readback" in messages[-1]["content"]
+
+
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_unknown_exact_replay_uses_unknown_fence_message(agent, mode):
+    agent.startup_resume_reconciliation_only = True
+    args = {"command": "deploy candidate"}
+    canonical = json.dumps(
+        args, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    agent.startup_resume_effect_fence = {
+        ("terminal", canonical): "unknown_pre_restart_effect"
+    }
+    messages: list[dict] = []
+
+    with patch("run_agent.handle_function_call", return_value="REPLAYED") as invoke:
+        _execute(agent, mode, _direct_call("terminal", args, "unknown-1"), messages)
+
+    invoke.assert_not_called()
+    result = messages[-1]["content"]
+    assert '"status": "replay_fenced"' in result
+    assert '"reason": "unknown_pre_restart_effect"' in result
+    assert "UNKNOWN outcome" in result

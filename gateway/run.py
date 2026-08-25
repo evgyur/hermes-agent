@@ -1443,6 +1443,7 @@ def build_resume_recovery_note(
     *,
     interactive: bool = True,
     startup_resume: bool = False,
+    reconciliation_only: bool = False,
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
@@ -1467,7 +1468,19 @@ def build_resume_recovery_note(
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
-    if startup_resume:
+    if startup_resume and reconciliation_only:
+        resume_guidance = (
+            "This is a synthetic startup RECONCILIATION-ONLY turn, not a new "
+            "human instruction. One or more pre-restart tool effects are "
+            "UNKNOWN. Read back their external postconditions using read-only "
+            "lookups before doing anything else."
+        )
+        tail_guidance = (
+            "Never replay, retry, or re-execute an UNKNOWN call, and do not "
+            "perform a new external effect. If readback cannot prove the "
+            "outcome, report the ambiguity and stop."
+        )
+    elif startup_resume:
         resume_guidance = (
             "This is a synthetic startup continuation, not a new human "
             "instruction. Reconcile the durable transcript frontier and "
@@ -1525,6 +1538,7 @@ def _prepare_resume_pending_message(
     *,
     interactive: bool = True,
     startup_resume: bool = False,
+    reconciliation_only: bool = False,
 ) -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
@@ -1542,6 +1556,7 @@ def _prepare_resume_pending_message(
         message or "",
         interactive=interactive,
         startup_resume=startup_resume,
+        reconciliation_only=reconciliation_only,
     )
     if isinstance(message, str) and message.strip():
         persist_message = message
@@ -6478,6 +6493,10 @@ class TurnRunner:
         # on every cache hit so an ordinary later user turn cannot inherit a
         # stale replay fence.
         agent.startup_resume = ctx.startup_resume is True
+        agent.startup_resume_reconciliation_only = (
+            agent.startup_resume
+            and ctx.startup_resume_reconciliation_only is True
+        )
         agent.startup_resume_effect_fence = (
             dict(ctx.startup_resume_effect_fence)
             if agent.startup_resume
@@ -7068,6 +7087,7 @@ class TurnRunner:
                 ctx.message,
                 interactive=_interactive_resume,
                 startup_resume=ctx.startup_resume,
+                reconciliation_only=ctx.startup_resume_reconciliation_only,
             )
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
@@ -7116,6 +7136,7 @@ class TurnRunner:
                     getattr(_sn_adapter, "interactive_resume", True)
                 ),
                 startup_resume=ctx.startup_resume,
+                reconciliation_only=ctx.startup_resume_reconciliation_only,
             )
 
         _approval_session_key = ctx.session_key or ""
@@ -13651,6 +13672,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Freeze one exact authorized task slice and its replay capability."""
         unsafe = {
             "disposition": "unsafe_unknown",
+            "unsafe_reason": "invalid_task_slice",
+            "unknown_effects": [],
             "safe_dangling_calls": [],
             "effect_fence": {},
         }
@@ -13756,6 +13779,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         safe_dangling: list[dict] = []
         effect_fence: dict[tuple[str, str], str] = {}
+        unknown_effects: list[dict] = []
         for call_id, (name, canonical_args, _index) in calls.items():
             receipt = receipts.get(call_id)
             effective_name = self._startup_effective_tool_name(
@@ -13774,13 +13798,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "startup_proves_gateway_restart"
                     )
                     continue
-                return unsafe
+                replay_identity = (name, canonical_args)
+                effect_fence[replay_identity] = "unknown_pre_restart_effect"
+                unknown_effects.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "outcome": "missing_receipt",
+                        "replay_identity": replay_identity,
+                    }
+                )
+                continue
             receipt_row, _receipt_index = receipt
             disposition = receipt_row.get("effect_disposition")
             if disposition == "unknown" and effectful:
-                return unsafe
+                replay_identity = (name, canonical_args)
+                effect_fence[replay_identity] = "unknown_pre_restart_effect"
+                unknown_effects.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "outcome": "unknown_receipt",
+                        "replay_identity": replay_identity,
+                    }
+                )
+                continue
             if effectful and disposition != "none":
                 effect_fence[(name, canonical_args)] = "completed_effect_receipt"
+
+        if unknown_effects:
+            return {
+                "disposition": "unsafe_unknown",
+                "unsafe_reason": "unresolved_pre_restart_tool_outcome",
+                "unknown_effects": unknown_effects,
+                "safe_dangling_calls": safe_dangling,
+                # UNKNOWN identities are denial entries, never replay grants.
+                "effect_fence": effect_fence,
+            }
 
         for row in task_rows[last_effect_frontier + 1 :]:
             if (
@@ -21813,7 +21867,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
             return False
-        if disposition != "continue":
+        unknown_effects = analysis.get("unknown_effects")
+        effect_fence = analysis.get("effect_fence")
+        reconciliation_only = bool(
+            disposition == "unsafe_unknown"
+            and analysis.get("unsafe_reason")
+            == "unresolved_pre_restart_tool_outcome"
+            and isinstance(unknown_effects, list)
+            and unknown_effects
+            and isinstance(effect_fence, dict)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("replay_identity"), tuple)
+                and effect_fence.get(item["replay_identity"])
+                == "unknown_pre_restart_effect"
+                for item in unknown_effects
+            )
+        )
+        if disposition != "continue" and not reconciliation_only:
             logger.warning(
                 "Refusing startup continuation for %s: leased task slice is %s",
                 session_entry.session_key,
@@ -21838,6 +21909,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         event_metadata["startup_resume_effect_fence"] = dict(
             analysis.get("effect_fence") or {}
+        )
+        event_metadata["startup_resume_reconciliation_only"] = reconciliation_only
+        event_metadata["startup_resume_unknown_effects"] = (
+            list(unknown_effects) if reconciliation_only else []
         )
         event.metadata = event_metadata
         for dangling in event_metadata["startup_safe_dangling_calls"]:
@@ -23894,6 +23969,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 startup_resume=bool(getattr(event, "startup_resume", False)),
+                startup_resume_reconciliation_only=bool(
+                    event_metadata.get("startup_resume_reconciliation_only")
+                ),
                 startup_resume_effect_fence=dict(
                     event_metadata.get("startup_resume_effect_fence") or {}
                 ),
@@ -32294,6 +32372,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
+        startup_resume_reconciliation_only: bool = False,
         startup_resume_effect_fence: Optional[dict] = None,
         _trusted_restart_wake: Any = None,
         _trusted_parent_task_continuation: Any = None,
@@ -32323,6 +32402,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
+                startup_resume_reconciliation_only=(
+                    startup_resume_reconciliation_only
+                ),
                 startup_resume_effect_fence=startup_resume_effect_fence,
                 _trusted_restart_wake=_trusted_restart_wake,
                 _trusted_parent_task_continuation=(
@@ -32347,6 +32429,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
+                startup_resume_reconciliation_only=(
+                    startup_resume_reconciliation_only
+                ),
                 startup_resume_effect_fence=startup_resume_effect_fence,
                 _trusted_restart_wake=_trusted_restart_wake,
                 _trusted_parent_task_continuation=(
@@ -32508,6 +32593,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
+        startup_resume_reconciliation_only: bool = False,
         startup_resume_effect_fence: Optional[dict] = None,
         _trusted_restart_wake: Any = None,
         _trusted_parent_task_continuation: Any = None,
@@ -32876,6 +32962,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_turn_authority=durable_turn_authority,
             persist_user_display_kind=persist_user_display_kind,
             startup_resume=startup_resume,
+            startup_resume_reconciliation_only=startup_resume_reconciliation_only,
             startup_resume_effect_fence=dict(
                 startup_resume_effect_fence or {}
             ),

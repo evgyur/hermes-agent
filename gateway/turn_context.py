@@ -114,6 +114,10 @@ class TurnContext:
     # survive the async-to-executor seam; inferring it from blank text would
     # let ordinary empty messages acquire continuation authority.
     startup_resume: bool = False
+    # A startup turn admitted solely to reconcile an unresolved pre-restart
+    # effect. It may read back external state, but must not replay the UNKNOWN
+    # call or continue into new effects.
+    startup_resume_reconciliation_only: bool = False
     startup_resume_effect_fence: dict = field(default_factory=dict)
     user_config: Any = None
     enabled_toolsets: Any = None

@@ -34,6 +34,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_result_classification import tool_may_have_side_effect
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -660,15 +661,20 @@ def _run_agent_tool_execution_middleware(
                         "reason": reason,
                     }
                 )
+                replay_message = (
+                    "This pre-restart effect has an UNKNOWN outcome; replay "
+                    "was blocked. Use a read-only tool to inspect its "
+                    "postconditions."
+                    if reason == "unknown_pre_restart_effect"
+                    else "This effect already completed before restart; "
+                    "replay was blocked."
+                )
                 result = json.dumps(
                     {
                         "blocked": True,
                         "status": "replay_fenced",
                         "reason": reason,
-                        "message": (
-                            "This effect already completed before restart; "
-                            "replay was blocked."
-                        ),
+                        "message": replay_message,
                     },
                     ensure_ascii=False,
                 )
@@ -691,6 +697,53 @@ def _run_agent_tool_execution_middleware(
                     blocked=True,
                     dispatched=False,
                 )
+
+        if (
+            getattr(agent, "startup_resume_reconciliation_only", False) is True
+            and tool_may_have_side_effect(function_name)
+        ):
+            if begin_execution is not None:
+                begin_execution()
+            trace = middleware_trace if middleware_trace is not None else []
+            reason = "startup_reconciliation_effect_block"
+            trace.append(
+                {
+                    "middleware": "startup_resume_reconciliation_only",
+                    "action": "blocked",
+                    "reason": reason,
+                }
+            )
+            result = json.dumps(
+                {
+                    "blocked": True,
+                    "status": "reconciliation_effect_blocked",
+                    "reason": reason,
+                    "message": (
+                        "This startup turn may only inspect state with "
+                        "no-effect tools; new external effects are blocked."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type="startup_resume_reconciliation_only",
+                error_message=reason,
+                middleware_trace=list(trace),
+            )
+            return _ManagedToolResult(
+                result=result,
+                args=function_args,
+                middleware_trace=trace,
+                blocked=True,
+                dispatched=False,
+            )
 
     from agent import relay_tools
     from hermes_cli.middleware import (
