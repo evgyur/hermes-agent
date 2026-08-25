@@ -26,6 +26,7 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import json
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -211,6 +212,7 @@ class TestMarkResumePending:
         store = _make_store(tmp_path)
         source = _make_source()
         entry = store.get_or_create_session(source)
+        assert store.mark_turn_active(entry.session_key, source)
 
         assert store.mark_resume_pending(entry.session_key) is True
         refreshed = store._entries[entry.session_key]
@@ -222,6 +224,7 @@ class TestMarkResumePending:
         store = _make_store(tmp_path)
         source = _make_source()
         entry = store.get_or_create_session(source)
+        assert store.mark_turn_active(entry.session_key, source)
 
         store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
         assert store._entries[entry.session_key].resume_reason == "shutdown_timeout"
@@ -235,6 +238,62 @@ class TestClearResumePending:
         entry = store.get_or_create_session(source)
         # Not marked
         assert store.clear_resume_pending(entry.session_key) is False
+
+
+def test_resume_projection_mirrors_only_committed_db_obligation(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="db-obligation", user_id="db-obligation")
+    entry = store.get_or_create_session(source)
+    task_id = store.mark_turn_active(entry.session_key, source)
+    assert task_id
+
+    assert store.mark_resume_pending(entry.session_key) is True
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row is not None
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == task_id == entry.resume_task_id
+    assert row["generation"] == entry.continuation_generation
+
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        expected_generation=entry.continuation_generation,
+        claim_owner=entry.continuation_claim_owner,
+        claim_token=entry.continuation_claim_token,
+    )
+    identity = {
+        "resume_task_id": entry.resume_task_id,
+        "continuation_generation": entry.continuation_generation,
+        "continuation_claim_owner": entry.continuation_claim_owner,
+        "continuation_claim_token": entry.continuation_claim_token,
+    }
+    assert store.clear_resume_pending_exact(entry.session_key, **identity) is True
+    assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "TERMINAL"
+    assert entry.resume_pending is False
+
+
+def test_crash_recovery_admits_before_clearing_active_marker(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="crash-a", user_id="crash-a")
+    entry = store.get_or_create_session(source)
+    task_id = store.mark_turn_active(entry.session_key, source)
+    assert task_id
+
+    admit = store._db.admit_gateway_resume_obligation
+    with patch.object(store._db, "admit_gateway_resume_obligation", return_value=None):
+        assert store.recover_interrupted_turns() == 0
+    assert entry.active_turn_token == task_id
+    assert entry.resume_pending is False
+    assert store._db.get_gateway_resume_obligation(entry.session_key) is None
+
+    with patch.object(store._db, "admit_gateway_resume_obligation", side_effect=admit):
+        assert store.recover_interrupted_turns() == 1
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row is not None
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == task_id == entry.resume_task_id
+    assert row["generation"] == entry.continuation_generation
+    assert entry.active_turn_token is None
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +313,7 @@ class TestGetOrCreateResumePending:
         )
         first = store.get_or_create_session(source)
         original_sid = first.session_id
+        assert store.mark_turn_active(first.session_key, source)
         store.mark_resume_pending(first.session_key)
 
         with patch.object(
@@ -276,6 +336,7 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         store = _make_store(tmp_path)
         source = _make_source()
         entry = store.get_or_create_session(source)
+        assert store.mark_turn_active(entry.session_key, source)
         store.mark_resume_pending(entry.session_key)
 
         count = store.suspend_recently_active()
@@ -1046,6 +1107,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
         tg_entry.session_key: tg_entry,
         discord_entry.session_key: discord_entry,
     }
+    runner._session_db = _ResumeObligationDB(tg_entry)
     adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
 
@@ -1311,6 +1373,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         resume_task_id="startup-restore-task",
     ))
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = _ResumeObligationDB(pending_entry)
 
     resume_done = asyncio.Event()
     seen: list[str] = []
@@ -1548,6 +1611,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
         resume_task_id="full-path-restart-task",
     ))
     runner.session_store._entries = {session_key: pending_entry}
+    runner._session_db = _ResumeObligationDB(pending_entry)
 
     # Wire the REAL runner pipeline that _handle_message depends on.
     from gateway.run import GatewayRunner
@@ -1604,6 +1668,123 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # No leaked sentinel and no orphaned queued event.
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})
+
+
+class _ResumeObligationDB:
+    def __init__(self, entry):
+        snapshot = entry.resume_origin_snapshot
+        self.row = {
+            "session_key": entry.session_key,
+            "resume_task_id": entry.resume_task_id,
+            "generation": entry.continuation_generation,
+            "state": "PENDING",
+            "origin_json": json.dumps(
+                snapshot["source"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "origin_sha256": snapshot["source_sha256"],
+            "reason": entry.resume_reason,
+            "marked_at": entry.last_resume_marked_at.timestamp(),
+        }
+        self.claim_calls = 0
+
+    def get_gateway_resume_obligation(self, session_key):
+        return dict(self.row) if session_key == self.row["session_key"] else None
+
+    def claim_gateway_resume_obligation(self, **kwargs):
+        self.claim_calls += 1
+        if self.row["state"] != "PENDING":
+            return False
+        if (
+            kwargs["session_key"] != self.row["session_key"]
+            or kwargs["resume_task_id"] != self.row["resume_task_id"]
+            or kwargs["expected_generation"] != self.row["generation"]
+        ):
+            return False
+        self.row["state"] = "CLAIMED"
+        self.row["claim_owner"] = kwargs["claim_owner"]
+        self.row["claim_token"] = kwargs["claim_token"]
+        return True
+
+
+@pytest.mark.asyncio
+async def test_newer_human_b_runs_before_exact_owed_a_once():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="b-before-a",
+        message_id="message-a",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-b-before-a",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-a",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    obligation_db = _ResumeObligationDB(entry)
+    runner._session_db = obligation_db
+    observed = ["B"]
+
+    async def handle(event):
+        observed.append("A")
+        assert event.resume_task_id == "task-a"
+        assert event.continuation_generation == entry.continuation_generation
+
+    adapter.handle_message = handle
+
+    assert await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+    assert not await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+    assert observed == ["B", "A"]
+    assert obligation_db.claim_calls == 1
+    assert entry.resume_pending is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", [None, datetime.now() - timedelta(days=1)])
+async def test_priority_continuation_fails_closed_for_unmarked_or_stale_a(marker):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="stale-a",
+        message_id="message-a",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-stale-a",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=marker,
+            resume_task_id="task-a",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = _ResumeObligationDB(entry) if marker is not None else MagicMock()
+    adapter.handle_message = AsyncMock()
+
+    assert not await runner._continue_resume_pending_after_priority_reply(
+        entry, source, adapter
+    )
+    adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

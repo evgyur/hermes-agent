@@ -3664,10 +3664,10 @@ class SessionStore:
         now = _now()
         max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
-        changed = False
 
         with self._lock:
             self._ensure_loaded_locked()
+            candidates = []
             for entry in self._entries.values():
                 if not entry.active_turn_token:
                     continue
@@ -3682,41 +3682,28 @@ class SessionStore:
                     # Mixed aware/naive timestamps are invalid for this local
                     # marker.  Clear rather than risking an unsafe old resume.
                     marker_is_stale = True
+                candidates.append(
+                    (
+                        entry.session_key,
+                        str(entry.active_turn_token),
+                        marker_is_stale or entry.suspended,
+                        entry.resume_pending,
+                        entry.resume_reason,
+                    )
+                )
 
-                if not marker_is_stale and not entry.suspended:
-                    interrupted_token = str(entry.active_turn_token or "")
-                    origin_payload = _active_origin_payload(entry)
-                    if entry.resume_pending:
-                        # A drain-timeout marker is more specific than the
-                        # generic crash reason; preserve it and its freshness.
-                        if entry.last_resume_marked_at is None:
-                            entry.last_resume_marked_at = now
-                        if not entry.resume_task_id:
-                            self._stamp_resume_identity(
-                                entry, task_id=interrupted_token
-                            )
-                        _bind_resume_origin_snapshot(entry, origin_payload)
-                    else:
-                        entry.resume_pending = True
-                        entry.resume_reason = "restart_interrupted"
-                        # Freshness starts when recovery is discovered, not
-                        # when a potentially hours-long turn began.
-                        entry.last_resume_marked_at = now
-                        self._stamp_resume_identity(
-                            entry, task_id=interrupted_token
-                        )
-                        _bind_resume_origin_snapshot(entry, origin_payload)
-                        promoted += 1
-
-                entry.active_turn_token = None
-                entry.active_turn_started_at = None
-                entry.active_turn_origin_snapshot = None
-                changed = True
-
-            if changed:
-                # Cold-start batch: one durable rewrite is clearer and cheaper
-                # than an upsert per interrupted routing entry.
-                self._save()
+        for session_key, token, discard, was_pending, existing_reason in candidates:
+            if discard:
+                self.clear_turn_active(session_key, token)
+                continue
+            reason = existing_reason if was_pending and existing_reason else "restart_interrupted"
+            receipt = self.mark_resume_pending_with_receipt(session_key, reason)
+            if receipt is None:
+                # Admission is the durable authority. Keep the active marker
+                # retryable when K cannot commit the matching PENDING row.
+                continue
+            if self.clear_turn_active(session_key, token) and not was_pending:
+                promoted += 1
 
         return promoted
 
@@ -3754,26 +3741,7 @@ class SessionStore:
 
         Returns True if the session existed and was marked.
         """
-        with self._lock:
-            self._ensure_loaded_locked()
-            if session_key in self._entries:
-                entry = self._entries[session_key]
-                # Never override an explicit ``suspended`` — that is a hard
-                # forced-wipe signal (from /stop or stuck-loop escalation).
-                if entry.suspended:
-                    return False
-                entry.resume_pending = True
-                entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
-                origin_payload = _active_origin_payload(entry)
-                self._stamp_resume_identity(
-                    entry,
-                    task_id=str(entry.active_turn_token or ""),
-                )
-                _bind_resume_origin_snapshot(entry, origin_payload)
-                self._save()
-                return True
-        return False
+        return self.mark_resume_pending_with_receipt(session_key, reason) is not None
 
     def mark_resume_pending_with_receipt(
         self,
@@ -3786,15 +3754,71 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or entry.suspended:
                 return None
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.last_resume_marked_at = _now()
             origin_payload = _active_origin_payload(entry)
-            self._stamp_resume_identity(
-                entry,
-                task_id=str(entry.active_turn_token or ""),
+            if origin_payload is None:
+                return None
+
+            active_task_id = str(entry.active_turn_token or "")
+            if entry.resume_pending:
+                if not active_task_id or active_task_id != entry.resume_task_id:
+                    return None
+                expected_generation = int(entry.continuation_generation) - 1
+                candidate = replace(entry)
+            else:
+                if not active_task_id:
+                    return None
+                expected_generation = int(entry.continuation_generation or 0)
+                candidate = replace(entry)
+                candidate.resume_task_id = active_task_id
+                candidate.continuation_generation = expected_generation + 1
+                candidate.continuation_claim_owner = f"gateway:{os.getpid()}"
+                candidate.continuation_claim_token = uuid.uuid4().hex
+
+            candidate.resume_pending = True
+            candidate.resume_reason = reason
+            candidate.last_resume_marked_at = _now()
+            _bind_resume_origin_snapshot(candidate, origin_payload)
+            snapshot = candidate.resume_origin_snapshot or {}
+            source_payload = snapshot.get("source")
+            source_digest = snapshot.get("source_sha256")
+            if not isinstance(source_payload, dict) or not isinstance(source_digest, str):
+                return None
+
+            db = self._db
+            admit = getattr(db, "admit_gateway_resume_obligation", None) if db else None
+            if not callable(admit):
+                return None
+            committed = admit(
+                session_key=session_key,
+                resume_task_id=candidate.resume_task_id,
+                expected_generation=expected_generation,
+                origin_json=json.dumps(
+                    source_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                origin_sha256=source_digest,
+                reason=reason,
+                marked_at=candidate.last_resume_marked_at.timestamp(),
             )
-            _bind_resume_origin_snapshot(entry, origin_payload)
+            if (
+                not isinstance(committed, dict)
+                or committed.get("state") != "PENDING"
+                or committed.get("resume_task_id") != candidate.resume_task_id
+                or committed.get("generation") != candidate.continuation_generation
+                or committed.get("origin_sha256") != source_digest
+            ):
+                return None
+
+            entry.resume_pending = candidate.resume_pending
+            entry.resume_reason = candidate.resume_reason
+            entry.last_resume_marked_at = candidate.last_resume_marked_at
+            entry.resume_task_id = candidate.resume_task_id
+            entry.continuation_generation = candidate.continuation_generation
+            entry.continuation_claim_owner = candidate.continuation_claim_owner
+            entry.continuation_claim_token = candidate.continuation_claim_token
+            entry.resume_origin_snapshot = candidate.resume_origin_snapshot
             receipt = {
                 "resume_task_id": str(entry.resume_task_id or ""),
                 "continuation_generation": int(entry.continuation_generation or 0),
@@ -3891,11 +3915,39 @@ class SessionStore:
                 )
             if current != expected:
                 return False
+            db = self._db
+            get_obligation = (
+                getattr(db, "get_gateway_resume_obligation", None) if db else None
+            )
+            if not callable(get_obligation):
+                return False
+            row = get_obligation(session_key)
+            if not isinstance(row, dict):
+                return False
+            if row.get("state") == "PENDING":
+                settle = getattr(db, "cancel_gateway_resume_obligation", None)
+                settled = callable(settle) and settle(
+                    session_key=session_key,
+                    resume_task_id=resume_task_id,
+                    expected_generation=continuation_generation,
+                    reason="completed_before_resume",
+                )
+            elif row.get("state") == "CLAIMED":
+                settle = getattr(db, "clear_gateway_resume_obligation", None)
+                settled = callable(settle) and settle(
+                    session_key=session_key,
+                    resume_task_id=resume_task_id,
+                    expected_generation=continuation_generation,
+                    claim_token=continuation_claim_token,
+                )
+            else:
+                settled = False
+            if not settled:
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
             entry.resume_task_id = ""
-            entry.continuation_generation = 0
             entry.continuation_claim_owner = ""
             entry.continuation_claim_token = ""
             entry.resume_origin_snapshot = None

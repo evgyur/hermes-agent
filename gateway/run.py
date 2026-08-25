@@ -12801,6 +12801,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            if event.metadata.get("startup_resume_after_priority_reply") is not True:
+                try:
+                    with self.session_store._lock:  # noqa: SLF001
+                        self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                        entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                except Exception:
+                    entry = None
+                if entry is None or not await self._claim_startup_resume_obligation(entry):
+                    return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -12907,18 +12916,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Start the still-owed continuation after a newer human turn settles."""
         if not getattr(entry, "resume_pending", False):
             return False
+        marker = getattr(entry, "last_resume_marked_at", None)
+        if not _is_fresh_gateway_interruption(
+            marker,
+            window_secs=_auto_continue_freshness_window(),
+        ):
+            return False
+        if (
+            getattr(entry, "suspended", False)
+            or getattr(entry, "resume_reason", None) not in self._AUTO_RESUME_REASONS
+        ):
+            return False
         sealed_source = resume_origin_from_snapshot(entry)
         if sealed_source is None:
             return False
         sealed_adapter = self._startup_resume_adapter_for_source(sealed_source)
         if sealed_adapter is None:
             return False
+        try:
+            if not self._is_user_authorized(sealed_source):
+                return False
+        except Exception:
+            return False
+
+        if not await self._claim_startup_resume_obligation(entry):
+            return False
         event = self._build_startup_resume_event(
             entry,
             sealed_source,
         )
+        event.metadata["startup_resume_after_priority_reply"] = True
         await sealed_adapter.handle_message(event)
         return True
+
+    async def _claim_startup_resume_obligation(self, entry: SessionEntry) -> bool:
+        """Claim the exact committed continuation mirrored by ``entry``."""
+        snapshot = getattr(entry, "resume_origin_snapshot", None) or {}
+        source_payload = snapshot.get("source")
+        source_digest = snapshot.get("source_sha256")
+        if not isinstance(source_payload, dict) or not isinstance(source_digest, str):
+            return False
+        try:
+            row = await self._await_db_call(
+                self._session_db,
+                "get_gateway_resume_obligation",
+                entry.session_key,
+            )
+        except Exception:
+            return False
+        expected_generation = int(getattr(entry, "continuation_generation", 0) or 0)
+        if (
+            not isinstance(row, dict)
+            or row.get("state") != "PENDING"
+            or row.get("resume_task_id") != entry.resume_task_id
+            or row.get("generation") != expected_generation
+            or row.get("origin_sha256") != source_digest
+            or row.get("reason") != entry.resume_reason
+            or row.get("origin_json")
+            != json.dumps(
+                source_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            or not _is_fresh_gateway_interruption(
+                row.get("marked_at"),
+                window_secs=_auto_continue_freshness_window(),
+            )
+        ):
+            return False
+        try:
+            return bool(
+                await self._await_db_call(
+                    self._session_db,
+                    "claim_gateway_resume_obligation",
+                    session_key=entry.session_key,
+                    resume_task_id=entry.resume_task_id,
+                    expected_generation=expected_generation,
+                    claim_owner=entry.continuation_claim_owner,
+                    claim_token=entry.continuation_claim_token,
+                )
+            )
+        except Exception:
+            return False
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
@@ -13566,6 +13646,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rows: Optional[list],
         *,
         source_message_id: Optional[str] = None,
+        allow_newer_human: bool = False,
     ) -> dict[str, Any]:
         """Freeze one exact authorized task slice and its replay capability."""
         unsafe = {
@@ -13629,16 +13710,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task_rows = frozen_rows[trigger_index:]
         # A later human command owns the route now. Synthetic/internal notes do
         # not steal the lease, but another real user row does.
-        if any(
-            self._startup_real_user_row(row)
-            for row in task_rows[1:]
-            if isinstance(row, dict)
-        ):
-            return {
-                "disposition": "new_human_turn",
-                "safe_dangling_calls": [],
-                "effect_fence": {},
-            }
+        newer_human_index = next(
+            (
+                index
+                for index, row in enumerate(task_rows[1:], start=1)
+                if isinstance(row, dict) and self._startup_real_user_row(row)
+            ),
+            None,
+        )
+        if newer_human_index is not None:
+            if not allow_newer_human:
+                return {
+                    "disposition": "new_human_turn",
+                    "safe_dangling_calls": [],
+                    "effect_fence": {},
+                }
+            task_rows = task_rows[:newer_human_index]
 
         from agent.tool_result_classification import tool_may_have_side_effect
 
@@ -21680,10 +21767,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
-        analysis = self._analyze_startup_resume_rows(
-            history,
-            source_message_id=sealed_message_id,
-        )
+        analysis_kwargs: dict[str, Any] = {
+            "source_message_id": sealed_message_id,
+        }
+        if event_metadata.get("startup_resume_after_priority_reply") is True:
+            analysis_kwargs["allow_newer_human"] = True
+        analysis = self._analyze_startup_resume_rows(history, **analysis_kwargs)
         disposition = str(analysis.get("disposition") or "unsafe_unknown")
         if disposition == "terminal_checkpoint":
             try:
@@ -23709,7 +23798,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return
             _turn_resume_identity = None
-            if bool(getattr(session_entry, "resume_pending", False)):
+            if (
+                bool(getattr(event, "startup_resume", False))
+                and bool(getattr(session_entry, "resume_pending", False))
+            ):
                 _candidate_resume_identity = {
                     "resume_task_id": str(
                         getattr(session_entry, "resume_task_id", "") or ""
