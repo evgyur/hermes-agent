@@ -3508,6 +3508,7 @@ class AIAgent:
                 getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
                 if not preserve_redirect:
                     self._pending_redirect = None
+                    self._pending_redirect_receipts = []
         else:
             if preserve_redirect and not getattr(self, "_pending_redirect", None):
                 return False
@@ -3517,6 +3518,7 @@ class AIAgent:
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
+                self._pending_redirect_receipts = []
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
@@ -3545,9 +3547,16 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_receipts = []
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(
+        self,
+        text: str,
+        *,
+        receipt_id: str = "",
+        receipt_transition: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3568,6 +3577,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        receipt = (
+            (str(receipt_id), receipt_transition)
+            if receipt_id and callable(receipt_transition)
+            else None
+        )
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3575,15 +3589,29 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_steer_receipts = pending
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_steer_receipts = pending
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(
+        self,
+        text: str,
+        *,
+        receipt_id: str = "",
+        receipt_transition: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """Redirect the active turn without converting it into a new task.
 
         During a normal Hermes model request this cancels only that request;
@@ -3600,6 +3628,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        receipt = (
+            (str(receipt_id), receipt_transition)
+            if receipt_id and callable(receipt_transition)
+            else None
+        )
 
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
@@ -3615,7 +3648,10 @@ class AIAgent:
                 elif self._interrupt_requested:
                     return False
                 try:
-                    return bool(_native_steer(cleaned))
+                    accepted = bool(_native_steer(cleaned))
+                    if accepted and receipt is not None:
+                        receipt[1](receipt[0], "REQUEST_FENCED")
+                    return accepted
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
@@ -3624,7 +3660,11 @@ class AIAgent:
         # existing steer drain puts it on the final tool result before the next
         # model decision, including delegate_task children.
         if getattr(self, "_executing_tools", False):
-            return self.steer(cleaned)
+            return self.steer(
+                cleaned,
+                receipt_id=receipt_id,
+                receipt_transition=receipt_transition,
+            )
 
         _model_active = getattr(self, "_model_request_active", None)
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
@@ -3641,6 +3681,10 @@ class AIAgent:
             )
             self._interrupt_requested = True
             self._interrupt_message = None
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_redirect_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_redirect_receipts = pending
         else:
             with _redirect_lock:
                 if _model_active is None or not _model_active.is_set():
@@ -3658,6 +3702,10 @@ class AIAgent:
                     self._pending_redirect = cleaned
                 self._interrupt_requested = True
                 self._interrupt_message = None
+                if receipt is not None:
+                    pending = list(getattr(self, "_pending_redirect_receipts", []) or [])
+                    pending.append(receipt)
+                    self._pending_redirect_receipts = pending
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
@@ -3689,10 +3737,20 @@ class AIAgent:
         if _redirect_lock is None:
             text = getattr(self, "_pending_redirect", None)
             self._pending_redirect = None
+            drained = list(getattr(self, "_pending_redirect_receipts", []) or [])
+            self._drained_steer_receipts = (
+                list(getattr(self, "_drained_steer_receipts", []) or []) + drained
+            )
+            self._pending_redirect_receipts = []
             return text
         with _redirect_lock:
             text = self._pending_redirect
             self._pending_redirect = None
+            drained = list(getattr(self, "_pending_redirect_receipts", []) or [])
+            self._drained_steer_receipts = (
+                list(getattr(self, "_drained_steer_receipts", []) or []) + drained
+            )
+            self._pending_redirect_receipts = []
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
@@ -3705,11 +3763,33 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_drained_steer_receipts", []) or []
+            ) + list(getattr(self, "_pending_steer_receipts", []) or [])
+            self._pending_steer_receipts = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_drained_steer_receipts", []) or []
+            ) + list(getattr(self, "_pending_steer_receipts", []) or [])
+            self._pending_steer_receipts = []
         return text
+
+    def _mark_drained_steer_request_fenced(self) -> None:
+        receipts = list(getattr(self, "_drained_steer_receipts", []) or [])
+        self._fenced_steer_receipts = receipts
+        self._drained_steer_receipts = []
+        for receipt_id, transition in receipts:
+            transition(receipt_id, "REQUEST_FENCED")
+
+    def _mark_fenced_steer_provider_result(self, *, accepted: bool) -> None:
+        receipts = list(getattr(self, "_fenced_steer_receipts", []) or [])
+        self._fenced_steer_receipts = []
+        state = "CONSUMED_CURRENT" if accepted else "AMBIGUOUS_PROVIDER_REQUEST"
+        for receipt_id, transition in receipts:
+            transition(receipt_id, state)
 
     def _record_file_mutation_result(
         self,

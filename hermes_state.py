@@ -56,7 +56,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -14946,6 +14946,633 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+    # ── Gateway continuation and busy-input authority ─────────────────────
+
+    @staticmethod
+    def _gateway_ledger_lookup_key(
+        platform: Any, chat_id: Any, thread_id: Any = None,
+        message_id: Any = None,
+    ) -> Optional[str]:
+        if platform is None or chat_id is None or message_id is None:
+            return None
+        message = str(message_id).strip()
+        if not message:
+            return None
+        return ":".join((str(platform), str(chat_id), str(thread_id or ""), message))
+
+    def record_gateway_message_received(
+        self, *, platform: Any, chat_id: Any, thread_id: Any = None,
+        message_id: Any = None, user_id: Any = None,
+        session_key: Optional[str] = None, session_id: Optional[str] = None,
+        origin_type: str = "real_user", reason: Optional[str] = None,
+        metadata: Any = None, snippet: Any = None,
+        received_at: Optional[float] = None,
+    ) -> int:
+        """Certified ingress-ledger admission surface restored from 2af595."""
+        now = float(received_at or time.time())
+        platform_s = str(platform) if platform is not None else None
+        chat_s = str(chat_id) if chat_id is not None else None
+        thread_s = str(thread_id) if thread_id is not None else None
+        message_s = str(message_id) if message_id is not None else None
+        user_s = str(user_id) if user_id is not None else None
+        lookup = self._gateway_ledger_lookup_key(
+            platform_s, chat_s, thread_s, message_s
+        )
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+            if metadata is not None else None
+        )
+        snippet_s = re.sub(r"\s+", " ", str(snippet)).strip()[:240] if snippet else None
+
+        def _do(conn):
+            if lookup:
+                existing = conn.execute(
+                    "SELECT id FROM gateway_message_ledger WHERE lookup_key=?",
+                    (lookup,),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
+            cursor = conn.execute(
+                """INSERT INTO gateway_message_ledger (
+                       lookup_key, platform, chat_id, thread_id, message_id,
+                       user_id, session_key, session_id, status, origin_type,
+                       received_at, updated_at, reason, metadata, snippet
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?)""",
+                (lookup, platform_s, chat_s, thread_s, message_s, user_s,
+                 session_key, session_id, str(origin_type or "real_user"), now,
+                 now, str(reason)[:500] if reason else None, metadata_json, snippet_s),
+            )
+            return int(cursor.lastrowid)
+        return int(self._execute_write(_do))
+
+    def get_gateway_message_ledger(self, ledger_id: int) -> Optional[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?", (int(ledger_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        if result.get("metadata"):
+            try:
+                result["metadata"] = json.loads(result["metadata"])
+            except (TypeError, ValueError):
+                result["metadata"] = {}
+        else:
+            result["metadata"] = {}
+        return result
+
+    def get_gateway_resume_obligation(
+        self, session_key: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM gateway_resume_obligations WHERE session_key = ?",
+                (str(session_key),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def admit_gateway_resume_obligation(
+        self, *, session_key: str, resume_task_id: str,
+        expected_generation: int, origin_json: str, origin_sha256: str,
+        reason: str, marked_at: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Allocate one monotonic continuation generation under DB CAS."""
+        key = str(session_key)
+        task = str(resume_task_id)
+        expected = int(expected_generation)
+        if not key or not task or expected < 0 or not origin_json or not origin_sha256:
+            raise ValueError("invalid gateway resume obligation identity")
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_resume_obligations WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                if expected != 0:
+                    return None
+                conn.execute(
+                    """INSERT INTO gateway_resume_obligations (
+                           session_key, resume_task_id, generation, state,
+                           origin_json, origin_sha256, reason, marked_at,
+                           created_at, updated_at
+                       ) VALUES (?, ?, 1, 'PENDING', ?, ?, ?, ?, ?, ?)""",
+                    (key, task, origin_json, origin_sha256, str(reason),
+                     float(marked_at), now, now),
+                )
+            else:
+                existing = dict(row)
+                if (
+                    int(existing["generation"]) == expected + 1
+                    and existing["resume_task_id"] == task
+                    and existing["origin_json"] == origin_json
+                    and existing["origin_sha256"] == origin_sha256
+                ):
+                    return existing
+                if int(existing["generation"]) != expected:
+                    return None
+                if existing["state"] not in ("TERMINAL", "CANCELLED"):
+                    return None
+                cursor = conn.execute(
+                    """UPDATE gateway_resume_obligations
+                          SET resume_task_id=?, generation=?, state='PENDING',
+                              origin_json=?, origin_sha256=?, reason=?, marked_at=?,
+                              claim_owner=NULL, claim_token=NULL, updated_at=?
+                        WHERE session_key=? AND generation=?
+                          AND state IN ('TERMINAL','CANCELLED')""",
+                    (task, expected + 1, origin_json, origin_sha256, str(reason),
+                     float(marked_at), now, key, expected),
+                )
+                if cursor.rowcount != 1:
+                    return None
+            committed = conn.execute(
+                "SELECT * FROM gateway_resume_obligations WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+            return dict(committed)
+
+        return self._execute_write(_do)
+
+    def claim_gateway_resume_obligation(
+        self, *, session_key: str, resume_task_id: str,
+        expected_generation: int, claim_owner: str, claim_token: str,
+    ) -> bool:
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE gateway_resume_obligations
+                      SET state='CLAIMED', claim_owner=?, claim_token=?, updated_at=?
+                    WHERE session_key=? AND resume_task_id=? AND generation=?
+                      AND state='PENDING'""",
+                (str(claim_owner), str(claim_token), time.time(), str(session_key),
+                 str(resume_task_id), int(expected_generation)),
+            )
+            if cursor.rowcount == 1:
+                return True
+            row = conn.execute(
+                """SELECT state, claim_owner, claim_token
+                     FROM gateway_resume_obligations
+                    WHERE session_key=? AND resume_task_id=? AND generation=?""",
+                (str(session_key), str(resume_task_id), int(expected_generation)),
+            ).fetchone()
+            return bool(row and row["state"] == "CLAIMED"
+                        and row["claim_owner"] == str(claim_owner)
+                        and row["claim_token"] == str(claim_token))
+        return bool(self._execute_write(_do))
+
+    def clear_gateway_resume_obligation(
+        self, *, session_key: str, resume_task_id: str,
+        expected_generation: int, claim_token: str,
+    ) -> bool:
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE gateway_resume_obligations
+                      SET state='TERMINAL', updated_at=?
+                    WHERE session_key=? AND resume_task_id=? AND generation=?
+                      AND state='CLAIMED' AND claim_token=?""",
+                (time.time(), str(session_key), str(resume_task_id),
+                 int(expected_generation), str(claim_token)),
+            )
+            return cursor.rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def cancel_gateway_resume_obligation(
+        self, *, session_key: str, resume_task_id: str,
+        expected_generation: int, reason: str,
+    ) -> bool:
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE gateway_resume_obligations
+                      SET state='CANCELLED', reason=?, updated_at=?
+                    WHERE session_key=? AND resume_task_id=? AND generation=?
+                      AND state='PENDING'""",
+                (str(reason), time.time(), str(session_key), str(resume_task_id),
+                 int(expected_generation)),
+            )
+            return cursor.rowcount == 1
+        return bool(self._execute_write(_do))
+
+    _GATEWAY_BUSY_STATES = frozenset({
+        "ADMITTED", "OFFERED", "REQUEST_FENCED", "CONSUMED_CURRENT",
+        "QUEUED_NEXT", "AMBIGUOUS_PROVIDER_REQUEST", "CANCELLED",
+    })
+    _GATEWAY_BUSY_TERMINAL = frozenset({
+        "CONSUMED_CURRENT", "QUEUED_NEXT", "AMBIGUOUS_PROVIDER_REQUEST",
+        "CANCELLED",
+    })
+    _GATEWAY_BUSY_TRANSITIONS = {
+        "ADMITTED": frozenset({"OFFERED", "QUEUED_NEXT", "CANCELLED"}),
+        "OFFERED": frozenset({"REQUEST_FENCED", "QUEUED_NEXT", "CANCELLED"}),
+        "REQUEST_FENCED": frozenset({
+            "CONSUMED_CURRENT", "AMBIGUOUS_PROVIDER_REQUEST"
+        }),
+    }
+
+    def admit_gateway_busy_receipt(
+        self, *, receipt_id: str, kind: str, session_key: str,
+        session_id: str, generation: int, ingress_ledger_id: int,
+        origin_json: str, origin_sha256: str, payload_json: str,
+    ) -> Dict[str, Any]:
+        receipt = str(receipt_id)
+        kind_s = str(kind).lower()
+        identity = (kind_s, str(session_key), str(session_id), int(generation),
+                    int(ingress_ledger_id), str(origin_json), str(origin_sha256),
+                    str(payload_json))
+        if not receipt or kind_s not in ("redirect", "steer") or not all(
+            (session_key, session_id, origin_json, origin_sha256, payload_json)
+        ):
+            raise ValueError("invalid gateway busy receipt identity")
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO gateway_busy_receipts (
+                       receipt_id, kind, session_key, session_id, generation,
+                       ingress_ledger_id, origin_json, origin_sha256, payload_json,
+                       state, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ADMITTED', ?, ?)""",
+                (receipt, *identity, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM gateway_busy_receipts WHERE receipt_id=?", (receipt,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("gateway busy receipt admission produced no row")
+            actual = (row["kind"], row["session_key"], row["session_id"],
+                      int(row["generation"]), int(row["ingress_ledger_id"]),
+                      row["origin_json"], row["origin_sha256"], row["payload_json"])
+            if actual != identity:
+                raise ValueError("gateway busy receipt identity collision")
+            return dict(row)
+        return self._execute_write(_do)
+
+    def transition_gateway_busy_receipt(
+        self, receipt_id: str, *, generation: int,
+        expected_states: Iterable[str], state: str,
+    ) -> bool:
+        expected = tuple(str(value).upper() for value in expected_states)
+        target = str(state).upper()
+        if not expected or target not in self._GATEWAY_BUSY_STATES:
+            raise ValueError("invalid gateway busy receipt transition")
+        if any(target not in self._GATEWAY_BUSY_TRANSITIONS.get(source, ())
+               for source in expected):
+            raise ValueError("forbidden gateway busy receipt transition")
+        placeholders = ",".join("?" for _ in expected)
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"""UPDATE gateway_busy_receipts
+                       SET state=?, updated_at=?,
+                           request_fenced_at=CASE WHEN ?='REQUEST_FENCED'
+                               THEN COALESCE(request_fenced_at, ?) ELSE request_fenced_at END,
+                           terminal_at=CASE WHEN ? IN (
+                               'CONSUMED_CURRENT','QUEUED_NEXT',
+                               'AMBIGUOUS_PROVIDER_REQUEST','CANCELLED')
+                               THEN COALESCE(terminal_at, ?) ELSE terminal_at END
+                     WHERE receipt_id=? AND generation=?
+                       AND state IN ({placeholders})""",
+                (target, now, target, now, target, now, str(receipt_id),
+                 int(generation), *expected),
+            )
+            return cursor.rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def list_gateway_busy_receipts(
+        self, session_key: str, *, generation: Optional[int] = None,
+        terminal: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["session_key=?"]
+        params: List[Any] = [str(session_key)]
+        if generation is not None:
+            clauses.append("generation=?")
+            params.append(int(generation))
+        if terminal is not None:
+            states = tuple(sorted(self._GATEWAY_BUSY_TERMINAL))
+            placeholders = ",".join("?" for _ in states)
+            clauses.append(f"state {'IN' if terminal else 'NOT IN'} ({placeholders})")
+            params.extend(states)
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM gateway_busy_receipts WHERE {' AND '.join(clauses)} "
+                "ORDER BY sequence, receipt_id", tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _queue_busy_receipt(conn, receipt_id: str, now: float) -> bool:
+        row = conn.execute(
+            "SELECT * FROM gateway_busy_receipts WHERE receipt_id=?", (receipt_id,)
+        ).fetchone()
+        if row is None or row["state"] not in ("ADMITTED", "OFFERED"):
+            return False
+        cursor = conn.execute(
+            """UPDATE gateway_busy_receipts SET state='QUEUED_NEXT',
+                   updated_at=?, terminal_at=COALESCE(terminal_at, ?)
+                 WHERE receipt_id=? AND state=?""",
+            (now, now, receipt_id, row["state"]),
+        )
+        if cursor.rowcount != 1:
+            return False
+        conn.execute(
+            """INSERT INTO gateway_busy_queue (
+                   receipt_id, sequence, kind, session_key, session_id, generation,
+                   ingress_ledger_id, origin_json, origin_sha256, payload_json,
+                   state, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?)
+               ON CONFLICT(receipt_id) DO NOTHING""",
+            (row["receipt_id"], row["sequence"], row["kind"], row["session_key"],
+             row["session_id"], row["generation"], row["ingress_ledger_id"],
+             row["origin_json"], row["origin_sha256"], row["payload_json"], now),
+        )
+        return True
+
+    def reconcile_gateway_busy_receipts_after_restart(self) -> Dict[str, int]:
+        now = time.time()
+
+        def _do(conn):
+            cancelled = conn.execute(
+                """UPDATE gateway_busy_receipts AS stale
+                      SET state='CANCELLED', updated_at=?, terminal_at=?
+                    WHERE state IN ('ADMITTED','OFFERED')
+                      AND EXISTS (
+                          SELECT 1 FROM gateway_busy_receipts AS newer
+                           WHERE newer.session_key=stale.session_key
+                             AND newer.generation>stale.generation
+                      )""",
+                (now, now),
+            ).rowcount
+            fenced = [row["receipt_id"] for row in conn.execute(
+                "SELECT receipt_id FROM gateway_busy_receipts "
+                "WHERE state='REQUEST_FENCED' ORDER BY sequence"
+            ).fetchall()]
+            ambiguous = 0
+            for receipt in fenced:
+                ambiguous += conn.execute(
+                    """UPDATE gateway_busy_receipts
+                          SET state='AMBIGUOUS_PROVIDER_REQUEST', updated_at=?, terminal_at=?
+                        WHERE receipt_id=? AND state='REQUEST_FENCED'""",
+                    (now, now, receipt),
+                ).rowcount
+            pending = [row["receipt_id"] for row in conn.execute(
+                "SELECT receipt_id FROM gateway_busy_receipts "
+                "WHERE state IN ('ADMITTED','OFFERED') ORDER BY sequence"
+            ).fetchall()]
+            queued = sum(self._queue_busy_receipt(conn, receipt, now)
+                         for receipt in pending)
+            return {"ambiguous": int(ambiguous), "queued_next": int(queued),
+                    "cancelled": int(cancelled or 0)}
+        return self._execute_write(_do)
+
+    def list_gateway_busy_queue_ready(
+        self, *, current_generations: Optional[Dict[str, int]] = None,
+        limit: int = 256,
+    ) -> List[Dict[str, Any]]:
+        """List only rows authorized by the caller's exact live generations."""
+        if not current_generations or int(limit) <= 0:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT * FROM gateway_busy_queue WHERE state='READY'
+                    ORDER BY sequence, receipt_id"""
+            ).fetchall()
+        authorized = [
+            dict(row) for row in rows
+            if current_generations.get(str(row["session_key"])) == int(row["generation"])
+        ]
+        return authorized[:int(limit)]
+
+    @staticmethod
+    def _gateway_busy_queue_is_current(
+        row: Any, current_generation: Optional[int]
+    ) -> bool:
+        return (
+            current_generation is not None
+            and not isinstance(current_generation, bool)
+            and int(row["generation"]) == int(current_generation)
+        )
+
+    def claim_gateway_busy_queue(
+        self, receipt_id: str, *, owner: str, token: str,
+        lease_expires_at: float, current_generation: Optional[int] = None,
+    ) -> bool:
+        owner_s, token_s = str(owner), str(token)
+        expiry = float(lease_expires_at)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_busy_queue WHERE receipt_id=?",
+                (str(receipt_id),),
+            ).fetchone()
+            if row is None or not self._gateway_busy_queue_is_current(
+                row, current_generation
+            ):
+                return False
+            if row["state"] == "LEASED":
+                return bool(row["lease_owner"] == owner_s
+                            and row["lease_token"] == token_s
+                            and row["lease_expires_at"] == expiry)
+            if row["state"] != "READY":
+                return False
+            conflict = conn.execute(
+                """SELECT 1 FROM gateway_busy_queue
+                    WHERE receipt_id<>? AND lease_owner=? AND lease_token=?""",
+                (str(receipt_id), owner_s, token_s),
+            ).fetchone()
+            if conflict is not None:
+                return False
+            return conn.execute(
+                """UPDATE gateway_busy_queue SET state='LEASED', lease_owner=?,
+                       lease_token=?, lease_expires_at=?, updated_at=?
+                     WHERE receipt_id=? AND state='READY'""",
+                (owner_s, token_s, expiry, time.time(), str(receipt_id)),
+            ).rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def ack_gateway_busy_queue_materialized(
+        self, receipt_id: str, *, owner: str, token: str,
+        current_generation: Optional[int] = None,
+    ) -> bool:
+        owner_s, token_s = str(owner), str(token)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_busy_queue WHERE receipt_id=?",
+                (str(receipt_id),),
+            ).fetchone()
+            if row is None or not self._gateway_busy_queue_is_current(
+                row, current_generation
+            ):
+                return False
+            if row["state"] == "MATERIALIZED":
+                return row["lease_owner"] == owner_s and row["lease_token"] == token_s
+            if row["state"] != "LEASED":
+                return False
+            return conn.execute(
+                """UPDATE gateway_busy_queue SET state='MATERIALIZED', updated_at=?
+                     WHERE receipt_id=? AND state='LEASED'
+                       AND lease_owner=? AND lease_token=?""",
+                (time.time(), str(receipt_id), owner_s, token_s),
+            ).rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def handoff_gateway_busy_queue(
+        self, receipt_id: str, *, owner: str, token: str,
+        ingress_ledger_id: int, dispatch_token: str,
+        dispatch_expires_at: float, current_generation: Optional[int] = None,
+    ) -> bool:
+        receipt, owner_s, token_s = str(receipt_id), str(owner), str(token)
+        ledger_id, dispatch = int(ingress_ledger_id), str(dispatch_token)
+        expiry = float(dispatch_expires_at)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_busy_queue WHERE receipt_id=?", (receipt,)
+            ).fetchone()
+            if row is None or not self._gateway_busy_queue_is_current(
+                row, current_generation
+            ):
+                return False
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?", (ledger_id,)
+            ).fetchone()
+            reason = f"busy-receipt:{receipt}:{dispatch}"
+            if row["state"] == "DISPATCHED":
+                return bool(
+                    row["lease_owner"] == owner_s and row["lease_token"] == token_s
+                    and int(row["ingress_ledger_id"]) == ledger_id
+                    and row["dispatch_token"] == dispatch
+                    and row["dispatch_expires_at"] == expiry
+                    and ledger is not None and ledger["status"] == "in_progress"
+                    and ledger["reason"] == reason
+                )
+            if (
+                row["state"] != "MATERIALIZED"
+                or row["lease_owner"] != owner_s or row["lease_token"] != token_s
+                or int(row["ingress_ledger_id"]) != ledger_id
+                or ledger is None or ledger["status"] not in ("received", "requeued")
+                or ledger["dispatch_started_at"] is not None
+            ):
+                return False
+            prior = ledger["status"]
+            now = time.time()
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='in_progress', dispatch_started_at=?, updated_at=?, reason=?
+                    WHERE id=? AND status=? AND dispatch_started_at IS NULL""",
+                (now, now, reason, ledger_id, prior),
+            ).rowcount != 1:
+                return False
+            cursor = conn.execute(
+                """UPDATE gateway_busy_queue SET state='DISPATCHED',
+                       dispatch_token=?, dispatch_expires_at=?,
+                       ingress_prior_status=?, updated_at=?
+                     WHERE receipt_id=? AND state='MATERIALIZED'
+                       AND lease_owner=? AND lease_token=? AND ingress_ledger_id=?""",
+                (dispatch, expiry, prior, now, receipt, owner_s, token_s, ledger_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("busy queue handoff lost its serialized CAS")
+            return True
+        return bool(self._execute_write(_do))
+
+    def accept_gateway_busy_dispatch(
+        self, receipt_id: str, *, dispatch_token: str,
+        consumer_owner: str, consumer_token: str,
+        consumer_expires_at: float, current_generation: Optional[int] = None,
+    ) -> bool:
+        receipt, dispatch = str(receipt_id), str(dispatch_token)
+        owner, token, expiry = (
+            str(consumer_owner), str(consumer_token), float(consumer_expires_at)
+        )
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_busy_queue WHERE receipt_id=?", (receipt,)
+            ).fetchone()
+            if (
+                row is None or row["state"] != "DISPATCHED"
+                or row["dispatch_token"] != dispatch
+                or not self._gateway_busy_queue_is_current(row, current_generation)
+            ):
+                return False
+            if row["consumer_token"] is not None:
+                return bool(row["consumer_owner"] == owner
+                            and row["consumer_token"] == token
+                            and row["consumer_expires_at"] == expiry)
+            return conn.execute(
+                """UPDATE gateway_busy_queue SET consumer_owner=?, consumer_token=?,
+                       consumer_expires_at=?, updated_at=?
+                     WHERE receipt_id=? AND state='DISPATCHED'
+                       AND dispatch_token=? AND consumer_token IS NULL""",
+                (owner, token, expiry, time.time(), receipt, dispatch),
+            ).rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def reclaim_gateway_busy_queue(
+        self, *, now: float, dead_owners: Tuple[str, ...] = (),
+        current_generations: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, int]:
+        dead = frozenset(str(owner) for owner in dead_owners)
+        now_f = float(now)
+
+        def _do(conn):
+            counts = {"leased": 0, "materialized": 0, "dispatched": 0}
+            rows = conn.execute(
+                """SELECT * FROM gateway_busy_queue
+                    WHERE state IN ('LEASED','MATERIALIZED','DISPATCHED')
+                    ORDER BY sequence, receipt_id"""
+            ).fetchall()
+            for row in rows:
+                if (
+                    not current_generations
+                    or current_generations.get(str(row["session_key"]))
+                    != int(row["generation"])
+                ):
+                    continue
+                state = row["state"]
+                expired = row["lease_expires_at"] is not None and row["lease_expires_at"] <= now_f
+                owner_dead = row["lease_owner"] in dead
+                if state == "DISPATCHED":
+                    effective_expiry = row["consumer_expires_at"] or row["dispatch_expires_at"]
+                    expired = effective_expiry is not None and effective_expiry <= now_f
+                    owner_dead = owner_dead or row["consumer_owner"] in dead
+                    ledger = conn.execute(
+                        "SELECT * FROM gateway_message_ledger WHERE id=?",
+                        (int(row["ingress_ledger_id"]),),
+                    ).fetchone()
+                    expected_reason = f"busy-receipt:{row['receipt_id']}:{row['dispatch_token']}"
+                    if (expired or owner_dead) and (
+                        ledger is None or ledger["status"] != "in_progress"
+                        or ledger["reason"] != expected_reason
+                    ):
+                        continue
+                if not (expired or owner_dead):
+                    continue
+                if state == "DISPATCHED":
+                    if conn.execute(
+                        """UPDATE gateway_message_ledger
+                              SET status=?, dispatch_started_at=NULL,
+                                  updated_at=?, reason='busy-receipt-reclaimed'
+                            WHERE id=? AND status='in_progress' AND reason=?""",
+                        (row["ingress_prior_status"], now_f,
+                         int(row["ingress_ledger_id"]), expected_reason),
+                    ).rowcount != 1:
+                        continue
+                cursor = conn.execute(
+                    """UPDATE gateway_busy_queue SET state='READY',
+                           lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL,
+                           dispatch_token=NULL, dispatch_expires_at=NULL,
+                           ingress_prior_status=NULL, consumer_owner=NULL,
+                           consumer_token=NULL, consumer_expires_at=NULL, updated_at=?
+                         WHERE receipt_id=? AND state=?""",
+                    (now_f, row["receipt_id"], state),
+                )
+                counts[state.lower()] += int(cursor.rowcount or 0)
+            return counts
+        return self._execute_write(_do)
 
 
 class AsyncSessionDB:

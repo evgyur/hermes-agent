@@ -366,6 +366,101 @@ CREATE TABLE IF NOT EXISTS system_prompts (
     prompt TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gateway_resume_obligations (
+    session_key TEXT PRIMARY KEY,
+    resume_task_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    origin_json TEXT NOT NULL,
+    origin_sha256 TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    marked_at REAL NOT NULL,
+    claim_owner TEXT,
+    claim_token TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gateway_message_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lookup_key TEXT UNIQUE,
+    platform TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    message_id TEXT,
+    user_id TEXT,
+    session_key TEXT,
+    session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    origin_type TEXT NOT NULL DEFAULT 'real_user',
+    received_at REAL NOT NULL,
+    dispatch_started_at REAL,
+    completed_at REAL,
+    drained_at REAL,
+    failed_at REAL,
+    updated_at REAL NOT NULL,
+    reason TEXT,
+    metadata TEXT,
+    snippet TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gateway_busy_receipts (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK (kind IN ('redirect', 'steer')),
+    session_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    ingress_ledger_id INTEGER NOT NULL,
+    origin_json TEXT NOT NULL,
+    origin_sha256 TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    request_fenced_at REAL,
+    terminal_at REAL,
+    UNIQUE (session_key, generation, ingress_ledger_id)
+);
+
+CREATE TABLE IF NOT EXISTS gateway_busy_queue (
+    receipt_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    ingress_ledger_id INTEGER NOT NULL,
+    origin_json TEXT NOT NULL,
+    origin_sha256 TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at REAL,
+    dispatch_token TEXT,
+    dispatch_expires_at REAL,
+    ingress_prior_status TEXT,
+    consumer_owner TEXT,
+    consumer_token TEXT,
+    consumer_expires_at REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (receipt_id) REFERENCES gateway_busy_receipts(receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gateway_busy_receipts_session
+    ON gateway_busy_receipts(session_key, generation, sequence);
+CREATE INDEX IF NOT EXISTS idx_gateway_busy_receipts_state
+    ON gateway_busy_receipts(state, sequence);
+CREATE INDEX IF NOT EXISTS idx_gateway_busy_queue_ready
+    ON gateway_busy_queue(state, sequence);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup
+    ON gateway_message_ledger(lookup_key);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session
+    ON gateway_message_ledger(session_key, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_status
+    ON gateway_message_ledger(status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
