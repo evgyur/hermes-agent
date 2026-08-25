@@ -1,5 +1,10 @@
 """Maintained Telegram plugin authority and private-context safety gates."""
 
+import json
+import os
+from pathlib import Path
+import urllib.parse
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -78,6 +83,201 @@ def test_telegram_chip_rejects_non_loopback_origin_before_network(monkeypatch):
     with pytest.raises(ValueError):
         adapter._telegram_chip_fetch_message_sync(CHAT_ID, 1)
     urlopen.assert_not_called()
+
+
+def test_telegram_chip_decodes_the_deployed_outer_message_envelope(monkeypatch):
+    adapter = _adapter()
+    inner = {
+        "id": 47266,
+        "text": "production-shaped context",
+        "has_media": True,
+    }
+    body = json.dumps(
+        {"success": True, "data": json.dumps(inner), "error": None}
+    ).encode()
+
+    class _Headers(dict):
+        pass
+
+    class _Response:
+        headers = _Headers({"Content-Length": str(len(body))})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def geturl(self):
+            return f"http://127.0.0.1:8080/chats/{CHAT_ID}/messages/47266"
+
+        def read(self, _limit):
+            return body
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Response())
+
+    assert adapter._telegram_chip_fetch_message_sync(CHAT_ID, 47266) == inner
+
+
+def test_telegram_chip_decodes_the_deployed_media_path_envelope(
+    monkeypatch, tmp_path
+):
+    adapter = _adapter()
+    requested_paths = []
+
+    class _Headers(dict):
+        def get_content_type(self):
+            return "application/json"
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+            self.headers = _Headers({"Content-Length": str(len(body))})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, _limit):
+            return self._body
+
+    class _Opener:
+        def open(self, request, **_kwargs):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            media_path = query["output_path"][0]
+            requested_paths.append(media_path)
+            Path(media_path).write_bytes(b"production-shaped audio")
+            body = json.dumps(
+                {
+                    "success": True,
+                    "data": json.dumps(
+                        {"success": True, "path": media_path, "error": None}
+                    ),
+                    "error": None,
+                }
+            ).encode()
+            return _Response(body)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_a: _Opener())
+
+    returned = adapter._telegram_chip_media_download_sync(CHAT_ID, 47266)
+
+    assert returned == requested_paths[0]
+    assert Path(returned).is_file()
+
+
+def test_telegram_chip_never_accepts_or_deletes_an_unowned_media_path(
+    monkeypatch, tmp_path
+):
+    adapter = _adapter()
+    unowned = tmp_path / "keep.ogg"
+    unowned.write_bytes(b"must survive")
+    requested_paths = []
+
+    class _Headers(dict):
+        def get_content_type(self):
+            return "application/json"
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+            self.headers = _Headers({"Content-Length": str(len(body))})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, _limit):
+            return self._body
+
+    class _Opener:
+        def open(self, request, **_kwargs):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            requested_paths.append(query["output_path"][0])
+            body = json.dumps(
+                {
+                    "success": True,
+                    "data": json.dumps(
+                        {"success": True, "path": str(unowned), "error": None}
+                    ),
+                    "error": None,
+                }
+            ).encode()
+            return _Response(body)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_a: _Opener())
+
+    with pytest.raises(ValueError, match="unowned media path"):
+        adapter._telegram_chip_media_download_sync(CHAT_ID, 47266)
+
+    assert unowned.read_bytes() == b"must survive"
+    assert requested_paths and not Path(requested_paths[0]).exists()
+
+
+@pytest.mark.parametrize("case", ["error", "oversize", "symlink"])
+def test_telegram_chip_cleans_only_its_owned_target_on_media_failure(
+    monkeypatch, tmp_path, case
+):
+    adapter = _adapter()
+    requested_paths = []
+    symlink_target = tmp_path / "symlink-target.ogg"
+    symlink_target.write_bytes(b"must survive")
+
+    class _Headers(dict):
+        def get_content_type(self):
+            return "application/json"
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+            self.headers = _Headers({"Content-Length": str(len(body))})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, _limit):
+            return self._body
+
+    class _Opener:
+        def open(self, request, **_kwargs):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            owned_path = query["output_path"][0]
+            requested_paths.append(owned_path)
+            if case == "error":
+                payload = {"success": False, "data": None, "error": "download failed"}
+            else:
+                if case == "oversize":
+                    with open(owned_path, "wb") as oversized:
+                        oversized.truncate(64 * 1024 * 1024 + 1)
+                else:
+                    Path(owned_path).unlink()
+                    try:
+                        os.symlink(symlink_target, owned_path)
+                    except OSError:
+                        pytest.skip("symlinks are unavailable on this platform")
+                payload = {
+                    "success": True,
+                    "data": json.dumps(
+                        {"success": True, "path": owned_path, "error": None}
+                    ),
+                    "error": None,
+                }
+            return _Response(json.dumps(payload).encode())
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_a: _Opener())
+
+    with pytest.raises((RuntimeError, ValueError)):
+        adapter._telegram_chip_media_download_sync(CHAT_ID, 47266)
+
+    assert requested_paths and not Path(requested_paths[0]).exists()
+    assert symlink_target.read_bytes() == b"must survive"
 
 
 @pytest.mark.asyncio
