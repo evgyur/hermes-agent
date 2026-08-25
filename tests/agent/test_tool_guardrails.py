@@ -105,6 +105,9 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.action == "block"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+    assert blocked.blocks_execution is True
+    assert blocked.should_halt is False
+    assert controller.halt_decision is None
 
 
 
@@ -166,8 +169,9 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     decision = controller.before_call("web_search", {"query": "q4"})
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
-    assert decision.should_halt is True
-
+    assert decision.blocks_execution is True
+    assert decision.should_halt is False
+    assert controller.halt_decision is None
 
 
 
