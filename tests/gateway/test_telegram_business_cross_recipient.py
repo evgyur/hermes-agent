@@ -128,6 +128,99 @@ def test_unset_mock_reply_does_not_forge_business_connection() -> None:
     assert TelegramAdapter._telegram_supplied_business_connection_id(message) is None
 
 
+def test_owner_business_voice_uses_the_bounded_auto_transcribe_route() -> None:
+    adapter = _adapter()
+    message = _business_message(
+        chat_id=SAFE_CUSTOMER_ID,
+        voice=SimpleNamespace(file_id="voice-owner", file_size=1024),
+    )
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_customer_business_voice_never_enters_the_owner_transcribe_route() -> None:
+    adapter = _adapter()
+    message = _business_message(
+        chat_id=SAFE_CUSTOMER_ID,
+        from_user_id=SAFE_CUSTOMER_ID,
+        voice=SimpleNamespace(file_id="voice-customer", file_size=1024),
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_dispatch_preserves_the_exact_safe_route(
+    monkeypatch, tmp_path
+) -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    cached = tmp_path / "owner-business.ogg"
+    file_obj = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"voice")))
+    voice = SimpleNamespace(
+        file_id="voice-owner",
+        file_size=1024,
+        get_file=AsyncMock(return_value=file_obj),
+    )
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, voice=voice)
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+        lambda *_a, **_k: str(cached),
+    )
+
+    await adapter._handle_media_message(_business_update(message), SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+    assert event.source.thread_id is None
+    assert event.media_urls == [str(cached)]
+    assert event.media_types == ["audio/ogg"]
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_bot_chat_mirror_never_downloads_or_dispatches() -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    voice = SimpleNamespace(
+        file_id="voice-mirror",
+        file_size=1024,
+        get_file=AsyncMock(),
+    )
+    mirror = _business_message(chat_id=str(BOT_ID), voice=voice)
+
+    await adapter._handle_media_message(_business_update(mirror), SimpleNamespace())
+
+    voice.get_file.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_download_error_stays_on_the_same_safe_route() -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    voice = SimpleNamespace(
+        file_id="voice-error",
+        file_size=1024,
+        get_file=AsyncMock(side_effect=RuntimeError("cdn unavailable")),
+    )
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, voice=voice)
+    message.reply_text = AsyncMock()
+
+    await adapter._handle_media_message(_business_update(message), SimpleNamespace())
+
+    message.reply_text.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+    assert "could not be downloaded" in event.text
+
+
 @pytest.mark.asyncio
 async def test_owner_auto_transcript_in_customer_chat_is_dropped_before_dispatch() -> None:
     """The exact incident envelope must never become a Hermes turn."""

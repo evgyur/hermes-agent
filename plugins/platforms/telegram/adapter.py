@@ -2529,7 +2529,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if user_id not in self._business_owner_ids() or self._is_business_bot_echo(message):
             return False
-        return self._has_explicit_business_wake(message) or self._is_reply_to_own_outbound_text(message)
+        owner_voice_route = bool(
+            getattr(message, "voice", None)
+            and self._truthy_config_value(
+                self._telegram_business_config().get("auto_transcribe_voice", False)
+            )
+        )
+        return (
+            self._has_explicit_business_wake(message)
+            or self._is_reply_to_own_outbound_text(message)
+            or owner_voice_route
+        )
 
     def _strip_business_wake_trigger(self, text: Optional[str]) -> Optional[str]:
         if not text:
@@ -9773,6 +9783,44 @@ class TelegramAdapter(BasePlatformAdapter):
         except UnicodeDecodeError:
             return ""
 
+    def _expand_link_entities(self, message: Message) -> str:
+        """Inline hidden Telegram ``text_link`` URLs into visible text."""
+        text = getattr(message, "text", None)
+        entities = getattr(message, "entities", None) or []
+        if not text:
+            text = getattr(message, "caption", None) or ""
+            entities = getattr(message, "caption_entities", None) or []
+        if not text or not entities:
+            return text
+
+        raw = text.encode("utf-16-le")
+        links: List[tuple[int, int, str]] = []
+        for entity in entities:
+            entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+            url = getattr(entity, "url", None)
+            if entity_type != "text_link" or not isinstance(url, str) or not url.strip():
+                continue
+            try:
+                offset = int(getattr(entity, "offset", -1))
+                length = int(getattr(entity, "length", 0))
+                start_bytes = offset * 2
+                end_bytes = (offset + length) * 2
+                if offset < 0 or length <= 0 or end_bytes > len(raw):
+                    continue
+                start = len(raw[:start_bytes].decode("utf-16-le"))
+                end = start + len(raw[start_bytes:end_bytes].decode("utf-16-le"))
+            except (TypeError, ValueError, UnicodeDecodeError):
+                continue
+            if end > start:
+                links.append((start, end, url.strip()))
+
+        expanded = text
+        for _start, end, url in sorted(links, reverse=True):
+            inline = f" ({url})"
+            if not expanded[end:].startswith(inline):
+                expanded = f"{expanded[:end]}{inline}{expanded[end:]}"
+        return expanded
+
     def _message_mentions_bot(self, message: Message) -> bool:
         if not self._bot:
             return False
@@ -10615,6 +10663,16 @@ class TelegramAdapter(BasePlatformAdapter):
             payload = json.loads(raw_payload.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("telegram-chip returned a non-object message payload")
+        if "success" in payload:
+            if payload.get("success") is not True:
+                raise RuntimeError(
+                    str(payload.get("error") or "telegram-chip message lookup failed")
+                )
+            payload = payload.get("data")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("telegram-chip returned invalid message data")
         return payload
 
     def _telegram_chip_media_download_sync(self, chat_id: str, message_id: int) -> str:
@@ -10640,17 +10698,59 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise RuntimeError("telegram-chip media redirects are not allowed")
 
         quoted_chat = urllib.parse.quote(str(chat_id), safe="")
-        url = f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"
-        request = urllib.request.Request(url, headers={"Accept": "audio/*,application/octet-stream"})
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".media") as owned_file:
+            owned_path = owned_file.name
+        query = urllib.parse.urlencode({"output_path": owned_path})
+        url = (
+            f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"
+            f"?{query}"
+        )
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
         max_bytes = 64 * 1024 * 1024
         opener = urllib.request.build_opener(_NoRedirect())
         temp_path = ""
+        keep_owned_path = False
         try:
             with opener.open(request, timeout=20.0) as response:
                 declared = response.headers.get("Content-Length")
+                content_type = str(response.headers.get_content_type() or "")
+                if content_type == "application/json":
+                    if declared and int(declared) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
+                        raise ValueError("telegram-chip JSON body exceeds the size limit")
+                    raw_payload = response.read(_TELEGRAM_CHIP_MAX_JSON_BYTES + 1)
+                    if len(raw_payload) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
+                        raise ValueError("telegram-chip JSON body exceeds the size limit")
+                    payload = json.loads(raw_payload.decode("utf-8"))
+                    if not isinstance(payload, dict) or payload.get("success") is not True:
+                        raise RuntimeError(
+                            str(
+                                payload.get("error")
+                                if isinstance(payload, dict)
+                                else "telegram-chip media lookup failed"
+                            )
+                        )
+                    media_result = payload.get("data")
+                    if isinstance(media_result, str):
+                        media_result = json.loads(media_result)
+                    if (
+                        not isinstance(media_result, dict)
+                        or media_result.get("success") is not True
+                    ):
+                        raise RuntimeError("telegram-chip media download failed")
+                    media_path = media_result.get("path")
+                    if not isinstance(media_path, str) or not os.path.isabs(media_path):
+                        raise ValueError("telegram-chip returned an invalid media path")
+                    if os.path.realpath(media_path) != os.path.realpath(owned_path):
+                        raise ValueError("telegram-chip returned an unowned media path")
+                    if os.path.islink(media_path) or not os.path.isfile(media_path):
+                        raise ValueError("telegram-chip returned an unsafe media path")
+                    media_size = os.path.getsize(media_path)
+                    if media_size <= 0 or media_size > max_bytes:
+                        raise ValueError("telegram-chip returned empty or oversized media")
+                    keep_owned_path = True
+                    return media_path
                 if declared and int(declared) > max_bytes:
                     raise ValueError("telegram-chip media exceeds the byte limit")
-                content_type = str(response.headers.get_content_type() or "")
                 if content_type and not (
                     content_type.startswith("audio/")
                     or content_type == "application/octet-stream"
@@ -10671,6 +10771,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 except OSError:
                     pass
             raise
+        finally:
+            if not keep_owned_path:
+                try:
+                    os.unlink(owned_path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _bounded_telegram_chip_context(text: object, limit: int = 16 * 1024) -> str:
@@ -11244,7 +11350,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 _observe_type = self._media_message_type(_m)
                 _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
                 if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
+                    _event.text = self._clean_bot_trigger_text(
+                        self._expand_link_entities(_m)
+                    )
                 await self._cache_observed_media(_m, _event)
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
@@ -11259,7 +11367,9 @@ class TelegramAdapter(BasePlatformAdapter):
         
         # Add caption as text
         if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+            event.text = self._clean_bot_trigger_text(
+                self._expand_link_entities(msg)
+            )
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -11999,7 +12109,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        _event_text = message.text or ""
+        _event_text = self._expand_link_entities(message)
         _auto_skill = topic_skill
         for _route in self.config.extra.get("auto_skill_routes", []) or []:
             if not isinstance(_route, dict):
