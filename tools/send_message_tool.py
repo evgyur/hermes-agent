@@ -169,6 +169,8 @@ def _prepare_telegram_egress(chat_id, thread_id=None, route_envelope=None) -> di
     recipient and Business trust lane must also survive exactly; the returned
     kwargs are shared by text, media, and their existing retry paths.
     """
+    if str(chat_id).strip().lstrip("@").casefold() == "vladisfom":
+        raise TelegramEgressDenied("telegram_recipient_denied")
     if route_envelope is None:
         assert_recipient_allowed(chat_id)
         return {}
@@ -183,6 +185,31 @@ def _prepare_telegram_egress(chat_id, thread_id=None, route_envelope=None) -> di
         chat_id,
         metadata={**route, "route_envelope": route},
     )
+
+    # ``route_envelope`` is model-call input, not proof.  Bind it to the
+    # gateway's task-local session identity before constructing a Bot.  This
+    # reuses the existing session authority rather than introducing another
+    # recipient/auth engine.
+    from gateway.session_context import get_session_env
+
+    runtime_profile = get_session_env("HERMES_SESSION_PROFILE", "").strip() or "default"
+    runtime_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip() or None
+    runtime = {
+        "platform": get_session_env("HERMES_SESSION_PLATFORM", "").strip(),
+        "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", "").strip(),
+        "thread_id": runtime_thread,
+        "user_id": get_session_env("HERMES_SESSION_USER_ID", "").strip() or None,
+        "profile": runtime_profile,
+    }
+    if (
+        runtime["platform"] != "telegram"
+        or runtime["chat_id"] != route["chat_id"]
+        or runtime["thread_id"] != route["thread_id"]
+        or runtime["user_id"] != route["user_id"]
+        or runtime["profile"] != route["runtime_profile"]
+        or runtime["profile"] != route["transport_profile"]
+    ):
+        raise TelegramEgressDenied("telegram_runtime_route_unbound")
 
     business_connection_id = route.get("business_connection_id")
     if business_connection_id:

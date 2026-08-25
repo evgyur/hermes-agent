@@ -1204,6 +1204,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        # Multiplex adapters install a profile-bound resolver.  It is the
+        # authoritative callback gate because the bound message handler may
+        # belong to the shared/default runner.  A resolver exception is a
+        # denial, never permission to borrow process-wide env grants.
+        if getattr(self, "_authorization_check", None) is not None:
+            decision = self._is_sender_authorized(
+                normalized_user_id,
+                chat_type=chat_type,
+                chat_id=str(chat_id) if chat_id is not None else None,
+            )
+            return decision is True
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
@@ -1233,10 +1245,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
+                    "[Telegram] Callback authorization failed for user %s",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
 
         allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
@@ -4796,6 +4809,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
+    def _drop_pending_updates_on_connect(self, *, is_reconnect: bool) -> bool:
+        """Drop only for an explicit operator reset on a non-reconnect start."""
+        return bool(
+            not is_reconnect
+            and self.config.extra.get("drop_pending_updates") is True
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -5237,7 +5257,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # server-side getUpdates queue, so this flag is a no-op
                     # in practice. Mirror the polling path's reconnect
                     # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates_on_connect(
+                        is_reconnect=is_reconnect
+                    ),
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -5294,7 +5316,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates_on_connect(
+                        is_reconnect=is_reconnect
+                    ),
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
@@ -9438,6 +9462,26 @@ class TelegramAdapter(BasePlatformAdapter):
             return group_allowed & response_allowed
         return group_allowed
 
+    def _should_ignore_foreign_bot_reply(self, message: Message) -> bool:
+        """Apply one foreign-bot reply rule to dispatch and observation."""
+        reply = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply, "from_user", None)
+        if not (
+            reply_user
+            and getattr(reply_user, "is_bot", False)
+            and str(getattr(reply_user, "id", ""))
+            != str(getattr(getattr(self, "_bot", None), "id", ""))
+        ):
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        ignored = {
+            str(value)
+            for value in self.config.extra.get(
+                "ignore_other_bot_replies_chats", []
+            )
+        }
+        return chat_id in ignored
+
     def _telegram_allowed_topics(self) -> set[str]:
         """Return the whitelist of Telegram forum topic IDs this bot handles.
 
@@ -9879,6 +9923,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if not self._is_group_chat(message):
             return False
+        if self._should_ignore_foreign_bot_reply(message):
+            return False
 
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
@@ -10267,10 +10313,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
             user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+            user_name = str(
+                getattr(getattr(message, "from_user", None), "username", "") or ""
+            )
+            if user_name.casefold() == "vladisfom":
+                return False
             try:
                 from gateway.telegram_egress_policy import assert_recipient_allowed
 
-                assert_recipient_allowed(chat_id)
+                assert_recipient_allowed(chat_id, username=user_name or None)
             except Exception:
                 # The same operator deny applies on ingress: a blocked peer can
                 # never create state that a later callback/replay might answer.
@@ -10297,6 +10348,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Customer-authored Business traffic is not admitted into the
                 # private agent/tool lane by this connector.
                 return False
+
+            thread_id = self._effective_message_thread_id(message)
+            if thread_id is not None:
+                try:
+                    if int(thread_id) in self._telegram_ignored_threads():
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            if (
+                thread_id is None
+                and self.config.extra.get("ignore_root_dm", False)
+                and not is_command
+                and chat_id in self._dm_topic_chat_ids
+            ):
+                return False
             return True
 
         thread_id = self._effective_message_thread_id(message)
@@ -10306,7 +10372,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if topic_id not in allowed_topics:
                 return False
 
-        # Check ignored_threads first — applies to both groups and DM topics
+        # Check ignored_threads first for groups (DM topics returned above).
         if thread_id is not None:
             try:
                 if int(thread_id) in self._telegram_ignored_threads():
@@ -10314,28 +10380,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
 
-        if not self._is_group_chat(message):
-            # Root DM (non-topic): ignore if ignore_root_dm is configured
-            if thread_id is None and self.config.extra.get("ignore_root_dm", False):
-                chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-                if not is_command and chat_id in self._dm_topic_chat_ids:
-                    return False
-            return True
-
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
-
-        _reply = getattr(message, "reply_to_message", None)
-        _reply_user = getattr(_reply, "from_user", None)
-        _reply_is_foreign_bot = bool(
-            _reply_user
-            and getattr(_reply_user, "is_bot", False)
-            and str(getattr(_reply_user, "id", "")) != str(getattr(self._bot, "id", ""))
-        )
-        _ignore_foreign_reply_chats = {
-            str(value)
-            for value in self.config.extra.get("ignore_other_bot_replies_chats", [])
-        }
-        if _reply_is_foreign_bot and chat_id_str in _ignore_foreign_reply_chats:
+        if self._should_ignore_foreign_bot_reply(message):
             return False
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
@@ -10351,6 +10397,9 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
+        authority_chats = self._telegram_group_allowed_chats()
+        if authority_chats and chat_id_str not in authority_chats:
+            return False
 
         if guest_mention:
             return True

@@ -486,6 +486,54 @@ def test_allowed_topics_drop_other_forum_topics_before_other_gates():
     ) is False
 
 
+def test_group_allowed_chats_is_an_authority_gate_for_dispatch():
+    adapter = _make_adapter(
+        require_mention=False,
+        allowed_chats=["-100", "-999"],
+        group_allowed_chats=["-100"],
+    )
+
+    assert adapter._should_process_message(_group_message(chat_id=-100)) is True
+    assert adapter._should_process_message(_group_message(chat_id=-999)) is False
+
+
+def test_dm_root_and_ignored_topic_filters_run_before_dm_return():
+    adapter = _make_adapter(require_mention=False, ignored_threads=[77])
+    adapter.config.extra["ignore_root_dm"] = True
+    adapter._dm_topic_chat_ids = {"111"}
+
+    root = _group_message(chat_id=111)
+    root.chat.type = "private"
+    root.chat.is_forum = False
+    root.is_topic_message = False
+    assert adapter._should_process_message(root) is False
+
+    topic = _group_message(chat_id=111, thread_id=77)
+    topic.chat.type = "private"
+    topic.chat.is_forum = False
+    assert adapter._should_process_message(topic) is False
+
+
+def test_foreign_bot_reply_policy_matches_dispatch_and_observe():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    adapter.config.extra["ignore_other_bot_replies_chats"] = ["-100"]
+    message = _group_message("follow-up", chat_id=-100)
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=555, is_bot=True),
+        message_id=10,
+        text="foreign bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is False
+
+
 def _forum_message(*, chat_id, thread_id, is_topic_message, is_forum, chat_type="supergroup"):
     """Build a message with independently-controlled topic/forum flags.
 

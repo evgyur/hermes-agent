@@ -4325,6 +4325,12 @@ class GatewaySlashCommandsMixin:
             or str(source.user_id) != str(source.chat_id)
         ):
             return "Tool progress can only be changed from the bot owner's plain Telegram DM."
+        if source.platform == Platform.TELEGRAM:
+            from gateway.slash_access import policy_for_source
+
+            policy = policy_for_source(self.config, source)
+            if not policy.enabled or not policy.is_admin(source.user_id):
+                return "Only the configured Telegram profile admin can change tool progress."
 
         # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose", "log"]
