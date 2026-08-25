@@ -1779,7 +1779,12 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
         # the in_place branch in conversation_compression.py do.
         agent._last_compaction_in_place = True
         compacted = [{"role": "user", "content": "[summary of prior tool-heavy work]"}]
-        agent._session_db.archive_and_compact(agent.session_id, compacted)
+        agent._session_db.archive_and_compact(
+            agent.session_id,
+            compacted,
+            turn_lease_holder=agent._active_session_turn_lease_holder,
+            turn_lease_ttl_seconds=agent._active_session_turn_lease_ttl_seconds,
+        )
         agent._flushed_db_message_ids = set()
         return compacted, "You are Hermes."
 
