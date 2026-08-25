@@ -28828,15 +28828,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            from tools.parent_task_barrier import TrustedParentTaskContinuation
+
+            identity_free_continuation = isinstance(
+                evt,
+                (TrustedRestartEvent, TrustedParentTaskContinuation),
+            )
+            # A trusted restart/parent continuation is a new synthetic turn,
+            # not a replay of the platform message that originally created
+            # this route. Cached SessionSource objects retain that old identity
+            # for routing provenance; carrying it into the authority row makes
+            # the continuation impersonate the real user message and trips the
+            # immutable-content guard when the synthetic text differs. Copy
+            # before clearing so the cached/durable origin remains unchanged.
+            synthetic_source = (
+                dataclasses.replace(source, message_id=None)
+                if identity_free_continuation
+                else source
+            )
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
-                source=source,
+                source=synthetic_source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=(
+                    None
+                    if identity_free_continuation
+                    else str(evt.get("message_id") or "").strip() or None
+                ),
                 metadata=metadata,
             )
-            from tools.parent_task_barrier import TrustedParentTaskContinuation
 
             if isinstance(evt, TrustedRestartEvent):
                 # Preserve the trusted in-process object through a busy-session
