@@ -374,6 +374,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
     runner = _make_runner(session_entry, platform=Platform.SLACK)
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = False
+    runner._session_db = MagicMock()
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -438,6 +439,7 @@ async def test_handle_message_stale_result_keeps_newer_generation_callback(monke
     )
     runner = _make_runner(session_entry)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
+    runner._session_db = MagicMock()
     session_key = session_entry.session_key
     adapter = _Adapter()
     runner.adapters[Platform.TELEGRAM] = adapter
