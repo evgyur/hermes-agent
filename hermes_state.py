@@ -10699,6 +10699,230 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def append_or_reuse_gateway_user_authority(
+        self,
+        session_id: str,
+        *,
+        content: Any,
+        platform_message_id: Optional[str],
+        timestamp: Any = None,
+        display_kind: Optional[str] = None,
+        display_metadata: Optional[Dict[str, Any]] = None,
+        turn_lease_holder: str,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> int:
+        """Persist the gateway's triggering user row under its turn lease.
+
+        A transport retry may revisit the exact same platform message after a
+        marker write failed. Reuse is allowed only while that exact row is the
+        active transcript tail. Once any downstream row exists, replaying the
+        platform message would replay effects and therefore fails closed.
+        """
+        if not session_id or not turn_lease_holder:
+            raise ValueError("gateway authority requires session and lease holder")
+        if platform_message_id is not None and (
+            type(platform_message_id) is not str
+            or not platform_message_id.strip()
+            or platform_message_id != platform_message_id.strip()
+        ):
+            raise ValueError("platform_message_id must be an exact non-empty string")
+
+        stored_content = self._encode_content(content)
+        stored_display_kind = (
+            _scrub_surrogates(display_kind)
+            if isinstance(display_kind, str)
+            else None
+        )
+        stored_display_metadata = self._encode_display_metadata(display_metadata)
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                message_timestamp = float(
+                    timestamp.timestamp() if hasattr(timestamp, "timestamp") else timestamp
+                )
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Ignoring invalid gateway authority timestamp: %r",
+                    timestamp,
+                )
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone() is None:
+                raise RuntimeError("durable gateway session row is missing")
+
+            if platform_message_id is not None:
+                existing = conn.execute(
+                    "SELECT id, content, display_kind FROM messages "
+                    "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                    "AND platform_message_id = ? ORDER BY id",
+                    (session_id, platform_message_id),
+                ).fetchall()
+                if len(existing) > 1:
+                    raise RuntimeError(
+                        "duplicate durable gateway authority rows are ambiguous"
+                    )
+                if existing:
+                    row = existing[0]
+                    if row["content"] != stored_content:
+                        raise RuntimeError(
+                            "platform message identity was reused with different content"
+                        )
+                    if row["display_kind"] != stored_display_kind:
+                        raise RuntimeError(
+                            "platform message identity was reused with different provenance"
+                        )
+                    tail = conn.execute(
+                        "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                        "ORDER BY id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if tail is None or int(tail["id"]) != int(row["id"]):
+                        raise RuntimeError(
+                            "platform message already has durable downstream rows"
+                        )
+                    return int(row["id"])
+
+            cursor = conn.execute(
+                "INSERT INTO messages ("
+                "session_id, role, content, timestamp, platform_message_id, "
+                "active, display_kind, display_metadata"
+                ") VALUES (?, 'user', ?, ?, ?, 1, ?, ?)",
+                (
+                    session_id,
+                    stored_content,
+                    message_timestamp,
+                    platform_message_id,
+                    stored_display_kind,
+                    stored_display_metadata,
+                ),
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+        )
+
+    def enrich_gateway_user_authority(
+        self,
+        session_id: str,
+        row_id: int,
+        *,
+        content: Any,
+        platform_message_id: Optional[str],
+        turn_lease_holder: str,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> int:
+        """Backfill post-admission content onto the exact authority row.
+
+        The gateway first commits the raw transport payload so no hook, model,
+        compressor, or attachment processor can run without durable origin.
+        Once those downstream enrichments succeed, this method may replace the
+        row content while the same lease is held and the row is still the
+        active transcript tail.  It cannot create authority or cross a row
+        written by the turn itself.
+        """
+        if not session_id or not turn_lease_holder:
+            raise ValueError("gateway authority requires session and lease holder")
+        if type(row_id) is not int or row_id <= 0:
+            raise ValueError("gateway authority row_id must be a positive int")
+        if platform_message_id is not None and (
+            type(platform_message_id) is not str
+            or not platform_message_id.strip()
+            or platform_message_id != platform_message_id.strip()
+        ):
+            raise ValueError("platform_message_id must be an exact non-empty string")
+
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            row = conn.execute(
+                "SELECT id, role, content, active, platform_message_id, "
+                "display_kind FROM messages "
+                "WHERE id = ? AND session_id = ? LIMIT 1",
+                (row_id, session_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("durable gateway authority row is missing")
+            if row["role"] != "user":
+                raise RuntimeError("durable gateway authority row is not user input")
+            if row["platform_message_id"] != platform_message_id:
+                raise RuntimeError("durable gateway authority provenance changed")
+
+            target = row
+            if int(row["active"] or 0) != 1:
+                if platform_message_id is None:
+                    raise RuntimeError(
+                        "inactive gateway authority without platform identity is ambiguous"
+                    )
+                candidates = conn.execute(
+                    "SELECT id, role, content, active, platform_message_id, "
+                    "display_kind FROM messages WHERE session_id = ? "
+                    "AND role = 'user' AND active = 1 "
+                    "AND platform_message_id = ? ORDER BY id",
+                    (session_id, platform_message_id),
+                ).fetchall()
+                if len(candidates) != 1:
+                    raise RuntimeError(
+                        "compacted durable gateway authority is ambiguous"
+                    )
+                target = candidates[0]
+                if (
+                    target["content"] != row["content"]
+                    or target["display_kind"] != row["display_kind"]
+                ):
+                    raise RuntimeError(
+                        "compacted durable gateway authority provenance changed"
+                    )
+            target_id = int(target["id"])
+
+            tail = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if tail is None or int(tail["id"]) != target_id:
+                raise RuntimeError(
+                    "durable gateway authority already has downstream rows"
+                )
+
+            cursor = conn.execute(
+                "UPDATE messages SET content = ?, api_content = NULL "
+                "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
+                (stored_content, target_id, session_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("durable gateway authority enrichment missed")
+            return target_id
+
+        return int(
+            self._execute_write(
+                _do,
+                patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            )
+        )
+
     def append_messages_batch(
         self,
         session_id: str,

@@ -80,6 +80,76 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+@pytest.fixture(autouse=True)
+def _isolate_hygiene_from_durable_authority(monkeypatch):
+    """Give legacy hygiene fixtures a committed outer authority boundary.
+
+    This module intentionally constructs partial runners, often without a
+    SessionDB, to exercise compression only. Durable-authority failures and
+    ordering are covered by test_outer_durable_authority_barrier.py.
+    """
+    from gateway.run import GatewayRunner
+
+    async def _mark(*_args, **_kwargs):
+        return True
+
+    async def _acquire(self, event, _source, entry, *, run_generation):
+        authority = {
+            "db": MagicMock(),
+            "session_id": entry.session_id,
+            "holder": f"hygiene-test-{run_generation}",
+            "ttl_seconds": 300.0,
+            "lost": False,
+            "released": False,
+            "agent": None,
+            "refresh_task": None,
+        }
+        event._gateway_durable_turn_authority = authority
+        return authority
+
+    async def _persist(*_args, **_kwargs):
+        return 4242
+
+    async def _enrich(_self, _entry, _authority, row_id, **_kwargs):
+        return row_id
+
+    async def _validate(*_args, **_kwargs):
+        return True
+
+    async def _release(_self, event):
+        authority = getattr(event, "_gateway_durable_turn_authority", None)
+        if isinstance(authority, dict):
+            authority["released"] = True
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_mark_durable_active_turn", _mark)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_acquire_gateway_durable_turn_authority",
+        _acquire,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_persist_gateway_triggering_user_row",
+        _persist,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_enrich_gateway_triggering_user_row",
+        _enrich,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_validate_and_seal_startup_resume",
+        _validate,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_release_gateway_durable_turn_authority",
+        _release,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------

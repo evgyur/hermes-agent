@@ -6294,6 +6294,35 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        # The gateway acquired this lease before any hook/enrichment work and
+        # owns its refresh/release through the whole handler. Publish it onto
+        # the cached agent for holder-qualified transcript writes; always clear
+        # stale values on turns that do not carry the capability.
+        _durable_authority = ctx.durable_turn_authority
+        agent._gateway_preacquired_session_turn_lease_holder = None
+        agent._gateway_preacquired_session_turn_lease_session_id = None
+        agent._gateway_preacquired_session_turn_lease_ttl_seconds = None
+        agent._gateway_preacquired_session_turn_lease_external = False
+        if isinstance(_durable_authority, dict):
+            if (
+                _durable_authority.get("session_id") != ctx.session_id
+                or not _durable_authority.get("holder")
+                or _durable_authority.get("released")
+                or _durable_authority.get("lost")
+            ):
+                raise RuntimeError("gateway durable turn authority is not current")
+            _durable_authority["agent"] = agent
+            agent._gateway_preacquired_session_turn_lease_holder = (
+                _durable_authority["holder"]
+            )
+            agent._gateway_preacquired_session_turn_lease_session_id = (
+                _durable_authority["session_id"]
+            )
+            agent._gateway_preacquired_session_turn_lease_ttl_seconds = (
+                _durable_authority["ttl_seconds"]
+            )
+            agent._gateway_preacquired_session_turn_lease_external = True
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Recovery capabilities are likewise per-turn and must be overwritten
@@ -7007,6 +7036,12 @@ class TurnRunner:
                 _conversation_kwargs["after_user_row_commit"] = (
                     ctx.after_user_row_commit
                 )
+            if ctx.precommitted_authority:
+                _conversation_kwargs["precommitted_authority"] = True
+                if ctx.precommitted_user_row_id is not None:
+                    _conversation_kwargs["precommitted_user_row_id"] = (
+                        ctx.precommitted_user_row_id
+                    )
             _restart_wake = getattr(ctx, "_trusted_restart_wake", None)
             if _restart_wake is not None:
                 # A marker type is only an envelope. The durable
@@ -13305,6 +13340,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return call_id, name, canonical_args
 
     @staticmethod
+    def _startup_effective_tool_name(name: str, canonical_args: str) -> str:
+        """Classify a Tool Search wrapper by its validated inner tool only.
+
+        Replay fence keys remain the immutable model-emitted ``name`` and
+        ``canonical_args``.  This projection is used solely to decide whether
+        a completed or dangling call could have changed state.
+        """
+        from tools.tool_search import BRIDGE_TOOL_NAMES, TOOL_CALL_NAME
+
+        if name != TOOL_CALL_NAME:
+            return name
+        try:
+            wrapper = json.loads(canonical_args)
+        except (TypeError, ValueError):
+            return name
+        if not isinstance(wrapper, dict):
+            return name
+        inner_name = wrapper.get("name")
+        if not isinstance(inner_name, str):
+            return name
+        inner_name = inner_name.strip()
+        if not inner_name or inner_name in BRIDGE_TOOL_NAMES:
+            return name
+        inner_args = wrapper.get("arguments")
+        if inner_args is None:
+            inner_args = {}
+        if isinstance(inner_args, str):
+            try:
+                inner_args = json.loads(inner_args)
+            except (TypeError, ValueError):
+                return name
+        if not isinstance(inner_args, dict):
+            return name
+        return inner_name
+
+    @staticmethod
     def _startup_gateway_restart_proven(name: str, canonical_args: str) -> bool:
         """Whether this boot proves one exact dangling lifecycle command ran."""
         if name != "terminal":
@@ -13449,7 +13520,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         effect_fence: dict[tuple[str, str], str] = {}
         for call_id, (name, canonical_args, _index) in calls.items():
             receipt = receipts.get(call_id)
-            effectful = tool_may_have_side_effect(name)
+            effective_name = self._startup_effective_tool_name(
+                name,
+                canonical_args,
+            )
+            effectful = tool_may_have_side_effect(effective_name)
             if receipt is None:
                 if not effectful:
                     safe_dangling.append(
@@ -20265,6 +20340,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
             await self._clear_durable_active_turn(event)
+            await self._release_gateway_durable_turn_authority(event)
+            try:
+                self._clear_event_session_env(event)
+            except Exception:
+                logger.debug(
+                    "Failed to restore event session context during outer cleanup",
+                    exc_info=True,
+                )
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -20979,6 +21062,351 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("source and event platform message ids disagree")
         return source_message_id or event_message_id
 
+    @staticmethod
+    async def _await_db_call(db: Any, method_name: str, *args, **kwargs) -> Any:
+        """Call either an AsyncSessionDB method or a synchronous test double."""
+        method = getattr(db, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"session database lacks {method_name}")
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _acquire_gateway_durable_turn_authority(
+        self,
+        event: "MessageEvent",
+        source: SessionSource,
+        session_entry: SessionEntry,
+        *,
+        run_generation: int,
+    ) -> Dict[str, Any]:
+        """Acquire the cross-process lease before transcript authority work."""
+        db = self._session_db
+        if db is None:
+            raise RuntimeError("turn authority requires a session database")
+        is_mock = type(db).__module__.startswith("unittest.mock")
+
+        # A failed create_session is recoverable only through the existing
+        # identity-complete peer repair. Run it now, then prove the row exists;
+        # neither a history read nor any hook may run against an absent row.
+        await self.async_session_store._record_gateway_session_peer(
+            session_entry.session_id,
+            session_entry.session_key,
+            source,
+            display_name=session_entry.display_name,
+        )
+        durable_session = await self._await_db_call(
+            db,
+            "get_session",
+            session_entry.session_id,
+        )
+        if durable_session is None and not is_mock:
+            raise RuntimeError("durable gateway session row creation failed")
+
+        holder_digest = hashlib.sha256(
+            (
+                f"{session_entry.session_id}:{session_entry.session_key}:"
+                f"{run_generation}:{time.time_ns()}"
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        holder = (
+            f"pid={os.getpid()}:gateway-turn={holder_digest}:"
+            f"platform={getattr(source.platform, 'value', source.platform) or 'unknown'}"
+        )
+        ttl_seconds = 300.0
+        acquired = await self._await_db_call(
+            db,
+            "acquire_session_turn_lease",
+            session_entry.session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+            wait_seconds=1800.0,
+        )
+        if acquired is not True and not (is_mock and bool(acquired)):
+            raise RuntimeError("durable session turn lease was not acquired")
+
+        authority: Dict[str, Any] = {
+            "db": db,
+            "session_id": session_entry.session_id,
+            "holder": holder,
+            "ttl_seconds": ttl_seconds,
+            "lost": False,
+            "released": False,
+            "agent": None,
+            "refresh_task": None,
+        }
+
+        if not is_mock:
+            async def _refresh() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(60.0)
+                        refreshed = await self._await_db_call(
+                            db,
+                            "refresh_session_turn_lease",
+                            authority["session_id"],
+                            holder,
+                            ttl_seconds=ttl_seconds,
+                        )
+                        if refreshed is True:
+                            continue
+                        authority["lost"] = True
+                        agent = authority.get("agent")
+                        if agent is not None:
+                            agent.interrupt(
+                                "Session turn lease lost; stopping to protect the transcript.",
+                                hard_cancel=True,
+                            )
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    authority["lost"] = True
+                    logger.error(
+                        "Gateway durable turn lease refresh failed for %s",
+                        authority["session_id"],
+                        exc_info=True,
+                    )
+                    agent = authority.get("agent")
+                    if agent is not None:
+                        try:
+                            agent.interrupt(
+                                "Session turn lease refresh failed; stopping to protect the transcript.",
+                                hard_cancel=True,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not interrupt agent after turn lease loss",
+                                exc_info=True,
+                            )
+
+            authority["refresh_task"] = asyncio.create_task(_refresh())
+
+        setattr(event, "_gateway_durable_turn_authority", authority)
+        return authority
+
+    async def _release_gateway_durable_turn_authority(
+        self,
+        event: "MessageEvent",
+    ) -> bool:
+        """Stop refresh and holder-qualified release; idempotent."""
+        authority = getattr(event, "_gateway_durable_turn_authority", None)
+        if not isinstance(authority, dict) or authority.get("released"):
+            return False
+        refresh_task = authority.get("refresh_task")
+        if isinstance(refresh_task, asyncio.Task):
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Gateway durable turn lease refresher cleanup failed",
+                    exc_info=True,
+                )
+        try:
+            released = await self._await_db_call(
+                authority["db"],
+                "release_session_turn_lease",
+                authority["session_id"],
+                authority["holder"],
+            )
+        except Exception:
+            logger.error(
+                "Failed to release gateway durable turn lease for %s",
+                authority.get("session_id"),
+                exc_info=True,
+            )
+            return False
+        # Mark complete only after the holder-qualified DB operation returns.
+        # An exception remains retryable by the outer handler's final cleanup;
+        # a concrete False means the holder was already absent and cannot be
+        # made safer by repeating the same release.
+        authority["released"] = True
+        return released is not False
+
+    async def _persist_gateway_triggering_user_row(
+        self,
+        event: "MessageEvent",
+        session_entry: SessionEntry,
+        authority: Dict[str, Any],
+        *,
+        platform_message_id: Optional[str],
+        display_kind: Optional[str],
+    ) -> Optional[int]:
+        """Persist or safely reuse the exact raw inbound row before hooks."""
+        row_id = await self._await_db_call(
+            authority["db"],
+            "append_or_reuse_gateway_user_authority",
+            session_entry.session_id,
+            content=(event.text if event.text is not None else ""),
+            platform_message_id=platform_message_id,
+            timestamp=getattr(event, "timestamp", None),
+            display_kind=display_kind,
+            turn_lease_holder=authority["holder"],
+            turn_lease_ttl_seconds=authority["ttl_seconds"],
+        )
+        if type(row_id) is int and row_id > 0:
+            return row_id
+        if type(authority["db"]).__module__.startswith("unittest.mock"):
+            return None
+        raise RuntimeError("triggering user row did not return a durable row id")
+
+    async def _enrich_gateway_triggering_user_row(
+        self,
+        session_entry: SessionEntry,
+        authority: Dict[str, Any],
+        row_id: Optional[int],
+        *,
+        content: Any,
+        platform_message_id: Optional[str],
+    ) -> Optional[int]:
+        """Backfill prepared content without changing durable turn identity."""
+        if row_id is None:
+            return None
+        enriched = await self._await_db_call(
+            authority["db"],
+            "enrich_gateway_user_authority",
+            session_entry.session_id,
+            row_id,
+            content=content,
+            platform_message_id=platform_message_id,
+            turn_lease_holder=authority["holder"],
+            turn_lease_ttl_seconds=authority["ttl_seconds"],
+        )
+        if type(enriched) is int and enriched > 0:
+            return enriched
+        if type(authority["db"]).__module__.startswith("unittest.mock"):
+            return row_id
+        raise RuntimeError("triggering user row enrichment did not commit")
+
+    async def _validate_and_seal_startup_resume(
+        self,
+        event: "MessageEvent",
+        source: SessionSource,
+        session_entry: SessionEntry,
+        history: List[Dict[str, Any]],
+    ) -> bool:
+        """Freeze one post-lease startup task slice into the synthetic event."""
+        if not bool(getattr(event, "startup_resume", False)):
+            return True
+
+        event_metadata = getattr(event, "metadata", None) or {}
+        sealed_source = resume_origin_from_snapshot(session_entry)
+        sealed_message_id = (
+            str(getattr(sealed_source, "message_id", "") or "").strip()
+            if sealed_source is not None
+            else ""
+        )
+        event_message_id = str(getattr(event, "message_id", "") or "").strip()
+        expected_resume_identity = {
+            "resume_task_id": str(
+                getattr(session_entry, "resume_task_id", "") or ""
+            ),
+            "continuation_generation": getattr(
+                session_entry,
+                "continuation_generation",
+                0,
+            ),
+            "continuation_claim_owner": str(
+                getattr(session_entry, "continuation_claim_owner", "") or ""
+            ),
+            "continuation_claim_token": str(
+                getattr(session_entry, "continuation_claim_token", "") or ""
+            ),
+        }
+        event_resume_identity = {
+            "resume_task_id": str(getattr(event, "resume_task_id", "") or ""),
+            "continuation_generation": getattr(
+                event,
+                "continuation_generation",
+                0,
+            ),
+            "continuation_claim_owner": str(
+                getattr(event, "continuation_claim_owner", "") or ""
+            ),
+            "continuation_claim_token": str(
+                getattr(event, "continuation_claim_token", "") or ""
+            ),
+        }
+        valid = bool(
+            sealed_source is not None
+            and sealed_message_id
+            and event_message_id == sealed_message_id
+            and type(expected_resume_identity["continuation_generation"]) is int
+            and expected_resume_identity["continuation_generation"] > 0
+            and type(event_resume_identity["continuation_generation"]) is int
+            and event_resume_identity["continuation_generation"] > 0
+            and expected_resume_identity == event_resume_identity
+            and all(expected_resume_identity.values())
+            and canonical_resume_origin(sealed_source)
+            == canonical_resume_origin(source)
+        )
+        if not valid:
+            logger.warning(
+                "Refusing startup continuation for %s: leased origin or "
+                "continuation identity is not exact",
+                session_entry.session_key,
+            )
+            return False
+
+        analysis = self._analyze_startup_resume_rows(
+            history,
+            source_message_id=sealed_message_id,
+        )
+        disposition = str(analysis.get("disposition") or "unsafe_unknown")
+        if disposition == "terminal_checkpoint":
+            try:
+                await self.async_session_store.clear_resume_pending_exact(
+                    session_entry.session_key,
+                    **expected_resume_identity,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not settle terminal startup continuation for %s",
+                    session_entry.session_key,
+                    exc_info=True,
+                )
+            return False
+        if disposition != "continue":
+            logger.warning(
+                "Refusing startup continuation for %s: leased task slice is %s",
+                session_entry.session_key,
+                disposition,
+            )
+            return False
+
+        event_metadata["startup_safe_dangling_calls"] = list(
+            analysis.get("safe_dangling_calls") or []
+        )
+        event_metadata["startup_resume_effect_fence"] = dict(
+            analysis.get("effect_fence") or {}
+        )
+        event.metadata = event_metadata
+        for dangling in event_metadata["startup_safe_dangling_calls"]:
+            if not isinstance(dangling, dict):
+                continue
+            call_id = str(dangling.get("tool_call_id") or "")
+            tool_name = str(dangling.get("tool_name") or "")
+            if not call_id or not tool_name:
+                continue
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": tool_name,
+                    "content": (
+                        "Interrupted by gateway restart before a result was "
+                        "recorded. This tool is classified as no-effect; repeat "
+                        "the read/search if its result is still needed."
+                    ),
+                    "display_kind": "internal_notification",
+                }
+            )
+        return True
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
@@ -20988,9 +21416,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Validate or persist the exact source that owns this running turn.
 
-        ``preflight`` is deliberately read-only.  It lets ingress fail before
-        handing work to the agent when the source cannot possibly mint a marker;
-        the real marker is committed only by the post-user-row callback.
+        ``preflight`` is deliberately read-only. It lets ingress fail before
+        durable admission when the source cannot possibly mint a marker; the
+        real marker is committed immediately after the triggering user row.
         """
         source = event.source
         try:
@@ -21396,10 +21824,131 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # Freeze the reset flags without consuming or acting on them yet. The
+        # hooks, cache cleanup, notifications, skills, compression and inbound
+        # enrichment below are all downstream of durable turn authority.
+        _was_auto_reset = bool(getattr(session_entry, "was_auto_reset", False))
+        _is_fresh_reset = bool(getattr(session_entry, "is_fresh_reset", False))
+        _is_new_session = bool(
+            session_entry.created_at == session_entry.updated_at
+            or _was_auto_reset
+            or _is_fresh_reset
+        )
+        persist_user_display_kind = (
+            "internal_notification" if getattr(event, "internal", False) else None
+        )
+
+        # Session resolution is final. First serialize aliases in-process, then
+        # acquire the cross-process state.db lease. The latter remains held
+        # through gateway preprocessing, agent work and transcript flush.
+        _lease_registry = getattr(self, "_turn_leases", None)
+        if _lease_registry is not None:
+            _lease_token = await _lease_registry.acquire(
+                session_entry.session_id,
+                owner_key=_quick_key,
+                generation=run_generation,
+                timeout=_float_env(
+                    "HERMES_TURN_LEASE_TIMEOUT",
+                    DEFAULT_LEASE_WAIT,
+                ),
+            )
+            if _lease_token is not None:
+                _lease_state = self._session_state(_quick_key).turn
+                _lease_state.lease_token = _lease_token
+                _lease_state.lease_generation = run_generation
+
+        try:
+            triggering_platform_message_id = self._turn_platform_message_id(event)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Refusing turn %s: invalid platform message identity: %s",
+                session_entry.session_key,
+                exc,
+            )
+            return
+        if (
+            triggering_platform_message_id is None
+            and not bool(getattr(event, "internal", False))
+            and not bool(getattr(event, "startup_resume", False))
+        ):
+            logger.warning(
+                "Refusing external turn %s without a platform message id",
+                session_entry.session_key,
+            )
+            return
+        if not await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+            preflight=True,
+        ):
+            logger.warning(
+                "Refusing turn %s: active-turn source preflight failed",
+                session_entry.session_key,
+            )
+            return
+
+        durable_authority = await self._acquire_gateway_durable_turn_authority(
+            event,
+            source,
+            session_entry,
+            run_generation=run_generation,
+        )
+        history = await self.async_session_store.load_transcript(
+            session_entry.session_id
+        )
+        if not await self._validate_and_seal_startup_resume(
+            event,
+            source,
+            session_entry,
+            history,
+        ):
+            await self._release_gateway_durable_turn_authority(event)
+            return
+
+        # Ordinary input queued behind a required child is not a new active
+        # parent turn. Decide that from the leased snapshot before writing a
+        # user row or marker and before any media/plugin preprocessing.
+        if not bool(getattr(event, "internal", False)):
+            try:
+                parked = await self._park_user_event_for_parent_barrier(
+                    event=event,
+                    session_key=session_key,
+                    parent_session_id=str(session_entry.session_id or ""),
+                )
+            except Exception:
+                logger.exception("Could not inspect active parent-task barrier")
+                await self._release_gateway_durable_turn_authority(event)
+                return
+            if parked:
+                await self._release_gateway_durable_turn_authority(event)
+                return
+
+        precommitted_user_row_id: Optional[int] = None
+        if not bool(getattr(event, "startup_resume", False)):
+            precommitted_user_row_id = (
+                await self._persist_gateway_triggering_user_row(
+                    event,
+                    session_entry,
+                    durable_authority,
+                    platform_message_id=triggering_platform_message_id,
+                    display_kind=persist_user_display_kind,
+                )
+            )
+        if not await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+        ):
+            logger.warning(
+                "Refusing turn %s: durable active-turn marker commit failed",
+                session_entry.session_key,
+            )
+            await self._release_gateway_durable_turn_authority(event)
+            return
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
-        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
@@ -21418,14 +21967,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.was_auto_reset = False
         
         # Emit session:start for new or auto-reset sessions
-        _is_new_session = (
-            session_entry.created_at == session_entry.updated_at
-            or _was_auto_reset
-            or getattr(session_entry, "is_fresh_reset", False)
-        )
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
-        if getattr(session_entry, "is_fresh_reset", False):
+        if _is_fresh_reset:
             session_entry.is_fresh_reset = False
         if _is_new_session:
             await self.hooks.emit("session:start", {
@@ -21440,22 +21984,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        setattr(event, "_gateway_session_env_tokens", _session_env_tokens)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
-        # Synthetic self-injected turns (async-delegation batch completions,
-        # background watch notifications, resume wake-ups) arrive as
-        # MessageEvent(internal=True). Persist their user row typed with
-        # display_kind="internal_notification" so transcripts/UIs can render
-        # them as timeline notices instead of user bubbles (#82888). Role and
-        # content are untouched — display_kind is a DB-only sidecar stripped
-        # from every provider-bound payload (see conversation_loop's
-        # api_msg.pop("display_kind")).
-        persist_user_display_kind = (
-            "internal_notification" if getattr(event, "internal", False) else None
-        )
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -21599,227 +22133,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # ── Turn lease (#64934) ────────────────────────────────────────
-        # Session resolution is FINAL here (get_or_create → async-delegation
-        # pinning → topic tip-walk switch_session are all above). Serialize
-        # the [load history → run → flush] region per resolved SESSION_ID:
-        # when a second routing key is mapped to this same session_id, its
-        # turn waits here for the previous turn's flush instead of loading a
-        # stale history base and interleaving transcript writes. Same-key
-        # messages never reach this point mid-turn (adapter + runner guards
-        # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-closed on timeout: never enter the transcript region without a
-        # lease. Outer dispatch returns a bounded rejection/resend notice rather
-        # than recreating the exact concurrent-turn corruption this lease exists
-        # to prevent. Released in _handle_message's finally via
-        # _release_turn_lease — granted per (routing key, run generation) so a
-        # stale unwind can't release a newer turn's lease.
-        _lease_registry = getattr(self, "_turn_leases", None)
-        if _lease_registry is not None:
-            try:
-                _lease_token = await _lease_registry.acquire(
-                    session_entry.session_id,
-                    owner_key=_quick_key,
-                    generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
-                    ),
-                )
-            except TurnLeaseTimeoutError:
-                # The broad session-context cleanup finally starts later in this
-                # method. Restore the tokens here before propagating the rejection
-                # to outer dispatch, or this early exit leaks task-local identity.
-                self._clear_session_env(_session_env_tokens)
-                raise
-            if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
-
-        try:
-            triggering_platform_message_id = self._turn_platform_message_id(event)
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "Refusing turn %s: invalid platform message identity: %s",
-                session_entry.session_key,
-                exc,
-            )
-            self._clear_session_env(_session_env_tokens)
-            return
-
-        # Fail fast on a source/key mismatch without writing recovery authority.
-        # The real marker is committed later by ``after_user_row_commit`` after
-        # the exact user row has landed in state.db.
-        if not await self._mark_durable_active_turn(
-            event,
-            session_entry.session_key,
-            preflight=True,
-        ):
-            logger.warning(
-                "Refusing turn %s: active-turn source preflight failed",
-                session_entry.session_key,
-            )
-            self._clear_session_env(_session_env_tokens)
-            return
-
-        marker_loop = asyncio.get_running_loop()
-        marker_once_lock = threading.Lock()
-        marker_fired = [False]
-
-        def _after_user_row_commit() -> bool:
-            """Bridge the agent worker's durable-row boundary to the loop."""
-
-            with marker_once_lock:
-                if marker_fired[0]:
-                    return False
-                marker_fired[0] = True
-            future = asyncio.run_coroutine_threadsafe(
-                self._mark_durable_active_turn(
-                    event,
-                    session_entry.session_key,
-                ),
-                marker_loop,
-            )
-            try:
-                return bool(future.result(timeout=30.0))
-            except Exception:
-                future.cancel()
-                logger.warning(
-                    "Post-user-row active marker failed for %s",
-                    session_entry.session_key,
-                    exc_info=True,
-                )
-                return False
-
-        # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
-        if bool(getattr(event, "startup_resume", False)):
-            # The per-session turn lease above owns the sole authoritative
-            # transcript snapshot.  Revalidate the sealed continuation identity
-            # and derive every replay capability from this same loaded object
-            # before arming the active marker or entering the model/tool loop.
-            sealed_source = resume_origin_from_snapshot(session_entry)
-            sealed_message_id = (
-                str(getattr(sealed_source, "message_id", "") or "").strip()
-                if sealed_source is not None
-                else ""
-            )
-            event_message_id = str(getattr(event, "message_id", "") or "").strip()
-            expected_resume_identity = {
-                "resume_task_id": str(
-                    getattr(session_entry, "resume_task_id", "") or ""
-                ),
-                "continuation_generation": getattr(
-                    session_entry,
-                    "continuation_generation",
-                    0,
-                ),
-                "continuation_claim_owner": str(
-                    getattr(session_entry, "continuation_claim_owner", "") or ""
-                ),
-                "continuation_claim_token": str(
-                    getattr(session_entry, "continuation_claim_token", "") or ""
-                ),
-            }
-            event_resume_identity = {
-                "resume_task_id": str(getattr(event, "resume_task_id", "") or ""),
-                "continuation_generation": getattr(
-                    event,
-                    "continuation_generation",
-                    0,
-                ),
-                "continuation_claim_owner": str(
-                    getattr(event, "continuation_claim_owner", "") or ""
-                ),
-                "continuation_claim_token": str(
-                    getattr(event, "continuation_claim_token", "") or ""
-                ),
-            }
-            _startup_identity_valid = bool(
-                sealed_source is not None
-                and sealed_message_id
-                and event_message_id == sealed_message_id
-                and type(expected_resume_identity["continuation_generation"])
-                is int
-                and expected_resume_identity["continuation_generation"] > 0
-                and type(event_resume_identity["continuation_generation"])
-                is int
-                and event_resume_identity["continuation_generation"] > 0
-                and expected_resume_identity == event_resume_identity
-                and all(expected_resume_identity.values())
-                and canonical_resume_origin(sealed_source)
-                == canonical_resume_origin(source)
-            )
-            if not _startup_identity_valid:
-                logger.warning(
-                    "Refusing startup continuation for %s: leased origin or "
-                    "continuation identity is not exact",
-                    session_entry.session_key,
-                )
-                self._clear_session_env(_session_env_tokens)
-                return
-
-            analysis = self._analyze_startup_resume_rows(
-                history,
-                source_message_id=sealed_message_id,
-            )
-            disposition = str(analysis.get("disposition") or "unsafe_unknown")
-            if disposition == "terminal_checkpoint":
-                try:
-                    await self.async_session_store.clear_resume_pending_exact(
-                        session_entry.session_key,
-                        **expected_resume_identity,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Could not settle terminal startup continuation for %s",
-                        session_entry.session_key,
-                        exc_info=True,
-                    )
-                self._clear_session_env(_session_env_tokens)
-                return
-            if disposition != "continue":
-                logger.warning(
-                    "Refusing startup continuation for %s: leased task slice "
-                    "is %s",
-                    session_entry.session_key,
-                    disposition,
-                )
-                self._clear_session_env(_session_env_tokens)
-                return
-
-            # Publish only the leased analysis; scheduler admission carries no
-            # transcript-derived capability.
-            event_metadata["startup_safe_dangling_calls"] = list(
-                analysis.get("safe_dangling_calls") or []
-            )
-            event_metadata["startup_resume_effect_fence"] = dict(
-                analysis.get("effect_fence") or {}
-            )
-            event.metadata = event_metadata
-
-            safe_dangling_calls = event_metadata.get("startup_safe_dangling_calls") or []
-            for dangling in safe_dangling_calls:
-                if not isinstance(dangling, dict):
-                    continue
-                call_id = str(dangling.get("tool_call_id") or "")
-                tool_name = str(dangling.get("tool_name") or "")
-                if not call_id or not tool_name:
-                    continue
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "tool_name": tool_name,
-                        "content": (
-                            "Interrupted by gateway restart before a result was "
-                            "recorded. This tool is classified as no-effect; "
-                            "repeat the read/search if its result is still needed."
-                        ),
-                        "display_kind": "internal_notification",
-                    }
-                )
-        
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
@@ -22127,6 +22440,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
+                                if precommitted_user_row_id is not None:
+                                    # Hygiene summarizes the leased pre-turn
+                                    # snapshot, which intentionally excludes
+                                    # the newly committed authority row. Keep
+                                    # that row above the compaction watermark;
+                                    # archive_and_compact then clones it as the
+                                    # exact active tail after the summary.
+                                    _hyg_agent._compression_commit_watermark_ceiling = (
+                                        precommitted_user_row_id - 1
+                                    )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
                                     _hyg_session_row,
@@ -22722,6 +23045,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
         )
         if message_text is None:
+            # The broad turn cleanup starts below this preprocessing phase.
+            # Restore task-local identity on this sole early exit after
+            # _set_session_env; durable marker/lease cleanup remains owned by
+            # _handle_message's outer finally.
+            self._clear_event_session_env(event)
             return
 
         # Capture the platform event time as message metadata and keep the
@@ -22762,22 +23090,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
-        # Ordinary user input is parked behind an active required-child
-        # continuation instead of cancelling it or entering the wrong root turn.
-        # Explicit /stop, /new, and /reset are handled by the existing command
-        # paths before this point and still cancel child + barrier ownership.
-        if not bool(getattr(event, "internal", False)):
-            try:
-                parked = await self._park_user_event_for_parent_barrier(
-                    event=event,
-                    session_key=session_key,
-                    parent_session_id=str(session_entry.session_id or ""),
-                )
-            except Exception:
-                logger.exception("Could not inspect active parent-task barrier")
-                return
-            if parked:
-                return
+        # The raw transport payload already owns the durable row + active
+        # marker.  Backfill STT/vision/adapter preparation now, while the same
+        # cross-process lease is still held and before any model-facing hook.
+        precommitted_user_row_id = await self._enrich_gateway_triggering_user_row(
+            session_entry,
+            durable_authority,
+            precommitted_user_row_id,
+            content=(
+                persist_user_message
+                if persist_user_message is not None
+                else message_text
+            ),
+            platform_message_id=triggering_platform_message_id,
+        )
 
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
@@ -22933,7 +23259,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bool(getattr(event, "startup_resume", False))
                     else triggering_platform_message_id
                 ),
-                after_user_row_commit=_after_user_row_commit,
+                after_user_row_commit=None,
+                precommitted_authority=True,
+                precommitted_user_row_id=precommitted_user_row_id,
+                durable_turn_authority=durable_authority,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 startup_resume=bool(getattr(event, "startup_resume", False)),
@@ -23834,7 +24163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, run_generation
             )
             # Restore session context variables to their pre-handler state
-            self._clear_session_env(_session_env_tokens)
+            self._clear_event_session_env(event)
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
@@ -27424,6 +27753,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
+
+    def _clear_event_session_env(self, event: "MessageEvent") -> bool:
+        """Restore per-event context once, including pre-agent fault paths."""
+        tokens = getattr(event, "_gateway_session_env_tokens", None)
+        if tokens is None:
+            return False
+        # Consume before reset so outer cleanup is idempotent even if resetting
+        # one malformed token raises.
+        setattr(event, "_gateway_session_env_tokens", None)
+        self._clear_session_env(tokens)
+        return True
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
@@ -31299,6 +31639,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_message_id: Optional[str] = None,
         after_user_row_commit: Optional[Callable[[], bool]] = None,
+        precommitted_authority: bool = False,
+        precommitted_user_row_id: Optional[int] = None,
+        durable_turn_authority: Optional[Dict[str, Any]] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
@@ -31325,6 +31668,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_message_id=persist_user_message_id,
                 after_user_row_commit=after_user_row_commit,
+                precommitted_authority=precommitted_authority,
+                precommitted_user_row_id=precommitted_user_row_id,
+                durable_turn_authority=durable_turn_authority,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
@@ -31346,6 +31692,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_message_id=persist_user_message_id,
                 after_user_row_commit=after_user_row_commit,
+                precommitted_authority=precommitted_authority,
+                precommitted_user_row_id=precommitted_user_row_id,
+                durable_turn_authority=durable_turn_authority,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 startup_resume=startup_resume,
@@ -31504,6 +31853,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_message_id: Optional[str] = None,
         after_user_row_commit: Optional[Callable[[], bool]] = None,
+        precommitted_authority: bool = False,
+        precommitted_user_row_id: Optional[int] = None,
+        durable_turn_authority: Optional[Dict[str, Any]] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         startup_resume: bool = False,
@@ -31870,6 +32222,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             persist_user_message_id=persist_user_message_id,
             after_user_row_commit=after_user_row_commit,
+            precommitted_authority=precommitted_authority,
+            precommitted_user_row_id=precommitted_user_row_id,
+            durable_turn_authority=durable_turn_authority,
             persist_user_display_kind=persist_user_display_kind,
             startup_resume=startup_resume,
             startup_resume_effect_fence=dict(

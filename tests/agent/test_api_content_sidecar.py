@@ -281,6 +281,40 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
+    def test_legacy_authority_callback_still_backfills_committed_row(self):
+        """The retained callback lane must keep its original sidecar contract."""
+        agent = _FakeAgent()
+        agent._session_db_created = True
+        agent._session_db = MagicMock()
+        agent._session_db.set_latest_user_api_content.return_value = 1
+
+        def _persist(messages, _history=None):
+            messages[-1]["_db_persisted"] = True
+            messages[-1]["_row_id"] = 7
+
+        agent._persist_session = MagicMock(side_effect=_persist)
+        marker = MagicMock(return_value=True)
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(
+                agent,
+                persist_user_message_id="telegram:legacy-1",
+                after_user_row_commit=marker,
+            )
+
+        marker.assert_called_once_with()
+        assert ctx.messages[ctx.current_turn_user_idx]["api_content"] == (
+            "hello\n\nPLUGIN-CTX"
+        )
+        agent._session_db.set_latest_user_api_content.assert_called_once_with(
+            "sess-1",
+            "hello",
+            "hello\n\nPLUGIN-CTX",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)

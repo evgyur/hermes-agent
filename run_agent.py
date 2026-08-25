@@ -8668,6 +8668,8 @@ class AIAgent:
         persist_user_timestamp: Optional[float] = None,
         persist_user_message_id: Optional[str] = None,
         after_user_row_commit: Optional[callable] = None,
+        precommitted_authority: bool = False,
+        precommitted_user_row_id: Optional[int] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -8716,6 +8718,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        durable_turn_lease_owned_here = False
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8763,6 +8766,52 @@ class AIAgent:
             # process; this durable lease covers Desktop, CLI resume, gateway,
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
+            _external_turn_lease = bool(
+                getattr(
+                    self,
+                    "_gateway_preacquired_session_turn_lease_external",
+                    False,
+                )
+            )
+            _external_holder = getattr(
+                self,
+                "_gateway_preacquired_session_turn_lease_holder",
+                None,
+            )
+            _external_session_id = getattr(
+                self,
+                "_gateway_preacquired_session_turn_lease_session_id",
+                None,
+            )
+            if _external_turn_lease:
+                if (
+                    _turn_db is None
+                    or not session_id
+                    or _external_session_id != session_id
+                    or not _external_holder
+                ):
+                    raise RuntimeError(
+                        "gateway pre-acquired session turn lease is invalid"
+                    )
+                _external_ttl = float(
+                    getattr(
+                        self,
+                        "_gateway_preacquired_session_turn_lease_ttl_seconds",
+                        300.0,
+                    )
+                    or 300.0
+                )
+                if not _turn_db.refresh_session_turn_lease(
+                    session_id,
+                    _external_holder,
+                    ttl_seconds=_external_ttl,
+                ):
+                    raise RuntimeError(
+                        "gateway pre-acquired session turn lease was lost"
+                    )
+                durable_turn_lease = _external_holder
+                self._active_session_turn_lease_holder = _external_holder
+                self._active_session_turn_lease_ttl_seconds = _external_ttl
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -8785,6 +8834,7 @@ class AIAgent:
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
+                and not _external_turn_lease
                 # A fresh session id is process-unique and has no durable
                 # transcript to race over. More importantly, subagent/new-turn
                 # callers may intentionally supply an in-memory seed before the
@@ -8897,6 +8947,7 @@ class AIAgent:
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
+                durable_turn_lease_owned_here = True
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
                 if _lease_waited:
@@ -9044,6 +9095,8 @@ class AIAgent:
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_message_id=persist_user_message_id,
                         after_user_row_commit=after_user_row_commit,
+                        precommitted_authority=precommitted_authority,
+                        precommitted_user_row_id=precommitted_user_row_id,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
@@ -9111,7 +9164,7 @@ class AIAgent:
                     # the inner stop and this join. Must run AFTER join so a
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
-                    if durable_turn_lease is not None:
+                    if durable_turn_lease is not None and durable_turn_lease_owned_here:
                         try:
                             _turn_db.release_session_turn_lease(
                                 session_id, durable_turn_lease
@@ -9122,12 +9175,13 @@ class AIAgent:
                                 session_id,
                                 exc_info=True,
                             )
-                        if (
-                            getattr(self, "_active_session_turn_lease_holder", None)
-                            == durable_turn_lease
-                        ):
-                            self._active_session_turn_lease_holder = None
-                            self._active_session_turn_lease_ttl_seconds = None
+                    if (
+                        durable_turn_lease is not None
+                        and getattr(self, "_active_session_turn_lease_holder", None)
+                        == durable_turn_lease
+                    ):
+                        self._active_session_turn_lease_holder = None
+                        self._active_session_turn_lease_ttl_seconds = None
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

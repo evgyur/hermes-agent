@@ -99,6 +99,12 @@ class TurnContext:
     # One-shot sync bridge invoked only after that user dict is durably marked.
     # It commits the active-turn origin snapshot on the gateway event loop.
     after_user_row_commit: Optional[Callable[[], bool]] = None
+    # Gateway already committed the triggering row and active snapshot before
+    # entering any hook, enrichment, compressor, memory or agent code.
+    precommitted_authority: bool = False
+    precommitted_user_row_id: Optional[int] = None
+    # Cross-process lease acquired by the gateway and held through the turn.
+    durable_turn_authority: Optional[dict] = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications
