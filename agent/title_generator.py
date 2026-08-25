@@ -21,12 +21,12 @@ import json
 import logging
 import re
 import threading
+from contextvars import copy_context
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.message_content import flatten_message_text
-from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,14 @@ MAX_TITLE_INPUT_CHARS = 1000
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
 # Codex CLI independently landed on the same ~50-char slice.
 MAX_DERIVED_TITLE_CHARS = 48
+
+# Upper bound on accepted title word count. Titling is a 3-7 word task; a
+# small tiny-model sometimes ignores the task and answers the user's message
+# instead — that answer must never become the session title (see the
+# answer-shaped output guard in generate_title; port of
+# can1357/oh-my-pi#7306). 12 leaves headroom for legitimate wordy titles
+# while excluding full-sentence answers.
+_MAX_TITLE_WORDS = 12
 
 _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
@@ -405,7 +413,22 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
+        title = _clean_title(_extract_title_text(content))
+        # Answer-shaped output guard: titling is a 3-7 word task, so a title
+        # with many words is a model that ignored the task and answered
+        # the user's message instead ("I don't have context on X — that's
+        # not something I recognize..."). Truncating would store half an
+        # assistant blob as the session title, which is still an assistant
+        # blob — reject instead so the caller retries on the next exchange
+        # (maybe_auto_title fires for the first two exchanges).
+        # Port of can1357/oh-my-pi#7306.
+        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
+            logger.debug(
+                "Rejecting answer-shaped title output (%d words > %d)",
+                len(title.split()), _MAX_TITLE_WORDS,
+            )
+            return None
+        return title
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -725,9 +748,15 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    # ``threading.Thread`` starts with a fresh Context.  In a multiplexed
+    # gateway that drops the active profile's secret/HERMES_HOME scopes and
+    # makes the auxiliary model call fail closed as an unscoped credential
+    # read.  Capture the current turn context while it is still authoritative
+    # and enter that exact snapshot in the daemon worker.
+    context = copy_context()
     thread = threading.Thread(
-        target=propagate_context_to_thread(auto_title_session),
-        args=(session_db, session_id, user_message),
+        target=context.run,
+        args=(auto_title_session, session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

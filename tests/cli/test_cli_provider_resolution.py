@@ -123,6 +123,93 @@ def _import_cli():
     return importlib.import_module("cli")
 
 
+def test_provider_flag_uses_named_custom_default_model(monkeypatch):
+    """`--provider <custom>` without `-m` uses that entry's default_model (#86978)."""
+    cli = _import_cli()
+    monkeypatch.setitem(
+        cli.CLI_CONFIG,
+        "model",
+        {"default": "tencent/hy3:free", "provider": "nous"},
+    )
+    config = {
+        "model": {"default": "tencent/hy3:free", "provider": "nous"},
+        "providers": {
+            "gmk-lan": {
+                "name": "GMK Local",
+                "base_url": "http://gmk.lan:9931/v1",
+                "api_key": "not-needed",
+                "default_model": "/models/gemma.gguf",
+            }
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+
+    shell = cli.HermesCLI(provider="gmk-lan", compact=True, max_turns=1)
+
+    assert shell.model == "/models/gemma.gguf"
+    assert shell.requested_provider == "gmk-lan"
+
+
+def test_explicit_model_wins_over_provider_default_model(monkeypatch):
+    """`-m` still wins when `--provider` also names a custom default_model."""
+    cli = _import_cli()
+    monkeypatch.setitem(
+        cli.CLI_CONFIG,
+        "model",
+        {"default": "tencent/hy3:free", "provider": "nous"},
+    )
+    config = {
+        "model": {"default": "tencent/hy3:free", "provider": "nous"},
+        "providers": {
+            "gmk-lan": {
+                "name": "GMK Local",
+                "base_url": "http://gmk.lan:9931/v1",
+                "api_key": "not-needed",
+                "default_model": "/models/gemma.gguf",
+            }
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+
+    shell = cli.HermesCLI(
+        provider="gmk-lan",
+        model="explicit-id",
+        compact=True,
+        max_turns=1,
+    )
+
+    assert shell.model == "explicit-id"
+
+
+def test_provider_flag_logs_when_custom_default_model_cannot_resolve(monkeypatch, caplog):
+    """A named --provider that fails to resolve must not fail silently."""
+    cli = _import_cli()
+    monkeypatch.setitem(
+        cli.CLI_CONFIG,
+        "model",
+        {"default": "tencent/hy3:free", "provider": "nous"},
+    )
+
+    def _boom(_name):
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._get_named_custom_provider",
+        _boom,
+    )
+
+    with caplog.at_level("WARNING"):
+        shell = cli.HermesCLI(provider="gmk-lan", compact=True, max_turns=1)
+
+    assert shell.model == "tencent/hy3:free"
+    assert any(
+        "gmk-lan" in rec.getMessage() and "catalog unavailable" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 def test_hermes_cli_init_does_not_eagerly_resolve_runtime_provider(monkeypatch):
     cli = _import_cli()
     calls = {"count": 0}
@@ -188,63 +275,6 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     assert result["runtime"]["provider"] == "openrouter"
 
 
-def test_cli_turn_routing_forces_sco_to_openrouter_opus_without_mutating_session(
-    monkeypatch,
-):
-    cli = _import_cli()
-
-    calls = []
-
-    def _runtime_resolve(*, requested, target_model):
-        calls.append((requested, target_model))
-        return {
-            "provider": "openrouter",
-            "requested_provider": "openrouter",
-            "api_mode": "chat_completions",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "openrouter-test-key",
-        }
-
-    monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        _runtime_resolve,
-    )
-    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
-    shell.provider = "openai-codex"
-    shell.requested_provider = "openai-codex"
-    shell.api_mode = "codex_responses"
-    shell.base_url = "https://chatgpt.com/backend-api/codex"
-    shell.api_key = "current-session-key"
-    loaded_sco = (
-        '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
-        "you to follow its instructions. The full skill content is loaded below.]"
-    )
-
-    result = shell._resolve_turn_agent_config(loaded_sco)
-
-    assert calls == [("openrouter", "anthropic/claude-opus-5")]
-    assert result["model"] == "anthropic/claude-opus-5"
-    assert result["runtime"]["provider"] == "openrouter"
-    assert result["runtime"]["requested_provider"] == "openrouter"
-    assert result["disable_fallbacks"] is True
-    assert shell.model == "gpt-5"
-    assert shell.provider == "openai-codex"
-
-
-def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):
-    cli = _import_cli()
-
-    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
-    config_copy = dict(cli.CLI_CONFIG)
-    model_copy = dict(config_copy.get("model", {}))
-    model_copy["provider"] = "custom"
-    model_copy["base_url"] = "https://api.fireworks.ai/inference/v1"
-    config_copy["model"] = model_copy
-    monkeypatch.setattr(cli, "CLI_CONFIG", config_copy)
-
-    shell = cli.HermesCLI(model="fireworks/minimax-m2p5", compact=True, max_turns=1)
-
-    assert shell.requested_provider == "custom"
 
 
 

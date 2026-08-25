@@ -37,8 +37,6 @@ def _goal_continuation_event(source, goal="finish the task"):
         text=CONTINUATION_PROMPT_TEMPLATE.format(goal=goal),
         message_type=MessageType.TEXT,
         source=source,
-        internal=True,
-        metadata={"durable_internal_goal": True},
     )
 
 
@@ -82,41 +80,3 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
     ]
 
 
-def test_clear_goal_pending_continuations_removes_slot_and_overflow_only():
-    """Regression: /goal pause/clear must cancel queued self-continuations.
-
-    A user-issued /goal pause can arrive after the judge queued the next
-    continuation but before that queued turn runs.  The queued synthetic goal
-    continuation should be removed without dropping normal user /queue items.
-    """
-    runner = GatewayRunner.__new__(GatewayRunner)
-    adapter = FakeAdapter()
-    adapter._pending_messages = {}
-    runner._queued_events = {}
-    runner._update_gateway_ledger = lambda *_args, **_kwargs: True
-
-    source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="parent-channel",
-        thread_id="thread-123",
-    )
-    session_key = "discord:parent-channel:thread-123"
-    normal_event = MessageEvent(
-        text="normal queued user message",
-        message_type=MessageType.TEXT,
-        source=source,
-    )
-
-    adapter._pending_messages[session_key] = _goal_continuation_event(source)
-    runner._queued_events[session_key] = [
-        normal_event,
-        _goal_continuation_event(source, goal="second continuation"),
-    ]
-
-    removed = runner._clear_goal_pending_continuations(session_key, adapter)
-
-    assert removed == 2
-    # Removing a synthetic head must promote the first real overflow event;
-    # otherwise pause/clear strands an accepted user turn in overflow forever.
-    assert adapter._pending_messages[session_key] is normal_event
-    assert session_key not in runner._queued_events

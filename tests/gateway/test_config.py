@@ -397,6 +397,25 @@ class TestLoadGatewayConfig:
 
         assert config.multiplex_profiles is True
 
+    def test_multiplex_allowlist_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "  multiplex_profile_allowlist:\n"
+            "    - Worker\n"
+            "    - worker\n"
+            "    - guest\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.multiplex_profiles is True
+        assert config.multiplex_profile_allowlist == ["worker", "guest"]
+
     def test_discord_websocket_health_settings_seed_platform_extra(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -667,6 +686,194 @@ class TestLoadGatewayConfig:
         assert Platform.RELAY in config.get_connected_platforms()
 
 
+    def test_relay_env_url_disables_other_messaging_platforms(self, tmp_path, monkeypatch):
+        """A GATEWAY_RELAY_URL env stamp means the connector owns all platform
+        connections: directly-connected messaging platforms must be disabled,
+        even when explicitly enabled in config.yaml, while non-messaging
+        surfaces (api_server et al.) survive."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      enabled: true\n"
+            "      bot_token: '123:abc'\n"
+            "    api_server:\n"
+            "      enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("GATEWAY_RELAY_URL", "https://connector.example/relay")
+        # Credential-based auto-enable path must be suppressed too.
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "fake-token-for-test")
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.RELAY].enabled is True
+        assert config.platforms[Platform.TELEGRAM].enabled is False
+        discord_cfg = config.platforms.get(Platform.DISCORD)
+        assert discord_cfg is None or discord_cfg.enabled is False
+        # Non-messaging surfaces are untouched.
+        assert config.platforms[Platform.API_SERVER].enabled is True
+
+
+    def test_relay_yaml_url_keeps_other_platforms_enabled(self, tmp_path, monkeypatch):
+        """gateway.relay_url in config.yaml (no env stamp) keeps the old
+        additive behavior: relay runs beside directly-connected platforms."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    relay:\n"
+            "      enabled: true\n"
+            "      extra:\n"
+            "        relay_url: https://connector.example/relay\n"
+            "    telegram:\n"
+            "      enabled: true\n"
+            "      bot_token: '123:abc'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("GATEWAY_RELAY_URL", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.RELAY].enabled is True
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+
+
+    def test_relay_env_url_opt_out_keeps_direct_platforms(self, tmp_path, monkeypatch):
+        """GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true opts a deployment out of
+        the relay-exclusive sweep: direct adapters stay enabled beside the
+        relay even with the GATEWAY_RELAY_URL env stamp present."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      enabled: true\n"
+            "      bot_token: '123:abc'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("GATEWAY_RELAY_URL", "https://connector.example/relay")
+        monkeypatch.setenv("GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS", "true")
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.RELAY].enabled is True
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+
+
+    def test_relay_exclusive_reads_profile_scoped_env(self, tmp_path, monkeypatch):
+        """GATEWAY_RELAY_URL is a process-global deployment stamp (like the
+        API_SERVER listener vars, #69379): the scoped runner reload in a
+        multiplexed gateway must keep seeing it, so config's relay enablement
+        and sweep agree with gateway.relay.relay_url()/register_relay_adapter()
+        (which read os.environ). A secondary profile's .env stamp does NOT
+        override the shared process stamp — an isolated multiplex scope is
+        never consulted for globals. (A single-profile gateway, or the profile
+        the process is launched under, still activates via its .env because
+        load_hermes_dotenv exports that file into os.environ at startup.)"""
+        from agent import secret_scope as ss
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      enabled: true\n"
+            "      bot_token: '123:abc'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        # Managed-deploy stamp in the process env; the profile .env has none.
+        monkeypatch.setenv("GATEWAY_RELAY_URL", "https://deploy.example/relay")
+
+        profile_dir = tmp_path / "profile-a"
+        profile_dir.mkdir()
+        (profile_dir / ".env").write_text("", encoding="utf-8")
+
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope(ss.build_profile_secret_scope(profile_dir))
+        try:
+            config = load_gateway_config()
+        finally:
+            ss.reset_secret_scope(tok)
+            ss.set_multiplex_active(False)
+
+        # The deploy stamp survives the profile scope: relay enabled, sweep
+        # ran — matching what register_relay_adapter() sees in os.environ.
+        assert config.platforms[Platform.RELAY].enabled is True
+        assert config.platforms[Platform.TELEGRAM].enabled is False
+
+        # A profile-only stamp does NOT activate relay: globals read only the
+        # process env, so config and the relay transport can never disagree.
+        monkeypatch.delenv("GATEWAY_RELAY_URL", raising=False)
+        (profile_dir / ".env").write_text(
+            "GATEWAY_RELAY_URL=https://profile.example/relay\n", encoding="utf-8"
+        )
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope(ss.build_profile_secret_scope(profile_dir))
+        try:
+            config = load_gateway_config()
+        finally:
+            ss.reset_secret_scope(tok)
+            ss.set_multiplex_active(False)
+
+        relay_cfg = config.platforms.get(Platform.RELAY)
+        assert relay_cfg is None or relay_cfg.enabled is False
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+
+
+    def test_relay_exclusive_sweep_log_levels_and_marker_cleanup(self, tmp_path, monkeypatch, caplog):
+        """Explicitly-enabled platforms are disabled at WARNING, auto-enabled
+        ones at INFO, and the _enabled_explicit marker never survives config
+        load."""
+        import logging as _logging
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      enabled: true\n"
+            "      bot_token: '123:abc'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("GATEWAY_RELAY_URL", "https://connector.example/relay")
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "fake-token-for-test")
+
+        with caplog.at_level(_logging.INFO, logger="gateway.config"):
+            config = load_gateway_config()
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING and "telegram" in r.getMessage()
+        ]
+        assert warnings, "explicit platform must be disabled at WARNING"
+        discord_infos = [
+            r for r in caplog.records
+            if r.levelno == _logging.INFO and "discord" in r.getMessage()
+        ]
+        if config.platforms.get(Platform.DISCORD) is not None:
+            assert discord_infos, "auto-enabled platform must be disabled at INFO"
+
+        for pc in config.platforms.values():
+            assert "_enabled_explicit" not in (pc.extra or {})
+
+
     def test_thread_require_mention_yaml_does_not_overwrite_env(self, tmp_path, monkeypatch):
         """Explicit env var should win over config.yaml (env > yaml precedence)."""
         hermes_home = tmp_path / ".hermes"
@@ -788,274 +995,6 @@ class TestLoadGatewayConfig:
             "bridged into PlatformConfig.extra by the shared-key loop"
         )
 
-    def test_shared_key_loop_bridges_allow_from_from_nested_gateway_platforms(self, tmp_path, monkeypatch):
-        """Same regression check for ``gateway.platforms:`` path."""
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "gateway:\n"
-            "  platforms:\n"
-            "    telegram:\n"
-            "      allow_from:\n"
-            "        - \"777888999\"\n"
-            "      require_mention: false\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        telegram = config.platforms[Platform.TELEGRAM]
-        assert telegram.extra.get("allow_from") == ["777888999"], (
-            "allow_from configured under plugins.platforms.telegram.adapter must be "
-            "bridged into PlatformConfig.extra by the shared-key loop"
-        )
-        assert telegram.extra.get("require_mention") is False
-
-    def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "session_reset:\n"
-            "  notify: \"false\"\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.default_reset_policy.notify is False
-
-    def test_bridges_quoted_false_always_log_local_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "always_log_local: \"false\"\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.always_log_local is False
-
-    def test_bridges_discord_channel_overrides_from_top_level_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "discord:\n"
-            "  channel_overrides:\n"
-            '    "1234567890":\n'
-            "      model: openrouter/healer-alpha\n"
-            "      provider: openrouter\n"
-            "      system_prompt: Daily news summarizer\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        discord = config.platforms[Platform.DISCORD]
-        assert "1234567890" in discord.channel_overrides
-        ov = discord.channel_overrides["1234567890"]
-        assert ov.model == "openrouter/healer-alpha"
-        assert ov.provider == "openrouter"
-        assert ov.system_prompt == "Daily news summarizer"
-
-    def test_bridges_discord_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "discord:\n"
-            "  channel_prompts:\n"
-            "    \"123\": Research mode\n"
-            "    456: Therapist mode\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.platforms[Platform.DISCORD].extra["channel_prompts"] == {
-            "123": "Research mode",
-            "456": "Therapist mode",
-        }
-
-    def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "discord:\n"
-            "  history_backfill: true\n"
-            "  history_backfill_limit: 17\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("DISCORD_HISTORY_BACKFILL", raising=False)
-        monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_LIMIT", raising=False)
-
-        load_gateway_config()
-
-        assert os.getenv("DISCORD_HISTORY_BACKFILL") == "true"
-        assert os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT") == "17"
-
-    def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "telegram:\n"
-            "  channel_prompts:\n"
-            '    "-1001234567": Research assistant\n'
-            "    789: Creative writing\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.platforms[Platform.TELEGRAM].extra["channel_prompts"] == {
-            "-1001234567": "Research assistant",
-            "789": "Creative writing",
-        }
-
-    def test_bridges_telegram_auto_skill_routes_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "telegram:\n"
-            "  auto_skill_routes:\n"
-            "    - skill: tg\n"
-            "      chats:\n"
-            '        - "-1001234567"\n'
-            "      match:\n"
-            "        urls: true\n"
-            "        media:\n"
-            "          - photo\n"
-            "          - video\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.platforms[Platform.TELEGRAM].extra["auto_skill_routes"] == [
-            {
-                "skill": "tg",
-                "chats": ["-1001234567"],
-                "match": {"urls": True, "media": ["photo", "video"]},
-            }
-        ]
-
-    def test_bridges_slack_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "slack:\n"
-            "  channel_prompts:\n"
-            '    "C01ABC": Code review mode\n',
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.platforms[Platform.SLACK].extra["channel_prompts"] == {
-            "C01ABC": "Code review mode",
-        }
-
-    def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "feishu:\n  allow_bots: mentions\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("FEISHU_ALLOW_BOTS", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("FEISHU_ALLOW_BOTS") == "mentions"
-
-    def test_feishu_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "feishu:\n  allow_bots: all\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("FEISHU_ALLOW_BOTS", "none")
-
-        load_gateway_config()
-
-        assert os.environ.get("FEISHU_ALLOW_BOTS") == "none"
-
-    def test_bridges_telegram_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "telegram:\n  allow_bots: mentions\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("TELEGRAM_ALLOW_BOTS", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "mentions"
-
-    def test_telegram_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "telegram:\n  allow_bots: all\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "none")
-
-        load_gateway_config()
-
-        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "none"
-
-    def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text("quick_commands: not-a-mapping\n", encoding="utf-8")
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.quick_commands == {}
 
     def test_bridges_unauthorized_dm_behavior_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"

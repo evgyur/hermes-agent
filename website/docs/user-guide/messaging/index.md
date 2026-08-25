@@ -520,14 +520,15 @@ When the agent running a background session uses `terminal(background=true)` to 
 
 ```yaml
 display:
-  background_process_notifications: all    # all | result | error | off
+  background_process_notifications: concise    # concise | all | result | error | off
 ```
 
 | Mode | What you receive |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
-| `result` | Only the final completion message (regardless of exit code) |
-| `error` | Only the final message when the exit code is non-zero |
+| `concise` | One-line status message on completion; failures append a short output tail (default) |
+| `all` | Running-output updates **and** the final raw-output message |
+| `result` | Only the final raw-output completion message (regardless of exit code) |
+| `error` | Only the final raw-output message when the exit code is non-zero |
 | `off` | No process watcher messages at all |
 
 You can also set this via environment variable:
@@ -753,7 +754,15 @@ display:
       # Or quiet them entirely
       interim_assistant_messages: false
       long_running_notifications: false
+      # Optional deterministic fallback when a tool turn has no commentary
+      start_ack_text: "↳ Принял. Начинаю проверку."
+      start_ack_mode: required
 ```
+
+`start_ack_text` is empty by default. When configured, it is sent once before
+the first tool effect only if the model has not already emitted visible
+commentary. It retains the triggering chat/topic/reply metadata and remains
+separate from busy-steering acknowledgments and long-running heartbeats.
 
 ### Progress bubble cleanup (opt-in)
 

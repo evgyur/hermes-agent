@@ -171,17 +171,6 @@ _PLATFORM_MAP = {
     "windows": "win32",
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EXCLUDED_SKILL_DIRS = frozenset(
-    (
-        ".git",
-        ".github",
-        ".hub",
-        ".archive",
-        ".sync-backups",
-        "node_modules",
-        "vendor",
-    )
-)
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
@@ -681,56 +670,6 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _extract_skill_tags(frontmatter: Dict[str, Any]) -> List[str]:
-    """Return normalized searchable tags from skill frontmatter."""
-    metadata = frontmatter.get("metadata")
-    if isinstance(metadata, dict):
-        hermes_meta = metadata.get("hermes")
-        if isinstance(hermes_meta, dict):
-            tags = _parse_tags(hermes_meta.get("tags"))
-            if tags:
-                return tags
-    return _parse_tags(frontmatter.get("tags"))
-
-
-def _extract_related_skills(frontmatter: Dict[str, Any]) -> List[str]:
-    """Return normalized searchable related-skill names from frontmatter."""
-    metadata = frontmatter.get("metadata")
-    if isinstance(metadata, dict):
-        hermes_meta = metadata.get("hermes")
-        if isinstance(hermes_meta, dict):
-            related = _parse_tags(hermes_meta.get("related_skills"))
-            if related:
-                return related
-    return _parse_tags(frontmatter.get("related_skills"))
-
-
-def _skill_matches_query(skill: Dict[str, Any], query: str | None = None, tag: str | None = None) -> bool:
-    """Match local skill metadata by name, description, category, tags, or related skills."""
-    if tag:
-        wanted = tag.strip().lower()
-        tags = [str(t).lower() for t in skill.get("tags", [])]
-        if wanted not in tags:
-            return False
-
-    if query:
-        q = query.strip().lower()
-        if q:
-            searchable = " ".join(
-                [
-                    str(skill.get("name", "")),
-                    str(skill.get("description", "")),
-                    str(skill.get("category", "")),
-                    " ".join(str(t) for t in skill.get("tags", [])),
-                    " ".join(str(s) for s in skill.get("related_skills", [])),
-                ]
-            ).lower()
-            if q not in searchable:
-                return False
-
-    return True
-
-
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -746,7 +685,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        get_external_skills_dirs,
+        get_project_skills_dirs,
+        iter_project_skill_files,
+        iter_skill_index_files,
+    )
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
 
@@ -756,8 +700,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
-    # SKILLS_DIR can be stale in long-lived runtimes).
-    dirs_to_scan: list = []
+    # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
+    # dirs come FIRST: first-wins dedup below gives them precedence over
+    # same-named local/external skills.
+    project_dirs = list(get_project_skills_dirs())
+    dirs_to_scan: list = list(project_dirs)
     active_skills_dir = _skills_dir()
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
@@ -780,10 +727,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     skills = []
     seen_names: set = set()
 
-    # Scan local dir first, then external dirs (local takes precedence) —
-    # dirs_to_scan already resolved above for the signature.
+    # Scan project dirs first, then local, then external (first-wins) —
+    # dirs_to_scan already resolved above for the signature. Project dirs
+    # iterate through the quarantine chokepoint (scan-time injection gate).
     for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+        _is_project = scan_dir in project_dirs
+        _iter = (
+            iter_project_skill_files(scan_dir)
+            if _is_project
+            else iter_skill_index_files(scan_dir, "SKILL.md")
+        )
+        for skill_md in _iter:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
 
@@ -817,16 +771,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
                 category = _get_category_from_path(skill_md)
-                tags = _extract_skill_tags(frontmatter)
-                related_skills = _extract_related_skills(frontmatter)
 
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
-                    "tags": tags,
-                    "related_skills": related_skills,
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -851,50 +801,7 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def _load_category_description(category_dir: Path) -> Optional[str]:
-    """
-    Load category description from DESCRIPTION.md if it exists.
-
-    Args:
-        category_dir: Path to the category directory
-
-    Returns:
-        Description string or None if not found
-    """
-    desc_file = category_dir / "DESCRIPTION.md"
-    if not desc_file.exists():
-        return None
-
-    try:
-        content = desc_file.read_text(encoding="utf-8")
-        # Parse frontmatter if present
-        frontmatter, body = _parse_frontmatter(content)
-
-        # Prefer frontmatter description, fall back to first non-header line
-        description = frontmatter.get("description", "")
-        if not description:
-            for line in body.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    description = line
-                    break
-
-        # Truncate to reasonable length
-        if len(description) > MAX_DESCRIPTION_LENGTH:
-            description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
-
-        return description if description else None
-    except (UnicodeDecodeError, PermissionError) as e:
-        logger.debug("Failed to read category description %s: %s", desc_file, e)
-        return None
-    except Exception as e:
-        logger.warning(
-            "Error parsing category description %s: %s", desc_file, e, exc_info=True
-        )
-        return None
-
-
-def skills_list(category: str = None, query: str = None, tag: str = None, task_id: str = None) -> str:
+def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -903,8 +810,6 @@ def skills_list(category: str = None, query: str = None, tag: str = None, task_i
 
     Args:
         category: Optional category filter (e.g., "mlops")
-        query: Optional substring search across name, description, category, tags, and related skills
-        tag: Optional exact tag filter (e.g., "design")
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
@@ -945,8 +850,6 @@ def skills_list(category: str = None, query: str = None, tag: str = None, task_i
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
-        if query or tag:
-            all_skills = [s for s in all_skills if _skill_matches_query(s, query=query, tag=tag)]
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
@@ -962,7 +865,7 @@ def skills_list(category: str = None, query: str = None, tag: str = None, task_i
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content and linked files. Use query/tag filters to search local skill metadata.",
+                "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
         )
@@ -1226,7 +1129,41 @@ def skill_view(
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
             plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
@@ -1272,7 +1209,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1288,8 +1225,11 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        # Build list of all skill directories to search
-        all_dirs = []
+        # Build list of all skill directories to search. Project dirs first —
+        # they're the highest-precedence tier and the collision resolver
+        # below uses this ordering.
+        project_dirs = get_project_skills_dirs()
+        all_dirs = list(project_dirs)
         active_skills_dir = _skills_dir()
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
@@ -1388,6 +1328,30 @@ def skill_view(
                 ):
                     _record(None, found_md)
 
+        if len(candidates) > 1 and project_dirs:
+            # Cross-tier collision resolution: a project skill intentionally
+            # overrides a same-named local/external skill, so when at least
+            # one candidate lives under a trusted project dir, narrow to
+            # those. Ambiguity WITHIN the project tier still refuses below.
+            def _in_project(smd: Path) -> bool:
+                try:
+                    resolved = smd.resolve()
+                except Exception:
+                    resolved = smd
+                for pd in project_dirs:
+                    try:
+                        resolved.relative_to(pd)
+                        return True
+                    except ValueError:
+                        continue
+                return False
+
+            project_candidates = [
+                (sd, smd) for sd, smd in candidates if _in_project(smd)
+            ]
+            if project_candidates:
+                candidates = project_candidates
+
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1415,6 +1379,43 @@ def skill_view(
         if candidates:
             skill_dir, skill_md = candidates[0]
 
+        # Quarantine gate: a project-tier skill with a dangerous scan verdict
+        # must not load even by explicit name (same chokepoint the index and
+        # skills_list use — see agent.skill_utils.iter_project_skill_files).
+        if skill_md is not None and project_dirs:
+            from agent.skill_utils import is_quarantined_project_skill
+
+            def _under_project(p: Path) -> bool:
+                try:
+                    rp = p.resolve()
+                except Exception:
+                    rp = p
+                for pd in project_dirs:
+                    try:
+                        rp.relative_to(pd)
+                        return True
+                    except ValueError:
+                        continue
+                return False
+
+            if _under_project(skill_md) and is_quarantined_project_skill(skill_md):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Project skill '{name}' is quarantined: the security "
+                            "scan flagged its content as dangerous. It will not "
+                            "load until the repo's skill content changes and "
+                            "passes a re-scan."
+                        ),
+                        "hint": (
+                            "Inspect the skill in the repo checkout, or untrust "
+                            "the repo with `hermes skills untrust`."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
@@ -1440,11 +1441,12 @@ def skill_view(
             )
 
         # Security: warn if skill is loaded from outside trusted directories
-        # (local skills dir + configured external_dirs are all trusted)
+        # (project dirs + local skills dir + configured external_dirs — i.e.
+        # everything in all_dirs — are trusted)
         _outside_skills_dir = True
         _trusted_dirs = [active_skills_dir.resolve()]
         try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+            _trusted_dirs.extend(d.resolve() for d in all_dirs)
         except Exception:
             pass
         for _td in _trusted_dirs:
@@ -1973,15 +1975,7 @@ SKILLS_LIST_SCHEMA = {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            },
-            "query": {
-                "type": "string",
-                "description": "Optional local metadata search across skill name, description, category, tags, and related skills",
-            },
-            "tag": {
-                "type": "string",
-                "description": "Optional exact tag filter, e.g. 'design'",
-            },
+            }
         },
         "required": [],
     },
@@ -2011,10 +2005,7 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"),
-        query=args.get("query"),
-        tag=args.get("tag"),
-        task_id=kw.get("task_id"),
+        category=args.get("category"), task_id=kw.get("task_id")
     ),
     check_fn=check_skills_requirements,
     emoji="📚",

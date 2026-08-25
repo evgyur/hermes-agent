@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import ast
 import logging
 import os
 import re
@@ -30,12 +31,9 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
-        ".backups",
-        ".sync-backups",
         ".venv",
         "venv",
         "node_modules",
-        "vendor",
         "site-packages",
         "__pycache__",
         ".tox",
@@ -45,20 +43,12 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".ruff_cache",
     )
 )
-EXCLUDED_SKILL_DIR_SUFFIXES = (
-    ".bak",
-    ".backup",
-    ".local-backup",
-)
 
-# Supporting files and embedded package snapshots live inside a concrete skill
-# root and are loaded explicitly by that skill. They are not standalone skills.
-# The names remain valid as top-level categories because the iterator prunes
-# them only when the current directory already owns a SKILL.md.
-SKILL_SUPPORT_DIRS = frozenset(
-    ("references", "templates", "assets", "scripts", "skills", "runtime", "upstream")
-)
-EXCLUDED_SKILL_PATH_SEGMENT_PAIRS = frozenset((("references", "absorbed"),))
+# Supporting files live inside a skill package and are loaded explicitly via
+# skill_view(skill, file_path=...). They are not standalone skills and must not
+# be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
+# archive workflow preserves a complete old skill package under references/.
+SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
@@ -73,6 +63,8 @@ EXCLUDED_SKILL_PATH_SEGMENT_PAIRS = frozenset((("references", "absorbed"),))
 ORG_MIRROR_DIR_NAME = "_org"
 ORG_ACTIVE_MARKER = ".active_org"
 ORG_PROVENANCE_FILE = ".org-provenance.json"
+# Records the fingerprint of each skill exactly as upstream sent it, so a
+# later local edit is detectable and an org pull can refuse to clobber it.
 ORG_BASELINE_FILE = ".org-baseline.json"
 
 
@@ -82,7 +74,8 @@ def read_active_org_id(skills_dir: Path) -> Optional[str]:
         marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
         if not marker.exists():
             return None
-        return marker.read_text(encoding="utf-8").strip() or None
+        val = marker.read_text(encoding="utf-8").strip()
+        return val or None
     except OSError:
         return None
 
@@ -107,16 +100,44 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return None
 
 
-def is_excluded_skill_dir(dirname: str) -> bool:
-    """Return True for operational/non-catalog skill directory names."""
-    normalized = str(dirname or "").strip().lower()
-    return normalized in EXCLUDED_SKILL_DIRS or normalized.endswith(EXCLUDED_SKILL_DIR_SUFFIXES)
+def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+    """True if *path* should be skipped by active skill scanners.
+
+    Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
+    prune dependency, virtualenv, VCS, cache, and progressive-disclosure
+    support-package paths. Centralising the check here keeps every
+    skill-scanning site in sync with the shared exclusion set.
+
+    Accepts a Path or string.
+    """
+    try:
+        parts = path.parts  # Path
+    except AttributeError:
+        from pathlib import PurePath
+        parts = PurePath(str(path)).parts
+    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
+        path, root=root
+    )
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
-    """True if *path* is under a support dir of an actual skill root."""
+    """True if *path* is under a support dir of an actual skill root.
+
+    ``references/``, ``templates/``, ``assets/``, and ``scripts/`` are
+    progressive-disclosure support areas when they sit directly inside a skill
+    directory containing ``SKILL.md``. They are not active discovery roots for
+    standalone skills. A preserved package such as
+    ``some-skill/references/old-skill-package/SKILL.md`` is documentation data
+    unless the caller explicitly loads it via ``file_path``.
+
+    Legitimate categories or skill names such as ``skills/scripts/foo`` remain
+    discoverable because their ``scripts`` component is not directly under a
+    directory that contains ``SKILL.md``.
+    """
     path_obj = path if isinstance(path, Path) else Path(str(path))
     parts = path_obj.parts
+    # Last component may be a file or candidate skill directory name. Only
+    # components before the leaf can be containing support directories.
     for idx, part in enumerate(parts[:-1]):
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
@@ -126,25 +147,6 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
         if (skill_root / "SKILL.md").exists():
             return True
     return False
-
-
-def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
-    """True if any component of *path* should be excluded from skill indexes."""
-    try:
-        parts = path.parts  # Path
-    except AttributeError:
-        from pathlib import PurePath
-        parts = PurePath(str(path)).parts
-    normalized_parts = tuple(str(part).strip().lower() for part in parts)
-    has_excluded_pair = any(
-        pair in tuple(zip(normalized_parts, normalized_parts[1:]))
-        for pair in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
-    )
-    return (
-        any(is_excluded_skill_dir(part) for part in normalized_parts)
-        or has_excluded_pair
-        or is_skill_support_path(path, root=root)
-    )
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -389,7 +391,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -408,13 +410,10 @@ def _load_raw_config() -> Dict[str, Any]:
     if not config_path.exists():
         return {}
     try:
-        data = config_path.read_bytes()
         stat = config_path.stat()
-        import hashlib
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size, hashlib.sha256(data).hexdigest())
+        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
     except OSError:
         cache_key = None
-        data = None
 
     if cache_key is not None:
         cached = _RAW_CONFIG_CACHE.get(cache_key)
@@ -422,8 +421,7 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        raw_text = data.decode("utf-8") if data is not None else config_path.read_text(encoding="utf-8")
-        parsed = yaml_load(raw_text)
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
@@ -474,12 +472,34 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def parse_config_string_list(value) -> List[str]:
+    """Normalize a config value that may hold a JSON-array string into a list.
+
+    ``hermes config set`` and JSON-mode editor saves store lists as quoted
+    JSON strings (``'["a","b"]'`` or the Python-literal ``"['a']"``). Treating
+    such a string as a single name makes a curated disabled list silently
+    filter nothing (#86661); parsing it restores the intended list. A scalar
+    string still means one name (#13026).
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item) for item in value]
+    return []
+
+
 def _normalize_string_set(values) -> Set[str]:
-    if values is None:
-        return set()
-    if isinstance(values, str):
-        values = [values]
-    return {str(v).strip() for v in values if str(v).strip()}
+    return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
 # ── External skills directories ──────────────────────────────────────────
@@ -587,10 +607,291 @@ def get_all_skills_dirs() -> List[Path]:
 
     The local dir is always first (and always included even if it doesn't exist
     yet — callers handle that).  External dirs follow in config order.
+
+    NOTE: trusted project-local dirs (``./.hermes/skills`` at the git root) are
+    NOT part of this list — they have *higher* precedence than the local dir,
+    so callers that need them use :func:`get_project_skills_dirs` and scan
+    those roots first. See ``get_scan_ordered_skills_dirs`` for the full
+    precedence-ordered list.
     """
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+# ── Project-local skills directories ──────────────────────────────────────
+#
+# Repo-local skills, mirroring what OpenCode (.opencode/skill/, .agents/skills/)
+# and Codex (.codex/skills/, .agents/skills/) do: a project checkout can carry
+# its own skills, active only for sessions started inside that project.
+#
+# Two candidate roots at the project root (found by walking up from cwd to the
+# first directory containing ``.git``):
+#   <root>/.hermes/skills/   — Hermes-native location
+#   <root>/.agents/skills/   — cross-tool convention shared with other harnesses
+#
+# TRUST GATE: unlike AGENTS.md (plain instruction text), skills are load-on-
+# demand procedure documents an agent will follow — auto-sourcing them from any
+# cloned repo is a prompt-injection vector. Project skills therefore only load
+# when the project root is listed in ``skills.trusted_project_dirs`` in
+# config.yaml (Codex-style per-path trust). Untrusted dirs are still
+# *discoverable* via get_untrusted_project_skills_root() so the CLI can print
+# a one-line "run `hermes skills trust`" notice.
+#
+# PRECEDENCE: trusted project skills override same-named profile/bundled
+# skills (index scans project dirs first; skill_view resolves cross-tier
+# collisions in favor of the project tier). This matches both competitor
+# harnesses and is the point of the feature: vendored repo skills win inside
+# their repo.
+#
+# CACHE SAFETY: cwd is fixed for the life of a session, and the trust list is
+# read from config at agent build time — the resolved dirs are stable for the
+# conversation, so the skills index (and with it the system prompt) stays
+# byte-stable. Same contract as AGENTS.md injection and project plugins.
+
+PROJECT_SKILLS_SUBDIRS = (
+    os.path.join(".hermes", "skills"),
+    os.path.join(".agents", "skills"),
+)
+
+# Walk-up bound: don't scan the whole filesystem on pathological cwds.
+_PROJECT_ROOT_MAX_DEPTH = 64
+
+
+def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
+    """Locate the enclosing project root: nearest ancestor containing ``.git``.
+
+    Returns None when cwd is not inside a git checkout. ``.git`` may be a dir
+    (normal clone) or a file (worktree/submodule) — both count.
+
+    When *start* is not given, the surface's working directory wins over the
+    process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
+    tool and cron jobs use (a cron job sets it from its per-job ``workdir``
+    without chdir'ing the scheduler process). This is what lets
+    non-interactive surfaces inherit a prior interactive trust decision by
+    project identity — and a surface with no workdir in a trusted repo simply
+    resolves no project and loads nothing (#48975).
+    """
+    try:
+        if start is None:
+            env_cwd = os.environ.get("TERMINAL_CWD")
+            start = Path(env_cwd) if env_cwd else Path.cwd()
+        cur = Path(start).resolve()
+    except OSError:
+        return None
+    home = Path.home().resolve()
+    for _ in range(_PROJECT_ROOT_MAX_DEPTH):
+        try:
+            if (cur / ".git").exists():
+                # A git checkout AT the home dir (dotfiles-style) would make
+                # every session project-scoped; treat home itself as non-project.
+                if cur == home:
+                    return None
+                return cur
+        except OSError:
+            return None
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+    return None
+
+
+def _project_trusted_dirs_from_config() -> Set[Path]:
+    """Resolved set of trusted project roots from ``skills.trusted_project_dirs``."""
+    parsed = _load_raw_config()
+    if not parsed:
+        return set()
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+    raw = skills_cfg.get("trusted_project_dirs")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    result: Set[Path] = set()
+    for entry in raw:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        try:
+            result.add(Path(os.path.expanduser(os.path.expandvars(entry))).resolve())
+        except OSError:
+            continue
+    return result
+
+
+def is_project_root_trusted(root: Path) -> bool:
+    """True when *root* is listed in ``skills.trusted_project_dirs``."""
+    try:
+        return Path(root).resolve() in _project_trusted_dirs_from_config()
+    except OSError:
+        return False
+
+
+def _candidate_project_skills_dirs(root: Path) -> List[Path]:
+    """Existing skill dirs under *root*, excluding the profile's own skills dir.
+
+    The exclusion matters when HERMES_HOME itself lives inside a git checkout:
+    ``<root>/.hermes/skills`` would otherwise double as both the profile-local
+    and the project tier.
+    """
+    local_skills = get_skills_dir().resolve()
+    dirs: List[Path] = []
+    for sub in PROJECT_SKILLS_SUBDIRS:
+        cand = root / sub
+        try:
+            if cand.is_dir() and cand.resolve() != local_skills:
+                dirs.append(cand.resolve())
+        except OSError:
+            continue
+    return dirs
+
+
+def get_project_skills_dirs() -> List[Path]:
+    """Trusted project-local skill dirs for the current cwd (may be empty).
+
+    Empty when: not in a git checkout, no project skills dirs exist, project
+    discovery is disabled (``skills.project_discovery: false``), or the
+    project root is not trusted.
+    """
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
+        return []
+    root = find_project_root()
+    if root is None:
+        return []
+    if not is_project_root_trusted(root):
+        return []
+    return _candidate_project_skills_dirs(root)
+
+
+def get_untrusted_project_skills_root() -> Optional[Tuple[Path, int]]:
+    """When cwd's project has skills but is NOT trusted: (root, skill_count).
+
+    Used by the CLI to print a one-line notice pointing at
+    ``hermes skills trust``. Returns None when there is nothing to notify
+    about (no project, no skills, already trusted, or discovery disabled).
+    """
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
+        return None
+    root = find_project_root()
+    if root is None or is_project_root_trusted(root):
+        return None
+    count = 0
+    for d in _candidate_project_skills_dirs(root):
+        try:
+            count += sum(1 for _ in iter_skill_index_files(d, "SKILL.md"))
+        except OSError:
+            continue
+    if count == 0:
+        return None
+    return root, count
+
+
+def get_scan_ordered_skills_dirs() -> List[Path]:
+    """All skill dirs in precedence order: project → local → external.
+
+    First-wins name deduplication over this order gives project skills
+    priority over profile-local and external ones.
+    """
+    dirs = list(get_project_skills_dirs())
+    dirs.append(get_skills_dir())
+    dirs.extend(get_external_skills_dirs())
+    return dirs
+
+
+# ── Project skill quarantine (scan-time injection defense) ────────────────
+#
+# Trust (`hermes skills trust`) is a REPO-level decision made once; the repo's
+# skill content keeps changing underneath it with every pull. The hub install
+# path runs skills_guard on install, but project skills are read straight from
+# a checkout — without this gate a `git pull` could inject a malicious skill
+# into an already-trusted repo with no scan anywhere (#48974).
+#
+# Every project SKILL.md's parent dir is scanned with the same skills_guard
+# scanner the hub uses (content-hash cached, so the cost is one scan per
+# skill per content change). A "dangerous" verdict quarantines the skill: it
+# is excluded from the index, skills_list, skill_view, and slash commands.
+# "caution" loads (matches hub behavior for prose-level keyword hits) — the
+# quarantine is for high-confidence findings only.
+#
+# The scan cache lives under HERMES_HOME, never inside the repo (we don't
+# write artifacts into the user's checkout).
+
+_PROJECT_SCAN_SOURCE = "project-local"
+# (skill_dir_resolved) -> quarantined bool, keyed per-process; scan_skill_cached
+# already re-scans on content change via the bundle hash, this only avoids
+# re-reading the attestation JSON on every index/list/view call in one run.
+_PROJECT_QUARANTINE_CACHE: Dict[str, bool] = {}
+
+
+def _project_scan_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "project_skill_scans"
+
+
+def is_quarantined_project_skill(skill_md) -> bool:
+    """True when a project skill's scan verdict is ``dangerous``.
+
+    Fail-closed: a scanner crash or missing scanner quarantines the skill
+    (repo-sourced content with no completed scan must not load). Non-project
+    callers should not call this — it scans unconditionally.
+    """
+    skill_dir = Path(skill_md).parent
+    try:
+        key = str(skill_dir.resolve())
+    except OSError:
+        key = str(skill_dir)
+    cached = _PROJECT_QUARANTINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from tools.skills_guard import scan_skill_cached
+
+        result, _prov = scan_skill_cached(
+            skill_dir,
+            source=_PROJECT_SCAN_SOURCE,
+            cache_dir=_project_scan_cache_dir(),
+        )
+        quarantined = result.verdict == "dangerous"
+        if quarantined:
+            logger.warning(
+                "Project skill quarantined (verdict=dangerous): %s — %s",
+                skill_dir,
+                result.summary,
+            )
+    except Exception:
+        logger.warning(
+            "Project skill scan failed — quarantining (fail closed): %s",
+            skill_dir,
+            exc_info=True,
+        )
+        quarantined = True
+    _PROJECT_QUARANTINE_CACHE[key] = quarantined
+    return quarantined
+
+
+def _project_quarantine_cache_clear() -> None:
+    """Test hook."""
+    _PROJECT_QUARANTINE_CACHE.clear()
+
+
+def iter_project_skill_files(project_dir: Path):
+    """Yield non-quarantined SKILL.md files under a trusted project dir.
+
+    The single iteration chokepoint for the project tier: every consumer
+    (index, skills_list, slash commands) iterates through here so the
+    quarantine cannot be bypassed by a new call site forgetting the check.
+    """
+    for skill_md in iter_skill_index_files(project_dir, "SKILL.md"):
+        if is_quarantined_project_skill(skill_md):
+            continue
+        yield skill_md
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:
@@ -623,6 +924,10 @@ def normalize_skill_lookup_name(identifier: str) -> str:
         primary_root = get_skills_dir()
 
     trusted_roots = [primary_root]
+    try:
+        trusted_roots.extend(get_project_skills_dirs())
+    except Exception:
+        pass
     try:
         trusted_roots.extend(get_external_skills_dirs())
     except Exception:
@@ -668,7 +973,14 @@ def is_external_skill_path(path) -> bool:
     not each need to re-interpret the config.
     """
     candidate = _resolve_for_skill_ownership(path)
-    for root in get_external_skills_dirs():
+    roots: List[Path] = list(get_external_skills_dirs())
+    # Trusted project-local dirs are repo-owned — same read-only boundary
+    # for autonomous lifecycle maintenance as configured external dirs.
+    try:
+        roots.extend(get_project_skills_dirs())
+    except Exception:
+        pass
+    for root in roots:
         resolved_root = _resolve_for_skill_ownership(root)
         try:
             candidate.relative_to(resolved_root)
@@ -880,8 +1192,17 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
-    Excludes Hermes metadata, VCS, virtualenv/dependency, cache, vendored,
-    backup trees, and support dirs inside concrete skill roots.
+    Excludes Hermes metadata, VCS, virtualenv/dependency, cache, and skill
+    support directories. Support directories (references/templates/assets/
+    scripts) can contain arbitrary markdown and even archived package
+    ``SKILL.md`` files, but they are progressive-disclosure data loaded through
+    ``skill_view(..., file_path=...)`` rather than active skill roots.
+
+    M2 org mirrors (``_org/``): TOKEN-GATED resolution. Only the active org's
+    subdir (per the sync-client-written ``.active_org`` marker) is walked;
+    every other ``_org/<id>/`` (stale mirror from a previous org, or no
+    marker at all) is pruned — leave an org and its skills stop resolving,
+    without any manual cleanup.
     """
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
@@ -894,27 +1215,16 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         elif root == org_root:
             # Inside _org/: descend ONLY into the active org's mirror.
             dirs[:] = [d for d in dirs if d == active_org]
-        try:
-            relative_root_parts = Path(root).relative_to(skills_dir).parts
-        except ValueError:
-            relative_root_parts = ()
         dirs[:] = [
             d
             for d in dirs
-            if not is_excluded_skill_dir(d)
-            and not (
-                relative_root_parts
-                and (str(relative_root_parts[-1]).lower(), str(d).lower())
-                in EXCLUDED_SKILL_PATH_SEGMENT_PAIRS
-            )
+            if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
-            path = Path(root) / filename
-            if not is_excluded_skill_path(path):
-                matches.append(path)
-    for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
-        yield path
+            matches.append(os.path.join(root, filename))
+    for path in sorted(matches):
+        yield Path(path)
 
 
 # ── Namespace helpers for plugin-provided skills ───────────────────────────

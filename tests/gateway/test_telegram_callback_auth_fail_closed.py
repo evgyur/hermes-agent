@@ -61,6 +61,7 @@ def _make_adapter():
     adapter = object.__new__(TelegramAdapter)
     adapter.config = config
     adapter._config = config
+    adapter.platform = Platform.TELEGRAM
     adapter._platform = Platform.TELEGRAM
     adapter._connected = True
     return adapter
@@ -86,4 +87,37 @@ class TestCallbackAuthFailClosed:
         adapter._message_handler = None
         assert adapter._is_callback_user_authorized("12345") is True
 
+    def test_profile_bound_callback_overrides_broad_default_runner(self):
+        """A secondary adapter must use its profile-bound resolver."""
+        adapter = _make_adapter()
 
+        class DefaultRunner:
+            def _is_user_authorized(self, source):
+                return True
+
+            async def handle(self, event):
+                return None
+
+        runner = DefaultRunner()
+        adapter._message_handler = runner.handle
+        adapter._owner_profile = "business"
+        adapter._authorization_check = lambda user_id, chat_type, chat_id: False
+
+        assert adapter._is_callback_user_authorized(
+            "12345", chat_id="12345", chat_type="dm"
+        ) is False
+
+    def test_profile_resolver_exception_denies_even_if_env_allows(self, monkeypatch):
+        """Resolver failures are authorization failures, never env fallback."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345")
+        adapter = _make_adapter()
+        adapter._message_handler = None
+
+        def broken_resolver(user_id, chat_type, chat_id):
+            raise RuntimeError("profile unavailable")
+
+        adapter._authorization_check = broken_resolver
+
+        assert adapter._is_callback_user_authorized(
+            "12345", chat_id="12345", chat_type="dm"
+        ) is False

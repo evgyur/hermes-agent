@@ -10,18 +10,8 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
-    is_postcraft_loaded_message,
-    is_postcraft_trigger_message,
-    is_sco_loaded_message,
-    is_shalimov_craft_loaded_message,
-    maybe_build_postcraft_autoload_message,
-    postcraft_reasoning_config,
     resolve_skill_command_key,
-    resolve_writing_skill_runtime,
     scan_skill_commands,
-    shalimov_craft_reasoning_config,
-    writing_skill_reasoning_config,
-    writing_skill_runtime_config,
 )
 
 
@@ -62,63 +52,6 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
 
 class TestScanSkillCommands:
 
-    def test_bundled_present_skill_registers_slash_command_and_slides_mode(self):
-        """The bundled /present skill must expose /present and document slides routing."""
-        repo_root = Path(__file__).resolve().parents[2]
-        bundled_skills = repo_root / "skills"
-
-        with patch("tools.skills_tool.SKILLS_DIR", bundled_skills):
-            result = scan_skill_commands()
-            message = build_skill_invocation_message(
-                "/present",
-                user_instruction="slides roadmap for launch",
-            )
-
-        assert "/present" in result
-        assert result["/present"]["name"] == "present"
-        assert message is not None
-        assert "/present slides" in message
-        assert "separate fullscreen deck mode" in message
-
-    def test_bundled_decision_rp_and_superpowers_register_slash_commands(self):
-        """Public distro convenience skills should be invokable as slash commands."""
-        repo_root = Path(__file__).resolve().parents[2]
-        bundled_skills = repo_root / "skills"
-
-        with patch("tools.skills_tool.SKILLS_DIR", bundled_skills):
-            result = scan_skill_commands()
-            decision = build_skill_invocation_message(
-                "/decision",
-                user_instruction="ship now or wait?",
-            )
-            rp = build_skill_invocation_message(
-                "/rp",
-                user_instruction="stress-test this plan",
-            )
-            superpowers = build_skill_invocation_message(
-                "/superpowers",
-                user_instruction="fix the failing test suite",
-            )
-
-        assert "/decision" in result
-        assert result["/decision"]["name"] == "decision"
-        assert decision is not None
-        assert "Phase 1: Decision deconstruction" in decision
-
-        assert "/rp" in result
-        assert result["/rp"]["name"] == "rp"
-        assert rp is not None
-        assert "Reasoning Personas Shortcut" in rp
-
-        assert "/superpowers" in result
-        assert result["/superpowers"]["name"] == "superpowers"
-        assert superpowers is not None
-        assert "Rigorous Execution Mode" in superpowers
-
-    def test_empty_dir(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            result = scan_skill_commands()
-        assert result == {}
 
 
 
@@ -267,6 +200,61 @@ class TestScanSkillCommands:
             assert "/telegram-only" in discord_commands
             assert "/discord-only" not in discord_commands
 
+    def test_get_skill_commands_rescans_when_profile_home_changes(self, tmp_path):
+        """Switching profiles must rescan even when the platform is unchanged
+        (#88023): a Desktop session that switches profiles mid-session keeps
+        the same platform scope, so only ``HERMES_HOME`` moves. Each profile
+        declares its own ``skills.external_dirs``, and the previous profile's
+        skill list must not leak into the new one.
+        """
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        empty_local_dir = tmp_path / "no-local-skills"
+        empty_local_dir.mkdir()
+
+        profile_a = tmp_path / "profile_a"
+        profile_b = tmp_path / "profile_b"
+        external_a = tmp_path / "external_a"
+        external_b = tmp_path / "external_b"
+        profile_a.mkdir()
+        profile_b.mkdir()
+        _make_skill(external_a, "a-only")
+        _make_skill(external_b, "b-only")
+        (profile_a / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_a}\n"
+        )
+        (profile_b / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_b}\n"
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", empty_local_dir),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            token = set_hermes_home_override(profile_a)
+            try:
+                profile_a_commands = dict(get_skill_commands())
+            finally:
+                reset_hermes_home_override(token)
+
+            assert "/a-only" in profile_a_commands
+            assert "/b-only" not in profile_a_commands
+
+            # Switching profiles without touching the cache directly must
+            # rescan — not keep serving profile_a's stale view.
+            token = set_hermes_home_override(profile_b)
+            try:
+                profile_b_commands = dict(get_skill_commands())
+            finally:
+                reset_hermes_home_override(token)
+
+            assert "/b-only" in profile_b_commands
+            assert "/a-only" not in profile_b_commands
+
     def test_get_skill_commands_rescans_when_leaving_platform_scope(self, tmp_path, monkeypatch):
         """Returning to no-platform-scope (CLI / cron / RL) after a gateway
         session must rescan so the unfiltered view is repopulated (#14536).
@@ -359,6 +347,140 @@ class TestScanSkillCommands:
             with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
                 scan_skill_commands()
         assert any("already claimed" in r.message for r in caplog.records)
+
+    # -- concurrent scans (#74574) ------------------------------------------
+
+    def test_concurrent_scans_do_not_report_skills_as_claiming_themselves(
+        self, tmp_path, caplog
+    ):
+        """Two overlapping scans must not see each other's partial results.
+
+        ``scan_skill_commands`` published into a module-global dict while it
+        built, but deduped against a *local* ``seen_names``. A second scan
+        starting mid-flight therefore found every slug already present and
+        logged one "already claimed" warning per skill — each naming the very
+        same skill as the incumbent. A gateway serving several platforms hits
+        this on startup, flooding errors.log with one line per installed skill.
+        """
+        import logging as _logging
+        import threading
+
+        import tools.skills_tool as _skills_tool
+
+        skill_count = 5
+        for index in range(skill_count):
+            _make_skill(tmp_path, f"skill-{index}")
+
+        real_parse = _skills_tool._parse_frontmatter
+        parked = threading.Event()
+        other_scan_finished = threading.Event()
+        already_parked = threading.local()
+
+        def parking_parse(content):
+            # Park the background scan once, before it has published anything,
+            # so the foreground scan runs to completion underneath it.
+            if (
+                threading.current_thread().name == "parked-scan"
+                and not getattr(already_parked, "done", False)
+            ):
+                already_parked.done = True
+                parked.set()
+                other_scan_finished.wait(timeout=10)
+            return real_parse(content)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "tools.skills_tool._parse_frontmatter", parking_parse
+        ):
+            with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
+                background = threading.Thread(
+                    target=scan_skill_commands, name="parked-scan", daemon=True
+                )
+                background.start()
+                assert parked.wait(timeout=10), "background scan never parked"
+
+                foreground = scan_skill_commands()
+
+                other_scan_finished.set()
+                background.join(timeout=10)
+                assert not background.is_alive()
+
+        collisions = [r for r in caplog.records if "already claimed" in r.message]
+        assert collisions == [], (
+            "overlapping scans reported self-collisions: "
+            f"{[r.getMessage() for r in collisions]}"
+        )
+        # Both scans still produce the full, correct map.
+        assert len(foreground) == skill_count
+        assert foreground["/skill-0"]["name"] == "skill-0"
+
+    def test_publication_and_lookup_share_one_lock(self, tmp_path):
+        """A reader must not land between the map and platform-tag writes.
+
+        They are two separate global assignments. A reader in between sees the
+        NEW map still carrying the OLD platform tag; if that stale tag matches
+        its own platform it accepts the map without rescanning and serves
+        another platform's disabled-skill view — the leak #14536 closed.
+        Holding the publish lock must therefore block a reader outright.
+        """
+        import threading
+
+        import agent.skill_commands as skill_commands_module
+        from agent.skill_commands import get_skill_commands
+
+        _make_skill(tmp_path, "shared")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+            done = threading.Event()
+
+            def _read():
+                with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                    get_skill_commands()
+                done.set()
+
+            with skill_commands_module._publish_lock:
+                reader = threading.Thread(target=_read, daemon=True)
+                reader.start()
+                # The reader must be unable to complete its freshness lookup
+                # while publication is in progress.
+                assert not done.wait(timeout=0.5), (
+                    "get_skill_commands read the (map, platform) pair without "
+                    "the publish lock"
+                )
+
+            assert done.wait(timeout=10), "reader did not finish after release"
+            reader.join(timeout=10)
+
+    def test_scan_never_publishes_a_partially_built_map(self, tmp_path):
+        """A reader during a scan sees the previous map, never a half-built one."""
+        import threading
+
+        import agent.skill_commands as skill_commands_module
+        import tools.skills_tool as _skills_tool
+
+        skill_count = 5
+        for index in range(skill_count):
+            _make_skill(tmp_path, f"skill-{index}")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+        real_parse = _skills_tool._parse_frontmatter
+        observed_sizes = []
+
+        def observing_parse(content):
+            observed_sizes.append(len(skill_commands_module._skill_commands))
+            return real_parse(content)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "tools.skills_tool._parse_frontmatter", observing_parse
+        ):
+            scan_skill_commands()
+
+        # Every mid-scan observation shows the complete previous map, never a
+        # partial one growing from 0.
+        assert observed_sizes == [skill_count] * skill_count
 
 
 class TestResolveSkillCommandKey:
@@ -681,132 +803,79 @@ class TestInlineShellExpansion:
         assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
 
 
-class TestPostcraftAutoload:
-    def test_detects_editorial_writing_requests(self):
-        assert is_postcraft_trigger_message("перепиши этот текст человеческим языком")
-        assert is_postcraft_trigger_message("напиши пост про память агентов")
-        assert is_postcraft_trigger_message("make it tighter and humanize this draft")
-        assert not is_postcraft_trigger_message("/status")
-        assert not is_postcraft_trigger_message("проверь порт 443")
+class TestStackedSkillCommands:
+    """Stacked slash-skill invocations — inspired by Claude Code v2.1.199."""
 
-    def test_reasoning_config_is_xhigh(self):
-        assert postcraft_reasoning_config() == {"enabled": True, "effort": "xhigh"}
+    def _setup_three_skills(self, tmp_path):
+        _make_skill(tmp_path, "skill-a", body="Body A.")
+        _make_skill(tmp_path, "skill-b", body="Body B.")
+        _make_skill(tmp_path, "skill-c", body="Body C.")
 
-    def test_autoloads_postcraft_skill_file_backed(self, tmp_path):
-        _make_skill(
-            tmp_path,
-            "postcraft",
-            body="Postcraft rail: run quality_check and write alive Russian text.",
-        )
+
+    def test_split_stops_at_non_skill_token(self, tmp_path):
+        from agent.skill_commands import split_stacked_skill_commands
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            msg = maybe_build_postcraft_autoload_message(
-                "перепиши этот черновик",
-                task_id="test-session",
+            self._setup_three_skills(tmp_path)
+            scan_skill_commands()
+            keys, instruction = split_stacked_skill_commands(
+                "/skill-b /not-a-skill /skill-c hello"
+            )
+        assert keys == ["/skill-b"]
+        # Parsing stops at the first unresolvable token; everything from
+        # there on is the user instruction (slash included).
+        assert instruction == "/not-a-skill /skill-c hello"
+
+
+
+    def test_split_caps_at_five_total(self, tmp_path):
+        from agent.skill_commands import split_stacked_skill_commands
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(7):
+                _make_skill(tmp_path, f"stk-{i}")
+            scan_skill_commands()
+            rest = " ".join(f"/stk-{i}" for i in range(1, 7)) + " run"
+            keys, instruction = split_stacked_skill_commands(rest)
+        # First skill was already consumed by the caller — split returns at
+        # most 4 extras so the total stays at 5.
+        assert len(keys) == 4
+        assert instruction.startswith("/stk-5")
+
+
+
+    def test_stacked_message_forwards_task_id_to_each_skill(self, tmp_path):
+        from agent.skill_commands import build_stacked_skill_invocation_message
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skill_usage.bump_use") as bump_use,
+        ):
+            self._setup_three_skills(tmp_path)
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(
+                ["/skill-a", "/skill-b"],
+                task_id="task-stacked",
             )
 
-        assert msg is not None
-        assert "postcraft" in msg.lower()
-        assert "reasoning=xhigh" in msg
-        assert "перепиши этот черновик" in msg
-        assert is_postcraft_loaded_message(msg)
-
-    def test_does_not_double_autoload_loaded_postcraft(self):
-        loaded = '[IMPORTANT: The user has invoked the "postcraft" skill, indicating they want you to follow its instructions.]'
-        assert is_postcraft_loaded_message(loaded)
-        assert maybe_build_postcraft_autoload_message(loaded) is None
-
-    def test_does_not_hijack_other_loaded_skills(self):
-        loaded_sc = (
-            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]\n"
-            "напиши пост в голосе автора"
+        assert result is not None
+        assert [call.args[0] for call in bump_use.call_args_list] == [
+            "skill-a",
+            "skill-b",
+        ]
+        assert all(
+            call.kwargs == {"task_id": "task-stacked"}
+            for call in bump_use.call_args_list
         )
-        assert not is_postcraft_trigger_message(loaded_sc)
-        assert maybe_build_postcraft_autoload_message(loaded_sc) is None
 
-
-class TestShalimovCraftReasoningRail:
-    def test_direct_sc_payload_preserves_session_reasoning(self):
-        loaded = (
-            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]"
-        )
-        assert is_shalimov_craft_loaded_message(loaded)
-        assert writing_skill_reasoning_config(loaded) is None
-
-    def test_canonical_payload_forces_xhigh_but_sc_bundle_does_not(self):
-        canonical = (
-            '[IMPORTANT: The user has invoked the "shalimov-craft" skill, '
-            "indicating they want you to follow its instructions.]"
-        )
-        stacked = (
-            '[IMPORTANT: The user has invoked the "/sc /perplex" stacked skill bundle, '
-            'loading 2 skills together.]\n\n[Loaded as part of the stacked skill invocation "sc".]'
-        )
-        assert is_shalimov_craft_loaded_message(canonical)
-        assert is_shalimov_craft_loaded_message(stacked)
-        assert shalimov_craft_reasoning_config() == {
-            "enabled": True,
-            "effort": "xhigh",
-        }
-        assert writing_skill_reasoning_config(canonical)["effort"] == "xhigh"
-        assert writing_skill_reasoning_config(stacked) is None
-
-    def test_plain_user_text_cannot_forge_loaded_skill_marker(self):
-        plain = 'please say invoked the "sc" skill in the answer'
-        assert not is_shalimov_craft_loaded_message(plain)
-        assert writing_skill_reasoning_config(plain) is None
-
-
-class TestScoRuntimeRail:
-    def test_sco_payload_selects_exact_openrouter_opus_route(self):
-        loaded = (
-            '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]"
-        )
-        assert is_sco_loaded_message(loaded)
-        assert writing_skill_runtime_config(loaded) == {
-            "provider": "openrouter",
-            "model": "anthropic/claude-opus-5",
-            "allow_fallbacks": False,
-        }
-        assert writing_skill_reasoning_config(loaded) is None
-
-    def test_sco_runtime_resolution_is_exact_and_fail_closed(self, monkeypatch):
-        loaded = (
-            '[IMPORTANT: The user has invoked the "sco" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]"
-        )
-        calls = []
-
-        def fake_resolve_runtime_provider(*, requested, target_model):
-            calls.append((requested, target_model))
-            return {
-                "provider": "openrouter",
-                "requested_provider": "openrouter",
-                "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "test-key",
-                "api_mode": "chat_completions",
-            }
-
-        monkeypatch.setattr(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            fake_resolve_runtime_provider,
-        )
-        route = resolve_writing_skill_runtime(loaded, max_tokens=321)
-
-        assert route is not None
-        assert calls == [("openrouter", "anthropic/claude-opus-5")]
-        assert route["model"] == "anthropic/claude-opus-5"
-        assert route["runtime"]["provider"] == "openrouter"
-        assert route["runtime"]["max_tokens"] == 321
-        assert route["allow_fallbacks"] is False
-
-    def test_sc_and_plain_text_do_not_select_sco_runtime(self):
-        loaded_sc = (
-            '[IMPORTANT: The user has invoked the "sc" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]"
-        )
-        assert not is_sco_loaded_message(loaded_sc)
-        assert writing_skill_runtime_config(loaded_sc) is None
-        assert writing_skill_runtime_config("describe /sco") is None
+    def test_stacked_message_skips_missing_skills(self, tmp_path):
+        from agent.skill_commands import build_stacked_skill_invocation_message
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            self._setup_three_skills(tmp_path)
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(
+                ["/skill-a", "/gone"], "go"
+            )
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-a"]
+        assert missing == ["gone"]
+        assert "Skills missing (skipped): gone" in msg

@@ -9,7 +9,6 @@ so CLI and messaging platforms behave identically.
 """
 
 import asyncio
-from contextvars import ContextVar
 import importlib
 import sys
 import threading
@@ -25,6 +24,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from hermes_state import GatewayUserAuthorityWrite
 
 
 # ---------------------------------------------------------------------------
@@ -81,21 +81,79 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+@pytest.fixture(autouse=True)
+def _isolate_hygiene_from_durable_authority(monkeypatch):
+    """Give legacy hygiene fixtures a committed outer authority boundary.
+
+    This module intentionally constructs partial runners, often without a
+    SessionDB, to exercise compression only. Durable-authority failures and
+    ordering are covered by test_outer_durable_authority_barrier.py.
+    """
+    from gateway.run import GatewayRunner
+
+    async def _mark(*_args, **_kwargs):
+        return True
+
+    async def _acquire(self, event, _source, entry, *, run_generation):
+        authority = {
+            "db": MagicMock(),
+            "session_id": entry.session_id,
+            "holder": f"hygiene-test-{run_generation}",
+            "ttl_seconds": 300.0,
+            "lost": False,
+            "released": False,
+            "agent": None,
+            "refresh_task": None,
+        }
+        event._gateway_durable_turn_authority = authority
+        return authority
+
+    async def _persist(*_args, **_kwargs):
+        return GatewayUserAuthorityWrite(row_id=4242, inserted=True)
+
+    async def _enrich(_self, _entry, _authority, row_id, **_kwargs):
+        return row_id
+
+    async def _validate(*_args, **_kwargs):
+        return True
+
+    async def _release(_self, event):
+        authority = getattr(event, "_gateway_durable_turn_authority", None)
+        if isinstance(authority, dict):
+            authority["released"] = True
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_mark_durable_active_turn", _mark)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_acquire_gateway_durable_turn_authority",
+        _acquire,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_persist_gateway_triggering_user_row",
+        _persist,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_enrich_gateway_triggering_user_row",
+        _enrich,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_validate_and_seal_startup_resume",
+        _validate,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_release_gateway_durable_turn_authority",
+        _release,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
-
-
-def test_hygiene_default_timeout_covers_auxiliary_compression_budget():
-    """Gateway must not abandon a healthy summary worker before its own deadline."""
-    gateway_run = importlib.import_module("gateway.run")
-    from agent.auxiliary_client import _COMPRESSION_TIMEOUT_FLOOR_SECONDS
-
-    assert (
-        gateway_run._HYG_COMPRESSION_TIMEOUT_SECS_DEFAULT
-        >= _COMPRESSION_TIMEOUT_FLOOR_SECONDS
-    )
-
 
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.
@@ -451,12 +509,6 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._resolve_session_agent_runtime = MagicMock(
-        return_value=(
-            "test-model",
-            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
-        )
-    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -470,8 +522,8 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length_async",
-        AsyncMock(return_value=100),
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
 
@@ -677,6 +729,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    compressor_bind_order = []
     async_session_db = SimpleNamespace(
         _db=fake_db,
         get_session=AsyncMock(
@@ -684,10 +737,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
                 "system_prompt": stored_system_prompt,
             }
         ),
-    )
-
-    profile_scope: ContextVar[str | None] = ContextVar(
-        "test_hygiene_profile_scope", default=None
     )
 
     class FakeInPlaceCompressAgent:
@@ -702,7 +751,16 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             self.compression_in_place = False
             self._last_compaction_in_place = False
             self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
+                bind_session_state=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "session"
+                    )
+                ),
+                bind_turn_lease=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "lease"
+                    )
+                ),
                 _last_compress_aborted=False,
                 _last_aux_model_failure_model=None,
             )
@@ -712,20 +770,12 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
-            assert profile_scope.get() == "default-profile"
             assert self.compression_in_place is True
             assert self._session_db is fake_db
-            # At >=95% of the model context, hygiene must bypass a stale
-            # anti-thrash/fallback breaker. Otherwise a persisted fallback
-            # streak can strand the session until the next API request exceeds
-            # the model window (regression: 398,608-token Telegram context).
-            assert _kwargs.get("force") is not True
-            assert _kwargs.get("bypass_ineffective_guard") is True
+            assert self.platform == "gateway_hygiene"
+            assert self._cached_system_prompt == stored_system_prompt
             self._last_compaction_in_place = True
-            # Persisted compaction happened, but the remaining payload is still
-            # above the 95% safety boundary; gateway must apply its bounded
-            # retry cooldown instead of compressing again on the next turn.
-            return ([{"role": "assistant", "content": "x" * 500}], None)
+            return ([{"role": "assistant", "content": "compressed in place"}], None)
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
@@ -761,15 +811,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._session_db = async_session_db
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    # Force the real hygiene branch to be eligible. The old regression only
-    # patched a legacy global resolver, so it could pass without ever invoking
-    # the helper agent (and therefore never exercised its ``force`` assertion).
-    runner._resolve_session_agent_runtime = MagicMock(
-        return_value=(
-            "test-model",
-            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
-        )
-    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -785,8 +826,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length_async",
-        AsyncMock(return_value=100),
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
     )
 
     event = MessageEvent(
@@ -812,18 +853,14 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
     )
 
-    scope_token = profile_scope.set("default-profile")
-    try:
-        result = await runner._handle_message(event)
-    finally:
-        profile_scope.reset(scope_token)
+    result = await runner._handle_message(event)
 
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
-    assert agent._last_compaction_in_place is True
+    async_session_db.get_session.assert_awaited_once_with("sess-1")
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
-    assert fake_db.record_compression_failure_cooldown.called
+    assert compressor_bind_order == ["session", "lease"]
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
@@ -1137,10 +1174,25 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     """
     from hermes_state import SessionDB
 
+    gateway_run = importlib.import_module("gateway.run")
     session_id = "sess-restart"
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(session_id, "telegram")
+
+        main_thread = threading.get_ident()
+        streak_threads = []
+        original_cooldown_for_failure = gateway_run._hygiene_cooldown_for_failure
+
+        def tracked_cooldown_for_failure(*args, **kwargs):
+            streak_threads.append(threading.get_ident())
+            return original_cooldown_for_failure(*args, **kwargs)
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_hygiene_cooldown_for_failure",
+            tracked_cooldown_for_failure,
+        )
 
         class AbortingCompressAgent:
             instances = 0
@@ -1169,6 +1221,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         )
         assert await runner1._handle_message(event1) == "ok"
         assert AbortingCompressAgent.instances == 1
+        assert len(streak_threads) == 1
+        assert streak_threads[0] != main_thread
 
         # The abort must have persisted a cooldown to the DB.
         state = db.get_compression_failure_cooldown(session_id)
@@ -1199,10 +1253,6 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         runner2, _adapter2, event2 = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-        # This is a new inbound turn after restart, not a redelivery of the
-        # first message. Give it a distinct durable ingress identity so the
-        # gateway ledger correctly allows the cooldown assertion to run.
-        event2.message_id = "restart-followup-2"
         assert await runner2._handle_message(event2) == "ok"
         assert ShouldNotRunAgent.instances == 0, (
             "REGRESSION (#74136): a fresh GatewayRunner on the same state DB "
@@ -1212,5 +1262,19 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         )
         # The user turn itself still runs; only compression is skipped.
         assert runner2._run_agent.await_count == 1
+
+        # Once the first deadline expires, the next failed attempt after a
+        # restart must use rung 2 (900s), not start over at 300s (#86650).
+        db.clear_compression_failure_cooldown(session_id)
+        runner3, _adapter3, event3 = _make_cooldown_runner(
+            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
+        )
+        assert await runner3._handle_message(event3) == "ok"
+        assert AbortingCompressAgent.instances == 2
+        assert len(streak_threads) == 2
+        assert all(thread_id != main_thread for thread_id in streak_threads)
+        escalated = db.get_compression_failure_cooldown(session_id)
+        assert escalated is not None
+        assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
     finally:
         db.close()

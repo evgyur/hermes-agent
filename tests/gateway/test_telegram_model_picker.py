@@ -1,36 +1,9 @@
 """Tests for Telegram model picker thread fallback."""
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-
-def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-
-    mod = MagicMock()
-    mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants.ParseMode.MARKDOWN = "Markdown"
-    mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    mod.constants.ParseMode.HTML = "HTML"
-    mod.constants.ChatType.PRIVATE = "private"
-    mod.constants.ChatType.GROUP = "group"
-    mod.constants.ChatType.SUPERGROUP = "supergroup"
-    mod.constants.ChatType.CHANNEL = "channel"
-    mod.error.NetworkError = type("NetworkError", (OSError,), {})
-    mod.error.TimedOut = type("TimedOut", (OSError,), {})
-    mod.error.BadRequest = type("BadRequest", (Exception,), {})
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, mod)
-    sys.modules.setdefault("telegram.error", mod.error)
-
-
-_ensure_telegram_mock()
-
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -43,6 +16,32 @@ def _make_adapter():
 
 
 class TestTelegramModelPicker:
+    @pytest.mark.asyncio
+    async def test_model_picker_callback_rejects_unauthorized_caller_before_state_lookup(self):
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized = MagicMock(return_value=False)
+        adapter._handle_model_picker_callback = AsyncMock()
+        query = SimpleNamespace(
+            data="mb",
+            message=SimpleNamespace(
+                chat_id=12345,
+                chat=SimpleNamespace(type="private"),
+                message_thread_id=None,
+                business_connection_id=None,
+            ),
+            from_user=SimpleNamespace(id=999, first_name="Mallory"),
+            answer=AsyncMock(),
+        )
+
+        await adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+
+        adapter._is_callback_user_authorized.assert_called_once()
+        adapter._handle_model_picker_callback.assert_not_awaited()
+        query.answer.assert_awaited_once()
+        assert "not authorized" in query.answer.await_args.kwargs["text"].lower()
+
     @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
@@ -74,7 +73,7 @@ class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
-        adapter._model_picker_state["12345"] = {
+        adapter._model_picker_state[("12345", "")] = {
             "providers": [{"slug": "provider_one", "name": "Provider One", "total_models": 1, "is_current": True}],
             "current_model": "model_1",
             "current_provider": "provider_one",
@@ -87,6 +86,7 @@ class TestTelegramModelPicker:
         query.data = "mb"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.business_connection_id = None
         query.from_user = MagicMock()
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -97,5 +97,3 @@ class TestTelegramModelPicker:
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
-
-

@@ -21,6 +21,7 @@ from agent.conversation_compression import (
     compress_context,
 )
 from hermes_state import SessionDB
+from tools.process_registry import format_process_notification
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 
@@ -238,6 +239,52 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
 
 
 @pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(
+            {
+                "type": "completion",
+                "session_id": "proc_build",
+                "command": "scripts/run_tests.sh tests/agent/",
+                "exit_code": 0,
+                "output": "42 passed",
+            },
+            id="completion",
+        ),
+        pytest.param(
+            {
+                "type": "watch_match",
+                "session_id": "proc_server",
+                "command": "python server.py",
+                "pattern": "Application startup complete",
+                "output": "Application startup complete",
+            },
+            id="watch_match",
+        ),
+    ],
+)
+def test_background_process_notifications_do_not_become_compaction_anchors(
+    compressor, event
+):
+    notification = format_process_notification(event)
+    assert notification is not None
+    process_turn = {"role": "user", "content": notification}
+    human = {"role": "user", "content": "Refactor the auth module and add tests."}
+    messages = [
+        human,
+        {"role": "assistant", "content": "Working on it."},
+        process_turn,
+    ]
+
+    assert ContextCompressor._is_synthetic_compression_user_turn(process_turn) is True
+    assert ContextCompressor._transcript_has_real_user_turn([process_turn]) is False
+    assert compressor._derive_auto_focus_topic(messages) == (
+        "Recent user focus:\n- Refactor the auth module and add tests."
+    )
+    assert compressor._find_last_user_message_idx(messages, head_end=0) == 0
+
+
+@pytest.mark.parametrize(
     "content",
     [
         pytest.param(
@@ -364,6 +411,11 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert first_handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "First boundary" in first_handoff["content"]
     assert any(
+        message.get("role") == "system"
+        and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
+        for message in first
+    )
+    assert not any(
         message.get("role") == "user"
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
         for message in first
@@ -397,10 +449,14 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "Second boundary" in handoff["content"]
     assert "User asked:" not in handoff["content"]
+    todo_rows = [
+        message
+        for message in second
+        if str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
+    ]
+    assert len(todo_rows) == 1
+    assert todo_rows[0]["role"] == "system"
     db.close()
-
-
-
 
 
 

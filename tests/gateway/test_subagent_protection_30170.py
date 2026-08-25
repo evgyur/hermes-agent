@@ -35,23 +35,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # ──────────────────────────────────────────────────────────────────────
-# Minimal fallback stubs so gateway imports cleanly when the optional Telegram
-# dependency is absent (mirrors test_busy_session_ack). Prefer the real module
-# when installed so this module-level fallback cannot poison later tests.
+# Minimal stubs so gateway imports cleanly (mirrors test_busy_session_ack)
 # ──────────────────────────────────────────────────────────────────────
-try:
-    import telegram as _tg  # noqa: F401
-except ImportError:
-    _tg = types.ModuleType("telegram")
-    _tg.constants = types.ModuleType("telegram.constants")
-    _ct = MagicMock()
-    _ct.SUPERGROUP = "supergroup"
-    _ct.GROUP = "group"
-    _ct.PRIVATE = "private"
-    _tg.constants.ChatType = _ct
-    sys.modules.setdefault("telegram", _tg)
-    sys.modules.setdefault("telegram.constants", _tg.constants)
-    sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
+_tg = types.ModuleType("telegram")
+_tg.constants = types.ModuleType("telegram.constants")
+_ct = MagicMock()
+_ct.SUPERGROUP = "supergroup"
+_ct.GROUP = "group"
+_ct.PRIVATE = "private"
+_tg.constants.ChatType = _ct
+sys.modules.setdefault("telegram", _tg)
+sys.modules.setdefault("telegram.constants", _tg.constants)
+sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (  # noqa: E402
     MessageEvent,
@@ -284,4 +279,3 @@ class TestBusyHandlerDemotesInterruptForSubagents:
 
         parent.steer.assert_called_once_with("course-correct")
         parent.interrupt.assert_not_called()
-

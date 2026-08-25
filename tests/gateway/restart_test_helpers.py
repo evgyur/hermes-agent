@@ -5,18 +5,20 @@ from unittest.mock import AsyncMock, MagicMock
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.restart import (
+    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
 )
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    _bind_resume_origin_snapshot,
+    canonical_resume_origin,
+)
 
 
-class _EmptySessionHistoryDB:
-    """Explicit safe history source for startup-recovery unit runners."""
-
-    def get_messages(self, _session_id):
-        return []
+RESTART_MESSAGE_ID = "restart-message-1"
 
 
 class RestartTestAdapter(BasePlatformAdapter):
@@ -47,14 +49,35 @@ def make_restart_source(
     chat_id: str = "123456",
     chat_type: str = "dm",
     thread_id: str | None = None,
+    message_id: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id=chat_id,
         chat_type=chat_type,
-        user_id="u1",
+        user_id=chat_id,
         thread_id=thread_id,
+        message_id=message_id,
     )
+
+
+def bind_restart_origin_snapshot(
+    entry: SessionEntry,
+    source: SessionSource | None = None,
+) -> SessionEntry:
+    """Seal a synthetic pending entry like SessionStore does in production."""
+    entry.continuation_generation = entry.continuation_generation or 1
+    entry.continuation_claim_owner = (
+        entry.continuation_claim_owner or "gateway:test"
+    )
+    entry.continuation_claim_token = (
+        entry.continuation_claim_token or "test-claim-token"
+    )
+    _bind_resume_origin_snapshot(
+        entry,
+        canonical_resume_origin(source or entry.origin),
+    )
+    return entry
 
 
 def make_restart_runner(
@@ -84,6 +107,7 @@ def make_restart_runner(
     runner._restart_command_source = None
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._restart_after_turn_timeout = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+    runner._cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     runner._stop_task = None
     runner._busy_input_mode = "interrupt"
     runner._update_prompt_pending = {}
@@ -163,7 +187,17 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
-    setattr(runner, "_session_db", _EmptySessionHistoryDB())
+    # Startup continuation is authorized only after a readable durable
+    # frontier.  The generic fixture models a safe user-only transcript;
+    # risk-specific tests replace this with tool-call rows.
+    runner._session_db = MagicMock()
+    runner._session_db.get_messages.return_value = [
+        {
+            "role": "user",
+            "content": "pending request",
+            "platform_message_id": RESTART_MESSAGE_ID,
+        }
+    ]
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

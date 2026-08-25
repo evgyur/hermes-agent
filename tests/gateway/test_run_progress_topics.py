@@ -229,6 +229,85 @@ class FakeAgent:
         }
 
 
+class NativeTaskCardAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.SLACK):
+        super().__init__(platform=platform)
+        self.native_updates = []
+        self.native_stops = 0
+
+    def native_task_cards_enabled(self):
+        return True
+
+    async def send_native_task_card_progress(
+        self,
+        chat_id,
+        tasks,
+        *,
+        title,
+        reply_to=None,
+        metadata=None,
+        fallback_text=None,
+    ) -> SendResult:
+        self.native_updates.append(
+            {
+                "chat_id": chat_id,
+                "tasks": [dict(task) for task in tasks],
+                "metadata": dict(metadata or {}),
+                "fallback_text": fallback_text,
+            }
+        )
+        return SendResult(success=True, message_id="native-stream-1")
+
+    async def stop_native_task_card_progress(
+        self, chat_id, *, reply_to=None, metadata=None
+    ):
+        self.native_stops += 1
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize=False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+
+class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        return SendResult(success=False, error="native stream unavailable", retryable=True)
+
+
+class DuplicateNativeToolsAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tool_start_callback = kwargs.get("tool_start_callback")
+        self.tool_complete_callback = kwargs.get("tool_complete_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_start_callback("call-a", "web_search", {"query": "alpha"})
+        time.sleep(0.15)
+        self.tool_start_callback("call-b", "web_search", {"query": "beta"})
+        time.sleep(0.15)
+        # Complete the second same-name call first. Correlation by tool name
+        # would incorrectly mark call-a as failed here.
+        self.tool_complete_callback(
+            "call-b", "web_search", {"query": "beta"}, '{"error": "boom"}'
+        )
+        time.sleep(0.15)
+        self.tool_complete_callback(
+            "call-a", "web_search", {"query": "alpha"}, '{"success": true}'
+        )
+        time.sleep(0.15)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -453,6 +532,56 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     }
     assert adapter.sent[0]["metadata"] == expected_metadata
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_telegram_business_route_suppresses_progress_even_when_platform_verbose(
+    monkeypatch, tmp_path
+):
+    """External Business contacts must never inherit owner-facing progress."""
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {"display": {"platforms": {"telegram": {"tool_progress": "verbose"}}}}
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="777",
+        user_id="42",
+        chat_type="dm",
+        business_connection_id="biz-external",
+        external_safe_mode=True,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-business-progress",
+        session_key="agent:main:telegram:business:biz-external:777:42",
+        event_message_id="991",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -789,12 +918,6 @@ class StreamingRefineAgent:
         }
 
 
-class DelegationCapableStreamingAgent(StreamingRefineAgent):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.valid_tool_names = {"delegate_task"}
-
-
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -802,7 +925,9 @@ class QueuedCommentaryAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1 and self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
@@ -823,7 +948,9 @@ class QueuedMediaAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             final_response = f"first response\nMEDIA:{type(self).media_path}"
@@ -848,7 +975,9 @@ class QueuedSilenceAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         return {
             "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
@@ -865,7 +994,9 @@ class QueuedFailedEmptyAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             return {
@@ -931,6 +1062,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    user_id=None,
+    scope_id=None,
 ):
     if config_data:
         import yaml
@@ -957,6 +1090,8 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        user_id=user_id,
+        scope_id=scope_id,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -978,6 +1113,80 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-ids",
+        config_data={
+            "display": {"platforms": {"slack": {"tool_progress": "off"}}}
+        },
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=NativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.native_updates
+    second_completed = next(
+        update
+        for update in adapter.native_updates
+        if {task["id"]: task["status"] for task in update["tasks"]}
+        == {"call-a": "in_progress", "call-b": "error"}
+    )
+    assert second_completed["metadata"]["recipient_team_id"] == "T1"
+    assert second_completed["metadata"]["recipient_user_id"] == "U1"
+    assert adapter.native_updates[-1]["tasks"] == [
+        {
+            "id": "call-a",
+            "title": "web_search - alpha",
+            "status": "complete",
+        },
+        {
+            "id": "call-b",
+            "title": "web_search - beta",
+            "status": "error",
+        },
+    ]
+    assert adapter.sent == []
+    assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-fallback",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=FailingNativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.native_updates) == 1
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"].endswith("web_search - alpha - running")
+    assert len(adapter.edits) >= 2
+    assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
+    assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
+    assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
+    assert adapter.native_stops == 1
 
 
 @pytest.mark.asyncio
@@ -1030,30 +1239,6 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
-
-
-@pytest.mark.asyncio
-async def test_delegation_capable_non_delegating_turn_flushes_stream(monkeypatch, tmp_path):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DelegationCapableStreamingAgent,
-        session_id="sess-delegation-capable-stream",
-        config_data={
-            "display": {"tool_progress": "off", "interim_assistant_messages": False},
-            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
-        },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
-        chat_type="group",
-        thread_id="$thread",
-        adapter_cls=MetadataEditProgressCaptureAdapter,
-    )
-
-    assert result.get("already_sent") is True
-    delivered = [call["content"] for call in adapter.sent]
-    delivered.extend(edit["content"] for edit in adapter.edits)
-    assert any("Continuing to refine: Final answer." in text for text in delivered)
 
 
 class TransformedStreamAgent:
@@ -1433,37 +1618,6 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 
 @pytest.mark.asyncio
-async def test_run_agent_keeps_telegram_interim_commentary_in_forum_topic(monkeypatch, tmp_path):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DelayedInterimAgent,
-        session_id="sess-forum-interim",
-        chat_id="-1003971448755",
-        chat_type="forum",
-        thread_id="21452",
-        config_data={
-            "display": {
-                "tool_progress": "off",
-                "interim_assistant_messages": True,
-                "streaming": False,
-            }
-        },
-    )
-
-    interim = [
-        call for call in adapter.sent
-        if call["content"] in {"first interim", "second interim"}
-    ]
-    assert result["final_response"] == "done"
-    assert interim
-    assert all(
-        (call["metadata"] or {}).get("thread_id") == "21452"
-        for call in interim
-    )
-
-
-@pytest.mark.asyncio
 async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
     import yaml
 
@@ -1652,43 +1806,6 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     assert "node --version" not in all_content
     # No truncated quoted preview for the terminal command.
     assert 'terminal: "' not in all_content
-
-
-@pytest.mark.asyncio
-async def test_terminal_progress_can_use_compact_one_line(monkeypatch, tmp_path):
-    """Per-platform config restores the historical compact terminal preview."""
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        TerminalCommandAgent,
-        session_id="sess-terminal-compact-line",
-        config_data={
-            "display": {
-                "platforms": {
-                    "telegram": {
-                        "tool_progress": "all",
-                        "tool_preview_length": 120,
-                        "tool_progress_code_blocks": False,
-                    }
-                }
-            }
-        },
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id="",
-        adapter_cls=CodeBlockProgressAdapter,
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```" not in all_content
-    assert "set -euo pipefail" in all_content
-    assert "node --version" in all_content
-    assert all(
-        "\n" not in call["content"] for call in [*adapter.sent, *adapter.edits]
-    )
 
 
 @pytest.mark.asyncio

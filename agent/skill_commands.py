@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -21,216 +22,13 @@ from agent.skill_preprocessing import (
 
 logger = logging.getLogger(__name__)
 
-
-_XHIGH_REASONING_CONFIG = {"enabled": True, "effort": "xhigh"}
-
-_POSTCRAFT_SKILL_NAME = "postcraft"
-_POSTCRAFT_ACTIVATION_MARKER = 'invoked the "postcraft" skill'
-_POSTCRAFT_AUTOLOAD_MARKER = (
-    "[IMPORTANT: The user's message matches the postcraft editorial-writing trigger"
-)
-_POSTCRAFT_TRIGGER_RE = re.compile(
-    r"("
-    r"\bpostcraft\b|"
-    r"/(?:postcraft)(?:\s|$)|"
-    r"\b(?:rewrite|rewrit(?:e|ing)|humanize|deslop|shorten|copyedit|proofread)\b|"
-    r"(?:перепиш(?:и|ь|ите|ем)|переформулируй|отрерайт|рерайт|"
-    r"сделай\s+(?:текст\s+)?(?:живее|человечнее|короче|жёстче|жестче|острее|сильнее|чище)|"
-    r"очеловечь|сократи|ужми|вычисти|убери\s+(?:ai|ии|слоп|канцелярит)|"
-    r"напиши\s+(?:пост|текст|заметку)|сделай\s+пост|"
-    r"(?:пост|текст|черновик|заметк[ауи])\s+(?:надо\s+)?(?:переписать|улучшить|дожать|сократить|оживить))"
-    r")",
-    re.IGNORECASE,
-)
-
-_SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
-    'invoked the "sc" skill',
-    'invoked the "shalimov-craft" skill',
-    'stacked skill invocation "sc"',
-    'stacked skill invocation "shalimov-craft"',
-)
-
-_DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS = (
-    'invoked the "shalimov-craft" skill',
-    'stacked skill invocation "shalimov-craft"',
-)
-
-_SCO_ACTIVATION_MARKERS = (
-    'invoked the "sco" skill',
-    'stacked skill invocation "sco"',
-)
-_SCO_PROVIDER = "openrouter"
-_SCO_MODEL = "anthropic/claude-opus-5"
-
-
-def postcraft_reasoning_config() -> dict[str, Any]:
-    """Return the hard rail for postcraft turns: reasoning=xhigh."""
-    return dict(_XHIGH_REASONING_CONFIG)
-
-
-def shalimov_craft_reasoning_config() -> dict[str, Any]:
-    """Return the hard rail for direct shalimov-craft turns."""
-    return dict(_XHIGH_REASONING_CONFIG)
-
-
-def is_postcraft_loaded_message(message: Any) -> bool:
-    """Return True when a message already contains the loaded postcraft skill."""
-    if not isinstance(message, str):
-        return False
-    lowered = message.lower()
-    return (
-        _POSTCRAFT_ACTIVATION_MARKER in lowered
-        or _POSTCRAFT_AUTOLOAD_MARKER.lower() in lowered
-    )
-
-
-def is_shalimov_craft_loaded_message(message: Any) -> bool:
-    """Return True for model-facing /sc or shalimov-craft skill payloads."""
-    if not isinstance(message, str):
-        return False
-    if not message.startswith(_SKILL_INVOCATION_PREFIX):
-        return False
-    lowered = message.lower()
-    return any(marker in lowered for marker in _SHALIMOV_CRAFT_ACTIVATION_MARKERS)
-
-
-def is_direct_shalimov_craft_loaded_message(message: Any) -> bool:
-    """Return True only for direct shalimov-craft payloads, excluding /sc."""
-    if not is_shalimov_craft_loaded_message(message):
-        return False
-    lowered = message.lower()
-    return any(
-        marker in lowered for marker in _DIRECT_SHALIMOV_CRAFT_ACTIVATION_MARKERS
-    )
-
-
-def is_sco_loaded_message(message: Any) -> bool:
-    """Return True only for model-facing /sco skill payloads."""
-    if not isinstance(message, str):
-        return False
-    if not message.startswith(_SKILL_INVOCATION_PREFIX):
-        return False
-    lowered = message.lower()
-    return any(marker in lowered for marker in _SCO_ACTIVATION_MARKERS)
-
-
-def writing_skill_runtime_config(message: Any) -> dict[str, Any] | None:
-    """Return deterministic model/provider rails for writing-skill turns."""
-    if is_sco_loaded_message(message):
-        return {
-            "provider": _SCO_PROVIDER,
-            "model": _SCO_MODEL,
-            "allow_fallbacks": False,
-        }
-    return None
-
-
-def resolve_writing_skill_runtime(
-    message: Any,
-    *,
-    max_tokens: int | None = None,
-) -> dict[str, Any] | None:
-    """Resolve a writing skill's exact runtime without mutating session state.
-
-    Provider resolution is deliberately fail-closed: callers must surface the
-    exception instead of silently keeping the current provider/model.
-    """
-    config = writing_skill_runtime_config(message)
-    if config is None:
-        return None
-
-    from hermes_cli.runtime_provider import resolve_runtime_provider
-
-    runtime = resolve_runtime_provider(
-        requested=config["provider"],
-        target_model=config["model"],
-    )
-    resolved_runtime = {
-        "api_key": runtime.get("api_key"),
-        "base_url": runtime.get("base_url"),
-        "provider": runtime.get("provider") or config["provider"],
-        "requested_provider": runtime.get("requested_provider")
-        or config["provider"],
-        "api_mode": runtime.get("api_mode"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
-        "credential_pool": runtime.get("credential_pool"),
-    }
-    if max_tokens is not None:
-        resolved_runtime["max_tokens"] = max_tokens
-
-    return {
-        "model": config["model"],
-        "runtime": resolved_runtime,
-        "allow_fallbacks": bool(config.get("allow_fallbacks", True)),
-    }
-
-
-def writing_skill_reasoning_config(message: Any) -> dict[str, Any] | None:
-    """Resolve deterministic per-turn reasoning rails for writing skills."""
-    if is_postcraft_loaded_message(message) or is_direct_shalimov_craft_loaded_message(
-        message
-    ):
-        return dict(_XHIGH_REASONING_CONFIG)
-    return None
-
-
-def is_postcraft_trigger_message(message: Any) -> bool:
-    """Deterministically catch common short-form writing/editing requests."""
-    if not isinstance(message, str):
-        return False
-    text = message.strip()
-    if not text:
-        return False
-    if text.startswith(_SKILL_INVOCATION_PREFIX):
-        return False
-    if text.startswith("/") and not text.lower().startswith("/postcraft"):
-        return False
-    return bool(_POSTCRAFT_TRIGGER_RE.search(text))
-
-
-def maybe_build_postcraft_autoload_message(
-    user_instruction: str,
-    task_id: str | None = None,
-) -> Optional[str]:
-    """Load postcraft for a matching natural-language writing/editing turn."""
-    if is_postcraft_loaded_message(user_instruction):
-        return None
-    if not is_postcraft_trigger_message(user_instruction):
-        return None
-
-    loaded = _load_skill_payload(_POSTCRAFT_SKILL_NAME, task_id=task_id)
-    if not loaded:
-        return None
-
-    loaded_skill, skill_dir, skill_name = loaded
-    try:
-        from tools.skill_usage import bump_use
-
-        bump_use(skill_name)
-    except Exception:
-        pass
-
-    activation_note = (
-        "[IMPORTANT: The user's message matches the postcraft editorial-writing trigger. "
-        'The "postcraft" skill has been loaded automatically; follow it as a hard rail, '
-        "not as optional style advice. This turn must run with reasoning=xhigh.]"
-    )
-    runtime_note = (
-        "Auto-loaded postcraft by deterministic pre-LLM trigger; "
-        "force reasoning_effort=xhigh for this turn."
-    )
-    return _build_skill_message(
-        loaded_skill,
-        skill_dir,
-        activation_note,
-        user_instruction=user_instruction,
-        runtime_note=runtime_note,
-        session_id=task_id,
-    )
-
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_home: Optional[str] = None
+# Guards the (map, platform-tag, home-tag) triple so publication and the
+# freshness lookup always see a consistent snapshot. Scanning itself stays
+# outside this lock.
+_publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -414,6 +212,22 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     except Exception:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
+
+
+def _resolve_skill_commands_home() -> str:
+    """Return the effective Hermes home the skill scan should be scoped to.
+
+    A gateway session can switch between profiles that each carry their own
+    ``skills.external_dirs`` (via ``set_hermes_home_override``), but the
+    module-level scan only tracked ``_resolve_skill_commands_platform()``.
+    Switching profiles without a platform change left the previous profile's
+    skill list cached, so ``get_skill_commands()`` reported a cache miss for
+    skills that only exist under the new profile (#88023).
+    """
+    from hermes_constants import get_hermes_home
+
+    return str(get_hermes_home())
+
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
@@ -613,24 +427,43 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands = {}
+    global _skill_commands, _skill_commands_platform, _skill_commands_home
+    platform = _resolve_skill_commands_platform()
+    home = _resolve_skill_commands_home()
+    # Build into a local map and publish once, at the end. Writing straight
+    # into the global made a scan's partial results visible to everything
+    # else in the process: a second, overlapping scan deduped against its own
+    # (empty) ``seen_names`` but collided against the first scan's already-
+    # published slugs, logging one bogus "already claimed" warning per skill —
+    # each naming the same skill as its own incumbent (#74574).
+    commands: Dict[str, Dict[str, Any]] = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import (
+            get_external_skills_dirs,
+            get_project_skills_dirs,
+            iter_project_skill_files,
+            iter_skill_index_files,
+        )
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
-        # Scan local dir first, then external dirs
-        dirs_to_scan = []
+        # Scan project dirs first (highest precedence), then local, then external.
+        # Project dirs iterate through the quarantine chokepoint.
+        project_dirs = list(get_project_skills_dirs())
+        dirs_to_scan = list(project_dirs)
         if SKILLS_DIR.exists():
             dirs_to_scan.append(SKILLS_DIR)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
-            for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+            _iter = (
+                iter_project_skill_files(scan_dir)
+                if scan_dir in project_dirs
+                else iter_skill_index_files(scan_dir, "SKILL.md")
+            )
+            for skill_md in _iter:
                 if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
                     continue
                 try:
@@ -683,14 +516,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
+                    if cmd_key in commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                            name, cmd_key, commands[cmd_key]["name"],
                         )
                         continue
-                    _skill_commands[cmd_key] = {
+                    commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -700,7 +533,18 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+    # Publish the finished map and the platform/home it was scanned for as
+    # ONE step. Bare assignments are not atomic together: a reader landing
+    # between them sees the NEW map still carrying the OLD platform tag, and
+    # if that stale tag happens to match its own platform it accepts the map
+    # without rescanning — serving another platform's disabled-skill view,
+    # exactly the leak #14536 closed. Only the publish/lookup pair is locked;
+    # the scan above (file I/O, deferred imports) stays outside it.
+    with _publish_lock:
+        _skill_commands = commands
+        _skill_commands_platform = platform
+        _skill_commands_home = home
+    return commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -708,51 +552,26 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
 
     Rescans when the active platform scope changes (e.g. a gateway
     process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    sees its own ``skills.platform_disabled`` view (#14536), and when the
+    active profile's Hermes home changes (e.g. Desktop switching profiles
+    mid-session) so each profile sees its own ``skills.external_dirs`` (#88023).
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
-    return _skill_commands
-
-
-def _hot_reload_entrypoint_plugins() -> list[str]:
-    """Reload command/tool-only pip-entrypoint plugins in this process."""
-    import importlib
-
-    from hermes_cli import plugins as plugins_mod
-    from tools.registry import registry
-
-    manager = plugins_mod.get_plugin_manager()
-    manager.discover_and_load()
-    reloaded: list[str] = []
-    importlib.invalidate_caches()
-    for key, loaded in list(manager._plugins.items()):
-        if not loaded.enabled or loaded.manifest.source != "entrypoint":
-            continue
-        if loaded.module is None:
-            continue
-        if loaded.hooks_registered or loaded.middleware_registered:
-            raise RuntimeError(
-                f"Plugin {key!r} has hooks/middleware and cannot be hot-reloaded safely"
-            )
-        for tool_name in loaded.tools_registered:
-            registry.deregister(tool_name)
-            manager._plugin_tool_names.discard(tool_name)
-        for command_name in loaded.commands_registered:
-            manager._plugin_commands.pop(command_name, None)
-
-        importlib.reload(loaded.module)
-        manager._plugins.pop(key, None)
-        manager._load_plugin(loaded.manifest)
-        refreshed = manager._plugins.get(key)
-        if refreshed is None or not refreshed.enabled:
-            detail = refreshed.error if refreshed is not None else "plugin disappeared"
-            raise RuntimeError(f"Plugin {key!r} hot reload failed: {detail}")
-        reloaded.append(key)
-    return sorted(reloaded)
+    current_platform = _resolve_skill_commands_platform()
+    current_home = _resolve_skill_commands_home()
+    # Read the map and its tags under the same lock that publishes them, so
+    # the freshness decision is made against a consistent snapshot.
+    with _publish_lock:
+        commands = _skill_commands
+        is_fresh = (
+            bool(commands)
+            and _skill_commands_platform == current_platform
+            and _skill_commands_home == current_home
+        )
+    if is_fresh:
+        return commands
+    # Scan outside the lock — it does file I/O and deferred imports, and
+    # concurrent scans are already safe (each builds its own map).
+    return scan_skill_commands()
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -760,8 +579,7 @@ def reload_skills() -> Dict[str, Any]:
 
     Rescans ``~/.hermes/skills/`` and any ``skills.external_dirs`` so the
     slash-command map (``agent.skill_commands._skill_commands``) reflects
-    skills added or removed on disk. Enabled command/tool-only pip-entrypoint
-    plugins are hot-reloaded so command changes do not require a gateway restart.
+    skills added or removed on disk.
 
     This does NOT invalidate the skills system-prompt cache. Skills are
     called by name via ``/skill-name``, ``skills_list``, or ``skill_view``
@@ -800,7 +618,6 @@ def reload_skills() -> Dict[str, Any]:
     # Rescan the skills dir. ``scan_skill_commands`` resets
     # ``_skill_commands = {}`` internally and repopulates it.
     new_commands = scan_skill_commands()
-    reloaded_plugins = _hot_reload_entrypoint_plugins()
 
     after = _snapshot(new_commands)
 
@@ -819,7 +636,6 @@ def reload_skills() -> Dict[str, Any]:
         "unchanged": unchanged,
         "total": len(after),
         "commands": len(new_commands),
-        "plugins_reloaded": reloaded_plugins,
     }
 
 

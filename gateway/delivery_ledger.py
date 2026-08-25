@@ -17,12 +17,8 @@ bounded retention). The gateway writes three checkpoints around the send:
     mark_failed()         state='failed'      on a definitive rejection
 
 On startup, ``sweep_recoverable()`` claims rows whose owning process is
-dead and hands them to the gateway for redelivery. At runtime,
-``sweep_failed_for_runtime()`` claims a platform's ``failed`` rows when
-that platform reconnects after an outage, so a rejection that happened
-while the gateway stayed alive (typically during the same network trouble
-that dropped the adapter) is retried without waiting for a restart. Crash
-semantics are explicit about ambiguity (the contract review of the earlier
+dead and hands them to the gateway for redelivery. Crash semantics are
+explicit about ambiguity (the contract review of the earlier
 delivery-outbox attempt, #61790, closed it for silently resending
 ambiguous sends):
 
@@ -44,12 +40,15 @@ or delay an actual send. Callers wrap every call in try/except.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -66,6 +65,20 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_UNDELIVERED_ROWS = 2000
+_MAX_UNDELIVERED_BYTES = 128 * 1024 * 1024
+
+
+class DeliveryLedgerCapacityError(RuntimeError):
+    """The durable outbox is full; an unreceipted send must not proceed."""
+
+
+@dataclass(frozen=True)
+class ObligationRecordResult:
+    """Transactional admission/duplicate disposition for one exact effect."""
+
+    disposition: str
+    claim_token: str = ""
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -111,24 +124,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT,
-            resume_task_id TEXT,
-            continuation_generation INTEGER,
-            continuation_claim_owner TEXT,
-            continuation_claim_token TEXT
+            last_error TEXT
         )"""
     )
     columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
     }
-    if "resume_task_id" not in columns:
-        conn.execute(
-            "ALTER TABLE delivery_obligations ADD COLUMN resume_task_id TEXT"
-        )
     for name, sql_type in (
-        ("continuation_generation", "INTEGER"),
-        ("continuation_claim_owner", "TEXT"),
-        ("continuation_claim_token", "TEXT"),
+        ("resume_task_id", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("continuation_claim_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("runtime_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("route_envelope_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(
@@ -182,16 +190,32 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         current_start = None
     if current_start is None:
         # No such process (or unreadable) — treat unreadable-but-extant
-        # processes as alive only if the pid exists.
+        # processes as alive only if the pid exists. Route through the
+        # cross-platform probe: ``os.kill(pid, 0)`` on Windows is NOT a
+        # no-op (bpo-14484 — CPython maps sig=0 to
+        # ``GenerateConsoleCtrlEvent(0, pid)``), so a raw probe here could
+        # Ctrl+C the gateway's own console group whenever psutil failed to
+        # read the start time of a live pid. ``_pid_exists`` keeps the
+        # EPERM-means-alive semantics (exists but owned by another user).
         try:
-            os.kill(pid, 0)  # windows-footgun: ok — EPERM counts as alive below
-        except ProcessLookupError:
-            return False
-        except PermissionError:
+            from gateway.status import _pid_exists
+        except Exception:
+            if os.name == "nt":
+                # Never fall back to a raw sig-0 probe on Windows.
+                return False
+            try:
+                os.kill(pid, 0)  # windows-footgun: ok — POSIX-only fallback branch
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
             return True
-        except OSError:
+        try:
+            return bool(_pid_exists(pid))
+        except Exception:
             return False
-        return True
     if started_at is None:
         return True
     try:
@@ -217,29 +241,101 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
-    resume_task_id: Optional[str] = None,
-    continuation_generation: Optional[int] = None,
-    continuation_claim_owner: Optional[str] = None,
-    continuation_claim_token: Optional[str] = None,
-) -> None:
+    resume_task_id: str = "",
+    continuation_generation: int = 0,
+    continuation_claim_owner: str = "",
+    continuation_claim_token: str = "",
+    route_envelope: Optional[Dict[str, Any]] = None,
+) -> ObligationRecordResult:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
+    envelope_json = None
+    if route_envelope is not None:
+        if str(platform) == "telegram":
+            from gateway.telegram_egress_policy import canonical_route_envelope
+
+            route_envelope = canonical_route_envelope(route_envelope)
+        envelope_json = json.dumps(
+            route_envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     with _DB_LOCK, _transaction() as conn:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """SELECT session_key, platform, chat_id, thread_id, content, state
+               FROM delivery_obligations WHERE obligation_id=?""",
+            (obligation_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+            )
+            if tuple(existing[:5]) != expected:
+                raise ValueError(
+                    "delivery obligation id collision with different payload"
+                )
+            state = str(existing[5] or "")
+            if state in {"pending", "failed"}:
+                claim_token = uuid.uuid4().hex
+                changed = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='attempting', attempts=attempts+1,
+                           owner_pid=?, owner_started_at=?, runtime_claim_token=?,
+                           updated_at=?, last_error=NULL
+                       WHERE obligation_id=? AND state=?""",
+                    (pid, started, claim_token, now, obligation_id, state),
+                )
+                if changed.rowcount == 1:
+                    return ObligationRecordResult("retry_claimed", claim_token)
+                return ObligationRecordResult("attempting")
+            return ObligationRecordResult(state or "attempting")
+        pending_count, pending_bytes = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(
+                     LENGTH(CAST(content AS BLOB))
+                     + LENGTH(CAST(session_key AS BLOB))
+                     + LENGTH(CAST(chat_id AS BLOB))
+                   ), 0)
+               FROM delivery_obligations
+               WHERE state NOT IN ('delivered','abandoned')"""
+        ).fetchone()
+        planned_bytes = len(content.encode("utf-8")) + len(
+            session_key.encode("utf-8")
+        ) + len(str(chat_id).encode("utf-8"))
+        if (
+            int(pending_count or 0) >= _MAX_UNDELIVERED_ROWS
+            or int(pending_bytes or 0) + planned_bytes
+            > _MAX_UNDELIVERED_BYTES
+        ):
+            raise DeliveryLedgerCapacityError(
+                "delivery outbox capacity is full; final was not sent"
+            )
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, resume_task_id,
                 continuation_generation, continuation_claim_owner,
-                continuation_claim_token)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                continuation_claim_token, runtime_claim_token,
+                route_envelope_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started, resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token),
+             pid, started, str(resume_task_id or ""),
+             int(continuation_generation or 0),
+             str(continuation_claim_owner or ""),
+             str(continuation_claim_token or ""), envelope_json),
         )
     _prune()
+    return ObligationRecordResult("created")
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -298,14 +394,14 @@ def sweep_recoverable(
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, resume_task_id,
                       continuation_generation, continuation_claim_owner,
-                      continuation_claim_token
+                      continuation_claim_token, route_envelope_json
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at,
-             resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token) in rows:
+             attempts, created_at, owner_pid, owner_started_at, resume_task_id,
+             continuation_generation, continuation_owner,
+             continuation_token, route_envelope_json) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -322,10 +418,48 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            route_envelope = None
+            if platform == "telegram":
+                try:
+                    if not route_envelope_json:
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import (
+                        assert_recipient_allowed,
+                        canonical_route_envelope,
+                    )
+
+                    route_envelope = canonical_route_envelope(
+                        json.loads(route_envelope_json)
+                    )
+                    if (
+                        route_envelope["chat_id"] != str(chat_id)
+                        or route_envelope["platform"] != str(platform)
+                        or route_envelope["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    assert_recipient_allowed(chat_id)
+                except Exception as exc:
+                    error = str(exc) or "ambiguous_route_envelope"
+                    if "denied" not in error:
+                        error = "ambiguous_route_envelope"
+                    conn.execute(
+                        """UPDATE delivery_obligations
+                           SET state='abandoned', updated_at=?, last_error=?
+                           WHERE obligation_id=?""",
+                        (now, error, oid),
+                    )
+                    continue
+            elif route_envelope_json:
+                try:
+                    decoded = json.loads(route_envelope_json)
+                    route_envelope = decoded if isinstance(decoded, dict) else None
+                except (TypeError, ValueError):
+                    route_envelope = None
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       state='attempting', updated_at=?
+                       updated_at=?
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )
@@ -341,10 +475,11 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
-                    "resume_task_id": resume_task_id,
-                    "continuation_generation": continuation_generation,
-                    "continuation_claim_owner": continuation_claim_owner,
-                    "continuation_claim_token": continuation_claim_token,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
 
@@ -352,81 +487,254 @@ def sweep_recoverable(
 def sweep_failed_for_runtime(
     platform: str,
     now: Optional[float] = None,
+    *,
+    transport_profile: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Claim 'failed' rows for a platform so a just-reconnected gateway can
-    retry them without waiting for a restart.
-
-    The startup sweep (``sweep_recoverable``) only claims rows owned by a
-    DEAD process, so a final response definitively rejected while this
-    gateway stayed alive — typically during the network outage that also
-    dropped the adapter — would otherwise sit undelivered until the next
-    boot. Firing after a successful reconnect closes that gap: the platform
-    is known-good again, so a rejected send is worth one more attempt.
-
-    Claiming atomically re-stamps the owner to THIS process, sets
-    ``state='attempting'`` and increments ``attempts`` (the redelivery
-    budget), so a concurrent sweep cannot double-claim. Rows over the
-    attempts cap or older than the stale cutoff transition to 'abandoned'
-    instead of being returned, and rows owned by a DIFFERENT live process
-    are left untouched (that process owns their retry budget).
-    """
+    """Claim failed sends after reconnect without stealing another live owner."""
     now = now if now is not None else time.time()
+    expected_transport = (
+        str(transport_profile).strip() if transport_profile is not None else None
+    )
     pid, started = _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
-                      owner_pid, owner_started_at, resume_task_id,
-                      continuation_generation, continuation_claim_owner,
-                      continuation_claim_token
+                      content, attempts, created_at, owner_pid, owner_started_at,
+                      resume_task_id, continuation_generation,
+                      continuation_claim_owner, continuation_claim_token,
+                      route_envelope_json
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""",
-            (platform,),
+               WHERE state='failed' AND platform=?
+               ORDER BY created_at, obligation_id""",
+            (str(platform),),
         ).fetchall()
-        for (oid, session_key, row_platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at,
-             resume_task_id, continuation_generation,
-             continuation_claim_owner, continuation_claim_token) in rows:
-            # Ownership is authoritative before every terminalization or claim.
-            # A stale/over-cap row owned by another live process is still that
-            # process's row and must not be abandoned by this gateway.
-            if owner_pid != pid and _owner_alive(owner_pid, owner_started_at):
+        for row in rows:
+            (oid, session_key, platform_name, chat_id, thread_id, content,
+             attempts, created_at, owner_pid, owner_started_at, resume_task_id,
+             continuation_generation, continuation_owner,
+             continuation_token, route_envelope_json) = row
+            route_envelope = None
+            if platform_name == "telegram":
+                # Route provenance is authority for a reconnect send. Validate
+                # it before *any* ownership, expiry, or claim mutation so a
+                # transport-specific sweep cannot steal/quarantine another
+                # transport's row merely by observing it.
+                raw_route = None
+                try:
+                    if not route_envelope_json:
+                        raise ValueError("ambiguous_route_envelope")
+                    raw_route = json.loads(route_envelope_json)
+                    required = {
+                        "version",
+                        "platform",
+                        "runtime_profile",
+                        "transport_profile",
+                        "chat_id",
+                        "thread_id",
+                        "user_id",
+                        "business_connection_id",
+                        "external_safe_mode",
+                    }
+                    if not isinstance(raw_route, dict) or not required.issubset(
+                        raw_route
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    for profile_field in ("runtime_profile", "transport_profile"):
+                        value = raw_route.get(profile_field)
+                        if (
+                            not isinstance(value, str)
+                            or not value.strip()
+                            or value != value.strip()
+                        ):
+                            raise ValueError("ambiguous_route_envelope")
+                    if type(raw_route.get("external_safe_mode")) is not bool:
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import canonical_route_envelope
+
+                    route_envelope = canonical_route_envelope(raw_route)
+                    if (
+                        route_envelope["platform"] != str(platform_name)
+                        or route_envelope["chat_id"] != str(chat_id)
+                        or route_envelope["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                except Exception:
+                    # Quarantine malformed rows only when the remaining
+                    # explicit transport field still proves this sweep owns
+                    # them. Foreign/unknown routes remain untouched.
+                    raw_transport = (
+                        raw_route.get("transport_profile")
+                        if isinstance(raw_route, dict)
+                        else None
+                    )
+                    if (
+                        expected_transport is not None
+                        and isinstance(raw_transport, str)
+                        and raw_transport == expected_transport
+                        and raw_transport.strip() == raw_transport
+                    ):
+                        conn.execute(
+                            "UPDATE delivery_obligations SET state='abandoned', "
+                            "updated_at=?, last_error='ambiguous_route_envelope' "
+                            "WHERE obligation_id=? AND state='failed'",
+                            (now, oid),
+                        )
+                    continue
+                if (
+                    expected_transport is not None
+                    and route_envelope["transport_profile"] != expected_transport
+                ):
+                    continue
+            exact_current_owner = int(owner_pid or 0) == int(pid) and (
+                owner_started_at is None
+                or started is None
+                or int(owner_started_at) == int(started)
+            )
+            if _owner_alive(owner_pid, owner_started_at) and not exact_current_owner:
                 continue
-            owner_guard = """owner_pid IS ? AND owner_started_at IS ?"""
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+            if int(attempts or 0) >= MAX_ATTEMPTS or (
+                now - float(created_at or now)
+            ) > STALE_AFTER_SECONDS:
                 conn.execute(
-                    f"""UPDATE delivery_obligations
-                        SET state='abandoned', updated_at=?
-                        WHERE obligation_id=? AND state='failed' AND {owner_guard}""",
-                    (now, oid, owner_pid, owner_started_at),
+                    "UPDATE delivery_obligations SET state='abandoned', "
+                    "updated_at=? WHERE obligation_id=? AND state='failed'",
+                    (now, oid),
                 )
                 continue
-            cursor = conn.execute(
-                f"""UPDATE delivery_obligations
-                    SET owner_pid=?, owner_started_at=?, state='attempting',
-                        attempts=attempts+1, updated_at=?
-                    WHERE obligation_id=? AND state='failed' AND {owner_guard}""",
-                (pid, started, now, oid, owner_pid, owner_started_at),
-            )
-            if cursor.rowcount:
+            claim_token = uuid.uuid4().hex
+            changed = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       attempts=attempts+1, runtime_claim_token=?, updated_at=?
+                   WHERE obligation_id=? AND state='failed'
+                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                (pid, started, claim_token, now, oid, owner_pid, owner_started_at),
+            ).rowcount
+            if changed:
+                if platform_name != "telegram" and route_envelope_json:
+                    try:
+                        decoded = json.loads(route_envelope_json)
+                        route_envelope = (
+                            decoded if isinstance(decoded, dict) else None
+                        )
+                    except Exception:
+                        route_envelope = None
                 claimed.append({
                     "obligation_id": oid,
                     "session_key": session_key,
-                    "platform": row_platform,
+                    "platform": platform_name,
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
-                    # failed = definitively rejected once; a resend may
-                    # duplicate, so the marker labels the at-least-once retry.
                     "needs_marker": True,
-                    "attempts": attempts + 1,
-                    "resume_task_id": resume_task_id,
-                    "continuation_generation": continuation_generation,
-                    "continuation_claim_owner": continuation_claim_owner,
-                    "continuation_claim_token": continuation_claim_token,
+                    "attempts": int(attempts or 0) + 1,
+                    "runtime_claim_token": claim_token,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def abandon_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    error: str = "",
+) -> bool:
+    """Abandon only the reconnect generation represented by ``claim_token``."""
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='abandoned', runtime_claim_token='', updated_at=?,
+                   last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                time.time(),
+                str(error or "")[:500] or None,
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
+
+
+def settle_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    *,
+    delivered: bool,
+    error: str = "",
+) -> bool:
+    """Settle only the exact reconnect claim generation."""
+    state = "delivered" if delivered else "failed"
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state=?, runtime_claim_token='', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                state,
+                time.time(),
+                None if delivered else str(error or "")[:500],
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
+
+
+async def settle_with_retry(callable_, *args, **kwargs):
+    """Retry only an idempotent post-wire ledger settlement off-loop."""
+    delay = 0.01
+    for attempt in range(4):
+        try:
+            return await asyncio.to_thread(callable_, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked:
+                raise
+            if attempt == 3:
+                task = asyncio.create_task(
+                    _settle_locked_until_owned(callable_, args, kwargs)
+                )
+                _PENDING_SETTLEMENT_TASKS.add(task)
+                task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)
+                # Give the supervised owner one short handoff slice. If the
+                # lock clears on the next attempt, callers observe the settled
+                # row before returning; a persistent lock still continues in
+                # the retained background task without blocking wire delivery.
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                return False
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+_PENDING_SETTLEMENT_TASKS: set[asyncio.Task] = set()
+
+
+async def _settle_locked_until_owned(callable_, args, kwargs) -> None:
+    """Continue DB-only settlement after irreversible wire acceptance."""
+    delay = 0.08
+    while True:
+        try:
+            await asyncio.to_thread(callable_, *args, **kwargs)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                logger.error("delivery settlement failed permanently: %s", exc)
+                return
+            await asyncio.sleep(delay)
+            delay = min(2.0, delay * 2)
+        except Exception:
+            logger.exception("delivery settlement failed permanently")
+            return
 
 
 def _prune(now: Optional[float] = None) -> None:
@@ -447,11 +755,8 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered','abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )

@@ -176,18 +176,11 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs
-- No memory of previous cron executions (unless persisted to memory/files)
+- No memory of previous cron executions (persistent memory — MEMORY.md /
+  USER.md — does load, like any other agent run, so durable preferences and
+  facts carry over; per-run conversation context does not)
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
-
-### Manual-run execution modes
-
-`cronjob(action="run")` has two execution modes selected by call context:
-
-- **Agent/tool invocation** (`task_id` is present): `trigger_job_if_active()` atomically verifies that the job is active and sets `next_run_at` to now. The tool returns `execution_state: "queued"`; the persistent scheduler executes it asynchronously on the next tick. It never re-enables a paused job.
-- **Direct CLI/Python invocation** (`task_id` is absent): `_execute_job_now()` takes the normal at-most-once fire claim and runs the shared `run_one_job()` body inline. This keeps `hermes cron run` useful on CLI-only installations with no active gateway ticker.
-
-The split prevents a long cron agent from blocking its parent gateway turn while preserving truthful immediate execution for direct operator calls. Callers in agent context must inspect `action="list"` later; queue acceptance is not completion.
 
 ## Skill-Backed Jobs
 
@@ -223,18 +216,6 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 4. **Default** — 3600 seconds (1 hour)
 
 This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
-
-### SessionDB initialization timeout
-
-The LLM path initializes `SessionDB` before creating `AIAgent`. Because SQLite open/migration is synchronous, a wedged connection at that point would otherwise happen before the agent inactivity guard exists and could leave the job ID stuck in `_running_job_ids` forever.
-
-Hermes resolves the initialization timeout in this order:
-
-1. `HERMES_CRON_SESSION_DB_TIMEOUT`
-2. `cron.session_db_timeout_seconds` in `config.yaml`
-3. 10 seconds
-
-Positive values run `SessionDB()` in a single-worker executor and bound `Future.result()`. `0` restores the unbounded legacy behavior and should be reserved for debugging. On timeout, the worker is abandoned without waiting, the cron run proceeds with `session_db=None`, and the outer dispatch `finally` path still releases the running-job guard.
 
 ### Provider Recovery
 
@@ -273,12 +254,15 @@ Most platforms also accept an optional thread/topic as a third segment: `platfor
 | WeCom | `wecom` or `wecom:<chat_id>` | Bare name delivers to WeCom |
 | BlueBubbles | `bluebubbles` or `bluebubbles:<chat_guid>` | Bare name delivers to iMessage via BlueBubbles |
 | QQ Bot | `qqbot` or `qqbot:<chat_id>` | Bare name delivers to QQ (Tencent) via Official API v2 |
+| Bot Chat | `bot-chat` or `bot-chat:<profile>` | Inject into a local profile's canonical Bot Chat (the bot responds) |
 
 Platforms in the first group have explicit, validated target syntax — named channels (`#channel`), topics/threads, room/user IDs, group IDs, or phone numbers. The remaining platforms accept the generic `platform:<chat_id>` form (the value after the colon is used verbatim as the destination ID); a bare platform name always delivers to the home channel.
 
 **Named channels** (`slack:#engineering`, `discord:#engineering`, or a friendly name like `slack:engineering`) are resolved against the channel directory the gateway builds from connected adapters, so the gateway must have discovered the channel for name resolution to succeed; raw IDs (`slack:C0123ABCD45`) always work.
 
 For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`). For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
+
+**Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter: the scheduler delivers by running `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` — the same lane Bot Mode agent-to-agent messages use — so the output arrives as a real inbound turn in the profile's canonical Bot Chat and the bot runs a full agent turn on it (alternation-safe by construction; this is the chat command lane, not a transcript mirror). The bare token targets the job's own profile; the named form is validated against `~/.hermes/profiles/` at create time and again at fire time, and never resolves across machines. Bot-chat targets are excluded from the `all` routing token and from delivery preflight (no gateway credentials involved). The per-delivery subprocess timeout is `cron.bot_chat_delivery_timeout_seconds` (default 600).
 
 ### Response Wrapping
 

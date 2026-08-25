@@ -239,16 +239,14 @@ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeyp
 
     from hermes_cli.setup import setup_terminal_backend
 
-def test_prompt_yes_no_keyboard_interrupt_still_exits(monkeypatch):
-    """Ctrl+C is an explicit user abort and must keep exiting."""
-    monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
+    setup_terminal_backend(config)
 
-    def _interrupt(*_a, **_k):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr("builtins.input", _interrupt)
-
-    import pytest
-
-    with pytest.raises(SystemExit):
-        setup_mod.prompt_yes_no("Install it now?", True)
+    assert config["terminal"]["backend"] == "vercel_sandbox"
+    assert config["terminal"]["container_persistent"] is False
+    assert config["terminal"]["container_disk"] == 51200
+    assert "VERCEL_OIDC_TOKEN" not in os.environ
+    assert os.environ["VERCEL_TOKEN"] == "token"
+    assert os.environ["VERCEL_PROJECT_ID"] == "linked-project"
+    assert os.environ["VERCEL_TEAM_ID"] == "linked-team"
+    assert defaults["    Vercel project ID"] == "linked-project"
+    assert defaults["    Vercel team ID"] == "linked-team"

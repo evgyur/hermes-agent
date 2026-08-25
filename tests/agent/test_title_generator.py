@@ -1,5 +1,7 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
+import threading
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -89,6 +91,43 @@ class TestGenerateTitle:
             title = generate_title("question")
             assert len(title) == 80
             assert title.endswith("...")
+
+    def test_rejects_answer_shaped_output(self):
+        """A model that ignores the titling task and answers the user's
+        message returns a full sentence; without a word bound the whole
+        reply (truncated mid-sentence) became the session title.
+        Regression for the can1357/oh-my-pi#7306 bug class."""
+        answer = (
+            "I don't have context on a \"registration system\" - that's not "
+            "something I recognize from this conversation, and I don't see "
+            "any prior discussion or code about it here"
+        )
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = answer
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("how does the registration system work?", "...") is None
+
+    def test_rejects_many_short_words(self):
+        """13 short words stays under the 80-char cap but is not a title."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "one two three four five six seven eight nine ten eleven twelve thirteen"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") is None
+
+    def test_accepts_normal_title(self):
+        """A normal 3-7 word title is unaffected by the answer-shape guard."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Investigate the title resolver bug"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") == "Investigate the title resolver bug"
 
 
 
@@ -208,6 +247,47 @@ class TestAutoTitleSession:
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
+    def test_background_title_keeps_the_active_profile_secret_scope(self):
+        """The daemon worker must not lose multiplex profile credentials."""
+        from agent.secret_scope import (
+            get_secret,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        called = threading.Event()
+        observed = {}
+
+        def worker(*_args, **_kwargs):
+            try:
+                observed["key"] = get_secret("FREEMODEL_API_KEY")
+            except Exception as exc:  # captured for the assertion below
+                observed["error"] = exc
+            finally:
+                called.set()
+
+        set_multiplex_active(True)
+        token = set_secret_scope({"FREEMODEL_API_KEY": "profile-key"})
+        try:
+            with patch(
+                "agent.title_generator.auto_title_session", side_effect=worker
+            ):
+                maybe_auto_title(
+                    db,
+                    "sess-profile-scope",
+                    "fix title generation",
+                    [{"role": "user", "content": "fix title generation"}],
+                )
+                assert called.wait(timeout=10), "auto-title worker never ran"
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert observed == {"key": "profile-key"}
+
     def test_skips_if_not_first_exchange(self):
         """Should not fire once the conversation is past its opening turn."""
         db = MagicMock()
@@ -252,38 +332,6 @@ class TestMaybeAutoTitle:
                 title_callback=None,
                 runtime_validator=None,
             )
-
-    def test_background_thread_preserves_profile_secret_scope(self):
-        """The title LLM must resolve credentials from the originating profile."""
-        import threading
-
-        from agent.secret_scope import (
-            current_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
-
-        db = MagicMock()
-        db.get_session_title.return_value = None
-        called = threading.Event()
-        seen = []
-
-        def capture_scope(*_args, **_kwargs):
-            seen.append(current_secret_scope())
-            called.set()
-
-        token = set_secret_scope({"FREEMODEL_API_KEY": "profile-key"})
-        try:
-            with patch(
-                "agent.title_generator.auto_title_session",
-                side_effect=capture_scope,
-            ):
-                maybe_auto_title(db, "sess-1", "hello", [])
-                assert called.wait(timeout=10), "auto-title thread never ran"
-        finally:
-            reset_secret_scope(token)
-
-        assert seen == [{"FREEMODEL_API_KEY": "profile-key"}]
 
     def test_writes_instant_title_before_the_model_runs(self, tmp_path):
         """The derived title lands synchronously — no LLM, no waiting."""

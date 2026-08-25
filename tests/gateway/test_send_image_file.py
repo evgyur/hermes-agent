@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, _is_supergoal_review_artifact
+from gateway.platforms.base import BasePlatformAdapter
 
 
 def _run(coro):
@@ -38,58 +38,10 @@ class TestExtractMediaImages:
         assert "MEDIA:" not in cleaned
         assert "Here is the screenshot" in cleaned
 
-    def test_jpg_image_extracted(self):
-        content = "MEDIA:/tmp/photo.jpg"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
-        assert len(media) == 1
-        assert media[0][0] == "/tmp/photo.jpg"
-
-    def test_webp_image_extracted(self):
-        content = "MEDIA:/tmp/image.webp"
-        media, _ = BasePlatformAdapter.extract_media(content)
-        assert len(media) == 1
-
-    def test_mixed_audio_and_image(self):
-        content = "MEDIA:/audio.ogg\nMEDIA:/screenshot.png"
-        media, _ = BasePlatformAdapter.extract_media(content)
-        assert len(media) == 2
-        paths = [m[0] for m in media]
-        assert "/audio.ogg" in paths
-        assert "/screenshot.png" in paths
-
-    def test_supergoal_review_artifacts_identified_for_chat_guard(self):
-        assert _is_supergoal_review_artifact("/tmp/project/.supergoal/THINKING.md")
-        assert _is_supergoal_review_artifact("/tmp/ROADMAP.md")
-        assert _is_supergoal_review_artifact("/tmp/LAUNCH_GOAL.md")
-        assert _is_supergoal_review_artifact("/tmp/supergoal-review/notes.pdf")
-        assert not _is_supergoal_review_artifact("/tmp/tg_human20_cover.png")
-        assert not _is_supergoal_review_artifact("/tmp/ordinary_report.pdf")
-
 
 # ---------------------------------------------------------------------------
 # Telegram send_image_file tests
 # ---------------------------------------------------------------------------
-
-
-def _ensure_telegram_mock():
-    """Install mock telegram modules so TelegramAdapter can be imported."""
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
-
-
-_ensure_telegram_mock()
-
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 

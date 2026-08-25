@@ -21,11 +21,42 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from collections import deque
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+
+class _BoundedPostDeliveryChain:
+    """Flat bounded callback batch; avoids recursive closure retention."""
+
+    def __init__(self, *callbacks) -> None:
+        self.callbacks = deque(
+            callback for callback in callbacks if callable(callback)
+        )
+
+    def append(self, callback) -> bool:
+        if not callable(callback) or len(self.callbacks) >= 64:
+            return False
+        self.callbacks.append(callback)
+        return True
+
+    def __len__(self) -> int:
+        return len(self.callbacks)
+
+    async def __call__(self) -> None:
+        for callback in tuple(self.callbacks):
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(
+                        result,
+                        timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                    )
+            except (asyncio.TimeoutError, Exception):
+                logger.debug("Post-delivery callback failed", exc_info=True)
 
 
 async def _prepare_parent_task_delivery(response, obligation_id: str) -> bool:
@@ -169,6 +200,7 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_POST_DELIVERY_CALLBACK_GLOBAL_LIMIT = 1024
 # Delivery-time history is best-effort dedup metadata, not canonical state.
 # Keep this comfortably below the Discord heartbeat watchdog window and fail
 # open rather than withholding a legitimate attachment.
@@ -208,16 +240,6 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     synthetic/resumed sends that have no reply anchor fall back to Telegram's
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
-    business_connection_id = getattr(source, "business_connection_id", None)
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and business_connection_id:
-        metadata: dict[str, Any] = {
-            "business_connection_id": str(business_connection_id)
-        }
-        if getattr(source, "external_safe_mode", False):
-            metadata["external_safe_mode"] = True
-            metadata["telegram_business_external_contact"] = True
-        return metadata
-
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
     # Slack workspace identity is durable routing state, not ephemeral event
@@ -228,9 +250,31 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if _platform_name(getattr(source, "platform", None)) == "telegram":
+        business_connection_id = getattr(source, "business_connection_id", None)
+        if business_connection_id:
+            metadata["business_connection_id"] = str(business_connection_id)
+            external_safe = bool(getattr(source, "external_safe_mode", False))
+            metadata["external_safe_mode"] = external_safe
+            if external_safe:
+                metadata["telegram_business_external_contact"] = True
+        profile = getattr(source, "profile", None)
+        if profile:
+            metadata["profile"] = str(profile)
+        transport_profile = getattr(source, "transport_profile", None)
+        if transport_profile:
+            metadata["transport_profile"] = str(transport_profile)
+        if business_connection_id:
+            from gateway.session import build_route_envelope
+
+            metadata["route_envelope"] = build_route_envelope(source)
     if not metadata:
         return None
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    if (
+        _platform_name(getattr(source, "platform", None)) == "telegram"
+        and getattr(source, "chat_type", None) == "dm"
+        and thread_id is not None
+    ):
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
@@ -686,7 +730,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Literal, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -1907,8 +1951,6 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".yaml": "application/yaml",
     ".yml": "application/yaml",
     ".toml": "application/toml",
-    ".html": "text/html",
-    ".htm": "text/html",
     ".ini": "text/plain",
     ".cfg": "text/plain",
     ".zip": "application/zip",
@@ -1949,9 +1991,6 @@ _TEXT_INJECT_EXTENSIONS = {
     ".dockerfile", ".makefile", ".cmake", ".gradle",
     ".rst", ".tex", ".srt", ".vtt", ".diff", ".patch",
 }
-
-# Public compatibility name used by Telegram's document intake path.
-TEXT_DOCUMENT_EXTENSIONS = _TEXT_INJECT_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -2060,11 +2099,17 @@ _MEDIA_EXT_ALTERNATION = "|".join(
 # guard keeps multi-part extensions intact — for ``archive.tar.gz`` the
 # ``.`` after ``tar`` is followed by ``g``, so the match must extend to
 # ``.gz`` instead of stopping early at ``.tar``.
+# CJK full-width punctuation accepted as MEDIA path terminators, mirroring the
+# ASCII set in the looka below. Chinese-language agent output naturally writes
+# ``MEDIA:D:\path\早报.pdf（782.6 KB）`` or ``MEDIA:...pdf：内容`` — without
+# these, the lookahead fails and the attachment is silently dropped (#88038).
+_MEDIA_CJK_TERMINATORS = "（）〈〉《》：，。；！？、\u201c\u201d\u2018\u2019【】"
+
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])\S+?(?:[^\S\n]+\S+?)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
-    r'''(?=[\s`"'*_,;:)\]}\[]|MEDIA:|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
+    r'''(?=[\s`"'*_,;:)\]}\[''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
     re.IGNORECASE,
 )
 
@@ -2100,7 +2145,7 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])[^\s\n`"']+?)'''
-    r'''(?=[`"'\s,;:)\]}]|MEDIA:|$)'''
+    r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|$)'''
     r'''[`"'*_]{0,3}\s*''',
     re.IGNORECASE,
 )
@@ -2403,20 +2448,32 @@ class MessageType(Enum):
     COMMAND = "command"  # /command style
 
 
-class EventOrigin(str, Enum):
-    """Typed provenance for real and synthetic gateway events."""
-
-    REAL_INBOUND = "real_inbound"
-    STARTUP_CONTINUATION = "startup_continuation"
-    SYNTHETIC_INTERNAL = "synthetic_internal"
-
-
 class ProcessingOutcome(Enum):
     """Result classification for message-processing lifecycle hooks."""
 
     SUCCESS = "success"
     FAILURE = "failure"
     CANCELLED = "cancelled"
+
+
+MAX_INBOUND_CONTEXT_NOTE_BYTES = 20 * 1024
+
+
+@dataclass(frozen=True)
+class InboundContextNote:
+    """Platform-owned context with an explicit persistence contract."""
+
+    text: str
+    persistence: Literal["never", "replayable"] = "never"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("Inbound plugin context text must be a string")
+        if len(self.text.encode("utf-8")) > MAX_INBOUND_CONTEXT_NOTE_BYTES:
+            raise ValueError(
+                "Inbound plugin context exceeds the 20 KiB boundary and must not "
+                "be truncated"
+            )
 
 
 @dataclass
@@ -2490,11 +2547,6 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
-
-    # Ephemeral same-chat/topic context supplied by a platform adapter. This is
-    # appended to the per-turn context prompt and must never be persisted as
-    # user text, transcript history, or long-term memory.
-    recent_context: Optional[str] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -2507,29 +2559,18 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    # Narrow provenance for the empty startup auto-resume turn. ``internal``
-    # is deliberately broader (background completions, handoffs, kickoffs), so
-    # recovery guidance must not use it as a synthetic-resume discriminator.
-    startup_resume: bool = False
-
-    # Top-level typed provenance.  Keep ``startup_resume`` as a compatibility
-    # field while recovery arbitration migrates to this non-ambiguous value.
-    event_origin: EventOrigin = EventOrigin.REAL_INBOUND
-
-    # Exact durable-continuation identity. These are top-level typed fields so
-    # provenance cannot be lost in free-form platform metadata or merged with a
-    # different queued event.
-    continuation_id: Optional[str] = None
-    continuation_generation: Optional[int] = None
-    continuation_claim_owner: Optional[str] = None
-    continuation_claim_token: Optional[str] = None
-
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Whether this event may resolve gateway commands or pending control
+    # prompts. Kept last to preserve positional construction compatibility.
+    # Proactive plugin events set this to False so untrusted payload text
+    # remains conversational input.
+    allow_gateway_control: bool = True
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        return (self.text or "").lstrip().startswith("/")
+        return self.allow_gateway_control and (self.text or "").lstrip().startswith("/")
     
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
@@ -2835,24 +2876,6 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
-def _gateway_ledger_ids(event: MessageEvent) -> list[int]:
-    """Return every durable ingress identity represented by one event."""
-    values = list(getattr(event, "_hermes_gateway_ledger_ids", None) or [])
-    primary = getattr(event, "_hermes_gateway_ledger_id", None)
-    if primary is not None:
-        values.append(primary)
-    return list(dict.fromkeys(int(value) for value in values if value is not None))
-
-
-def _merge_gateway_ledger_ids(retained: MessageEvent, incoming: MessageEvent) -> None:
-    """Attach merged ingress identities to the event that will be replayed."""
-    merged = list(dict.fromkeys(_gateway_ledger_ids(retained) + _gateway_ledger_ids(incoming)))
-    if merged:
-        setattr(retained, "_hermes_gateway_ledger_ids", merged)
-        if getattr(retained, "_hermes_gateway_ledger_id", None) is None:
-            setattr(retained, "_hermes_gateway_ledger_id", merged[0])
-
-
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2873,34 +2896,6 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
-        # Restart-recovery wakes have exact provenance and must never be folded
-        # into a real inbound turn. Real user input wins: replacing/dropping the
-        # synthetic wake is safe because resume_pending remains durable and the
-        # real turn registers a fresh post-delivery continuation.
-        existing_recovery = (
-            getattr(existing, "event_origin", EventOrigin.REAL_INBOUND)
-            == EventOrigin.STARTUP_CONTINUATION
-        )
-        incoming_recovery = (
-            getattr(event, "event_origin", EventOrigin.REAL_INBOUND)
-            == EventOrigin.STARTUP_CONTINUATION
-        )
-        if existing_recovery != incoming_recovery:
-            if existing_recovery:
-                pending_messages[session_key] = event
-            return
-        if existing_recovery and (
-            getattr(existing, "continuation_id", None),
-            getattr(existing, "continuation_generation", None),
-        ) != (
-            getattr(event, "continuation_id", None),
-            getattr(event, "continuation_generation", None),
-        ):
-            # Distinct durable generations are never merge-compatible. Keep the
-            # event already owning the queue slot; SessionDB arbitration decides
-            # which exact generation may execute.
-            return
-        _merge_gateway_ledger_ids(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -3170,6 +3165,19 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
+    # Whether a human is interactively present on this platform to answer a
+    # "session restored — what next?" prompt.  The startup auto-resume turn
+    # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
+    # branch in ``_handle_message_with_agent``) reads this to pick its
+    # guidance: interactive platforms (Telegram, Slack, Discord DMs, …) get
+    # "report the restore and ask what the user wants next"; non-interactive
+    # event platforms (webhook) get "finish the interrupted work" because
+    # nobody is there to answer, and an acknowledgement would silently
+    # abandon the task (#57056).  Read generically via ``getattr(adapter,
+    # "interactive_resume", True)`` — no per-platform branching at the call
+    # site.
+    interactive_resume: bool = True
+
     # Back-reference to the running ``GatewayRunner``, injected by
     # ``gateway/run.py`` after the adapter is created. Adapters consume it via
     # ``getattr(self, "gateway_runner", None)`` for cross-platform delivery and
@@ -3180,6 +3188,30 @@ class BasePlatformAdapter(ABC):
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
 
+    async def prepare_inbound_message_text(
+        self,
+        event: MessageEvent,
+        message_text: str,
+    ) -> Tuple[str, set[str]]:
+        """Prepare one inbound message through a platform-owned route.
+
+        The default is deliberately inert.  Overrides may replace the prepared
+        text and report the exact local media paths they consumed; route policy
+        and platform-specific delivery remain inside the adapter.  The gateway
+        validates this result before any generic STT or model dispatch.
+        """
+        return message_text, set()
+
+    def build_ephemeral_context_note(
+        self, event: MessageEvent
+    ) -> Optional[InboundContextNote]:
+        """Return a bounded platform-owned sidecar note, or ``None``.
+
+        The note is ephemeral quoted context, never an authorization grant or
+        a persisted user command.  Ordinary adapters inherit this safe no-op.
+        """
+        return None
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -3188,6 +3220,12 @@ class BasePlatformAdapter(ABC):
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
             Callable[[Dict[str, Any]], Awaitable[None]]
+        ] = None
+        # Normalized platform events cross this runner-owned boundary before
+        # plugin dispatch so authorization/profile state never lives in an SDK
+        # adapter. The second argument is an internal SessionSource.
+        self._platform_event_handler: Optional[
+            Callable[[Dict[str, Any], Any], Awaitable[None]]
         ] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
@@ -3246,8 +3284,23 @@ class BasePlatformAdapter(ABC):
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        self._post_delivery_callbacks_by_generation: Dict[tuple[str, int], Any] = {}
+        # Non-cleanup obligations (for example a memory-review notice) must
+        # survive a failed final and drain after the next confirmed delivery
+        # for the same exact session.  Unlike generation callbacks, these are
+        # intentionally session-owned and never used for ACK deletion.
+        self._active_turn_post_delivery_fallbacks: Dict[str, Any] = {}
+        self._post_delivery_callback_lock = threading.Lock()
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Owning profile for a multiplexed secondary adapter, installed by
+        # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
+        # keys must carry the profile namespace, but ``source.profile`` is only
+        # stamped later by the runner's profile message handler — so at adapter
+        # ingress every bot in a multiplexed gateway would otherwise derive the
+        # same ``agent:main:`` key (see ``_session_key_profile``). ``None`` on a
+        # primary/single-profile adapter, which keeps the legacy namespace.
+        self._owner_profile: Optional[str] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3382,6 +3435,7 @@ class BasePlatformAdapter(ABC):
         self,
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Whether this adapter supports native streaming-draft updates.
 
@@ -3390,6 +3444,10 @@ class BasePlatformAdapter(ABC):
         same ``draft_id`` and growing text.  Adapters that implement
         ``send_draft`` should return True here for the chat types where the
         platform supports it (Telegram restricts drafts to private DMs).
+
+        ``chat_id`` lets multi-platform adapters (relay) resolve the answer
+        through the chat's own negotiated capability profile instead of the
+        primary identity's; single-platform adapters may ignore it.
 
         Default implementation returns False.  Stream consumers fall back to
         the edit-based path (``send`` + ``edit_message``) when this returns
@@ -3574,7 +3632,19 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
-    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+    @staticmethod
+    def _voice_scope_key(chat_id: str, metadata=None):
+        if isinstance(metadata, dict):
+            business_connection_id = metadata.get("business_connection_id")
+        else:
+            business_connection_id = getattr(
+                metadata, "business_connection_id", None
+            )
+        if business_connection_id:
+            return str(chat_id), str(business_connection_id)
+        return chat_id
+
+    def _should_auto_tts_for_chat(self, chat_id: str, metadata=None) -> bool:
         """Whether auto-TTS on voice input should fire for ``chat_id``.
 
         Decision layers (Issue #16007):
@@ -3583,9 +3653,10 @@ class BasePlatformAdapter(ABC):
           2. Explicit ``/voice off`` → never fire.
           3. Fall back to the global ``voice.auto_tts`` config default.
         """
-        if chat_id in self._auto_tts_enabled_chats:
+        scope_key = self._voice_scope_key(chat_id, metadata)
+        if scope_key in self._auto_tts_enabled_chats:
             return True
-        if chat_id in self._auto_tts_disabled_chats:
+        if scope_key in self._auto_tts_disabled_chats:
             return False
         return bool(self._auto_tts_default)
 
@@ -3623,7 +3694,15 @@ class BasePlatformAdapter(ABC):
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(platform=self.platform.value, **kwargs)
+            # Multiplexed secondary adapters share the process-level runtime
+            # status file with the primary adapter.  Their runner stamps a
+            # namespaced key (``<profile>:<platform>``) so one profile's fatal
+            # state cannot overwrite another profile's healthy entry.
+            platform_key = (
+                getattr(self, "_runtime_status_platform_key", None)
+                or self.platform.value
+            )
+            write_runtime_status(platform=platform_key, **kwargs)
         except Exception as exc:
             # Use getattr so object.__new__(...) test harnesses that skip __init__
             # don't blow up on attribute access.
@@ -3692,6 +3771,7 @@ class BasePlatformAdapter(ABC):
         """
         from gateway.status import (
             acquire_scoped_lock,
+            scoped_lock_owner_label,
             take_over_scoped_lock_holder,
         )
 
@@ -3739,11 +3819,21 @@ class BasePlatformAdapter(ABC):
                     return True
 
         owner_pid = existing.get('pid') if isinstance(existing, dict) else None
-        message = (
-            f'{resource_desc} already in use'
-            + (f' (PID {owner_pid})' if owner_pid else '')
-            + '. Stop the other gateway first.'
-        )
+        # OOF-3: scoped locks are machine-global, so the holder can be a
+        # different profile's gateway. A bare PID gives an operator no way to
+        # tell WHICH profile owns the credential — name it when we can.
+        owner_profile = scoped_lock_owner_label(existing)
+        if owner_profile:
+            holder = f" by the '{owner_profile}' profile gateway"
+            holder += f" (PID {owner_pid})" if owner_pid else ""
+            remedy = (
+                f" Stop that gateway first "
+                f"(hermes --profile {owner_profile} gateway stop)."
+            )
+        else:
+            holder = f" (PID {owner_pid})" if owner_pid else ""
+            remedy = " Stop the other gateway first."
+        message = f"{resource_desc} already in use{holder}.{remedy}"
         logger.error('[%s] %s', self.name, message)
         self._set_fatal_error(f'{scope}_lock', message, retryable=True)
         return False
@@ -3766,7 +3856,7 @@ class BasePlatformAdapter(ABC):
     def is_connected(self) -> bool:
         """Check if adapter is currently connected."""
         return self._running
-    
+
     def set_message_handler(self, handler: MessageHandler) -> None:
         """
         Set the handler for incoming messages.
@@ -3775,6 +3865,19 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_platform_event_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
+    ) -> bool:
+        """Install the gateway-owned normalized platform-event boundary.
+
+        Adapters normalize SDK updates and pass only stable dictionaries plus an
+        internal ``SessionSource`` to this callback. The runner owns the final
+        authorization decision and plugin dispatch; an adapter with no callback
+        therefore fails closed instead of exposing pre-auth events.
+        """
+        self._platform_event_handler = handler
 
     def set_topic_recovery_fn(
         self,
@@ -3880,6 +3983,57 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
+
+    def set_owner_profile(self, profile_name: Optional[str]) -> None:
+        """Declare which multiplex profile owns this adapter.
+
+        Installed by ``GatewayRunner._configure_profile_adapter`` for secondary
+        profiles. Read by :meth:`_session_key_profile` so adapter-level keys
+        land in this profile's namespace instead of the shared ``agent:main:``.
+        """
+        name = (profile_name or "").strip() or None
+        self._owner_profile = None if name == "default" else name
+
+    def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:
+        """Resolve the profile namespace for an adapter-derived session key.
+
+        Adapter ingress runs BEFORE the runner stamps ``source.profile``
+        (``_make_profile_message_handler``), so the session store's resolver
+        falls back to the *active* profile and every bot in a multiplexed
+        gateway derives the same ``agent:main:`` key. Batching dicts,
+        ``_active_sessions`` and the busy-session guard are keyed on that
+        string, so two profiles sharing a chat id — which is EVERY Telegram DM,
+        where ``chat.id`` is the user's own id — collide on one lane.
+
+        Resolution order:
+          1. ``source.profile`` when already stamped (relay/connector ingress).
+          2. ``self._owner_profile`` — this adapter's own credential owner.
+          3. The session store's resolver (active profile / no-multiplex None).
+
+        ``getattr`` throughout: adapters are routinely constructed without
+        ``BasePlatformAdapter.__init__`` (``object.__new__`` in tests, subclasses
+        that build their own state), so no attribute here may be assumed to
+        exist — see the ``object.__new__`` pitfall in AGENTS.md. Every candidate
+        is also type-checked: a duck-typed/mock session store returns a truthy
+        non-string from ``_resolve_profile_for_key``, which would otherwise be
+        interpolated straight into the key as ``agent:<MagicMock ...>:``.
+        """
+        for candidate in (
+            getattr(source, "profile", None) if source is not None else None,
+            getattr(self, "_owner_profile", None),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        store = getattr(self, "_session_store", None)
+        resolver = getattr(store, "_resolve_profile_for_key", None) if store else None
+        if callable(resolver):
+            try:
+                resolved = resolver(source)
+            except Exception:
+                return None
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved
+        return None
     
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
@@ -4140,6 +4294,7 @@ class BasePlatformAdapter(ABC):
         self,
         chat_id: str,
         message_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Delete a previously sent message.  Optional — platforms that don't
@@ -4186,6 +4341,7 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         message_id: str,
         ttl_seconds: int,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Spawn a detached task that deletes ``message_id`` after ``ttl_seconds``.
 
@@ -4197,7 +4353,11 @@ class BasePlatformAdapter(ABC):
         async def _run_delete() -> None:
             try:
                 await asyncio.sleep(max(1, int(ttl_seconds)))
-                await self.delete_message(chat_id=chat_id, message_id=message_id)
+                await self.delete_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    metadata=metadata,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -5270,7 +5430,8 @@ class BasePlatformAdapter(ABC):
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                pause_key = self._typing_pause_key(chat_id, metadata)
+                if pause_key not in self._typing_paused:
                     try:
                         await asyncio.wait_for(
                             self.send_typing(chat_id, metadata=metadata),
@@ -5315,7 +5476,7 @@ class BasePlatformAdapter(ABC):
                     await self._stop_typing_with_metadata(chat_id, metadata)
                 except Exception:
                     pass
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(self._typing_pause_key(chat_id, metadata))
             # getattr-guard: bare object.__new__() adapters in tests lack
             # _status_text (same class of issue as _typing_paused, but that
             # one is always present because those tests predate it).
@@ -5331,7 +5492,8 @@ class BasePlatformAdapter(ABC):
         stop_attempts: int = 2,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
-        self._typing_paused.add(chat_id)
+        pause_key = self._typing_pause_key(chat_id, metadata)
+        self._typing_paused.add(pause_key)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -5352,19 +5514,32 @@ class BasePlatformAdapter(ABC):
                 if attempt < attempts - 1:
                     await asyncio.sleep(0)
         finally:
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(pause_key)
 
-    def pause_typing_for_chat(self, chat_id: str) -> None:
+    @staticmethod
+    def _typing_pause_key(chat_id: str, metadata=None):
+        """Return the smallest transport identity that owns typing state.
+
+        Preserve the historical plain chat-id key for ordinary conversations,
+        while keeping independent Telegram Business connections isolated even
+        when Telegram reuses the same chat id for both.
+        """
+        business_connection_id = (metadata or {}).get("business_connection_id")
+        if business_connection_id:
+            return str(chat_id), str(business_connection_id)
+        return chat_id
+
+    def pause_typing_for_chat(self, chat_id: str, metadata=None) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
         Thread-safe (CPython GIL) — can be called from the sync agent thread
         while ``_keep_typing`` runs on the async event loop.
         """
-        self._typing_paused.add(chat_id)
+        self._typing_paused.add(self._typing_pause_key(chat_id, metadata))
 
-    def resume_typing_for_chat(self, chat_id: str) -> None:
+    def resume_typing_for_chat(self, chat_id: str, metadata=None) -> None:
         """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
+        self._typing_paused.discard(self._typing_pause_key(chat_id, metadata))
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -5383,7 +5558,7 @@ class BasePlatformAdapter(ABC):
         callback: Callable,
         *,
         generation: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Register a deferred callback to fire after the main response.
 
         ``generation`` lets callers tie the callback to a specific gateway run
@@ -5397,54 +5572,69 @@ class BasePlatformAdapter(ABC):
         callers never overwrite a fresher generation's slot.
         """
         if not session_key or not callable(callback):
-            return
+            return False
 
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            if isinstance(existing, tuple) and len(existing) == 2:
-                existing_gen, existing_cb = existing
-            else:
-                existing_gen, existing_cb = None, existing
-            # Stale-generation registrations never overwrite a fresher slot.
+        lock = getattr(self, "_post_delivery_callback_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._post_delivery_callback_lock = lock
+
+        with lock:
             if (
-                existing_gen is not None
-                and generation is not None
-                and int(generation) < int(existing_gen)
+                self._post_delivery_callback_count_locked()
+                >= _POST_DELIVERY_CALLBACK_GLOBAL_LIMIT
+                and not self._post_delivery_callback_retained_locked(callback)
             ):
-                return
-            # Same-or-newer generation: chain with the existing callback so
-            # both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None
-                or generation is None
-                or int(existing_gen) == int(generation)
-            ):
-                _prev = existing_cb
-                _new = callback
+                logger.warning(
+                    "Global post-delivery callback capacity exhausted"
+                )
+                return False
+            if generation is not None:
+                ledger = getattr(
+                    self, "_post_delivery_callbacks_by_generation", None
+                )
+                if ledger is None:
+                    ledger = {}
+                    self._post_delivery_callbacks_by_generation = ledger
+                key = (session_key, int(generation))
+                existing_cb = ledger.get(key)
+                if callable(existing_cb):
+                    if isinstance(existing_cb, _BoundedPostDeliveryChain):
+                        return existing_cb.append(callback)
+                    ledger[key] = _BoundedPostDeliveryChain(existing_cb, callback)
+                    return True
+                session_entries = sum(
+                    1 for item in ledger
+                    if isinstance(item, tuple) and item[0] == session_key
+                )
+                if session_entries >= 64 or len(ledger) >= 1024:
+                    logger.warning(
+                        "Post-delivery callback capacity exhausted for %s generation %s",
+                        session_key,
+                        generation,
+                    )
+                    return False
+                ledger[key] = callback
+                return True
 
-                async def _chained() -> None:
-                    # Both _prev and _new may be sync or async. The chained
-                    # wrapper itself must be async because the outer invoker
-                    # (``_handle_message`` etc.) awaits awaitable callbacks; a
-                    # sync wrapper here would call ``_prev()`` / ``_new()`` and
-                    # silently drop any returned coroutine, breaking chained
-                    # async post-delivery hooks (e.g. ``/goal`` continuations).
-                    for _cb in (_prev, _new):
-                        try:
-                            _result = _cb()
-                            if inspect.isawaitable(_result):
-                                await _result
-                        except Exception:
-                            logger.debug(
-                                "Post-delivery callback failed", exc_info=True
-                            )
-
-                callback = _chained
-
-        if generation is None:
-            self._post_delivery_callbacks[session_key] = callback
-        else:
-            self._post_delivery_callbacks[session_key] = (int(generation), callback)
+            ledger = getattr(self, "_post_delivery_callbacks", None)
+            if ledger is None:
+                ledger = {}
+                self._post_delivery_callbacks = ledger
+            existing_cb = ledger.get(session_key)
+            if callable(existing_cb):
+                if isinstance(existing_cb, _BoundedPostDeliveryChain):
+                    return existing_cb.append(callback)
+                ledger[session_key] = _BoundedPostDeliveryChain(existing_cb, callback)
+                return True
+            if len(ledger) >= 1024:
+                logger.warning(
+                    "Ownerless post-delivery callback capacity exhausted for %s",
+                    session_key,
+                )
+                return False
+            ledger[session_key] = callback
+            return True
 
     def pop_post_delivery_callback(
         self,
@@ -5455,19 +5645,140 @@ class BasePlatformAdapter(ABC):
         """Pop a deferred callback, optionally requiring generation ownership."""
         if not session_key:
             return None
-        entry = self._post_delivery_callbacks.get(session_key)
-        if entry is None:
-            return None
-        if isinstance(entry, tuple) and len(entry) == 2:
-            entry_generation, callback = entry
-            if generation is not None and int(entry_generation) != int(generation):
+        lock = getattr(self, "_post_delivery_callback_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._post_delivery_callback_lock = lock
+        with lock:
+            if generation is not None:
+                ledger = getattr(
+                    self, "_post_delivery_callbacks_by_generation", {}
+                )
+                callback = ledger.pop((session_key, int(generation)), None)
+                return callback if callable(callback) else None
+            ledger = getattr(self, "_post_delivery_callbacks", {})
+            entry = ledger.pop(session_key, None)
+            if entry is None:
                 return None
-            self._post_delivery_callbacks.pop(session_key, None)
-            return callback if callable(callback) else None
-        if generation is not None:
+            return entry if callable(entry) else None
+
+    def _post_delivery_callback_count_locked(self) -> int:
+        """Count retained callback closures across every bounded registry."""
+        identities: set[int] = set()
+        for ledger_name in (
+            "_post_delivery_callbacks_by_generation",
+            "_post_delivery_callbacks",
+            "_active_turn_post_delivery_fallbacks",
+        ):
+            ledger = getattr(self, ledger_name, {})
+            if not isinstance(ledger, dict):
+                continue
+            for callback in ledger.values():
+                if isinstance(callback, _BoundedPostDeliveryChain):
+                    identities.update(id(item) for item in callback.callbacks)
+                elif callable(callback):
+                    identities.add(id(callback))
+        return len(identities)
+
+    def _post_delivery_callback_retained_locked(
+        self, callback: Callable
+    ) -> bool:
+        """Whether this exact logical callback already owns budget."""
+        for ledger_name in (
+            "_post_delivery_callbacks_by_generation",
+            "_post_delivery_callbacks",
+            "_active_turn_post_delivery_fallbacks",
+        ):
+            ledger = getattr(self, ledger_name, {})
+            if not isinstance(ledger, dict):
+                continue
+            for existing in ledger.values():
+                if existing is callback:
+                    return True
+                if (
+                    isinstance(existing, _BoundedPostDeliveryChain)
+                    and any(item is callback for item in existing.callbacks)
+                ):
+                    return True
+        return False
+
+    def register_delivery_success_fallback(
+        self,
+        session_key: str,
+        callback: Callable,
+    ) -> bool:
+        """Retain non-cleanup work until any later final is confirmed.
+
+        This lane is deliberately separate from generation-owned cleanup:
+        failed-generation ACK cleanup must not run against a later turn, while
+        user-visible background work must not be stranded forever.
+        """
+        if not session_key or not callable(callback):
+            return False
+        lock = getattr(self, "_post_delivery_callback_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._post_delivery_callback_lock = lock
+        with lock:
+            if (
+                self._post_delivery_callback_count_locked()
+                >= _POST_DELIVERY_CALLBACK_GLOBAL_LIMIT
+                and not self._post_delivery_callback_retained_locked(callback)
+            ):
+                return False
+            ledger = getattr(self, "_active_turn_post_delivery_fallbacks", None)
+            if ledger is None:
+                ledger = {}
+                self._active_turn_post_delivery_fallbacks = ledger
+            existing = ledger.get(session_key)
+            if callable(existing):
+                if isinstance(existing, _BoundedPostDeliveryChain):
+                    return existing.append(callback)
+                ledger[session_key] = _BoundedPostDeliveryChain(existing, callback)
+                return True
+            if len(ledger) >= 1024:
+                return False
+            ledger[session_key] = callback
+            return True
+
+    def pop_delivery_success_fallback(self, session_key: str) -> Callable | None:
+        """Claim session-owned non-cleanup work after confirmed delivery."""
+        if not session_key:
             return None
-        self._post_delivery_callbacks.pop(session_key, None)
-        return entry if callable(entry) else None
+        lock = getattr(self, "_post_delivery_callback_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._post_delivery_callback_lock = lock
+        with lock:
+            ledger = getattr(self, "_active_turn_post_delivery_fallbacks", {})
+            callback = ledger.pop(session_key, None)
+            return callback if callable(callback) else None
+
+    def remove_delivery_success_fallback(
+        self, session_key: str, callback: Callable
+    ) -> bool:
+        """Remove one duplicated backup after primary ownership succeeds."""
+        lock = getattr(self, "_post_delivery_callback_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            ledger = getattr(self, "_active_turn_post_delivery_fallbacks", {})
+            existing = ledger.get(session_key)
+            if existing is callback:
+                ledger.pop(session_key, None)
+                return True
+            if isinstance(existing, _BoundedPostDeliveryChain):
+                kept = [cb for cb in existing.callbacks if cb is not callback]
+                if len(kept) == len(existing.callbacks):
+                    return False
+                if not kept:
+                    ledger.pop(session_key, None)
+                elif len(kept) == 1:
+                    ledger[session_key] = kept[0]
+                else:
+                    ledger[session_key] = _BoundedPostDeliveryChain(*kept)
+                return True
+            return False
 
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
@@ -5793,7 +6104,6 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
-            _merge_gateway_ledger_ids(state.event, event)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"
@@ -5965,41 +6275,7 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-            startup_ack = getattr(event, "_hermes_startup_dispatch_ack", None)
-            if startup_ack is not None:
-                def _signal_terminal_handoff(_task) -> None:
-                    if not _task.cancelled() and _task.exception() is None:
-                        setattr(event, "_hermes_background_processing_completed", True)
-                    startup_ack.set()
-
-                task.add_done_callback(_signal_terminal_handoff)
-        setattr(event, "_hermes_adapter_handoff", "scheduled")
         return True
-
-    def ensure_pending_session_processing(self, session_key: str) -> bool:
-        """Bind a pending event to this adapter's session owner.
-
-        Queue producers call this after their durable handoff commits.  An
-        active frame already owns the eventual drain; an idle adapter must
-        atomically consume the pending slot and start ordinary processing so a
-        second user message is never needed merely to wake the queue.
-        """
-        if session_key not in self._pending_messages:
-            return False
-        if session_key in self._active_sessions:
-            task = self._session_tasks.get(session_key)
-            if task is None or not task.done():
-                return True
-            # Preserve the pending event while healing a dead owner.  The
-            # generic stale-lock helper intentionally discards pending input,
-            # which is wrong after a durable queue handoff.
-            self._active_sessions.pop(session_key, None)
-            self._session_tasks.pop(session_key, None)
-        event = self._pending_messages.pop(session_key)
-        if self._start_session_processing(event, session_key):
-            return True
-        self._pending_messages[session_key] = event
-        return False
 
     async def cancel_session_processing(
         self,
@@ -6158,23 +6434,16 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        coerce_plaintext_gateway_command(event)
+        if event.allow_gateway_control:
+            coerce_plaintext_gateway_command(event)
 
-        # Telegram topic recovery only applies to private DM topic lanes.  Do
-        # not submit the no-op check for group/forum/channel traffic to the
-        # shared default executor: when sync tools saturate that pool, even an
-        # exec quick command such as /hype can otherwise sit at ingress for
-        # tens of seconds before its background task is spawned.
-        source = getattr(event, "source", None)
-        source_platform = getattr(
-            getattr(source, "platform", None),
-            "value",
-            getattr(source, "platform", None),
-        )
+        # Telegram topic recovery only applies to private DM topic lanes. Do
+        # not submit a no-op check for group/forum/channel traffic to the
+        # shared default executor: a busy pool would delay message dispatch.
         needs_topic_recovery = (
             getattr(self, "_topic_recovery_fn", None) is not None
-            and source_platform == "telegram"
-            and getattr(source, "chat_type", None) == "dm"
+            and event.source.platform == Platform.TELEGRAM
+            and event.source.chat_type == "dm"
         )
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
@@ -6183,7 +6452,18 @@ class BasePlatformAdapter(ABC):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
+        expected_session_key = str(
+            (event.metadata or {}).get("gateway_session_key") or ""
+        ).strip()
+        if expected_session_key and session_key != expected_session_key:
+            logger.warning(
+                "Dropping internally routed event: expected session=%s derived=%s",
+                expected_session_key,
+                session_key,
+            )
+            return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6195,7 +6475,6 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
-            setattr(event, "_hermes_adapter_handoff", "queued")
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -6270,7 +6549,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd:
+            if not cmd and event.allow_gateway_control:
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -6315,7 +6594,11 @@ class BasePlatformAdapter(ABC):
 
             if self._busy_session_handler is not None:
                 try:
-                    if await self._busy_session_handler(event, session_key):
+                    _busy_admitted = await self._busy_session_handler(event, session_key)
+                    if getattr(event, "_hermes_require_busy_admission", False):
+                        setattr(event, "_hermes_busy_admitted", bool(_busy_admitted))
+                        return
+                    if _busy_admitted:
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
@@ -6397,21 +6680,14 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
-        main_delivery_attempted = False
-        main_delivery_succeeded = False
 
-        def _record_delivery(result, *, main: bool = False):
+        def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
-            nonlocal main_delivery_attempted, main_delivery_succeeded
             if result is None:
                 return
             delivery_attempted = True
-            succeeded = bool(getattr(result, "success", False))
-            if succeeded:
+            if getattr(result, "success", False):
                 delivery_succeeded = True
-            if main:
-                main_delivery_attempted = True
-                main_delivery_succeeded = succeeded
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6503,9 +6779,8 @@ class BasePlatformAdapter(ABC):
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                declared_media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(declared_media_files)
-                declared_media_missing = bool(declared_media_files and not media_files)
+                media_files, response = self.extract_media(response)
+                media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -6553,21 +6828,6 @@ class BasePlatformAdapter(ABC):
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
-                # A declared attachment is part of the response contract. If every
-                # declared path is missing or unsafe, never deliver the surrounding
-                # success prose by itself: that would claim a file was sent when no
-                # upload can happen.
-                if declared_media_missing and not (images or local_files):
-                    logger.error(
-                        "[%s] response_required_media_missing: declared attachment "
-                        "was not deliverable for %s",
-                        self.name,
-                        event.source.chat_id,
-                    )
-                    text_content = (
-                        "⚠️ Не удалось прикрепить изображение: файл не был создан."
-                    )
-
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
                 # below then drops it silently. Recover on every platform (#33842
@@ -6609,8 +6869,9 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
-                if (not _is_parent_task_delivery
-                        and self._should_auto_tts_for_chat(event.source.chat_id)
+                if (self._should_auto_tts_for_chat(
+                        event.source.chat_id, event.source
+                    )
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -6721,6 +6982,8 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _obligation_duplicate = False
+                    _obligation_claim_token = ""
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -6731,6 +6994,7 @@ class BasePlatformAdapter(ABC):
                                 mark_attempting,
                                 record_obligation,
                             )
+                            from gateway.session import build_route_envelope
 
                             if await asyncio.to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
@@ -6738,7 +7002,7 @@ class BasePlatformAdapter(ABC):
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                await asyncio.to_thread(
+                                _obligation_created = await asyncio.to_thread(
                                     record_obligation,
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
@@ -6749,21 +7013,81 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
-                                    resume_task_id=getattr(
-                                        event, "continuation_id", None
-                                    ) or getattr(event, "_hermes_resume_task_id", None),
-                                    continuation_generation=getattr(
-                                        event, "continuation_generation", None
+                                    resume_task_id=str(
+                                        getattr(event, "resume_task_id", None)
+                                        or (getattr(event, "metadata", None) or {}).get(
+                                            "resume_task_id", ""
+                                        )
                                     ),
-                                    continuation_claim_owner=getattr(
-                                        event, "continuation_claim_owner", None
+                                    continuation_generation=int(
+                                        getattr(
+                                            event,
+                                            "continuation_generation",
+                                            None,
+                                        )
+                                        or (getattr(event, "metadata", None) or {}).get(
+                                            "continuation_generation", 0
+                                        )
+                                        or 0
                                     ),
-                                    continuation_claim_token=getattr(
-                                        event, "continuation_claim_token", None
+                                    continuation_claim_owner=str(
+                                        getattr(
+                                            event,
+                                            "continuation_claim_owner",
+                                            None,
+                                        )
+                                        or (getattr(event, "metadata", None) or {}).get(
+                                            "continuation_claim_owner", ""
+                                        )
                                     ),
+                                    continuation_claim_token=str(
+                                        getattr(
+                                            event,
+                                            "continuation_claim_token",
+                                            None,
+                                        )
+                                        or (getattr(event, "metadata", None) or {}).get(
+                                            "continuation_claim_token", ""
+                                        )
+                                    ),
+                                    route_envelope=build_route_envelope(event.source),
                                 )
-                                await asyncio.to_thread(mark_attempting, _obligation_id)
-                        except Exception:
+                                # ``None`` is the legacy/test-double success
+                                # result. Only an explicit False proves the
+                                # stable receipt already existed.
+                                _record_disposition = getattr(
+                                    _obligation_created, "disposition", None
+                                )
+                                if not isinstance(_record_disposition, str):
+                                    _record_disposition = None
+                                _obligation_claim_token = (
+                                    str(
+                                        getattr(
+                                            _obligation_created, "claim_token", ""
+                                        )
+                                        or ""
+                                    )
+                                    if _record_disposition == "retry_claimed"
+                                    else ""
+                                )
+                                _obligation_duplicate = (
+                                    _obligation_created is False
+                                    or _record_disposition in {
+                                        "delivered", "attempting", "abandoned"
+                                    }
+                                )
+                                if (
+                                    not _obligation_duplicate
+                                    and _record_disposition != "retry_claimed"
+                                ):
+                                    await asyncio.to_thread(
+                                        mark_attempting, _obligation_id
+                                    )
+                        except Exception as _ledger_exc:
+                            if _ledger_exc.__class__.__name__ == (
+                                "DeliveryLedgerCapacityError"
+                            ):
+                                raise
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
                     if _is_parent_task_delivery:
@@ -6776,22 +7100,42 @@ class BasePlatformAdapter(ABC):
                             _obligation_id,
                         )
                         _parent_obligation_id = _obligation_id
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
-                    _record_delivery(result, main=True)
-                    if _obligation_id is not None and not _is_parent_task_delivery:
+                    if _obligation_duplicate:
+                        # The stable effect receipt already exists.  Never
+                        # reopen or re-send it; its current delivered/recovery
+                        # owner remains authoritative.
+                        result = SendResult(success=True, message_id=None)
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                    _record_delivery(result)
+                    if (
+                        _obligation_id is not None
+                        and not _is_parent_task_delivery
+                        and not _obligation_duplicate
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
+                                settle_runtime_claim,
+                                settle_with_retry,
                             )
 
-                            if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
+                            if _obligation_claim_token:
+                                await settle_with_retry(
+                                    settle_runtime_claim,
+                                    _obligation_id,
+                                    _obligation_claim_token,
+                                    delivered=bool(getattr(result, "success", False)),
+                                    error=str(getattr(result, "error", "") or ""),
+                                )
+                            elif getattr(result, "success", False):
+                                await settle_with_retry(mark_delivered, _obligation_id)
                             else:
                                 await asyncio.to_thread(
                                     mark_failed,
@@ -6971,20 +7315,16 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            setattr(
-                event,
-                "_hermes_delivery_succeeded",
-                bool(main_delivery_attempted and main_delivery_succeeded),
-            )
             if _is_parent_task_delivery:
                 if _parent_obligation_id is not None:
                     from gateway.delivery_ledger import (
                         mark_abandoned,
                         mark_delivered,
+                        settle_with_retry,
                     )
 
                     if processing_ok:
-                        await asyncio.to_thread(
+                        await settle_with_retry(
                             mark_delivered, _parent_obligation_id
                         )
                     else:
@@ -7112,7 +7452,7 @@ class BasePlatformAdapter(ABC):
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
-        except Exception as e:
+        except BaseException as e:
             _aborted_parent_delivery = await _abort_parent_task_delivery(
                 locals().get("_parent_delivery_response"),
                 locals().get("_parent_obligation_id"),
@@ -7141,6 +7481,14 @@ class BasePlatformAdapter(ABC):
                     "[%s] Failed to send error notification to user: %s",
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
+            # Preserve shutdown semantics: SystemExit/KeyboardInterrupt must
+            # still propagate after the user-facing failure notification, so
+            # the loop's own signal handling can shut down cleanly. Other
+            # BaseExceptions (e.g. GeneratorExit) are contained like ordinary
+            # failures — this handler is fire-and-forget, so swallowing them
+            # here prevents "Task exception was never retrieved" radio silence.
+            if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                raise
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
@@ -7162,23 +7510,148 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
-            if hasattr(self, "pop_post_delivery_callback"):
+            _post_cb = None
+            _processing_ok = bool(locals().get("processing_ok", False))
+            # A callback is an obligation to run only after confirmed final
+            # delivery.  Do not consume it on a failed send: that would erase
+            # ACK cleanup authority and unrelated deferred work even though
+            # the user's only visible breadcrumb is still the start ACK.
+            if _processing_ok and hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,
                     generation=_callback_generation,
                 )
-            else:
-                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+            elif _processing_ok:
+                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(
+                    session_key, None
+                )
             if callable(_post_cb):
+                if hasattr(self, "remove_delivery_success_fallback"):
+                    _primary_callbacks = (
+                        tuple(_post_cb.callbacks)
+                        if isinstance(_post_cb, _BoundedPostDeliveryChain)
+                        else (_post_cb,)
+                    )
+                    for _primary_callback in _primary_callbacks:
+                        if getattr(
+                            _primary_callback,
+                            "_hermes_delivery_success_fallback",
+                            False,
+                        ):
+                            self.remove_delivery_success_fallback(
+                                session_key, _primary_callback
+                            )
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
-                        await asyncio.wait_for(
-                            _post_result,
-                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
-                        )
+                        if isinstance(_post_cb, _BoundedPostDeliveryChain):
+                            await _post_result
+                        else:
+                            await asyncio.wait_for(
+                                _post_result,
+                                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                            )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            if _processing_ok:
+                _ledger_fallback = (
+                    self.pop_delivery_success_fallback(session_key)
+                    if hasattr(self, "pop_delivery_success_fallback")
+                    else None
+                )
+                if callable(_ledger_fallback):
+                    try:
+                        _fallback_result = _ledger_fallback()
+                        if inspect.isawaitable(_fallback_result):
+                            if isinstance(
+                                _ledger_fallback, _BoundedPostDeliveryChain
+                            ):
+                                await _fallback_result
+                            else:
+                                await asyncio.wait_for(
+                                    _fallback_result,
+                                    timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                                )
+                    except (asyncio.TimeoutError, Exception):
+                        logger.debug(
+                            "Ledger post-delivery fallback failed",
+                            exc_info=True,
+                        )
+                # Once a newer final has been confirmed, generation-owned
+                # callbacks from older failed turns have no safe future effect:
+                # cleanup must not target the newer turn, and non-cleanup work
+                # has already transferred to the session-owned lane above.
+                _cb_lock = getattr(self, "_post_delivery_callback_lock", None)
+                _unbacked_fallbacks = []
+                if _cb_lock is not None:
+                    with _cb_lock:
+                        _generation_ledger = getattr(
+                            self, "_post_delivery_callbacks_by_generation", {}
+                        )
+                        for _stale_key in tuple(_generation_ledger):
+                            if (
+                                isinstance(_stale_key, tuple)
+                                and _stale_key[0] == session_key
+                                and _stale_key[1] != _callback_generation
+                            ):
+                                _stale_cb = _generation_ledger.get(_stale_key)
+                                if isinstance(
+                                    _stale_cb, _BoundedPostDeliveryChain
+                                ):
+                                    _unbacked_fallbacks.extend(
+                                        cb for cb in _stale_cb.callbacks
+                                        if getattr(
+                                            cb,
+                                            "_hermes_delivery_success_fallback",
+                                            False,
+                                        )
+                                        and getattr(
+                                            cb,
+                                            "_hermes_delivery_success_fallback_registered",
+                                            True,
+                                        ) is False
+                                    )
+                                    _kept = [
+                                        cb for cb in _stale_cb.callbacks
+                                        if not getattr(
+                                            cb,
+                                            "_hermes_delivery_success_fallback",
+                                            False,
+                                        )
+                                    ]
+                                    if not _kept:
+                                        _generation_ledger.pop(_stale_key, None)
+                                    elif len(_kept) == 1:
+                                        _generation_ledger[_stale_key] = _kept[0]
+                                    else:
+                                        _generation_ledger[_stale_key] = (
+                                            _BoundedPostDeliveryChain(*_kept)
+                                        )
+                                elif getattr(
+                                    _stale_cb,
+                                    "_hermes_delivery_success_fallback",
+                                    False,
+                                ):
+                                    if getattr(
+                                        _stale_cb,
+                                        "_hermes_delivery_success_fallback_registered",
+                                        True,
+                                    ) is False:
+                                        _unbacked_fallbacks.append(_stale_cb)
+                                    _generation_ledger.pop(_stale_key, None)
+                for _unbacked_callback in _unbacked_fallbacks:
+                    try:
+                        _unbacked_result = _unbacked_callback()
+                        if inspect.isawaitable(_unbacked_result):
+                            await asyncio.wait_for(
+                                _unbacked_result,
+                                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                            )
+                    except (asyncio.TimeoutError, Exception):
+                        logger.debug(
+                            "Unbacked post-delivery fallback failed",
+                            exc_info=True,
+                        )
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.
@@ -7382,8 +7855,11 @@ class BasePlatformAdapter(ABC):
 
         # Resolve profile from configured routes (None when no match / no routes)
         profile = None
+        profile_route_rejected = False
         runner = getattr(self, "gateway_runner", None)
         if runner is not None:
+            from gateway.profile_routing import ProfileRouteRejected
+
             try:
                 profile = runner._profile_name_for_source(
                     SessionSource(
@@ -7404,6 +7880,8 @@ class BasePlatformAdapter(ABC):
                         message_id=str(message_id) if message_id else None,
                     )
                 )
+            except ProfileRouteRejected:
+                profile_route_rejected = True
             except Exception:
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
@@ -7427,6 +7905,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            transport_profile=getattr(self, "_owner_profile", None) or "default",
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
@@ -7435,6 +7914,11 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        # Keep this transport-only fail-closed signal out of SessionSource
+        # serialization/session identity. The shared gateway handler consumes it
+        # before auth, hooks, or session setup, so every adapter drops matched
+        # routes to unserved profiles consistently without surfacing HTTP 500s.
+        source.profile_route_rejected = profile_route_rejected
         return source
     
     @abstractmethod
@@ -7447,6 +7931,26 @@ class BasePlatformAdapter(ABC):
         - type: "dm", "group", "channel"
         """
         pass
+
+    def toolsets_for_source(self, source: "SessionSource") -> Optional[List[str]]:
+        """Per-source toolset override for agent runs triggered by this adapter.
+
+        Return a list of configurable toolset keys (e.g. ``["terminal",
+        "file", "web"]``) to REPLACE the platform-level toolset resolution
+        for this specific source, or ``None`` to use the normal
+        ``platform_toolsets.<platform>`` resolution (the default).
+
+        The gateway validates the returned list through the same
+        ``_get_platform_tools`` path as platform-level config, so unknown or
+        platform-restricted toolset names are dropped rather than trusted.
+
+        Currently used by the webhook adapter so individual routes can pin
+        their own toolsets (a trusted local monitoring route can get
+        ``terminal`` without widening every webhook route's default-safe
+        toolset). See ``platforms.webhook.extra.routes.<name>.toolsets`` and
+        the ``toolsets`` key in ``webhook_subscriptions.json``.
+        """
+        return None
     
     def format_message(self, content: str) -> str:
         """

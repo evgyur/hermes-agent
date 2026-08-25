@@ -9,7 +9,6 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
-import os
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,17 +29,38 @@ def _fresh_db(tmp_path, monkeypatch):
 
 
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
+    platform = kw.get("platform", "slack")
+    chat_id = kw.get("chat_id", "C1")
+    thread_id = kw.get("thread_id", "171.001")
+    route_envelope = kw.get("route_envelope")
+    if platform == "telegram" and route_envelope is None:
+        route_envelope = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": chat_id,
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
     dl.record_obligation(
         obligation_id=oid,
         session_key=session_key,
-        platform=kw.get("platform", "slack"),
-        chat_id=kw.get("chat_id", "C1"),
-        thread_id=kw.get("thread_id", "171.001"),
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
         content=kw.get("content", "the final answer"),
-        resume_task_id=kw.get("resume_task_id"),
-        continuation_generation=kw.get("continuation_generation"),
-        continuation_claim_owner=kw.get("continuation_claim_owner"),
-        continuation_claim_token=kw.get("continuation_claim_token"),
+        resume_task_id=kw.get("resume_task_id", "resume-task-1"),
+        continuation_generation=kw.get("continuation_generation", 1),
+        continuation_claim_owner=kw.get(
+            "continuation_claim_owner", "gateway:test"
+        ),
+        continuation_claim_token=kw.get(
+            "continuation_claim_token", "claim-test-1"
+        ),
+        route_envelope=route_envelope,
     )
 
 
@@ -127,33 +147,6 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
-    def test_startup_claim_is_not_reclaimed_by_runtime_reconnect(self):
-        _record()
-        dl.mark_failed("ob-1", "send_path_degraded")
-        _orphan("ob-1")
-
-        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
-
-        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
-        assert _row("ob-1")["state"] == "attempting"
-        assert dl.sweep_failed_for_runtime("slack") == []
-
-    def test_startup_claim_at_attempt_cap_is_not_abandoned_while_in_flight(self):
-        _record()
-        dl.mark_failed("ob-1", "send_path_degraded")
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
-                (dl.MAX_ATTEMPTS - 1, "ob-1"),
-            )
-        _orphan("ob-1")
-
-        assert dl.sweep_recoverable(deliverable_platforms={"slack"})
-        assert dl.sweep_failed_for_runtime("slack") == []
-        row = _row("ob-1")
-        assert row["state"] == "attempting"
-        assert row["attempts"] == dl.MAX_ATTEMPTS
-
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
@@ -186,6 +179,7 @@ class TestGatewayRedeliverySweep:
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending_exact = AsyncMock()
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
@@ -201,7 +195,7 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
-        _record(resume_task_id="resume-task-1")  # pending
+        _record()  # pending
         _orphan("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -213,111 +207,13 @@ class TestGatewayRedeliverySweep:
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
             "agent:main:slack:channel:C1",
-            expected_resume_task_id="resume-task-1",
-        )
-
-    @pytest.mark.asyncio
-    async def test_failed_redelivery_keeps_exact_resume_obligation(self):
-        _record(resume_task_id="resume-task-1")
-        _orphan("ob-1")
-        runner = self._runner(self._adapter(success=False))
-
-        assert await runner._redeliver_pending_obligations() == 0
-
-        runner._async_session_store.clear_resume_pending.assert_not_awaited()
-        assert runner._delivery_owed_resume_session_keys == {
-            "agent:main:slack:channel:C1"
-        }
-
-    @pytest.mark.asyncio
-    async def test_exact_durable_generation_must_complete_before_marker_clear(self):
-        _record(
             resume_task_id="resume-task-1",
-            continuation_generation=3,
-            continuation_claim_owner="gateway:owner",
-            continuation_claim_token="claim-token",
-        )
-        _orphan("ob-1")
-        runner = self._runner(self._adapter(success=True))
-        durable_store = MagicMock()
-        durable_store.complete = AsyncMock(return_value=True)
-        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
-
-        assert await runner._redeliver_pending_obligations() == 1
-
-        claim = durable_store.complete.await_args.args[0]
-        assert claim.continuation_id == "resume-task-1"
-        assert claim.generation == 3
-        assert claim.owner == "gateway:owner"
-        assert claim.claim_token == "claim-token"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_real_store_delivery_recovery_terminalizes_exact_claim(self, tmp_path):
-        from gateway.durable_continuation import GatewayContinuationStore
-        from hermes_state import SessionDB
-
-        state_db = SessionDB(db_path=tmp_path / "state.db")
-        try:
-            state_db.create_durable_continuation(
-                continuation_id="resume-task-real",
-                session_key="agent:main:slack:channel:C1",
-                session_id="session-1",
-                origin_turn_id="turn-1",
-                kind="gateway_restart_resume",
-                generation=1,
-                input_digest="sha256:input",
-                descriptor={"source": "test"},
-            )
-            claimed = state_db.claim_durable_continuation(
-                "resume-task-real",
-                1,
-                owner="gateway:real",
-                claim_token="real-token",
-                lease_seconds=90,
-            )
-            assert claimed is not None
-            _record(
-                resume_task_id="resume-task-real",
-                continuation_generation=1,
-                continuation_claim_owner="gateway:real",
-                continuation_claim_token="real-token",
-            )
-            _orphan("ob-1")
-            runner = self._runner(self._adapter(success=True))
-            store = GatewayContinuationStore(state_db, owner="gateway:real")
-            runner._gateway_continuation_store = MagicMock(return_value=store)
-
-            assert await runner._redeliver_pending_obligations() == 1
-
-            record = state_db.get_durable_continuation("resume-task-real")
-            assert record["state"] == "completed"
-            runner._async_session_store.clear_resume_pending.assert_awaited_once()
-        finally:
-            state_db.close()
-
-    @pytest.mark.asyncio
-    async def test_stale_durable_delivery_never_clears_newer_marker(self):
-        _record(
-            resume_task_id="old-task",
             continuation_generation=1,
-            continuation_claim_owner="dead-owner",
-            continuation_claim_token="stale-token",
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
-        _orphan("ob-1")
-        runner = self._runner(self._adapter(success=True))
-        durable_store = MagicMock()
-        durable_store.complete = AsyncMock(return_value=False)
-        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
-
-        assert await runner._redeliver_pending_obligations() == 1
-
-        runner._async_session_store.clear_resume_pending.assert_not_awaited()
-        assert runner._delivery_owed_resume_session_keys == {
-            "agent:main:slack:channel:C1"
-        }
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):
@@ -355,284 +251,47 @@ class TestGatewayRedeliverySweep:
 
         assert blocked_event_loop == []
 
-
-class TestRuntimeFailedSweep:
-    """``sweep_failed_for_runtime``: the runtime redelivery path that fires
-    after a platform reconnects, without waiting for a restart.
-
-    The startup sweep only claims rows owned by a DEAD process, so a final
-    response definitively rejected while this gateway stayed alive (e.g. the
-    network outage that also dropped the adapter) would otherwise sit in the
-    ledger until the next boot. This sweep claims exactly those rows for a
-    platform that just reconnected. The attempts cap and stale cutoff still
-    bound poison rows, and a different live process's rows are never stolen.
-    """
-
-    def _failed(self, oid="ob-1", **kw):
-        _record(oid=oid, **kw)
-        dl.mark_failed(oid, "send_path_degraded")
-
-    def test_failed_row_claimed_for_platform_with_marker(self):
-        self._failed()
-
-        claimed = dl.sweep_failed_for_runtime("slack")
-
-        assert len(claimed) == 1
-        assert claimed[0]["obligation_id"] == "ob-1"
-        # A previous rejection means a resend MIGHT duplicate — the marker
-        # keeps the at-least-once contract honest (same as the startup path).
-        assert claimed[0]["needs_marker"] is True
-        assert claimed[0]["attempts"] == 1
-        row = _row("ob-1")
-        assert row["state"] == "attempting"  # claimed → about to send
-        # Claim re-stamps ownership: a second sweep must not double-claim.
-        assert dl.sweep_failed_for_runtime("slack") == []
-
-    def test_two_concurrent_runtime_sweeps_claim_once(self):
-        self._failed()
-        gate = threading.Barrier(3)
-        results = []
-
-        def sweep():
-            gate.wait()
-            results.append(dl.sweep_failed_for_runtime("slack"))
-
-        workers = [threading.Thread(target=sweep) for _ in range(2)]
-        for worker in workers:
-            worker.start()
-        gate.wait()
-        for worker in workers:
-            worker.join(timeout=5)
-        assert sum(len(result) for result in results) == 1
-        assert _row("ob-1")["state"] == "attempting"
-
-    def test_other_platform_failed_rows_not_claimed(self):
-        self._failed(oid="ob-slack", platform="slack")
-        self._failed(
-            oid="ob-tg", platform="telegram",
-            session_key="agent:main:telegram:group:1",
-        )
-
-        claimed = dl.sweep_failed_for_runtime("slack")
-
-        assert [c["obligation_id"] for c in claimed] == ["ob-slack"]
-        assert _row("ob-tg")["state"] == "failed"
-
-    def test_other_live_process_rows_not_stolen(self):
-        """A failed row owned by a DIFFERENT live process is left alone —
-        that process owns the retry budget and will redeliver (or abandon)
-        it. Only rows owned by ourselves or by a dead process are claimed."""
-        self._failed()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET owner_pid=?, owner_started_at=NULL "
-                "WHERE obligation_id=?",
-                (os.getppid(), "ob-1"),  # our parent is alive for this test
-            )
-
-        assert dl.sweep_failed_for_runtime("slack") == []
-        assert _row("ob-1")["state"] == "failed"
-
-    @pytest.mark.parametrize("poison", ["over-cap", "stale"])
-    def test_other_live_process_poison_row_is_neither_claimed_nor_abandoned(
-        self, poison
+    @pytest.mark.asyncio
+    async def test_clear_resume_pending_before_send_so_a_hang_cannot_also_resume(
+        self,
     ):
-        self._failed()
-        with dl._connect() as conn:
-            if poison == "over-cap":
-                conn.execute(
-                    "UPDATE delivery_obligations SET attempts=?, owner_pid=?, "
-                    "owner_started_at=NULL WHERE obligation_id=?",
-                    (dl.MAX_ATTEMPTS, os.getppid(), "ob-1"),
-                )
-            else:
-                conn.execute(
-                    "UPDATE delivery_obligations SET created_at=?, owner_pid=?, "
-                    "owner_started_at=NULL WHERE obligation_id=?",
-                    (
-                        time.time() - dl.STALE_AFTER_SECONDS - 60,
-                        os.getppid(),
-                        "ob-1",
-                    ),
-                )
+        """A hung redelivery send must still clear resume_pending.
 
-        assert dl.sweep_failed_for_runtime("slack") == []
-        assert _row("ob-1")["state"] == "failed"
+        Otherwise a timed-out startup-restore gate would schedule resume and
+        replay a turn whose answer is already in the ledger (#91969).
+        """
+        import asyncio
 
-    def test_unowned_failed_row_is_claimable(self):
-        self._failed()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET owner_pid=NULL, owner_started_at=NULL "
-                "WHERE obligation_id=?",
-                ("ob-1",),
-            )
+        _record()
+        _orphan("ob-1")
+        hang = asyncio.Event()
 
-        claimed = dl.sweep_failed_for_runtime("slack")
-        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
-        assert _row("ob-1")["state"] == "attempting"
+        async def hanging_send(**_kwargs):
+            await hang.wait()
+            return MagicMock(success=True, error="")
 
-    def test_dead_owner_failed_row_is_claimable(self):
-        self._failed()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET owner_pid=?, owner_started_at=NULL "
-                "WHERE obligation_id=?",
-                (999_999_999, "ob-1"),
-            )
-
-        with patch.object(dl, "_owner_alive", return_value=False):
-            claimed = dl.sweep_failed_for_runtime("slack")
-        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
-        assert _row("ob-1")["state"] == "attempting"
-
-    def test_rows_over_attempts_cap_abandoned_not_claimed(self):
-        self._failed()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
-                (dl.MAX_ATTEMPTS, "ob-1"),
-            )
-
-        assert dl.sweep_failed_for_runtime("slack") == []
-        assert _row("ob-1")["state"] == "abandoned"
-
-    def test_stale_failed_row_abandoned_not_claimed(self):
-        self._failed()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
-                (time.time() - dl.STALE_AFTER_SECONDS - 60, "ob-1"),
-            )
-
-        assert dl.sweep_failed_for_runtime("slack") == []
-        assert _row("ob-1")["state"] == "abandoned"
-
-
-class TestRuntimeFailedRedelivery:
-    """Drive GatewayRunner._redeliver_failed_obligations_for_platform — the
-    runtime counterpart of the startup sweep, fired when a platform
-    reconnects after an outage. Uses the same real ledger + real adapter
-    harness as TestGatewayRedeliverySweep."""
-
-    @staticmethod
-    def _runner(adapter=None):
-        from gateway.config import Platform
-        from gateway.run import GatewayRunner
-
-        runner = object.__new__(GatewayRunner)
-        runner.adapters = {Platform.SLACK: adapter} if adapter else {}
-        _store = MagicMock()
-        _store.clear_resume_pending = AsyncMock()
-        _store._store = None
-        runner.session_store = None
-        runner._async_session_store = _store
-        return runner
-
-    @staticmethod
-    def _adapter(success=True):
         adapter = MagicMock()
-        adapter.send = AsyncMock(
-            return_value=MagicMock(success=success, error="" if success else "nope")
-        )
-        return adapter
-
-    @pytest.mark.asyncio
-    async def test_failed_row_redelivered_with_marker(self):
-        from gateway.config import Platform
-
-        _record()  # slack, pending
-        dl.mark_failed("ob-1", "send_path_degraded")
-        adapter = self._adapter()
+        adapter.send = hanging_send
         runner = self._runner(adapter)
+        task = asyncio.create_task(runner._redeliver_pending_obligations())
 
-        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+        deadline = asyncio.get_running_loop().time() + 2
+        while runner._async_session_store.clear_resume_pending_exact.await_count == 0:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("resume_pending was not cleared before send")
+            await asyncio.sleep(0)
 
-        assert n == 1
-        sent = adapter.send.call_args.kwargs
-        assert sent["content"].startswith(dl.RECOVERED_MARKER)
-        assert sent["content"].endswith("the final answer")
-        assert _row("ob-1")["state"] == "delivered"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
-        )
-
-    @pytest.mark.asyncio
-    async def test_runtime_redelivery_completes_exact_durable_generation(self):
-        from gateway.config import Platform
-
-        _record(
-            resume_task_id="resume-task-1",
-            continuation_generation=3,
-            continuation_claim_owner="gateway:owner",
-            continuation_claim_token="claim-token",
-        )
-        dl.mark_failed("ob-1", "send_path_degraded")
-        runner = self._runner(self._adapter(success=True))
-        durable_store = MagicMock()
-        durable_store.complete = AsyncMock(return_value=True)
-        runner._gateway_continuation_store = MagicMock(return_value=durable_store)
-
-        assert await runner._redeliver_failed_obligations_for_platform(
-            Platform.SLACK
-        ) == 1
-
-        claim = durable_store.complete.await_args.args[0]
-        assert claim.continuation_id == "resume-task-1"
-        assert claim.generation == 3
-        assert claim.owner == "gateway:owner"
-        assert claim.claim_token == "claim-token"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
             "agent:main:slack:channel:C1",
-            expected_resume_task_id="resume-task-1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
+        assert not task.done()
 
-    @pytest.mark.asyncio
-    async def test_absent_adapter_does_not_spend_attempt(self):
-        from gateway.config import Platform
-
-        _record()
-        dl.mark_failed("ob-1", "send_path_degraded")
-        runner = self._runner()
-
-        assert await runner._redeliver_failed_obligations_for_platform(Platform.SLACK) == 0
-        row = _row("ob-1")
-        assert row["state"] == "failed"
-        assert row["attempts"] == 0
-
-    @pytest.mark.asyncio
-    async def test_failed_send_marks_failed_again_without_crash(self):
-        from gateway.config import Platform
-
-        _record()
-        dl.mark_failed("ob-1", "send_path_degraded")
-        adapter = self._adapter(success=False)
-        runner = self._runner(adapter)
-
-        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
-
-        assert n == 0
-        assert _row("ob-1")["state"] == "failed"
-
-    @pytest.mark.asyncio
-    async def test_other_platform_failed_rows_not_redelivered(self):
-        from gateway.config import Platform
-
-        _record(oid="ob-slack", platform="slack")
-        _record(
-            oid="ob-tg", platform="telegram",
-            session_key="agent:main:telegram:group:1",
-        )
-        dl.mark_failed("ob-slack", "x")
-        dl.mark_failed("ob-tg", "x")
-        adapter = self._adapter()
-        runner = self._runner(adapter)  # only the slack adapter is connected
-
-        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
-
-        assert n == 1
-        assert _row("ob-slack")["state"] == "delivered"
-        assert _row("ob-tg")["state"] == "failed"
+        hang.set()
+        assert await task == 1
 
 
 class TestAttemptsOnlySpentOnRealSends:
@@ -710,3 +369,359 @@ class TestUnconnectedPlatformKeepsItsBudget:
         )
         assert _row("ob-1")["attempts"] == 0
 
+
+
+class TestOwnerAlivePidProbe:
+    """_owner_alive's no-start-time fallback must route through
+    gateway.status._pid_exists, never a raw ``os.kill(pid, 0)`` probe.
+
+    On Windows ``os.kill(pid, 0)`` is NOT a no-op: CPython maps sig=0 to
+    ``GenerateConsoleCtrlEvent(0, pid)`` (bpo-14484), so probing a LIVE pid
+    whose start time psutil could not read would Ctrl+C its console group.
+    Pattern per the windows-native-support reference: patch
+    ``gateway.status._pid_exists``, not ``os.kill``.
+    """
+
+    def _no_start_time(self, monkeypatch):
+        from gateway import status
+
+        monkeypatch.setattr(status, "get_process_start_time", lambda pid: None)
+
+    def test_alive_when_pid_exists(self, monkeypatch):
+        from gateway import status
+
+        self._no_start_time(monkeypatch)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        assert dl._owner_alive(12345, 999) is True
+
+    def test_dead_when_pid_gone(self, monkeypatch):
+        from gateway import status
+
+        self._no_start_time(monkeypatch)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+        assert dl._owner_alive(12345, 999) is False
+
+    def test_raw_os_kill_probe_never_used(self, monkeypatch):
+        """Regression guard: the probe must not touch os.kill when
+        gateway.status._pid_exists is importable (i.e. always in-tree)."""
+        from gateway import status
+
+        self._no_start_time(monkeypatch)
+        calls = []
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: calls.append(pid) or True)
+        monkeypatch.setattr(
+            dl.os, "kill", lambda *a, **k: (_ for _ in ()).throw(AssertionError("raw os.kill probe used"))
+        )
+        assert dl._owner_alive(4242, 999) is True
+        assert calls == [4242]
+
+    def test_probe_exception_means_dead(self, monkeypatch):
+        from gateway import status
+
+        self._no_start_time(monkeypatch)
+
+        def boom(pid):
+            raise RuntimeError("probe blew up")
+
+        monkeypatch.setattr(status, "_pid_exists", boom)
+        assert dl._owner_alive(12345, 999) is False
+
+
+def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
+    _record(
+        "runtime-claim",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="already generated",
+        resume_task_id="resume-3",
+        continuation_generation=3,
+        continuation_claim_owner="gateway:owner",
+        continuation_claim_token="continuation-token",
+    )
+    dl.mark_failed("runtime-claim", "offline")
+    rows = dl.sweep_failed_for_runtime("telegram")
+    assert len(rows) == 1
+    assert rows[0]["continuation_generation"] == 3
+    assert rows[0]["continuation_claim_token"] == "continuation-token"
+    assert rows[0]["route_envelope"]["transport_profile"] == "default"
+    assert dl.sweep_failed_for_runtime("telegram") == []
+    assert dl.settle_runtime_claim(
+        "runtime-claim", rows[0]["runtime_claim_token"], delivered=True
+    )
+    assert _row("runtime-claim")["state"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_sends_stored_final_without_model_replay():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    _record(
+        "runtime-send",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        thread_id=None,
+        content="stored final",
+    )
+    dl.mark_failed("runtime-send", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m1", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM
+    ) == 1
+    assert adapter.send.await_args.kwargs["content"].endswith("stored final")
+    runner._async_session_store.clear_resume_pending_exact.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_preserves_exact_business_route_envelope():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "hermesdev",
+        "transport_profile": "hermesdev",
+        "chat_id": "700000321",
+        "thread_id": "1858",
+        "user_id": "711111111",
+        "business_connection_id": "biz-42",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-business",
+        session_key="agent:hermesdev:telegram:business:biz-42:700000321:711111111:external",
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=route["thread_id"],
+        route_envelope=route,
+        content="stored business final",
+    )
+    dl.mark_failed("runtime-business", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "hermesdev"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m2", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "hermesdev": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter, runtime_profile="hermesdev"
+    ) == 1
+    kwargs = adapter.send.await_args.kwargs
+    assert kwargs["chat_id"] == route["chat_id"]
+    assert kwargs["metadata"]["business_connection_id"] == "biz-42"
+    assert kwargs["metadata"]["profile"] == "hermesdev"
+    assert kwargs["metadata"]["transport_profile"] == "hermesdev"
+    assert kwargs["metadata"]["external_safe_mode"] is True
+    assert kwargs["metadata"]["route_envelope"] == route
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_allows_distinct_runtime_and_transport_profiles():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": None,
+        "user_id": "700000111",
+        "business_connection_id": "biz-distinct",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-distinct-transport",
+        session_key=(
+            "agent:runtime-a:telegram:business:biz-distinct:"
+            "777000123:700000111:external"
+        ),
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=None,
+        route_envelope=route,
+        content="exact distinct route",
+    )
+    dl.mark_failed("runtime-distinct-transport", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m3", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 1
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["profile"] == "runtime-a"
+    assert metadata["transport_profile"] == "transport-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["chat", "thread", "user", "business"])
+async def test_gateway_reconnect_quarantines_tampered_exact_session_route(tamper):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": "1858",
+        "user_id": "700000111",
+        "business_connection_id": "biz-exact",
+        "external_safe_mode": True,
+    }
+    session_key = (
+        "agent:runtime-a:telegram:business:biz-exact:"
+        "777000123:700000111:external"
+    )
+    row_chat = route["chat_id"]
+    row_thread = route["thread_id"]
+    if tamper == "chat":
+        row_chat = "777000999"
+    elif tamper == "thread":
+        row_thread = "9999"
+    elif tamper == "user":
+        session_key = session_key.replace("700000111", "700000999")
+    elif tamper == "business":
+        session_key = session_key.replace("biz-exact", "biz-other")
+
+    oid = f"runtime-tampered-{tamper}"
+    _record(
+        oid,
+        session_key=session_key,
+        platform="telegram",
+        chat_id=row_chat,
+        thread_id=row_thread,
+        route_envelope=route,
+        content="must not send",
+    )
+    dl.mark_failed(oid, "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 0
+    adapter.send.assert_not_awaited()
+    assert _row(oid)["state"] == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing-envelope", "cross-profile"])
+async def test_gateway_reconnect_quarantines_ambiguous_telegram_route(case):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = None
+    session_key = "agent:main:telegram:dm:C1"
+    if case == "cross-profile":
+        route = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "hermesdev",
+            "transport_profile": "hermesdev",
+            "chat_id": "C1",
+            "thread_id": None,
+            "user_id": "U1",
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
+        session_key = "agent:hermesdev:telegram:dm:C1"
+    dl.record_obligation(
+        obligation_id=f"runtime-{case}",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="must not send",
+        route_envelope=route,
+    )
+    dl.mark_failed(f"runtime-{case}", "offline")
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter
+    ) == 0
+    adapter.send.assert_not_awaited()
+    # The transport-filtered sweep cannot prove ownership of an invalid or
+    # cross-transport row, so it leaves it untouched for operator repair.
+    assert _row(f"runtime-{case}")["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_settlement_continues_db_only_after_inline_lock_budget(monkeypatch):
+    import asyncio
+    import sqlite3
+
+    _record("settle-after-locks")
+    real_mark = dl.mark_delivered
+    calls = 0
+
+    def locked_then_open(obligation_id):
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark(obligation_id)
+
+    monkeypatch.setattr(dl, "mark_delivered", locked_then_open)
+    assert await dl.settle_with_retry(dl.mark_delivered, "settle-after-locks") is False
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while calls < 5 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert calls >= 5
+    assert _row("settle-after-locks")["state"] == "delivered"

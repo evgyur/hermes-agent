@@ -13,14 +13,22 @@ import contextvars
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import (
+    get_hermes_home,
+    get_skills_dir,
+    is_wsl,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
+    EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
     ORG_MIRROR_DIR_NAME,
     ORG_PROVENANCE_FILE,
+    SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
@@ -183,18 +191,45 @@ MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+USER_PROFILE_GUIDANCE = (
+    "You have a persistent user profile across sessions. Save durable facts about "
+    "the user with the memory tool (target='user'): name, role, preferences, "
+    "corrections, and communication style. The profile is injected into every turn, "
+    "so keep it compact and focused on facts that will still matter later.\n"
+    "The built-in memory notes store is disabled — write only to the user profile "
+    "(target='user'), never target='memory'.\n"
+    "Prioritize what reduces future user steering — the most valuable entry is one "
+    "that prevents the user from having to correct or remind you again.\n"
+    "Write entries as declarative facts, not instructions to yourself. "
+    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
+    "Imperative phrasing gets re-read as a directive in later sessions and can "
+    "cause repeated work or override the user's current request."
+)
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
     "asking them to repeat themselves."
 )
 
+# NOTE (#82154): the opening sentence is worded deliberately. Anthropic's
+# server-side content filter rejects the previous phrasing ("After completing a
+# complex task (5+ tool calls), fixing a tricky error, or discovering a
+# non-trivial workflow, save the approach as a skill with skill_manage so you
+# can reuse it next time.") on subscription OAuth credentials, and surfaces that
+# rejection as a billing-shaped HTTP 400 ("You're out of extra usage"), which
+# sends users to buy quota they do not need. Bisected against the live API: that
+# sentence alone reproduces the 400 and removing it alone clears it; size and
+# the system[0] identity gate were both ruled out. The reword is empirically
+# validated, not understood — if you rewrite this sentence, re-verify against a
+# subscription OAuth token, not an sk-ant-api… key, which does not hit the
+# filter.
 SKILLS_GUIDANCE = (
-    "Skill maintenance never extends the current assignment after its requested "
-    "outcome is complete. If a loaded skill is materially wrong and blocks that "
-    "outcome, patch only the smallest necessary correction with "
-    "skill_manage(action='patch'). Otherwise report the issue separately and "
-    "wait for a separate user request before creating or updating a skill.\n"
+    "When you work out a non-trivial workflow, record it with skill_manage "
+    "for future reuse.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, "
+    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
+    "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
     "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
@@ -234,24 +269,33 @@ KANBAN_GUIDANCE = (
     "infer (missing credentials, UX choice, paywalled source, peer output you "
     "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
     "The user will unblock with context and the dispatcher will respawn you.\n"
-    "5. **Complete with structured handoff.** Call `kanban_complete(summary=..., "
-    "metadata=...)`. `summary` is 1–3 human-readable sentences naming concrete "
-    "artifacts. `metadata` is machine-readable facts "
-    "(`{changed_files: [...], tests_run: N, decisions: [...]}`). Downstream "
-    "workers read both via their own `kanban_show`. Never put secrets / "
-    "tokens / raw PII in either field — run rows are durable forever. "
-    "Exception: if your output is a code change that needs human review "
-    "before counting as merged/done (most coding tasks), drop the "
-    "structured metadata (changed_files / tests_run / diff_path) into a "
-    "`kanban_comment` first, then end with "
-    "`kanban_block(reason=\"review-required: <one-line summary>\")` so a "
-    "reviewer can approve+unblock or request changes. Reviewing-then-"
-    "completing is more honest than auto-completing work that still needs "
-    "eyes on it.\n"
+    "5. **Finish with the review model encoded by the task graph.** Always "
+    "include the structured handoff (`summary`, `metadata`) on the lifecycle "
+    "transition itself; never put secrets, tokens, or raw PII in these durable "
+    "fields. If `kanban_show()` lists child IDs, inspect those cards with "
+    "`kanban_show(task_id=...)` before choosing the terminal action. When any "
+    "pre-created review, QA, or release child depends on your task, call "
+    "`kanban_complete`: your implementation phase is done, and completion is "
+    "what releases those children. Never sticky-block that parent for "
+    "`review-required` and never request same-card review as well — either "
+    "choice would strand or duplicate the downstream lane. Otherwise, when "
+    "this same task needs review before it is final, call "
+    "`kanban_request_review(summary=..., metadata=..., "
+    "reviewer=<optional-profile>)`. The reviewer approves with "
+    "`kanban_complete`, returns actionable rework with "
+    "`kanban_request_changes`, or uses `kanban_block` only for a genuine "
+    "external escalation. Review is not a block, so repeated review cycles do "
+    "not trip unblock-loop detection.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
     "scope-creeping into the next thing.\n"
+    "7. **Flag collision hotspots; don't pile on.** If your change keeps "
+    "colliding with sibling branches in one file, or a file your diff touches "
+    "shows up in other cards' recent comments, do not silently add more to it: "
+    "leave a `kanban_comment` starting with `hotspot: <path> — <one-line reason>` "
+    "on your card and repeat the flag in your completion metadata, so the "
+    "orchestrator can decompose that file before more work lands on it.\n"
     "\n"
     "## Orchestrator mode\n"
     "\n"
@@ -261,6 +305,13 @@ KANBAN_GUIDANCE = (
     "express dependencies. Then `kanban_complete` your own task with a summary "
     "of the decomposition. Do NOT execute the work yourself; your job is "
     "routing, not implementation.\n"
+    "\n"
+    "**Decision ownership.** Design decisions belong to you, the orchestrator, "
+    "not to workers — settle naming schemes, schemas, file formats, and API "
+    "shapes before fanning out. Never let two subtree cards decide the same "
+    "question: if two tasks would each pick one, decide it yourself and write "
+    "the decision into BOTH card bodies. Every child card body must carry the "
+    "decisions it depends on, because workers cannot see sibling context.\n"
     "\n"
     "## Reference details that change outcomes\n"
     "\n"
@@ -321,6 +372,25 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
+
+# Model name substrings whose sessions receive OPENAI_MODEL_EXECUTION_GUIDANCE
+# (execution discipline: tool persistence, mandatory tool use for arithmetic,
+# external-write read-back, count reconciliation, literal preservation,
+# verification-gated completion) when agent.execution_guidance is "auto".
+#
+# gpt/codex/grok are the historical set; deepseek/kimi/qwen/glm/minimax/
+# mimo/mistral were added after Composio agentic-eval traces showed the same
+# failure modes on those families (financial math in prose, no read-back after
+# external writes, identifier "repair", completeness claims despite count
+# mismatches). GLM's tool-calls-as-plain-text stall (#53847) and MiMo (#41874)
+# are covered here too. Gemini/Gemma are excluded — they get the more specific
+# GOOGLE_MODEL_OPERATIONAL_GUIDANCE block instead. Claude is excluded because
+# it does not exhibit these failure modes; users can opt any model in via
+# config.yaml `agent.execution_guidance: true` or a substring list.
+EXECUTION_GUIDANCE_MODELS = (
+    "gpt", "codex", "grok",
+    "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral",
+)
 
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
@@ -402,13 +472,22 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # without tool calls, suggests workarounds instead of using existing tools,
 # replies with plans/suggestions instead of executing). The body is
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
+#
+# As of the Composio agentic-eval follow-up, the block is no longer fenced to
+# gpt/codex/grok: eval traces showed DeepSeek/Kimi doing financial math in
+# prose, skipping read-back verification after external writes, "repairing"
+# malformed identifiers, and claiming completeness despite count mismatches —
+# exactly the failure modes this block targets. The injection gate lives in
+# agent/system_prompt.py and is controlled by config.yaml
+# ``agent.execution_guidance`` (auto/true/false/list); "auto" matches the
+# EXECUTION_GUIDANCE_MODELS substring tuple below.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
     "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
+    "- If a tool returns empty, partial, or suspiciously narrow results, retry "
+    "with a broader or different query or strategy before concluding.\n"
     "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
     "the result.\n"
     "</tool_persistence>\n"
@@ -451,7 +530,29 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
     "confirm scope before executing.\n"
+    "- Completion: 'done' means every named acceptance criterion is verified — "
+    "never a plausible subset. Completing your plan is not itself the answer; "
+    "the requested output must appear in your response.\n"
     "</verification>\n"
+    "\n"
+    "<external_state_verification>\n"
+    "- After any state-changing write to an external system (API call, message "
+    "post, record update), verify the effect by reading back the exact target "
+    "before claiming success — a successful tool call is not a successful task. "
+    "Do NOT re-verify internal file edits a tool already confirmed.\n"
+    "- Declared totals in responses (total, reply_count, has_more, '...N more') "
+    "are hard assertions. If your enumerated count disagrees, re-fetch or parse "
+    "programmatically — never finalize on 'go with what I have'.\n"
+    "- When building write payloads, set fields explicitly rather than relying "
+    "on provider defaults that could contradict intent.\n"
+    "</external_state_verification>\n"
+    "\n"
+    "<literal_preservation>\n"
+    "- Preserve identifiers, commands, and values exactly as given — never "
+    "'repair' or normalize a token that fails a stated format. A successful "
+    "lookup does not validate a malformed source token; validate format first, "
+    "then look up.\n"
+    "</literal_preservation>\n"
     "\n"
     "<missing_context>\n"
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
@@ -602,9 +703,13 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "browser chrome, OS permission prompts, native dialogs, and unsupported "
         "targets. Browser setup is a separately approved action; attaching an "
         "existing profile is enforced by cua-driver's immutable permission "
-        "mode: standard requires a certified protected host and fails closed "
-        "when Hermes has none; explicit Hermes YOLO uses a private unrestricted "
-        "daemon after the user's launch/session risk acceptance.\n\n"
+        "mode: in standard mode it requires the user's one-time config opt-in "
+        "`computer_use.grant_existing_profile: true` (if unset, report the "
+        "refusal and name that key — you can never grant it yourself); "
+        "bounded mode authorizes via the user's reviewed capability manifest; "
+        "explicit Hermes YOLO uses an unrestricted runtime after the user's "
+        "launch/session risk acceptance. Permission mode and grants are fixed "
+        "when Hermes launches that runtime.\n\n"
         "## Background mode rules\n"
         "- Do NOT use `raise_window=true` on `focus_app` unless the user "
         "explicitly asked you to bring a window to front. Input routing to "
@@ -614,9 +719,11 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "won't leak other windows the user has open.\n"
         + offscreen_line +
         "## The agent cursor you'll see on screen\n"
-        "Each computer-use run declares a session with cua-driver; that "
-        "session owns a tinted overlay cursor that glides to where you "
-        "act. It's a visual cue for the user — the REAL OS cursor never "
+        "Each computer-use run gives cua-driver a public session name. The "
+        "name labels its tinted overlay cursor and related state, while the "
+        "MCP transport owns a private lifecycle session inside the runtime. "
+        "The cursor glides "
+        "to where you act. It's a visual cue for the user; the REAL OS cursor never "
         "moves. Don't try to read it or click on it; it's UI feedback, "
         "not input.\n\n"
         "## Safety\n"
@@ -884,7 +991,29 @@ PLATFORM_HINTS = {
         "in your response. Images (.png, .jpg, .webp) appear inline, audio and "
         "video play inline, and other files arrive as download links. You can "
         "also include image URLs in markdown format ![alt](url) and they "
-        "render inline as photos."
+        "render inline as photos. "
+        "To show an HTML file you wrote as a LIVE inline page right in your "
+        "message, put ::preview{file=\"path/to/file.html\"} alone on its own "
+        "line — desktop plugins can register more ::name{...} directives like "
+        "it. When the user asks for an inline widget, chart, or visualization "
+        "(anything living IN the chat rather than a standalone page), design "
+        "it as a native piece of the app by default: transparent background, "
+        "colors from the provided theme tokens — var(--foreground), "
+        "var(--muted-foreground), var(--accent), var(--border), var(--card) — "
+        "the inherited app font, no body padding or margin, content flush "
+        "left and filling the viewport width, no centering wrappers, decorative "
+        "backdrops, or page chrome. The frame auto-sizes to the content. "
+        "Widgets can talk back: window.hermes.send(\"prompt\") — or a "
+        "data-hermes-send=\"prompt\" attribute on any clickable element — sends "
+        "that prompt to you as a hidden user turn (no chat bubble), so give "
+        "interactive widgets buttons whose clicks mean something and answer "
+        "them by updating the widget's file, not with prose. Only "
+        "a standalone PAGE (a mockup, a poster, a game) should bring its own "
+        "background and layout. "
+        "When the user asks to add, enable, or authorize an MCP server (or a "
+        "task clearly needs one that is missing), use the setup_mcp tool if "
+        "it is available — it shows an inline consent card right in the chat; "
+        "never hand-edit mcp_servers config for them."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -1085,6 +1214,26 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 _BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
 
 
+def _windows_marketing_version() -> str:
+    """Return the marketing Windows version ("10", "11", ...) for the prompt.
+
+    ``platform.release()`` reports the kernel version, which is ``10`` for
+    BOTH Windows 10 and Windows 11 — the prompt then claims "Windows (10)"
+    on Windows 11 hosts and misleads the model about the OS (#51755).
+    Windows 11 is distinguished by build number: >= 22000 is 11.
+    Falls back to ``platform.release()`` on any lookup failure.
+    """
+    try:
+        build = sys.getwindowsversion().build  # type: ignore[attr-defined]
+        if build >= 22000:
+            return "11"
+        return "10"
+    except Exception:
+        import platform
+
+        return platform.release()
+
+
 _WINDOWS_BASH_SHELL_HINT = (
     "Shell: on this Windows host your `terminal` tool runs commands through "
     "bash (git-bash / MSYS), NOT PowerShell or cmd.exe. Use POSIX shell "
@@ -1092,7 +1241,20 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`). Path arguments for NATIVE "
+    "Windows programs (git, rg, node, python, ...) are NOT translated: MSYS "
+    "path conversion is disabled here, so `git -C /c/Users/x` or "
+    "`node /tmp/a.js` fails with 'cannot change to'/'not found' even though "
+    "`cd /c/Users/x` (a bash builtin) works. Pass `C:/Users/x`-style "
+    "forward-slash native paths to native tools, and prefer "
+    "`$LOCALAPPDATA/Temp` over `/tmp` for scratch files a native tool must "
+    "read. When answering prompts in a "
+    "pty background process, use process(submit) — never process(write) "
+    "with a bare trailing newline: Enter on a Windows PTY is a carriage "
+    "return, and a lone `\\n` is not delivered as a line terminator, so the "
+    "child's prompt silently never returns. When a CLI offers a "
+    "non-interactive path (flags, `--with-token`, config files, an OAuth "
+    "device flow polled with curl), prefer it over driving prompts."
 )
 
 
@@ -1259,7 +1421,7 @@ def build_environment_hints() -> str:
         if is_wsl():
             host_lines.append("Host: WSL (Windows Subsystem for Linux)")
         elif sys.platform == "win32":
-            host_lines.append(f"Host: Windows ({platform.release()})")
+            host_lines.append(f"Host: Windows ({_windows_marketing_version()})")
         elif sys.platform == "darwin":
             mac_ver = platform.mac_ver()[0]
             host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
@@ -1421,12 +1583,17 @@ def drain_truncation_warnings() -> list:
 # Skills prompt cache
 # =========================================================================
 
-_SKILLS_PROMPT_CACHE_MAX = 8
+# Sized for multi-profile processes: since #86313 the cache key carries a
+# per-profile skills_dir (one entry per profile × platform), so the old cap
+# of 8 could thrash on a gateway multiplexing default + several bots (each
+# miss = full os.walk manifest rebuild). ~32 costs low single-digit MB worst
+# case.
+_SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v3: catalog iteration gained archive/embedded-package pruning and generic
-# frontmatter-name collision deduplication; v2 snapshots may contain stale noise.
-_SKILLS_SNAPSHOT_VERSION = 3
+# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
+# org-shared skills; older snapshots are discarded and rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1445,35 +1612,47 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """Build the index manifest through the canonical catalog iterator."""
+    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
+
+    Org mirrors (M2): only the ACTIVE org's mirror participates, and the
+    ``.active_org`` marker itself is included — so switching/leaving an org
+    invalidates the snapshot even when no SKILL.md changed.
+    """
     manifest: dict[str, list[int]] = {}
-    marker_path = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+    skills_dir_str = str(skills_dir)
+    base = os.path.join(skills_dir_str, "")
+    prefix_len = len(base)
+    active_org = read_active_org_id(skills_dir)
+    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
+    marker_path = os.path.join(org_root, ORG_ACTIVE_MARKER)
     try:
-        stat = marker_path.stat()
-        manifest[f"{ORG_MIRROR_DIR_NAME}/{ORG_ACTIVE_MARKER}"] = [
-            stat.st_mtime_ns,
-            stat.st_size,
+        st = os.stat(marker_path)
+        manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
+            int(st.st_mtime), int(st.st_size),
         ]
     except OSError:
         pass
-
-    scan_roots = [skills_dir]
-    active_org_id = read_active_org_id(skills_dir)
-    if active_org_id:
-        active_org_root = skills_dir / ORG_MIRROR_DIR_NAME / active_org_id
-        if active_org_root.is_dir():
-            scan_roots.append(active_org_root)
-
-    for scan_root in scan_roots:
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        has_skill_md = "SKILL.md" in files
+        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+            dirs.remove(ORG_MIRROR_DIR_NAME)
+        elif root == org_root:
+            dirs[:] = [d for d in dirs if d == active_org]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in EXCLUDED_SKILL_DIRS
+            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+        ]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
-            for index_path in iter_skill_index_files(scan_root, filename):
-                skill_path = Path(index_path)
-                try:
-                    stat = skill_path.stat()
-                    relative = skill_path.relative_to(skills_dir).as_posix()
-                except (OSError, ValueError):
-                    continue
-                manifest[relative] = [stat.st_mtime_ns, stat.st_size]
+            if filename not in files:
+                continue
+            path = os.path.join(root, filename)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
     return manifest
 
 
@@ -1650,15 +1829,9 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
-    *,
-    persist_snapshot: bool = True,
-    routing_policy: str = "conservative",
-    protected_boundaries: "tuple[str, ...] | None" = None,
+    skills_dir_override: "Path | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
-
-    ``persist_snapshot=False`` is reserved for strict read-only diagnostics. It
-    may consume an existing valid snapshot, but a cold scan never writes one.
 
     Two-layer cache:
       1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
@@ -1678,42 +1851,66 @@ def build_skills_system_prompt(
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
     """
-    from agent.skill_routing import (
-        normalize_routing_policy,
-        protected_boundary_guidance,
-        skill_routing_guidance,
-    )
+    # Home resolution is EXPLICIT when a caller passes skills_dir_override
+    # (the agent knows its own profile home from its session_db path). This
+    # avoids the ContextVar-on-a-thread trap: build threads that didn't bind
+    # HERMES_HOME would otherwise fall back to the launch (default) home and
+    # leak the default profile's skills into a bot's prompt (confirmed: a
+    # no-override thread builds default's full index). Snapshot + external
+    # dirs are scoped to the same home so nothing reads ambient state.
+    if skills_dir_override is not None:
+        skills_dir = Path(skills_dir_override)
+        _home_token = set_hermes_home_override(str(skills_dir.parent))
+    else:
+        skills_dir = get_skills_dir()
+        _home_token = None
+    try:
+        external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
+        # the git root) — highest-precedence tier, scanned before local.
+        # Resolved once here; cwd and trust are stable for the session, so
+        # the index (and the system prompt) stays byte-stable.
+        from agent.skill_utils import get_project_skills_dirs
+        project_dirs = get_project_skills_dirs()
 
-    skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
-    effective_routing_policy = normalize_routing_policy(routing_policy)
-    effective_protected_boundaries = tuple(
-        sorted(
-            str(value).strip().lower().replace("-", "_")
-            for value in (protected_boundaries or ())
-            if str(value).strip()
+        if not skills_dir.exists() and not external_dirs and not project_dirs:
+            return ""
+
+        return _build_skills_system_prompt_inner(
+            skills_dir,
+            external_dirs,
+            available_tools,
+            available_toolsets,
+            compact_categories,
+            project_dirs=project_dirs,
         )
-    )
+    finally:
+        if _home_token is not None:
+            reset_hermes_home_override(_home_token)
 
-    if not skills_dir.exists() and not external_dirs:
-        return ""
 
-    # ── Layer 1: in-process LRU cache ─────────────────────────────────
+def _build_skills_system_prompt_inner(
+    skills_dir: "Path",
+    external_dirs: "list[Path]",
+    available_tools: "set[str] | None",
+    available_toolsets: "set[str] | None",
+    compact_categories: "frozenset[str] | None",
+    project_dirs: "list[Path] | None" = None,
+) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
-        bool(persist_snapshot),
-        effective_routing_policy,
-        effective_protected_boundaries,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1773,34 +1970,80 @@ def build_skills_system_prompt(
                 continue
             visible_entries.append(entry)
 
-    # ── Provenance labels + fail-closed generic name collisions ──────────
-    # One frontmatter name gets one catalog line. Multiple physical candidates
-    # collapse to a synthetic collision entry; bare skill_view remains blocked
-    # by its independent multi-candidate resolver.
-    entries_by_name: dict[str, list[dict]] = {}
+    # ── Project-local skills (highest precedence) ──────────────────────
+    # Scanned before the local/org pass; names claimed here shadow same-named
+    # profile-local skills below (that's the feature — vendored repo skills
+    # win inside their repo). Each entry is tagged so the model and the user
+    # can see where it came from.
+    project_names: set[str] = set()
+    if project_dirs:
+        from agent.skill_utils import iter_project_skill_files
+
+        for proj_dir in project_dirs:
+            if not proj_dir.exists():
+                continue
+            for skill_file in iter_project_skill_files(proj_dir):
+                try:
+                    is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                    if not is_compatible:
+                        continue
+                    entry = _build_snapshot_entry(skill_file, proj_dir, frontmatter, desc)
+                    fm_name = entry["frontmatter_name"]
+                    if fm_name in project_names:
+                        continue
+                    if fm_name in disabled or entry["skill_name"] in disabled:
+                        continue
+                    if not _skill_should_show(
+                        extract_skill_conditions(frontmatter),
+                        available_tools,
+                        available_toolsets,
+                    ):
+                        continue
+                    project_names.add(fm_name)
+                    skills_by_category.setdefault(entry["category"], []).append(
+                        (fm_name, f"[project] {entry['description']}".strip())
+                    )
+                except Exception as e:
+                    logger.debug("Error reading project skill %s: %s", skill_file, e)
+
+    if project_names:
+        # Drop profile-local entries shadowed by a project skill BEFORE the
+        # org-labeling pass so collision flags don't fire on intentional
+        # project-over-local overrides.
+        visible_entries = [
+            e
+            for e in visible_entries
+            if (e.get("frontmatter_name") or e.get("skill_name") or "")
+            not in project_names
+        ]
+
+    # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
+    # An org skill lists with an explicit provenance tag. When a personal and
+    # an org skill share a name, NEITHER silently wins: both list qualified
+    # (personal keeps the bare name is the wrong default — silent divergence
+    # from the org set; org winning silently shadows the user's own work) —
+    # so both entries carry a [name collision] flag and skill_view refuses
+    # the ambiguous bare name (its existing multi-candidate guard).
+    name_owners: dict[str, set[str]] = {}
     for entry in visible_entries:
-        frontmatter_name = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        entries_by_name.setdefault(frontmatter_name, []).append(entry)
-
-    collision_counts: dict[str, int] = {}
-    for frontmatter_name, entries in entries_by_name.items():
-        if len(entries) > 1:
-            collision_counts[frontmatter_name] = len(entries)
-            continue
-
-        entry = entries[0]
-        description = entry.get("description", "")
+        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        kind = "org" if entry.get("org_id") else "personal"
+        name_owners.setdefault(fm, set()).add(kind)
+    for entry in visible_entries:
+        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        desc = entry.get("description", "")
         org_id = entry.get("org_id")
+        collided = len(name_owners.get(fm, set())) > 1
         if org_id:
             author = entry.get("org_author") or ""
             tag = f"[org-shared{': by ' + author if author else ''}]"
-            description = f"{tag} {description}".strip()
+            desc = f"{tag} {desc}".strip()
             category = f"org:{org_id}"
         else:
             category = entry.get("category") or "general"
-        skills_by_category.setdefault(category, []).append(
-            (frontmatter_name, description)
-        )
+        if collided:
+            desc = f"[name collision — also exists {'personally' if org_id else 'in your org'}; load via category path] {desc}".strip()
+        skills_by_category.setdefault(category, []).append((fm, desc))
 
     if snapshot is None:
         # (continuation of the cold path below: category descriptions + write)
@@ -1818,19 +2061,18 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read skill description %s: %s", desc_file, e)
 
-        if persist_snapshot:
-            _write_skills_snapshot(
-                skills_dir,
-                _build_skills_manifest(skills_dir),
-                skill_entries,
-                category_descriptions,
-            )
+        _write_skills_snapshot(
+            skills_dir,
+            _build_skills_manifest(skills_dir),
+            skill_entries,
+            category_descriptions,
+        )
 
     # ── External skill directories ─────────────────────────────────────
     # Scan external dirs directly (no snapshot caching — they're read-only
     # and typically small).  Local skills already in skills_by_category take
     # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set(collision_counts)
+    seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
@@ -1847,7 +2089,6 @@ def build_skills_system_prompt(
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
-                    collision_counts[frontmatter_name] = collision_counts.get(frontmatter_name, 1) + 1
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
                     continue
@@ -1877,21 +2118,6 @@ def build_skills_system_prompt(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
-
-    if collision_counts:
-        for category, entries in list(skills_by_category.items()):
-            filtered = [entry for entry in entries if entry[0] not in collision_counts]
-            if filtered:
-                skills_by_category[category] = filtered
-            else:
-                skills_by_category.pop(category, None)
-        for name, count in sorted(collision_counts.items()):
-            skills_by_category.setdefault("collisions", []).append(
-                (
-                    name,
-                    f"[name collision — {count} candidates; bare skill_view is blocked; load via category-qualified path]",
-                )
-            )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -1941,19 +2167,26 @@ def build_skills_system_prompt(
                     index_lines.append(f"    - {name}")
 
         result = (
-            skill_routing_guidance(effective_routing_policy)
-            + protected_boundary_guidance(effective_protected_boundaries)
-            + "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "## Skills (mandatory)\n"
+            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "Err on the side of loading — it is always better to have context you don't need "
+            "than to miss critical steps, pitfalls, or established workflows. "
+            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+            "and proven workflows that outperform general-purpose approaches. Load the skill "
+            "even if you think you could handle the task with basic tools like web_search or terminal. "
+            "Skills also encode the user's preferred approach, conventions, and quality standards "
+            "for tasks like code review, planning, and testing — load them even for tasks you "
+            "already know how to do, because the skill defines how it should be done here.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a loaded skill is materially wrong in a way that blocks the current "
-            "requested outcome, patch only the smallest necessary correction with "
-            "skill_manage(action='patch'). Otherwise report the issue separately; "
-            "do not expand a completed task into skill maintenance.\n"
-            "After difficult/iterative tasks, you may offer to save the workflow as a "
-            "skill, but creating or updating it requires a separate user request.\n"
+            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+            "After difficult/iterative tasks, offer to save as a skill. "
+            "If a skill you loaded was missing steps, had wrong commands, or needed "
+            "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
@@ -2083,12 +2316,21 @@ def _truncate_content(
     return head + marker + tail
 
 
-def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
+def load_soul_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
+
+    ``home_override`` scopes the read to an explicit profile home (the agent
+    knows its own home from its session_db path). Without it, resolution is
+    ambient — which on a thread that lost the HERMES_HOME ContextVar falls
+    back to the launch home and reads the wrong profile's SOUL.md (#50233,
+    same class as the skills-index leak fixed in #86313).
     """
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -2096,7 +2338,8 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
+    _home = Path(home_override) if home_override is not None else get_hermes_home()
+    soul_path = _home / "SOUL.md"
     if not soul_path.exists():
         return None
     try:
@@ -2171,18 +2414,21 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
-    contributes its ``AGENTS.md`` / ``agents.md`` (first name wins per
-    directory) as its own provenance-labelled section.  Identical content
-    encountered again further down the chain (copied or symlinked files) is
-    deduplicated.  With a single match — the common case, and always the
-    case outside a git repo — output is identical to the historical
-    single-file behavior.
+    contributes its ``AGENTS.override.md`` / ``AGENTS.md`` / ``agents.md``
+    (first name wins per directory) as its own provenance-labelled section.
+    ``AGENTS.override.md`` wins over ``AGENTS.md`` so a developer can keep a
+    personal, typically-gitignored override next to the committed project
+    instructions without editing the tracked file (same convention as
+    earendil-works/pi#7681).  Identical content encountered again further
+    down the chain (copied or symlinked files) is deduplicated.  With a
+    single match — the common case, and always the case outside a git repo —
+    output is identical to the historical single-file behavior.
     """
     cwd_resolved = cwd_path.resolve()
     sections: List[str] = []
     seen_content: set = set()
     for directory in _agents_md_directory_chain(cwd_resolved):
-        for name in ["AGENTS.md", "agents.md"]:
+        for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
             if not candidate.exists():
                 continue
@@ -2279,6 +2525,7 @@ def build_context_files_prompt(
     skip_soul: bool = False,
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
+    home_override: "Path | None" = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2342,7 +2589,7 @@ def build_context_files_prompt(
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
-        soul_content = load_soul_md(context_length)
+        soul_content = load_soul_md(context_length, home_override=home_override)
         if soul_content:
             sections.append(soul_content)
 

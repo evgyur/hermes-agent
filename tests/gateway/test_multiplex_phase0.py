@@ -75,6 +75,39 @@ class TestMultiplexConfigFlag:
         cfg = GatewayConfig.from_dict({"multiplex_profiles": True})
         assert cfg.multiplex_profiles is True
 
+    def test_profile_allowlist_defaults_to_serve_all(self):
+        assert GatewayConfig().multiplex_profile_allowlist is None
+
+    def test_profile_allowlist_normalizes_and_round_trips(self):
+        cfg = GatewayConfig.from_dict(
+            {
+                "gateway": {
+                    "multiplex_profiles": True,
+                    "multiplex_profile_allowlist": [
+                        " Worker ",
+                        "worker",
+                        "Guest",
+                        "default",
+                        "bad/name",
+                        7,
+                    ],
+                }
+            }
+        )
+
+        assert cfg.multiplex_profile_allowlist == ["worker", "guest"]
+        restored = GatewayConfig.from_dict(cfg.to_dict())
+        assert restored.multiplex_profile_allowlist == ["worker", "guest"]
+
+    def test_invalid_profile_allowlist_fails_safe_to_default_only(self, caplog):
+        with caplog.at_level("WARNING", logger="gateway.config"):
+            cfg = GatewayConfig.from_dict(
+                {"gateway": {"multiplex_profile_allowlist": "worker"}}
+            )
+
+        assert cfg.multiplex_profile_allowlist == []
+        assert "serving only the default profile" in caplog.text
+
 
 class TestSessionStoreProfileResolution:
     """SessionStore._generate_session_key honors the flag: legacy namespace
@@ -94,18 +127,48 @@ class TestSessionStoreProfileResolution:
         assert store._generate_session_key(s) == "agent:main:telegram:dm:99"
         assert store._generate_session_key(s) == build_session_key(s)
 
-    def test_flag_off_resolve_profile_is_none(self, tmp_path):
-        store = self._store(tmp_path)
-        assert store._resolve_profile_for_key() is None
 
-    def test_flag_on_uses_active_profile_namespace(self, tmp_path):
-        store = self._store(tmp_path, multiplex_profiles=True)
-        s = _src(chat_id="99", chat_type="dm")
+class _RecoveringDB:
+    def __init__(self, row):
+        self.row = row
+        self.reopened = []
+
+    def find_latest_gateway_session_for_peer(self, **_kwargs):
+        return self.row
+
+    def reopen_session(self, session_id):
+        self.reopened.append(session_id)
+
+
+class TestSessionStoreUnmultiplexedRecovery:
+    """Turning multiplexing off must not recover another profile's session."""
+
+    def _store_with_row(self, tmp_path, row, **cfg_kw):
+        config = GatewayConfig(**cfg_kw)
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = _RecoveringDB(row)
+        store._loaded = True
+        return store
+
+
+    def test_flag_off_allows_active_profile_peer_fallback(self, tmp_path):
+        row = {
+            "id": "sess-coder",
+            "started_at": 1700000000,
+            "session_key": "agent:coder:telegram:dm:99",
+        }
+        store = self._store_with_row(tmp_path, row)
+        source = _src(chat_id="99", chat_type="dm")
+
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="coder"):
-            assert store._generate_session_key(s) == "agent:coder:telegram:dm:99"
+            recovered = store._recover_session_from_db(
+                session_key="agent:main:telegram:dm:99",
+                source=source,
+                now=datetime.fromtimestamp(1700000001),
+            )
 
-    def test_flag_on_default_profile_stays_legacy(self, tmp_path):
-        store = self._store(tmp_path, multiplex_profiles=True)
-        s = _src(chat_id="99", chat_type="dm")
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
-            assert store._generate_session_key(s) == "agent:main:telegram:dm:99"
+        assert recovered is not None
+        assert recovered.session_id == "sess-coder"
+        assert recovered.session_key == "agent:main:telegram:dm:99"
+        assert store._db.reopened == ["sess-coder"]

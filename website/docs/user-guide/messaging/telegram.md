@@ -323,72 +323,7 @@ Supported schemes: `http://`, `https://`, `socks5://`.
 
 The proxy applies to both the main Telegram connection and the fallback IP transport. If no Telegram-specific proxy is set, the gateway falls back to `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (or macOS system proxy auto-detection).
 
-## Telegram Business concierge mode
-
-Hermes can use Telegram Business connections so an authorized account owner can wake the agent from a customer DM and have the result routed back to that exact Business dialog. This is an advanced mode: normal bot DMs keep their usual behavior, while Business traffic is gated separately to prevent mirrored turns, duplicate replies, and replies sent through the wrong account.
-
-Configure it under `platforms.telegram.extra`:
-
-```yaml
-platforms:
-  telegram:
-    extra:
-      allow_from:
-        - "123456789"          # trusted owner Telegram user ID
-      business:
-        enabled: true
-        trigger_words:
-          - Hermes
-        ignore_user_ids:
-          - "123456789"        # owner IDs used by startup recovery
-        send_as_account: true   # opt in to official Business send-as-account
-```
-
-`TELEGRAM_ALLOWED_USERS` is also treated as an owner allowlist. Keep `ignore_user_ids` aligned with the owner IDs when you want interrupted owner-triggered Business turns to resume after a gateway restart.
-
-### Routing and trigger rules
-
-- A customer-authored Business DM remains an external-contact turn. It keeps the customer chat as its origin and runs in external-safe mode; it is never silently upgraded to an owner command.
-- An owner-authored message in a customer dialog wakes the agent only when it starts with a configured `trigger_words` value (for example, `Hermes, check this`). Plain owner text is treated as an outbound echo and ignored.
-- The connection route comes from Telegram's `business_connection_id` on the message or its replied-to message. Hermes persists only Telegram-supplied routes in `~/.hermes/state/telegram_business_connections.json`.
-- If Telegram omits the route on a later explicit owner wake, Hermes reuses an exact saved route. It may reuse the only known route when exactly one Business connection exists; multiple possible connections fail closed instead of guessing.
-- `send_as_account: true` (legacy alias: `reply_via_business_connection`) is required before an owner concierge reply is sent through the connected Business account. External customer turns stay bot-authored even when this option is enabled.
-- Telegram can mirror the same owner DM into the bot's own dialog. Hermes drops that mirror using the bot/chat identity relationship, including updates where Telegram omitted `business_connection_id`, so one user action produces one agent turn.
-- Reply context, quick commands, rich messages, edits, overflow chunks, and file deliveries preserve the original Business route.
-
-:::warning Send-as-account is explicit
-Messages sent with a Business connection appear as the connected human/business account. Leave `send_as_account` disabled unless this is the intended concierge behavior. A missing, ambiguous, unauthorized, or invalid route fails closed or falls back to a normal bot-authored send rather than choosing another Business account.
-:::
-
-### Recovery after a restart
-
-Fresh interrupted owner-triggered Business DM turns are eligible for startup recovery without enabling global DM auto-resume. Recovery requires all of the following:
-
-1. `business.enabled: true`
-2. the persisted source is a Telegram DM whose sender ID differs from the customer chat ID
-3. the sender is listed in `business.ignore_user_ids`
-4. the session is marked `resume_pending` for an auto-resumable gateway interruption
-
-Ordinary customer DMs and shared/public chats do not enter this recovery lane. If the interrupted turn ended on an uncheckpointed side-effectful tool call, the recovery prompt tells the agent to inspect live state before repeating the action.
-
-### Troubleshooting
-
-```bash
-# Confirm the adapter is connected and inspect recent Business routing logs
-hermes gateway status
-grep -Ei "business|mirror|startup recovery" ~/.hermes/logs/gateway.log | tail -100
-
-# Inspect remembered route keys without printing bot credentials
-python - <<'PY'
-import json
-from pathlib import Path
-p = Path.home() / ".hermes/state/telegram_business_connections.json"
-data = json.loads(p.read_text()) if p.exists() else {}
-print({chat_id: bool(connection_id) for chat_id, connection_id in data.items()})
-PY
-```
-
-If replies duplicate, verify that only one gateway instance consumes the bot token and that the active plugin adapter is current. If a reply lands in the wrong dialog, disable `send_as_account`, inspect the saved route map, and wait for a new Telegram-supplied Business update before re-enabling it; do not hand-edit or guess a connection ID.
+If the fallback IP discovery path is unhealthy on your host, set `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=true` to keep cold connect on the plain `api.telegram.org` path. You can also bound DNS-over-HTTPS fallback discovery with `HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT` in seconds; the default is `5`.
 
 ## Home Channel
 
@@ -1024,7 +959,7 @@ gateway:
 
 ## Rendering: Rich Messages, Tables and Link Previews
 
-**Rich Messages (Bot API 10.1).** Final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the animated preview on the editable legacy draft path for client compatibility, then sends the persistent final with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. Ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
+**Rich Messages (Bot API 10.1).** Final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the streaming preview plain — it uses Telegram's ephemeral draft transport with legacy rendering (tables and other rich-only constructs stay as raw markdown in the preview) — then persists the completed response with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. Ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
 
 The rich path is skipped automatically when content exceeds the 32,768-character rich text limit, and any rejection from Telegram (unsupported endpoint on an older `python-telegram-bot`, parser error, oversized blocks/columns) **transparently falls back** to the MarkdownV2 path — your message is never lost. Transient/network errors are *not* silently re-sent (no duplicate final message).
 
@@ -1044,7 +979,7 @@ gateway:
         rich_drafts: false
 ```
 
-This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls the experimental rich draft preview path during Telegram DM streaming and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 
@@ -1202,9 +1137,9 @@ In some restricted networks, `api.telegram.org` may resolve to an IP that is unr
 
 1. If `TELEGRAM_FALLBACK_IPS` is set, those IPs are used directly.
 2. Otherwise, the adapter automatically queries **Google DNS** and **Cloudflare DNS** via DNS-over-HTTPS (DoH) to discover alternative IPs for `api.telegram.org`.
-3. IPs returned by DoH that differ from the system DNS result are used as fallbacks.
-4. If DoH is also blocked, a hardcoded seed IP (`149.154.167.220`) is used as a last resort.
-5. Once a fallback IP succeeds, it becomes "sticky" — subsequent requests use it directly without retrying the primary path first.
+3. Known IPv4 Telegram API IPs are tried **before** the dual-stack `api.telegram.org` hostname. A blackholed IPv6 path can sit in `connect()` without erroring, which used to pin the event loop so the 30s init deadline never fired.
+4. If DoH is also blocked or times out, a hardcoded IPv4 seed list (`149.154.166.110`, `149.154.167.220`) is used as that IPv4-first list. The hostname remains last resort.
+5. Once a path succeeds, it becomes "sticky" — subsequent requests use it directly. The hostname is kept as a last resort for IPv6-only networks.
 
 ### Configuration
 
@@ -1224,7 +1159,7 @@ platforms:
 ```
 
 :::tip
-You usually don't need to configure this manually. The auto-discovery via DoH handles most restricted-network scenarios. The `TELEGRAM_FALLBACK_IPS` env var is only needed if DoH is also blocked on your network.
+You usually don't need to configure this manually. The auto-discovery via DoH handles most restricted-network scenarios. The `TELEGRAM_FALLBACK_IPS` env var is only needed if DoH is also blocked on your network. If IPv6 is broken on the host, you can also set `network.force_ipv4: true` in `config.yaml` to skip AAAA lookups process-wide.
 :::
 
 ## Proxy Support

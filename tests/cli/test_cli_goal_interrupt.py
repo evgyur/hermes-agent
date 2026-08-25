@@ -83,19 +83,6 @@ class TestInterruptAutoPause:
         mgr.resume()
         assert mgr.state.status == "active"
 
-    def test_goal_resume_command_queues_immediate_continuation(self, hermes_home):
-        """CLI /goal resume must not require typing a second user message."""
-        sid = f"sid-command-resume-{uuid.uuid4().hex}"
-        cli, mgr = _make_cli_with_goal(sid, "finish the interrupted task")
-        mgr.pause(reason="interrupt")
-
-        cli._handle_goal_command("/goal resume")
-
-        assert mgr.state.status == "active"
-        queued = cli._pending_input.get_nowait()
-        assert queued.startswith("[Continuing toward your standing goal]\nGoal: ")
-        assert "finish the interrupted task" in queued
-
 
 
 
@@ -124,24 +111,6 @@ class TestHealthyTurnStillRuns:
         queued = cli._pending_input.get_nowait()
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
-
-    def test_goal_wait_snapshot_is_scoped_to_current_cli_session(self, hermes_home):
-        sid = f"sid-owner-{uuid.uuid4().hex}"
-        cli, _mgr = _make_cli_with_goal(sid)
-        cli.conversation_history = [
-            {"role": "assistant", "content": "waiting for owned process"},
-        ]
-
-        with patch(
-            "hermes_cli.goals.gather_background_processes",
-            return_value=[],
-        ) as gather, patch(
-            "hermes_cli.goals.judge_goal",
-            return_value=("continue", "no owned callback", False, None, False),
-        ):
-            cli._maybe_continue_goal_after_turn()
-
-        gather.assert_called_once_with(session_key=sid)
 
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
         sid = f"sid-done-{uuid.uuid4().hex}"

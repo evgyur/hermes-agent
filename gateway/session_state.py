@@ -105,6 +105,9 @@ class ConversationState:
     queued_events: List[Any] = field(default_factory=list)
     # Per-turn must-deliver sidecar notes (one-shot).
     sidecar_notes: List[str] = field(default_factory=list)
+    # Per-turn private context sent on the current API request only.
+    ephemeral_context_notes: List[str] = field(default_factory=list)
+    ephemeral_context_generation: Optional[int] = None
     # Pinned session-context bytes: (change_key, text).
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
     # Last voice-channel context delivered (None = never delivered).
@@ -124,6 +127,8 @@ class ConversationState:
         self.last_resolved_model = ""
         self.queued_events = []
         self.sidecar_notes = []
+        self.ephemeral_context_notes = []
+        self.ephemeral_context_generation = None
         self.ephemeral_pin = None
         self.vc_last = None
 
@@ -163,9 +168,8 @@ class PersistentState:
     # escalation back to rung 1 while the DB-backed deadline itself survives
     # (#74136). Keying on `session_key` rather than `session_id` is what buys
     # correctness across compaction ROTATION (the sid changes, the chat does
-    # not), which the persisted `compression_*_streak` columns cannot express
-    # since they key on sid. Making this durable is tracked on #79624 as a
-    # schema-level follow-up.
+    # not). gateway.run mirrors this value to the DB keyed by session_key so
+    # the same semantics also survive gateway restarts.
     hygiene_failure_streak: int = 0
 
 

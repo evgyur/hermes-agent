@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
@@ -15,7 +15,6 @@ def _make_agent(**overrides):
         valid_tool_names=[],
         _task_completion_guidance=False,
         _tool_use_enforcement=False,
-        _emit_status=MagicMock(),
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
@@ -25,6 +24,11 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        # build_system_prompt drains pending truncation warnings and
+        # forwards each to this; a warning left in the ContextVar by an
+        # earlier test file (they share one thread's context under plain
+        # pytest) must not make this stub AttributeError.
+        _emit_status=lambda *_args, **_kwargs: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -36,7 +40,7 @@ def _captured_context_cwd(agent):
 
     def fake_context_files(
         cwd=None, skip_soul=False, context_length=None,
-        allow_install_tree_fallback=False,
+        allow_install_tree_fallback=False, home_override=None,
     ):
         captured["cwd"] = cwd
         return ""
@@ -117,6 +121,151 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestExecutionGuidanceInjection:
+    """Injection gate for OPENAI_MODEL_EXECUTION_GUIDANCE via
+    ``agent.execution_guidance`` (auto/true/false/list).
+
+    Background — Composio agentic-eval traces (2026-08): the block was
+    historically fenced to gpt/codex/grok AND nested inside the
+    tool-use-enforcement branch, so DeepSeek/Kimi/Qwen-class models
+    received no execution discipline at all. The gate is now independent
+    of tool_use_enforcement and defaults to a broader family list.
+    """
+
+    def _prompt(self, model, execution_guidance="auto", *,
+                tool_use_enforcement=False,
+                valid_tool_names=("terminal", "read_file")):
+        agent = _make_agent(
+            valid_tool_names=list(valid_tool_names),
+            model=model,
+            _tool_use_enforcement=tool_use_enforcement,
+            _execution_guidance=execution_guidance,
+        )
+        return _stable_prompt(agent)
+
+    def test_deepseek_gets_guidance_by_default(self):
+        stable = self._prompt("deepseek/deepseek-v4-pro")
+        assert "Execution discipline" in stable
+        assert "<external_state_verification>" in stable
+
+    def test_kimi_gets_guidance_by_default(self):
+        assert "Execution discipline" in self._prompt("moonshotai/kimi-k3")
+
+    def test_qwen_glm_minimax_mimo_mistral_get_guidance_by_default(self):
+        for model in ("qwen/qwen-3-max", "z-ai/glm-5.2",
+                      "minimax/minimax-m2", "xiaomi/mimo-v2",
+                      "mistralai/mistral-large-3"):
+            assert "Execution discipline" in self._prompt(model), model
+
+    def test_gpt_still_gets_guidance(self):
+        assert "Execution discipline" in self._prompt("openai/gpt-5.5")
+
+    def test_grok_still_gets_guidance(self):
+        assert "Execution discipline" in self._prompt("xai/grok-4")
+
+    def test_independent_of_tool_use_enforcement(self):
+        # The gate must not require tool-use enforcement to be on.
+        stable = self._prompt("deepseek/deepseek-v4-flash",
+                              tool_use_enforcement=False)
+        assert "Execution discipline" in stable
+        assert "Tool-use enforcement" not in stable
+
+    def test_claude_does_not_get_guidance_by_default(self):
+        assert "Execution discipline" not in self._prompt(
+            "anthropic/claude-opus-4.8")
+
+    def test_gemini_does_not_get_guidance_by_default(self):
+        assert "Execution discipline" not in self._prompt(
+            "google/gemini-2.5-pro")
+
+    def test_config_false_suppresses(self):
+        assert "Execution discipline" not in self._prompt(
+            "openai/gpt-5.5", execution_guidance=False)
+        assert "Execution discipline" not in self._prompt(
+            "deepseek/deepseek-v4-pro", execution_guidance="off")
+
+    def test_config_true_forces_for_any_model(self):
+        assert "Execution discipline" in self._prompt(
+            "anthropic/claude-opus-4.8", execution_guidance=True)
+
+    def test_config_list_matches_substring(self):
+        stable = self._prompt("mycorp/custom-llm-7b",
+                              execution_guidance=["custom-llm", "gpt"])
+        assert "Execution discipline" in stable
+
+    def test_config_list_non_match_suppresses(self):
+        assert "Execution discipline" not in self._prompt(
+            "openai/gpt-5.5", execution_guidance=["deepseek"])
+
+    def test_no_tools_no_guidance(self):
+        assert "Execution discipline" not in self._prompt(
+            "deepseek/deepseek-v4-pro", valid_tool_names=())
+
+
+class TestNamedProfileHintIntegration:
+    """The same defect through the REAL resolution chain (#72894).
+
+    ``TestNamedProfileHint`` mocks ``get_hermes_home``,
+    ``get_default_hermes_root`` and ``_resolve_active_profile_name``, so it
+    validates template rendering but not the relationship that causes the bug:
+    ``_resolve_active_profile_name`` returns a named profile *only* when the
+    active home is already ``<root>/profiles/<name>``, which is exactly why
+    appending that suffix again doubled it. Drive it with a real
+    ``HERMES_HOME`` and no resolver mocks.
+    """
+
+    def test_real_hermes_home_under_profiles_renders_correct_paths(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        # Sanity-check the real chain before asserting on the prompt.
+        from agent.file_safety import _resolve_active_profile_name
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        assert _resolve_active_profile_name() == "coder"
+        assert get_hermes_home() == profile_home
+        assert get_default_hermes_root() == root
+
+        agent = _make_agent(valid_tool_names=["read_file"])
+        with patch("agent.coding_context._coding_mode", return_value="off"):
+            prompt = "\n\n".join(_prompt_parts(agent).values())
+
+        assert "Active Hermes profile: coder." in prompt
+        assert f"reads and writes {profile_home}/." in prompt
+        # The doubled form must not appear anywhere.
+        assert f"{profile_home}/profiles/coder" not in prompt
+        # Default-profile pointers belong at the root, not inside the profile.
+        assert f"The default profile's data lives at {root}/skills/" in prompt
+        assert f"{profile_home}/skills/" not in prompt
+
+    def test_real_default_home_renders_default_branch(self, tmp_path, monkeypatch):
+        """HERMES_HOME at the root resolves to the default profile, unchanged."""
+        root = tmp_path / ".hermes"
+        root.mkdir(parents=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        from agent.file_safety import _resolve_active_profile_name
+
+        assert _resolve_active_profile_name() == "default"
+
+        agent = _make_agent(valid_tool_names=["read_file"])
+        with patch("agent.coding_context._coding_mode", return_value="off"):
+            prompt = "\n\n".join(_prompt_parts(agent).values())
+
+        assert "Active Hermes profile: default." in prompt
+        assert f"under {root}/profiles/<name>/." in prompt
+
+
 def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
@@ -129,22 +278,6 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
-
-
-def test_tool_capable_prompt_has_scope_owner_lock_without_skills_tools():
-    parts = _prompt_parts(_make_agent(valid_tool_names=["terminal"]))
-
-    assert parts["stable"].count("### Scope-owner lock") == 1
-    assert "### Scope-owner lock" not in parts["volatile"]
-
-
-def test_full_skill_guidance_cannot_mandate_post_completion_maintenance():
-    stable = _stable_prompt(_make_agent(valid_tool_names=["skill_manage"]))
-
-    assert "Skill maintenance never extends the current assignment" in stable
-    assert "separate user request before creating or updating a skill" in stable
-    assert "After completing a complex task" not in stable
-    assert "patch it immediately" not in stable
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
@@ -170,12 +303,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
-        "### Scope-owner lock\n"
-        "Durability, autonomy, multi-agent, scale, or reliability requirements do not authorize replacing the assigned "
-        "object. If the user names Hermes, its ordinary tools, Shaw, `/goal`, or the current runtime, keep work inside that "
-        "owner. A loaded skill informs execution; it never transfers task ownership. Use another runtime only when it is a "
-        "strict prerequisite or the user explicitly authorizes migration; otherwise report it separately instead of "
-        "acting on it.",
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -205,7 +332,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
 
 
 class TestTelegramRichMessagesHint:

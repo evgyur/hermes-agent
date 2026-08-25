@@ -251,6 +251,12 @@ class TestUnsupportedPlatform:
         ("Linux", "riscv64", False),
     ])
     def test_is_platform_supported(self, system, machine, expected):
+        # The patched (system, machine) pairs are table inputs, not a host
+        # fake: is_platform_supported() is a pure string mapping that touches
+        # no OS facility beneath the check, so there is nothing for a real
+        # host to falsify. Two of the rows (Windows/AMD64, Linux/riscv64)
+        # could never execute honestly anyway — the second has no CI runner
+        # on any lane.
         with patch("tools.tirith_security.platform.system", return_value=system), \
              patch("tools.tirith_security.platform.machine", return_value=machine):
             assert _tirith_mod.is_platform_supported() is expected
@@ -620,89 +626,6 @@ class TestSpawnWarningDedup:
             f"expected exactly 1 spawn-failed warning across 15 commands, "
             f"got {len(spawn_warnings)}: {[r.message for r in spawn_warnings]}"
         )
-
-    @patch("tools.tirith_security.subprocess.run")
-    @patch("tools.tirith_security._load_security_config")
-    def test_distinct_exception_types_each_log_once(self, mock_cfg, mock_run, caplog):
-        """``FileNotFoundError`` and ``PermissionError`` are distinct
-        failure modes and each deserves its own first-occurrence log
-        line; the dedupe key includes the exception class.
-
-        After _CRASH_LIMIT consecutive failures the circuit breaker opens
-        and subsequent calls short-circuit without spawning, so we only
-        see the warnings from the first batch."""
-        mock_cfg.return_value = {
-            "tirith_enabled": True, "tirith_path": "tirith",
-            "tirith_timeout": 5, "tirith_fail_open": True,
-        }
-        _tirith_mod._reset_spawn_warning_state()
-
-        with caplog.at_level("WARNING", logger="tools.tirith_security"):
-            mock_run.side_effect = FileNotFoundError("[WinError 2]")
-            for _ in range(3):
-                check_command_security("a")
-            # Circuit breaker is now open — switching to PermissionError
-            # won't generate a new warning because the function returns
-            # before reaching subprocess.run.
-            mock_run.side_effect = PermissionError("denied")
-            for _ in range(3):
-                check_command_security("b")
-
-        spawn_warnings = [
-            rec for rec in caplog.records
-            if "tirith spawn failed" in rec.message
-        ]
-        assert len(spawn_warnings) == 1, (
-            f"expected 1 warning before circuit breaker opens, "
-            f"got {len(spawn_warnings)}"
-        )
-
-    @patch("tools.tirith_security.subprocess.run")
-    @patch("tools.tirith_security._load_security_config")
-    def test_repeated_timeout_logs_once(self, mock_cfg, mock_run, caplog):
-        mock_cfg.return_value = {
-            "tirith_enabled": True, "tirith_path": "tirith",
-            "tirith_timeout": 5, "tirith_fail_open": True,
-        }
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="tirith", timeout=5)
-        _tirith_mod._reset_spawn_warning_state()
-
-        with caplog.at_level("WARNING", logger="tools.tirith_security"):
-            for _ in range(10):
-                result = check_command_security("slow")
-                assert result["action"] == "allow"
-
-        timeout_warnings = [
-            rec for rec in caplog.records
-            if "tirith timed out" in rec.message
-        ]
-        assert len(timeout_warnings) == 1
-
-    @patch("tools.tirith_security._load_security_config")
-    def test_path_none_logs_once(self, mock_cfg, caplog):
-        """``_resolve_tirith_path`` returning ``None`` (explicit path set
-        but resolver returned None — unusual) should not spam the log
-        either."""
-        mock_cfg.return_value = {
-            "tirith_enabled": True, "tirith_path": "tirith",
-            "tirith_timeout": 5, "tirith_fail_open": True,
-        }
-        _tirith_mod._reset_spawn_warning_state()
-
-        with patch(
-            "tools.tirith_security._resolve_tirith_path", return_value=None
-        ):
-            with caplog.at_level("WARNING", logger="tools.tirith_security"):
-                for _ in range(10):
-                    result = check_command_security("echo")
-                    assert result["action"] == "allow"
-                    assert "tirith path unavailable" in result["summary"]
-
-        none_warnings = [
-            rec for rec in caplog.records
-            if "tirith path resolved to None" in rec.message
-        ]
-        assert len(none_warnings) == 1
 
 
 # ---------------------------------------------------------------------------

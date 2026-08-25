@@ -385,25 +385,12 @@ _RESPONSES_BUILTIN_TOOL_TYPES = {
 
 _RESPONSE_MESSAGE_STATUSES = {"completed", "incomplete", "in_progress"}
 
-# The Responses API accepts only ASCII letters, digits, underscores, and
-# dashes in input[].id, capped at 64 chars. Persisted transcripts can contain
-# legacy redaction placeholders such as ``<REDACTED_SECRET:...>`` in this
-# protocol field; replaying one bricks every later turn with a non-retryable
-# HTTP 400. Keep valid short ids for prefix-cache hits and drop malformed or
-# oversized ids while preserving the message item itself.
+# The Responses API rejects input[].id longer than this with a non-retryable
+# HTTP 400 ("string too long"). Codex-issued assistant message ids are
+# server-assigned base64 blobs that can run 400+ chars, while Hermes-minted
+# ids (msg_...) stay well under this cap and are worth keeping for
+# prefix-cache hits. Drop only the oversized ones on replay.
 _MAX_RESPONSES_ITEM_ID_LENGTH = 64
-_RESPONSES_ITEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def _valid_responses_item_id(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    if not stripped or len(stripped) > _MAX_RESPONSES_ITEM_ID_LENGTH:
-        return None
-    if _RESPONSES_ITEM_ID_PATTERN.fullmatch(stripped) is None:
-        return None
-    return stripped
 
 
 def _normalize_responses_message_status(value: Any, *, default: str = "completed") -> str:
@@ -427,6 +414,7 @@ def _chat_messages_to_responses_input(
     is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
+    native_compaction_eligible: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -471,8 +459,32 @@ def _chat_messages_to_responses_input(
     ``replay_encrypted_reasoning=False`` is the session-wide kill switch
     (drops ALL replay); ``current_issuer_kind`` is the per-item filter
     that runs only when replay is still enabled.
+
+    ``native_compaction_eligible`` mirrors, for THIS request, the decision
+    made by ``native_compaction.native_compaction_context_management`` — it
+    is True only when that gate returned a payload, i.e. when the request
+    actually carries ``context_management``. It controls two things that
+    must never outlive the gate: replaying ``type: "compaction"`` checkpoint
+    items, and restructuring the wire around them
+    (``prune_pre_checkpoint_items``). Checkpoints are persisted in the
+    ``codex_reasoning_items`` sidecar and survive a mid-session model swap,
+    a ``compression.enabled: false`` flip, the rejection kill switch and a
+    resumed session; without this flag a single captured checkpoint would
+    keep deleting every pre-checkpoint item from every later request, on a
+    model that cannot decrypt the blob (#85914). Default False = pre-feature
+    wire, which is also correct for every caller that never sends
+    ``context_management`` (auxiliary/compression client, ad-hoc
+    ``convert_messages``). Dropping the checkpoint costs nothing: Hermes'
+    local history is never truncated by native compaction, so the full
+    conversation is still on the wire.
     """
     items: List[Dict[str, Any]] = []
+    # Parallel to `items`: the raw chat message each converted item came
+    # from. Pruning needs this to read a canonical summary carrier's
+    # up-to-date, provenance-tagged content directly — the converted `item`
+    # can be a lossy shape (stale exact-replay, or a typed
+    # `function_call_output` wrapper) that no longer carries it (#90976).
+    item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
 
     for msg in messages:
@@ -512,6 +524,20 @@ def _chat_messages_to_responses_input(
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
                                 continue
+                            # Native-compaction gate: a checkpoint is only
+                            # meaningful to the endpoint/model that minted it
+                            # AND only while this request still asks for
+                            # server-side compaction. Once the gate closes
+                            # (model swapped out of the gpt-5.6 family,
+                            # compression disabled, rejection kill switch),
+                            # the persisted checkpoint must not be replayed —
+                            # replaying it is what makes the wire restructure
+                            # below erase pre-checkpoint history forever.
+                            if (
+                                ri.get("type") == "compaction"
+                                and not native_compaction_eligible
+                            ):
+                                continue
                             # Cross-issuer guard: drop reasoning blocks that
                             # were minted by a different Responses endpoint.
                             # The current endpoint cannot decrypt foreign
@@ -547,6 +573,7 @@ def _chat_messages_to_responses_input(
                                 if k not in ("id", "_issuer_kind")
                             }
                             items.append(replay_item)
+                            item_sources.append(msg)
                             if item_id:
                                 seen_item_ids.add(item_id)
                             has_codex_reasoning = True
@@ -590,21 +617,30 @@ def _chat_messages_to_responses_input(
                             "status": _normalize_responses_message_status(raw_item.get("status")),
                             "content": normalized_content_parts,
                         }
-                        item_id = _valid_responses_item_id(raw_item.get("id"))
-                        if not is_github_responses and item_id is not None:
-                            replay_item["id"] = item_id
+                        item_id = raw_item.get("id")
+                        if (
+                            not is_github_responses
+                            and isinstance(item_id, str)
+                            and item_id.strip()
+                        ):
+                            stripped_id = item_id.strip()
+                            if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+                                replay_item["id"] = stripped_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
                         items.append(replay_item)
+                        item_sources.append(msg)
                         replayed_message_items += 1
 
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
                     items.append({"role": "assistant", "content": content_parts})
+                    item_sources.append(msg)
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
+                    item_sources.append(msg)
                 elif has_codex_reasoning:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
@@ -612,6 +648,7 @@ def _chat_messages_to_responses_input(
                     # content, emit an empty assistant message as the required
                     # following item.
                     items.append({"role": "assistant", "content": ""})
+                    item_sources.append(msg)
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
@@ -654,6 +691,7 @@ def _chat_messages_to_responses_input(
                             "name": fn_name,
                             "arguments": arguments,
                         })
+                        item_sources.append(msg)
                 continue
 
             # Non-assistant (user) role: emit multimodal parts when present,
@@ -662,6 +700,7 @@ def _chat_messages_to_responses_input(
                 items.append({"role": role, "content": content_parts})
             else:
                 items.append({"role": role, "content": content_text})
+            item_sources.append(msg)
             continue
 
         if role == "tool":
@@ -696,8 +735,38 @@ def _chat_messages_to_responses_input(
                 "call_id": _clamp_responses_call_id(call_id),
                 "output": output_value,
             })
+            item_sources.append(msg)
 
-    return items
+    # Native server-side compaction: when a replayed checkpoint is present,
+    # restructure the wire around it. The server renders nothing placed
+    # before a compaction item (live-verified Aug 2026), so pre-checkpoint
+    # history is dead upload weight and — worse — the user's plaintext asks,
+    # and any local-compression summary already merged into that history,
+    # silently vanish from the model's view. Keep the newest checkpoint
+    # first, retain pre-checkpoint USER messages and compression-SUMMARY
+    # messages (whole, never byte-sliced) verbatim within a token budget
+    # each (Codex CLI parity for the user side), and leave the
+    # post-checkpoint tail untouched. Gated on the CURRENT request's native
+    # eligibility, not merely on the presence of a checkpoint: a persisted
+    # checkpoint outlives the gate, and pruning for a request that carries no
+    # ``context_management`` deletes history the server never compacted.
+    #
+    # ``item_sources`` (parallel to ``items``) carries the raw chat message
+    # each converted item came from. A canonical summary carrier's content
+    # can be lost or gone stale by the time it becomes a Responses item — a
+    # merge-into-tail tool-result carrier becomes a typed
+    # ``function_call_output`` (no ``content``/``role`` at all), and a
+    # merge-into-tail assistant carrier can be shadowed by a stale exact
+    # ``codex_message_items`` replay from before the merge rewrote its
+    # content. Pruning reads the source message's own up-to-date,
+    # provenance-tagged content directly instead of trying to recover it
+    # from whatever shape the conversion produced (#90976).
+    if not native_compaction_eligible:
+        return items
+
+    from agent.native_compaction import prune_pre_checkpoint_items
+
+    return prune_pre_checkpoint_items(items, item_sources=item_sources)
 
 
 # ---------------------------------------------------------------------------
@@ -872,9 +941,15 @@ def _preflight_codex_input_items(
                 "status": _normalize_responses_message_status(item.get("status")),
                 "content": normalized_content,
             }
-            item_id = _valid_responses_item_id(item.get("id"))
-            if not is_github_responses and item_id is not None:
-                normalized_item["id"] = item_id
+            item_id = item.get("id")
+            if (
+                not is_github_responses
+                and isinstance(item_id, str)
+                and item_id.strip()
+            ):
+                stripped_id = item_id.strip()
+                if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+                    normalized_item["id"] = stripped_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()

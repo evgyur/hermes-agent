@@ -9,6 +9,11 @@ for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
+* Session-gated GUI toolsets (``desktop_ui``, ``project``) are also never
+  deferred. They stay off the core list so CLI and messaging never pay for
+  their schemas, but once a session enables them they stay in the
+  model-facing array. Tool Search is for MCP/plugin catalog bloat, not for
+  hiding the tools that define this session's surface.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -60,13 +65,6 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
-# Exact, request-scoped proof that ``tool_call`` admitted one underlying tool
-# from the active session's scoped deferred catalog.  Model-visible
-# ``agent.valid_tool_names`` intentionally contains only the bridge names after
-# progressive disclosure, so effectful plugin handlers need this host-owned
-# signal to distinguish an authorized deferred call from a direct registry
-# invocation.  The dispatcher binds it only after the scoped-catalog and schema
-# gates pass, and always resets it when the recursive dispatch returns.
 _ACTIVE_SCOPED_DEFERRED_TOOL: ContextVar[Optional[str]] = ContextVar(
     "active_scoped_deferred_tool",
     default=None,
@@ -83,13 +81,7 @@ def _bind_scoped_deferred_tool_authority(tool_name: str):
 
 
 def get_active_scoped_deferred_tool_authority() -> Optional[str]:
-    """Return the exact deferred tool admitted for the current dispatch.
-
-    This is intentionally a read-only public seam for effectful plugin
-    handlers.  ``None`` means the handler was not reached through the scoped
-    ``tool_call`` bridge.
-    """
-
+    """Return the exact deferred tool admitted for the current dispatch."""
     return _ACTIVE_SCOPED_DEFERRED_TOOL.get()
 
 # When estimating tokens from char count without a real tokenizer, this is
@@ -235,12 +227,18 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
+# Session-gated GUI toolsets. Off ``_HERMES_CORE_TOOLS`` so non-GUI clients
+# never pay their schema; once a session enables them they stay direct.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
+    OR it is neither in ``_HERMES_CORE_TOOLS`` nor a session-gated GUI
+    surface toolset. Core and direct surface tools are never deferred even
+    when their toolset is technically plugin-provided (this protects
     against accidental shadowing).
     """
     if name in BRIDGE_TOOL_NAMES:
@@ -255,6 +253,8 @@ def is_deferrable_tool_name(name: str) -> bool:
             return False
         if entry.toolset.startswith("mcp-"):
             return True
+        if entry.toolset in _DIRECT_SURFACE_TOOLSETS:
+            return False
         # Non-MCP, non-core → plugin tool, eligible.
         return True
     except Exception:
@@ -265,8 +265,8 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    every core tool, every session-gated GUI surface tool, plus any tool we
+    can't classify. ``deferrable`` is the candidate set for catalog entry.
     """
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []

@@ -206,7 +206,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
-        atomic_json_write(DIRECTORY_PATH, directory)
+        await asyncio.to_thread(atomic_json_write, DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
@@ -440,10 +440,7 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        # Resolve the database path at call time.  HERMES_HOME may be changed
-        # by an embedded gateway or test after hermes_state was imported; its
-        # module-level default path would otherwise point at another profile.
-        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        db = SessionDB()
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):

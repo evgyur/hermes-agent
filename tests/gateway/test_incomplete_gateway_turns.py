@@ -11,7 +11,6 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
-from hermes_state import AsyncSessionDB, SessionDB
 
 
 class CaptureSlackAdapter(BasePlatformAdapter):
@@ -72,7 +71,7 @@ def _make_incomplete_result() -> dict:
     }
 
 
-def _make_runner(adapter: CaptureSlackAdapter, tmp_path) -> gateway_run.GatewayRunner:
+def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake-token")}
@@ -101,7 +100,7 @@ def _make_runner(adapter: CaptureSlackAdapter, tmp_path) -> gateway_run.GatewayR
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = AsyncSessionDB(SessionDB(tmp_path / "state.db"))
+    runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(return_value=_make_incomplete_result())
@@ -125,7 +124,7 @@ def _make_event() -> MessageEvent:
 @pytest.mark.asyncio
 async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, tmp_path):
     adapter = CaptureSlackAdapter()
-    runner = _make_runner(adapter, tmp_path)
+    runner = _make_runner(adapter)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})

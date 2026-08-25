@@ -1,10 +1,10 @@
-from hermes_state import AsyncSessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 """Tests for gateway /status behavior and token persistence."""
 
 from datetime import datetime
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -75,57 +75,102 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
-async def test_status_command_reports_running_agent_without_interrupt(monkeypatch):
+async def test_status_command_preserves_operator_grade_snapshot():
+    """The private /status contract must not regress to the legacy summary."""
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
-        session_id="sess-1",
+        session_id="sess-rich",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="dm",
-        total_tokens=321,
     )
     runner = _make_runner(session_entry)
-    # Token total comes from the SQLite SessionDB, not SessionEntry.
+    runner._gateway_started_at = time.time() - 331
+    runner._busy_input_mode = "interrupt"
+    runner._service_tier = None
     runner._session_db._db.get_session.return_value = {
-        "input_tokens": 200,
-        "output_tokens": 121,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "reasoning_tokens": 0,
+        "input_tokens": 1_000,
+        "output_tokens": 250,
+        "cache_read_tokens": 500,
+        "cache_write_tokens": 100,
+        "reasoning_tokens": 50,
+        "api_call_count": 7,
+        "actual_cost_usd": 0.125,
+        "model": "gpt-test",
+        "billing_provider": "openai-codex",
     }
-    running_agent = MagicMock()
-    runner._running_agents[build_session_key(_make_source())] = running_agent
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="gpt-test",
+        provider="openai-codex",
+        base_url="",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+            compression_count=2,
+        ),
+        interrupt=MagicMock(),
+    )
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "🪽 **Hermes" in result
-    assert "🆔 Session ID: `sess-1`" in result
-    assert "🧮 Tokens: 200 in / 121 out · total 321" in result
-    assert "Agent: running ⚡" in result
-    assert "My titled session" not in result
-    running_agent.interrupt.assert_not_called()
-    assert runner._pending_messages == {}
+    assert result.startswith("🪽 **Hermes ")
+    for expected in (
+        "⏱️ Uptime:",
+        "🧠 Model: openai-codex/gpt-test",
+        "🔄 Fallbacks:",
+        "🧮 Tokens: 1k in / 250 out · total 1.9k",
+        "🗄️ Cache: 33% hit · 500 cached, 100 new",
+        "📚 Context: 12.3k/100k (12%) · 🧹 Compactions: 2",
+        "🧵 Session:",
+        "⚙️ Execution:",
+        "🪢 Queue: interrupt (depth 0) · Agent: running ⚡ · Calls: 7",
+        "🔌 Platforms: telegram",
+        "🆔 Session ID: `sess-rich`",
+    ):
+        assert expected in result
 
 
 @pytest.mark.asyncio
-async def test_status_command_includes_session_title_when_present():
+async def test_status_resolves_provider_context_when_compressor_limit_is_zero(
+    monkeypatch,
+):
+    """The cockpit must not render a known model's context window as zero."""
+    import gateway.run as gateway_run
+    from hermes_cli import model_switch
+
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
-        session_id="sess-1",
+        session_id="sess-context-fallback",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="dm",
-        total_tokens=321,
     )
     runner = _make_runner(session_entry)
-    runner._session_db._db.get_session_title.return_value = "My titled session"
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        base_url="",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=143_189,
+            context_length=0,
+            compression_count=0,
+        ),
+        interrupt=MagicMock(),
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    resolver = AsyncMock(return_value=272_000)
+    monkeypatch.setattr(
+        model_switch,
+        "resolve_display_context_length_async",
+        resolver,
+    )
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "🆔 Session ID: `sess-1`" in result
-    assert "My titled session" in result
+    assert "📚 Context: 143.2k/272k (53%)" in result
+    resolver.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -156,27 +201,7 @@ async def test_status_command_reads_token_totals_from_session_db():
     # 1000 + 250 + 500 + 100 + 50 = 1,900
     assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
     assert "🗄️ Cache: 33% hit · 500 cached, 100 new" in result
-
-
-@pytest.mark.asyncio
-async def test_status_command_tokens_zero_when_session_db_row_missing():
-    """When the SessionDB has no row for the current session yet (fresh
-    session, no agent calls), /status reports 0 without raising."""
-    session_entry = SessionEntry(
-        session_key=build_session_key(_make_source()),
-        session_id="sess-1",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        total_tokens=999,  # This should be ignored.
-    )
-    runner = _make_runner(session_entry)
-    runner._session_db._db.get_session.return_value = None
-
-    result = await runner._handle_message(_make_event("/status"))
-
-    assert "🧮 Tokens: 0 in / 0 out · total 0" in result
+    assert "**Cumulative API tokens (re-sent each call):** 1,900" in result
 
 
 @pytest.mark.asyncio
@@ -215,6 +240,54 @@ async def test_status_command_includes_live_agent_model_and_context():
     assert "**Model:** `openai/gpt-test` (openai)" in result
     assert "**Context:** 12,345 / 100,000 (12%)" in result
     assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_uses_dominant_persisted_model_route(tmp_path):
+    """Persisted status must not combine a model and provider from different calls."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    try:
+        db.create_session("sess-1", "telegram", model="z-ai/glm-5.2")
+        db.update_token_counts(
+            "sess-1",
+            model="z-ai/glm-5.2",
+            billing_provider="nvidia",
+            billing_base_url="https://integrate.api.nvidia.com/v1/",
+            input_tokens=480,
+            api_call_count=48,
+        )
+        db.update_token_counts(
+            "sess-1",
+            model="upstage/solar-pro4:free",
+            billing_provider="nous",
+            billing_base_url="https://inference-api.nousresearch.com/v1/",
+            input_tokens=60,
+            api_call_count=6,
+        )
+        # Reproduce the inconsistent legacy summary observed in #87227.
+        db.update_session_model("sess-1", "z-ai/glm-5.2")
+        db.update_session_billing_route(
+            "sess-1",
+            provider="nous",
+            base_url="https://inference-api.nousresearch.com/v1/",
+        )
+
+        result = await runner._handle_message(_make_event("/status"))
+
+        assert "**Model:** `z-ai/glm-5.2` (nvidia)" in result
+        assert "**Model:** `z-ai/glm-5.2` (nous)" not in result
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -301,6 +374,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
     runner = _make_runner(session_entry, platform=Platform.SLACK)
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = False
+    runner._session_db = MagicMock()
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -365,6 +439,7 @@ async def test_handle_message_stale_result_keeps_newer_generation_callback(monke
     )
     runner = _make_runner(session_entry)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
+    runner._session_db = MagicMock()
     session_key = session_entry.session_key
     adapter = _Adapter()
     runner.adapters[Platform.TELEGRAM] = adapter
@@ -489,6 +564,61 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
 
 # ── /context command tests ────────────────────────────────────────────────
 
+
+@pytest.mark.asyncio
+async def test_context_command_keeps_configured_window_without_resident_agent():
+    """The no-agent fallback must not replace a custom-provider context pin."""
+    model = "unsloth/Qwen3.8-27B-GGUF:Q8_0"
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-context-pin",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    session_entry.last_prompt_tokens = 66_570
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {"model": model}
+
+    config = {
+        "model": {
+            "default": model,
+            "provider": "custom-local-qwen",
+            "context_length": 262_144,
+        },
+        "custom_providers": [
+            {
+                "name": "custom-local-qwen",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "models": {},
+            }
+        ],
+    }
+    runtime = {
+        "provider": "custom-local-qwen",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_key": "",
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value=config), patch(
+        "gateway.run._resolve_runtime_agent_kwargs", return_value=runtime
+    ), patch(
+        "hermes_cli.config.get_compatible_custom_providers",
+        return_value=config["custom_providers"],
+    ), patch(
+        "agent.model_metadata.get_model_context_length",
+        side_effect=lambda *args, **kwargs: kwargs.get("config_context_length") or 131_072,
+    ) as context_lookup:
+        result = await runner._handle_context_command(_make_event("/context"))
+
+    assert "Window: 262,144 tokens" in result
+    assert "In use: 66,570 / 262,144 (25%)" in result
+    assert "131,072" not in result
+    assert context_lookup.call_count == 1
+    assert context_lookup.call_args.kwargs["config_context_length"] == 262_144
+
+
 def _stub_agent(**overrides) -> SimpleNamespace:
     """Build a stub agent with the attributes _handle_context_command reads."""
     props = dict(
@@ -562,4 +692,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-

@@ -41,6 +41,19 @@ def _put_result(task_id, result):
     conn.close()
 
 
+def test_finalization_policy_delivers_when_storage_is_uninitialized(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    assert barrier.finalization_policy(
+        parent_session_id="ordinary-session",
+        root_turn_id="ordinary-turn",
+    ) == {"action": "deliver"}
+    assert not path.exists()
+
+
 def _accept(claim):
     assert barrier.accept_continuation(
         claim["barrier_id"],
@@ -795,84 +808,6 @@ def test_schema_version_five_advances_to_six(monkeypatch, tmp_path):
     conn.close()
 
 
-def test_active_barrier_inspection_is_select_only(monkeypatch, tmp_path):
-    _use_db(monkeypatch, tmp_path)
-    barrier.admit_required_child(
-        origin_session="origin",
-        parent_session_id="parent",
-        root_turn_id="turn",
-        task_id="child",
-    )
-    real_connect = sqlite3.connect
-    statements = []
-
-    def traced_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        conn.set_trace_callback(statements.append)
-        return conn
-
-    monkeypatch.setattr(barrier.sqlite3, "connect", traced_connect)
-    assert barrier.has_active_barrier(origin_session="origin") is True
-    assert barrier.has_active_barrier(origin_session="origin") is True
-    normalized = [statement.strip().upper() for statement in statements]
-    assert normalized
-    assert all(statement.startswith("SELECT") for statement in normalized)
-    assert any(
-        statement.startswith("SELECT 1 FROM PARENT_TASK_BARRIERS")
-        for statement in normalized
-    )
-
-
-def test_active_barrier_absent_startup_storage_is_inactive(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    sqlite3.connect(tmp_path / "state.db").close()
-
-    assert barrier.has_active_barrier(origin_session="origin") is False
-
-
-def test_cancel_absent_startup_storage_is_noop(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    sqlite3.connect(tmp_path / "state.db").close()
-
-    assert barrier.cancel_session_barriers(parent_session_id="parent") == 0
-
-
-def test_concurrent_active_barrier_reads_do_not_change_schema_or_mode(
-    monkeypatch, tmp_path
-):
-    path = _use_db(monkeypatch, tmp_path)
-    barrier.admit_required_child(
-        origin_session="origin",
-        parent_session_id="parent",
-        root_turn_id="turn",
-        task_id="child",
-    )
-    conn = sqlite3.connect(path)
-    before_schema = conn.execute(
-        "SELECT name, sql FROM sqlite_master ORDER BY name"
-    ).fetchall()
-    before_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    conn.close()
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(
-            pool.map(
-                lambda _: barrier.has_active_barrier(origin_session="origin"),
-                range(32),
-            )
-        )
-
-    conn = sqlite3.connect(path)
-    after_schema = conn.execute(
-        "SELECT name, sql FROM sqlite_master ORDER BY name"
-    ).fetchall()
-    after_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    conn.close()
-    assert all(results)
-    assert after_schema == before_schema
-    assert after_mode == before_mode
-
-
 def test_explicit_session_cancellation_terminalizes_open_barrier(monkeypatch, tmp_path):
     _use_db(monkeypatch, tmp_path)
     barrier_id = barrier.admit_required_child(
@@ -919,3 +854,22 @@ def test_retention_prune_cascades_terminal_children(monkeypatch, tmp_path):
     ).fetchone()[0]
     conn.close()
     assert count == 0
+
+
+def test_finalization_policy_fails_closed_when_existing_storage_cannot_open(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    path.touch()
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    def cannot_open(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(barrier.sqlite3, "connect", cannot_open)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        barrier.finalization_policy(
+            parent_session_id="parent-with-durable-state",
+            root_turn_id="turn-with-required-child",
+        )

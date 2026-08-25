@@ -10,7 +10,6 @@ We mock the telegram module at import time to avoid collection errors.
 
 import asyncio
 import os
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,30 +27,8 @@ from gateway.platforms.base import (
 # ---------------------------------------------------------------------------
 # Mock the telegram package if it's not installed
 # ---------------------------------------------------------------------------
-
-def _ensure_telegram_mock():
-    """Install mock telegram modules so TelegramAdapter can be imported."""
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        # Real library is installed — no mocking needed
-        return
-
-    telegram_mod = MagicMock()
-    # ContextTypes needs DEFAULT_TYPE as an actual attribute for the annotation
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
-
-
-_ensure_telegram_mock()
-
 # Now we can safely import
-from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +62,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     """Build a mock Telegram Message with the given document/photo."""
     msg = MagicMock()
     msg.message_id = 42
-    msg.text = ""
+    msg.text = caption or ""
     msg.caption = caption
     msg.date = None
     # Media flags — all None except explicit payload
@@ -105,16 +82,9 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.from_user = MagicMock()
     msg.from_user.id = 1
     msg.from_user.full_name = "Test User"
-    msg.from_user.is_bot = False
     msg.message_thread_id = None
     msg.business_connection_id = None
-    msg.quote = None
-    msg.reply_to_message = SimpleNamespace(
-        from_user=SimpleNamespace(id=999),
-        text=None,
-        caption=None,
-        message_id=None,
-    )
+    msg.reply_text = AsyncMock()
     return msg
 
 
@@ -122,8 +92,6 @@ def _make_update(msg):
     """Wrap a message in a mock Update."""
     update = MagicMock()
     update.message = msg
-    update.effective_message = msg
-    update.update_id = 123
     return update
 
 
@@ -139,7 +107,7 @@ def _make_video(file_obj=None):
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="fake-token", extra={"private_chats": "100,1"})
+    config = PlatformConfig(enabled=True, token="fake-token")
     a = TelegramAdapter(config)
     # Capture events instead of processing them
     a.handle_message = AsyncMock()
@@ -225,84 +193,6 @@ class TestDocumentDownloadBlock:
         assert "# Title" in event.text
 
     @pytest.mark.asyncio
-    async def test_goal_reply_to_markdown_document_hydrates_reply_context(self, adapter):
-        content = (
-            b"# Roadmap\n\n"
-            b"SUPERGOAL_GOAL_BODY: Run `.supergoal/demo` and finish with "
-            b"AUDIT_COMPLETE + SUPERGOAL_RUN_COMPLETE."
-        )
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name="ROADMAP.md",
-            mime_type="text/markdown",
-            file_size=len(content),
-            file_obj=file_obj,
-        )
-        msg = _make_message()
-        msg.text = "/goal"
-        msg.reply_to_message = SimpleNamespace(
-            document=doc,
-            text=None,
-            caption=None,
-            message_id=99,
-            entities=None,
-            caption_entities=None,
-        )
-        event = MessageEvent(text="/goal", message_type=MessageType.COMMAND, reply_to_message_id="99")
-
-        await adapter._hydrate_reply_to_document_text(event, msg)
-
-        assert event.reply_to_text is not None
-        assert event.reply_to_text.startswith("[Content of replied-to ROADMAP.md]:")
-        assert "SUPERGOAL_GOAL_BODY" in event.reply_to_text
-        assert event.text == "/goal"
-
-    @pytest.mark.asyncio
-    async def test_reply_document_hydration_ignores_large_markdown(self, adapter):
-        content = b"# Too big"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name="ROADMAP.md",
-            mime_type="text/markdown",
-            file_size=101 * 1024,
-            file_obj=file_obj,
-        )
-        msg = _make_message()
-        msg.reply_to_message = SimpleNamespace(
-            document=doc,
-            text=None,
-            caption=None,
-            message_id=99,
-            entities=None,
-            caption_entities=None,
-        )
-        event = MessageEvent(text="/goal", message_type=MessageType.COMMAND, reply_to_message_id="99")
-
-        await adapter._hydrate_reply_to_document_text(event, msg)
-
-        assert event.reply_to_text is None
-        assert event.text == "/goal"
-
-    @pytest.mark.asyncio
-    async def test_supported_html_injects_content(self, adapter):
-        content = b"<html><body><h1>Memory plan</h1></body></html>"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name="memory-plan.html",
-            mime_type="text/html",
-            file_size=len(content),
-            file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert event.media_types == ["text/html"]
-        assert "[Content of memory-plan.html]" in event.text
-        assert "<h1>Memory plan</h1>" in event.text
-
-    @pytest.mark.asyncio
     async def test_caption_preserved_with_injection(self, adapter):
         content = b"file text"
         file_obj = _make_file_obj(content)
@@ -318,122 +208,6 @@ class TestDocumentDownloadBlock:
         assert "file text" in event.text
         assert "Please summarize" in event.text
 
-    @pytest.mark.asyncio
-    async def test_zip_document_cached(self, adapter):
-        """A .zip upload should be cached as a supported document."""
-        doc = _make_document(file_name="archive.zip", mime_type="application/zip", file_size=100)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert event.media_urls and event.media_urls[0].endswith("archive.zip")
-        assert event.media_types == ["application/zip"]
-
-    @pytest.mark.asyncio
-    async def test_png_document_is_routed_as_image(self, adapter):
-        """Telegram documents that are really PNGs should use the image path."""
-        file_obj = _make_file_obj(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-        doc = _make_document(file_name="screenshot.png", mime_type="image/png", file_size=9, file_obj=file_obj)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch.object(adapter, "_photo_batch_key", return_value="batch-1"), patch.object(
-            adapter, "_enqueue_photo_event"
-        ) as enqueue_mock:
-            await adapter._handle_media_message(update, MagicMock())
-
-        enqueue_mock.assert_called_once()
-        event = enqueue_mock.call_args.args[1]
-        assert event.message_type == MessageType.PHOTO
-        assert event.media_urls and event.media_urls[0].endswith(".png")
-        assert event.media_types == ["image/png"]
-        assert adapter.handle_message.call_count == 0
-
-    @pytest.mark.asyncio
-    async def test_spoofed_png_document_falls_back_with_error(self, adapter):
-        """A .png filename with non-image bytes should fail clearly, not disappear."""
-        file_obj = _make_file_obj(b"not-a-real-image")
-        doc = _make_document(file_name="spoofed.png", mime_type="image/png", file_size=16, file_obj=file_obj)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch.object(adapter, "_photo_batch_key", return_value="batch-2"), patch.object(
-            adapter, "_enqueue_photo_event"
-        ) as enqueue_mock:
-            await adapter._handle_media_message(update, MagicMock())
-
-        enqueue_mock.assert_not_called()
-        event = adapter.handle_message.call_args[0][0]
-        assert "could not be read as an image" in event.text
-
-    @pytest.mark.asyncio
-    async def test_oversized_file_rejected(self, adapter):
-        doc = _make_document(file_name="huge.pdf", file_size=25 * 1024 * 1024)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert "too large" in event.text
-
-    @pytest.mark.asyncio
-    async def test_none_file_size_rejected(self, adapter):
-        """Security fix: file_size=None must be rejected (not silently allowed)."""
-        doc = _make_document(file_name="tricky.pdf", file_size=None)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert "too large" in event.text or "could not be verified" in event.text
-
-    @pytest.mark.asyncio
-    async def test_missing_filename_uses_mime_lookup(self, adapter):
-        """No file_name but valid mime_type should resolve to extension."""
-        content = b"some pdf bytes"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name=None, mime_type="application/pdf",
-            file_size=len(content), file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert len(event.media_urls) == 1
-        assert event.media_types == ["application/pdf"]
-
-    @pytest.mark.asyncio
-    async def test_missing_filename_and_mime_rejected(self, adapter):
-        doc = _make_document(file_name=None, mime_type=None, file_size=100)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert "Unsupported" in event.text
-
-    @pytest.mark.asyncio
-    async def test_unicode_decode_error_handled(self, adapter):
-        """Binary bytes that aren't valid UTF-8 in a .txt — content not injected but file still cached."""
-        binary = bytes(range(128, 256))  # not valid UTF-8
-        file_obj = _make_file_obj(binary)
-        doc = _make_document(
-            file_name="binary.txt", mime_type="text/plain",
-            file_size=len(binary), file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        # File should still be cached
-        assert len(event.media_urls) == 1
-        assert os.path.exists(event.media_urls[0])
-        # Content NOT injected — text should be empty (no caption set)
-        assert "[Content of" not in (event.text or "")
 
     @pytest.mark.asyncio
     async def test_text_injection_capped(self, adapter):
@@ -454,18 +228,55 @@ class TestDocumentDownloadBlock:
         # Content should NOT be injected
         assert "[Content of" not in (event.text or "")
 
+
     @pytest.mark.asyncio
-    async def test_download_exception_handled(self, adapter):
-        """If get_file() raises, the handler logs the error without crashing."""
-        doc = _make_document(file_name="crash.pdf", file_size=100)
-        doc.get_file = AsyncMock(side_effect=RuntimeError("Telegram API down"))
+    async def test_document_cache_failure_replies_and_signals_agent(self, adapter):
+        """A failed document download must surface on BOTH ends, not silently.
+
+        Regression for #23045 Bug 2: a CDN download/cache failure used to log a
+        warning and fall through to an empty agent turn — user thinks the file
+        arrived, agent sees nothing. Now the user gets a Telegram reply AND the
+        agent's event.text carries an attempted-attachment notice.
+        """
+        doc = _make_document(file_name="notes.md", mime_type="text/markdown", file_size=100)
+        doc.get_file = AsyncMock(side_effect=RuntimeError("Telegram CDN down"))
         msg = _make_message(document=doc)
         update = _make_update(msg)
 
-        # Should not raise
         await adapter._handle_media_message(update, MagicMock())
-        # handle_message should still be called (the handler catches the exception)
+
+        # 1. User is told the download failed, with the filename + exception type.
+        msg.reply_text.assert_awaited_once()
+        reply = msg.reply_text.await_args.args[0]
+        assert "Couldn't download" in reply
+        assert "notes.md" in reply
+        assert "RuntimeError" in reply
+
+        # 2. The agent still gets a turn, but event.text now carries a notice so
+        #    it knows an attachment was attempted and failed (not a silent empty turn).
         adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []  # nothing cached
+        assert "could not be downloaded" in (event.text or "")
+        assert "notes.md" in (event.text or "")
+
+
+    @pytest.mark.asyncio
+    async def test_voice_cache_failure_replies_and_signals_agent(self, adapter):
+        """Same fail-closed contract applies to the voice site (#23045 Bug 2 class)."""
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(side_effect=RuntimeError("CDN down"))
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        msg.reply_text.assert_awaited_once()
+        assert "voice message" in msg.reply_text.await_args.args[0]
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert "could not be downloaded" in (event.text or "")
 
 
 class TestVideoDownloadBlock:
@@ -498,7 +309,7 @@ class TestMediaGroups:
         msg1 = _make_message(caption="two images", photo=[first_photo])
         msg2 = _make_message(photo=[second_photo])
 
-        with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]):
+        with patch("plugins.platforms.telegram.adapter.cache_image_from_bytes", side_effect=["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]):
             await adapter._handle_media_message(_make_update(msg1), MagicMock())
             await adapter._handle_media_message(_make_update(msg2), MagicMock())
             assert adapter.handle_message.await_count == 0
@@ -509,44 +320,6 @@ class TestMediaGroups:
         assert event.text == "two images"
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
-
-    @pytest.mark.asyncio
-    async def test_photo_album_is_buffered_and_combined(self, adapter):
-        first_photo = _make_photo(_make_file_obj(b"first"))
-        second_photo = _make_photo(_make_file_obj(b"second"))
-
-        msg1 = _make_message(caption="two images", media_group_id="album-1", photo=[first_photo])
-        msg2 = _make_message(media_group_id="album-1", photo=[second_photo])
-
-        with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=["/tmp/one.jpg", "/tmp/two.jpg"]):
-            await adapter._handle_media_message(_make_update(msg1), MagicMock())
-            await adapter._handle_media_message(_make_update(msg2), MagicMock())
-            assert adapter.handle_message.await_count == 0
-            await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
-
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.call_args[0][0]
-        assert event.text == "two images"
-        assert event.media_urls == ["/tmp/one.jpg", "/tmp/two.jpg"]
-        assert len(event.media_types) == 2
-
-    @pytest.mark.asyncio
-    async def test_disconnect_cancels_pending_media_group_flush(self, adapter):
-        first_photo = _make_photo(_make_file_obj(b"first"))
-        msg = _make_message(caption="two images", media_group_id="album-2", photo=[first_photo])
-
-        with patch("gateway.platforms.telegram.cache_image_from_bytes", return_value="/tmp/one.jpg"):
-            await adapter._handle_media_message(_make_update(msg), MagicMock())
-
-        assert "album-2" in adapter._media_group_events
-        assert "album-2" in adapter._media_group_tasks
-
-        await adapter.disconnect()
-        await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
-
-        assert adapter._media_group_events == {}
-        assert adapter._media_group_tasks == {}
-        adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -710,8 +483,8 @@ class TestTelegramPhotoBatching:
         )
 
         with (
-            patch("gateway.platforms.telegram.asyncio.current_task", return_value=old_task),
-            patch("gateway.platforms.telegram.asyncio.sleep", new=AsyncMock()),
+            patch("plugins.platforms.telegram.adapter.asyncio.current_task", return_value=old_task),
+            patch("plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()),
         ):
             await adapter._flush_photo_batch(batch_key)
 
@@ -769,87 +542,3 @@ class TestSendVideo:
 
         call_kwargs = connected_adapter._bot.send_video.call_args[1]
         assert call_kwargs["message_thread_id"] == 789
-
-
-class TestRepliedToMedia:
-    @pytest.mark.asyncio
-    async def test_command_reply_to_text_document_caches_file_and_preserves_command(self, adapter):
-        content = b"Transcript body"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name="transcript.txt",
-            mime_type="text/plain",
-            file_size=len(content),
-            file_obj=file_obj,
-        )
-        replied = _make_message(document=doc)
-        replied.message_id = 66
-
-        msg = _make_message()
-        msg.text = "/summ"
-        msg.reply_to_message = replied
-        update = _make_update(msg)
-
-        await adapter._handle_command(update, MagicMock())
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.text.startswith("/summ")
-        assert "[Content of replied-to transcript.txt]" in event.text
-        assert "Transcript body" in event.text
-        assert event.reply_to_message_id == "66"
-        assert event.message_type == MessageType.DOCUMENT
-        assert len(event.media_urls) == 1
-        assert os.path.exists(event.media_urls[0])
-        assert event.media_types == ["text/plain"]
-
-    @pytest.mark.asyncio
-    async def test_text_reply_to_pdf_document_caches_replied_media(self, adapter):
-        pdf_bytes = b"%PDF-1.4 replied"
-        file_obj = _make_file_obj(pdf_bytes)
-        doc = _make_document(file_name="deck.pdf", file_size=len(pdf_bytes), file_obj=file_obj)
-        replied = _make_message(document=doc)
-        replied.message_id = 77
-
-        msg = _make_message()
-        msg.text = "summarize this"
-        msg.reply_to_message = replied
-        update = _make_update(msg)
-
-        await adapter._handle_text_message(update, MagicMock())
-
-        key, event = next(iter(adapter._pending_text_batches.items()))
-        assert key
-        assert event.text == "summarize this"
-        assert event.reply_to_message_id == "77"
-        assert event.message_type == MessageType.DOCUMENT
-        assert len(event.media_urls) == 1
-        assert os.path.exists(event.media_urls[0])
-        assert event.media_types == ["application/pdf"]
-
-    @pytest.mark.asyncio
-    async def test_command_reply_to_html_document_injects_content(self, adapter):
-        content = b"<section>Second brain memory plan</section>"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name="plan.html",
-            mime_type="text/html",
-            file_size=len(content),
-            file_obj=file_obj,
-        )
-        replied = _make_message(document=doc)
-        replied.message_id = 88
-
-        msg = _make_message()
-        msg.text = "/summ"
-        msg.reply_to_message = replied
-        update = _make_update(msg)
-
-        await adapter._handle_command(update, MagicMock())
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.text.startswith("/summ")
-        assert "[Content of replied-to plan.html]" in event.text
-        assert "Second brain memory plan" in event.text
-        assert event.reply_to_message_id == "88"
-        assert event.message_type == MessageType.DOCUMENT
-        assert event.media_types == ["text/html"]

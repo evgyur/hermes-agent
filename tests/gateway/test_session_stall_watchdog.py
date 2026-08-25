@@ -11,6 +11,7 @@ import pytest
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session_stall import (
+    format_agent_inactivity_warning,
     format_session_stall_notification,
     resolve_session_idle_seconds_from_activity,
     should_clear_session_stall_notification,
@@ -120,8 +121,18 @@ def test_should_clear_holds_latch_when_idle_unknown():
 def test_format_session_stall_notification_minutes():
     msg = format_session_stall_notification(125)
     assert "2 min ago" in msg
-    assert "/new" in msg
+    assert "/stop" in msg
+    assert "/new" not in msg
+    assert "/reset" not in msg
     assert format_session_stall_notification(30).count("1 min ago") == 1
+
+
+def test_format_agent_inactivity_warning_preserves_session():
+    msg = format_agent_inactivity_warning(15, 15)
+    assert "No activity for 15 min" in msg
+    assert "/stop" in msg
+    assert "/new" not in msg
+    assert "/reset" not in msg
 
 
 def test_resolve_idle_uses_shared_activity_snapshot_only():
@@ -180,7 +191,9 @@ async def test_check_session_stalls_notifies_once(monkeypatch):
     sent = await runner._check_session_stalls(60)
     assert sent == 1
     assert len(adapter.sent) == 1
-    assert "/new" in adapter.sent[0]["content"]
+    assert "/stop" in adapter.sent[0]["content"]
+    assert "/new" not in adapter.sent[0]["content"]
+    assert "/reset" not in adapter.sent[0]["content"]
     assert runner._session_stall_notified.get(session_key) is True
 
     # Second pass must not spam.
@@ -289,7 +302,9 @@ async def test_check_session_stalls_queued_events_overflow_notifies():
     runner._adapter_for_source = lambda source: adapter
 
     assert await runner._check_session_stalls(60) == 1
-    assert adapter.sent and "/new" in adapter.sent[0]["content"]
+    assert adapter.sent and "/stop" in adapter.sent[0]["content"]
+    assert "/new" not in adapter.sent[0]["content"]
+    assert "/reset" not in adapter.sent[0]["content"]
 
 
 @pytest.mark.asyncio
