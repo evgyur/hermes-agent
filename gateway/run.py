@@ -13786,13 +13786,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (
                 isinstance(row, dict)
                 and row.get("role") == "assistant"
-                and str(row.get("content") or "").strip()
             ):
-                return {
-                    "disposition": "terminal_checkpoint",
-                    "safe_dangling_calls": safe_dangling,
-                    "effect_fence": effect_fence,
-                }
+                from gateway.visible_final import is_successful_final
+
+                if is_successful_final(row):
+                    return {
+                        "disposition": "terminal_checkpoint",
+                        "safe_dangling_calls": safe_dangling,
+                        "effect_fence": effect_fence,
+                    }
         return {
             "disposition": "continue",
             "safe_dangling_calls": safe_dangling,
@@ -20698,33 +20700,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # erase embedded punctuation (``g.o`` must not become ``go``).
         _approval_token = message_text.strip().casefold()
         _short_approval_tokens = {
-            "го", "go", "давай", "продолжай", "continue",
+            "го", "go", "давай", "continue",
         }
         if (
             _approval_token in _short_approval_tokens
             and not str(getattr(event, "reply_to_text", None) or "").strip()
         ):
-            _max_raw_rows_scanned = 256
-            _max_visible_semantic_rows = 24
-            _semantic_rows_reversed: list[dict[str, Any]] = []
-            for _row in reversed(list(history or [])[-_max_raw_rows_scanned:]):
+            from gateway.visible_final import extract_bounded_visible_final
+
+            _bounded_raw_history = list(history or [])[-256:]
+            _bounded_history: list[dict[str, Any]] = []
+            _real_user_opener: dict[str, Any] | None = None
+            for _row in _bounded_raw_history:
                 if not isinstance(_row, dict):
                     continue
                 _role = str(_row.get("role") or "")
-                _content = str(_row.get("content") or "").strip()
                 _display_kind = str(_row.get("display_kind") or "").casefold()
-                if (
-                    _role not in {"assistant", "user"}
-                    or not _content
-                    or _display_kind in {"internal_notification", "hidden"}
-                    or _row.get("hidden") is True
-                    or _row.get("visible") is False
-                ):
+                if _role == "user":
+                    if (
+                        _row.get("observed") is True
+                        or _row.get("internal") is True
+                        or _display_kind in {"internal_notification", "hidden"}
+                    ):
+                        continue
+                    _content = str(_row.get("content") or "").strip()
+                    if not _content:
+                        continue
+                    _real_user_opener = _row
+                    _bounded_history.append(_row)
                     continue
-                _semantic_rows_reversed.append(_row)
-                if len(_semantic_rows_reversed) >= _max_visible_semantic_rows:
-                    break
-            _bounded_history = list(reversed(_semantic_rows_reversed))
+                if _role != "assistant" or _real_user_opener is None:
+                    continue
+                _visible = extract_bounded_visible_final(
+                    [_real_user_opener, _row],
+                    max_raw_rows=2,
+                    max_visible_finals=1,
+                    max_chars=2048,
+                )
+                if _visible is None:
+                    continue
+                _bounded_history.append(
+                    {"role": "assistant", "content": _visible.text}
+                )
+            _visible_finals_left = 24
+            _newest_bounded_history: list[dict[str, Any]] = []
+            for _row in reversed(_bounded_history):
+                if _row.get("role") == "assistant":
+                    if _visible_finals_left <= 0:
+                        continue
+                    _visible_finals_left -= 1
+                _newest_bounded_history.append(_row)
+            _bounded_history = list(reversed(_newest_bounded_history))
             _assistant_candidates: list[tuple[int, str]] = []
             _latest_semantic: tuple[int, str, str] | None = None
             for _idx, _row in enumerate(_bounded_history):
