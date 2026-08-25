@@ -186,6 +186,20 @@ def test_business_connection_survives_media_thread_fallback(
                 "chat_id": "123456789",
                 "external_safe_mode": True,
             },
+            "invalid_route_envelope",
+        ),
+        (
+            {
+                "version": 1,
+                "platform": "telegram",
+                "runtime_profile": "default",
+                "transport_profile": "default",
+                "chat_id": "123456789",
+                "thread_id": None,
+                "user_id": "owner-1",
+                "business_connection_id": None,
+                "external_safe_mode": True,
+            },
             "ambiguous_route_envelope",
         ),
         (

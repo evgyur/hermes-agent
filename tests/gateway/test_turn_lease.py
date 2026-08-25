@@ -193,14 +193,16 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner.session_store.load_transcript.side_effect = AssertionError(
         "transcript must not load after a turn-lease timeout"
     )
-    session_env_tokens = object()
-    runner._set_session_env = MagicMock(return_value=session_env_tokens)
+    runner._set_session_env = MagicMock()
     runner._clear_session_env = MagicMock()
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        # Keep the outer watchdog comfortably above the 20ms lease budget.
+        # Cold executor startup on non-root/overlay CI can exceed one second
+        # before dispatch reaches the lease without changing lease semantics.
+        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=3)
     finally:
         assert runner._turn_leases.release(holder) is True
 
@@ -208,7 +210,11 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     assert "not processed" in response.lower()
     assert "resend" in response.lower()
     runner.session_store.load_transcript.assert_not_called()
-    runner._clear_session_env.assert_called_once_with(session_env_tokens)
+    # Route/session authority is now acquired before task-local session context
+    # is installed.  A lease rejection therefore has no context tokens to
+    # restore and must not enter either side of the session-env lifecycle.
+    runner._set_session_env.assert_not_called()
+    runner._clear_session_env.assert_not_called()
     runner._post_turn_goal_continuation.assert_not_awaited()
 
 

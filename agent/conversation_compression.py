@@ -80,6 +80,14 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+
+def _cap_compression_commit_watermark(agent, captured: int) -> int:
+    """Preserve a gateway-authority tail excluded from the summary snapshot."""
+    ceiling = getattr(agent, "_compression_commit_watermark_ceiling", None)
+    if type(ceiling) is not int or ceiling < 0:
+        return captured
+    return min(captured, ceiling)
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -3064,6 +3072,10 @@ def compress_context(
                     try:
                         _commit_watermark = _lock_db.get_active_message_watermark(
                             _lock_sid
+                        )
+                        _commit_watermark = _cap_compression_commit_watermark(
+                            agent,
+                            _commit_watermark,
                         )
                     except Exception as _wm_err:
                         # Watermark capture is safety-additive: without it the

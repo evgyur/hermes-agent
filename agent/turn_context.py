@@ -559,6 +559,8 @@ def build_turn_context(
     *,
     persist_user_message_id: Optional[str] = None,
     after_user_row_commit: Optional[Callable[[], bool]] = None,
+    precommitted_authority: bool = False,
+    precommitted_user_row_id: Optional[int] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
@@ -588,9 +590,9 @@ def build_turn_context(
 
     # NOTE: ordinary turns create the DB session row later, AFTER the system
     # prompt is restored/built (see _ensure_db_session() below the system-prompt
-    # block).  Gateway turns carrying an ``after_user_row_commit`` capability
-    # are the security exception: their exact user row and active-turn marker
-    # must become durable before prompt hooks or any other turn work can run.
+    # block). Gateway turns arrive with the exact user row and active marker
+    # already committed; the legacy callback capability remains supported for
+    # non-gateway callers that need the same barrier inside this function.
 
     # Tag log records on this thread with the session ID for ``hermes logs``.
     set_session_context(agent.session_id)
@@ -688,13 +690,26 @@ def build_turn_context(
         raise ValueError("persist_user_message_id must be a non-empty string")
     if after_user_row_commit is not None and not callable(after_user_row_commit):
         raise TypeError("after_user_row_commit must be callable")
+    if precommitted_authority and after_user_row_commit is not None:
+        raise ValueError(
+            "precommitted authority cannot carry a marker callback"
+        )
+    if precommitted_user_row_id is not None and (
+        type(precommitted_user_row_id) is not int
+        or precommitted_user_row_id <= 0
+        or not precommitted_authority
+    ):
+        raise ValueError(
+            "precommitted_user_row_id requires committed authority and a positive int"
+        )
     # Cached gateway agents are reused across turns.  Always overwrite these
     # turn-scoped capabilities so a failed/aborted turn cannot arm the next
     # user message with stale provenance or a stale durable-marker callback.
     agent._persist_user_message_id = persist_user_message_id
     agent._after_user_row_commit = after_user_row_commit
     _authority_barrier_required = after_user_row_commit is not None
-    _authority_barrier_committed = False
+    _authority_user_row_precommitted = precommitted_user_row_id is not None
+    _authority_user_row_committed = _authority_user_row_precommitted
     agent._persist_user_message_never_replay = _never_persist_api_content
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
@@ -835,19 +850,20 @@ def build_turn_context(
     agent._persist_user_message_idx = current_turn_user_idx
 
     # ── Durable turn-authority barrier ──────────────────────────────────────
-    # A gateway-issued callback is an authorization capability for this exact
-    # input.  Persist the externally-addressable user row and consume that
-    # capability before system-prompt construction (which can fire plugin
-    # hooks), compression, memory callbacks/prefetch, model calls, or tools.
-    # Sidecar context does not exist yet; it is backfilled below after those
-    # providers run.  Failure is deliberately fatal: continuing without both
-    # durable records would let a restart replay work whose origin is missing
-    # or mutable.
+    # Gateway input reaches here with its externally-addressable user row and
+    # active marker already durable. The legacy callback path below establishes
+    # the same boundary for other callers. Sidecar context does not exist yet;
+    # it is backfilled below after those providers run. Failure is deliberately
+    # fatal: continuing without both durable records would let a restart replay
+    # work whose origin is missing or mutable.
     _turn_user_msg = messages[current_turn_user_idx]
     if not isinstance(_turn_user_msg, dict) or _turn_user_msg.get("role") != "user":
         raise RuntimeError("current turn user row is unavailable for persistence")
     if persist_user_message_id is not None:
         _turn_user_msg["platform_message_id"] = persist_user_message_id
+    if _authority_user_row_precommitted:
+        _turn_user_msg["_db_persisted"] = True
+        _turn_user_msg["_row_id"] = precommitted_user_row_id
 
     persist_lock = getattr(agent, "_session_persist_lock", None)
 
@@ -881,7 +897,7 @@ def build_turn_context(
             else:
                 with persist_lock:
                     _commit_turn_authority()
-            _authority_barrier_committed = True
+            _authority_user_row_committed = True
         finally:
             # Consume the capability exactly once even when any durable write
             # fails.  A cached agent or close path must never fire it later for
@@ -1623,7 +1639,7 @@ def build_turn_context(
             # dict, so backfill the exact API sidecar onto the newest matching
             # row.  This enrichment is intentionally downstream of the marker:
             # it can never delay or manufacture replay authority.
-            _needs_sidecar_backfill = _authority_barrier_committed or (
+            _needs_sidecar_backfill = _authority_user_row_committed or (
                 _preflight_compressed
                 and bool(getattr(agent, "_last_compaction_in_place", False))
             )
@@ -1647,12 +1663,12 @@ def build_turn_context(
                             _persisted_content,
                             _api_content,
                         )
-                        if _authority_barrier_committed and _updated != 1:
+                        if _authority_user_row_committed and _updated != 1:
                             raise RuntimeError(
                                 "durable user-row api_content backfill missed"
                             )
                     except Exception:
-                        if _authority_barrier_committed:
+                        if _authority_user_row_committed:
                             raise
                         logger.warning(
                             "in-place compaction api_content backfill failed "
