@@ -4137,7 +4137,7 @@ class SessionStore:
                             and current.continuation_generation == generation
                         ):
                             self._clear_resume_projection_locked(current)
-                            self._save()
+                            self._save_entry(session_key, lock_held=True)
                             counts["cleared_terminal_projection"] += 1
                 continue
 
@@ -4231,7 +4231,7 @@ class SessionStore:
                     and current.continuation_generation == generation
                 ):
                     self._clear_resume_projection_locked(current)
-                    self._save()
+                    self._save_entry(session_key, lock_held=True)
         return counts
 
     @staticmethod

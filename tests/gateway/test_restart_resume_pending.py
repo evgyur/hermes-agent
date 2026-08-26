@@ -396,16 +396,23 @@ def test_startup_reconciles_stale_exact_claim_and_clears_only_its_marker(
         lambda: entry.last_resume_marked_at + timedelta(hours=2),
     )
 
-    original_save = store._save
+    original_save_entry = store._save_entry
+    persisted_keys = []
 
-    def _assert_locked_save():
+    def _assert_locked_save_entry(session_key, *, entry_data=None, lock_held=False):
         acquired = store._lock.acquire(blocking=False)
         if acquired:
             store._lock.release()
         assert not acquired
-        original_save()
+        assert lock_held is True
+        persisted_keys.append(session_key)
+        original_save_entry(
+            session_key,
+            entry_data=entry_data,
+            lock_held=lock_held,
+        )
 
-    store._save = _assert_locked_save
+    store._save_entry = _assert_locked_save_entry
     result = store.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
 
     assert result == {
@@ -418,6 +425,52 @@ def test_startup_reconciles_stale_exact_claim_and_clears_only_its_marker(
     assert row["state"] == "CANCELLED"
     assert row["reason"] == "stale_claim"
     assert entry.resume_pending is False
+    assert persisted_keys == [entry.session_key]
+
+
+def test_startup_reconciliation_does_not_publish_unrelated_fallback_routes(
+    tmp_path,
+    monkeypatch,
+):
+    """Settling one claim must not turn an in-memory fallback into a DB row."""
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="incident-exact-save", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    monkeypatch.setattr(
+        "gateway.session._now",
+        lambda: entry.last_resume_marked_at + timedelta(hours=2),
+    )
+
+    unrelated_key = entry.session_key + ":fallback-only"
+    unrelated = replace(
+        entry,
+        session_key=unrelated_key,
+        session_id=entry.session_id + "-fallback-only",
+        resume_pending=False,
+    )
+    with store._lock:
+        store._entries[unrelated_key] = unrelated
+    before = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert unrelated_key not in before
+
+    result = store.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+
+    assert result["abandoned_claimed"] == 1
+    after = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert unrelated_key not in after
 
 
 @pytest.mark.parametrize("terminal_state", ["TERMINAL", "CANCELLED"])
