@@ -2211,7 +2211,13 @@ def _transcribe_groq(
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
+        groq_config = _load_stt_config().get("groq") or {}
+        base_url = str(
+            groq_config.get("base_url")
+            or get_env_value("GROQ_BASE_URL", GROQ_BASE_URL)
+            or GROQ_BASE_URL
+        ).rstrip("/")
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             create_kwargs = {
                 "model": model_name,
