@@ -5,6 +5,7 @@ import pytest
 from gateway.visible_final import (
     extract_bounded_visible_final,
     is_successful_final,
+    successful_final_text,
 )
 from gateway.run import GatewayRunner
 
@@ -71,6 +72,7 @@ def test_completed_empty_codex_final_is_terminal_but_malformed_is_not(
         source_message_id="a",
     )
     assert analysis["disposition"] == "terminal_checkpoint"
+    assert analysis["terminal_response"] == ""
 
     malformed = {
         **completed_empty_codex_final,
@@ -91,6 +93,32 @@ def test_completed_empty_codex_final_is_terminal_but_malformed_is_not(
         )
         is False
     )
+
+
+def test_terminal_checkpoint_carries_exact_undelivered_final_text():
+    row = {
+        "id": 118182,
+        "role": "assistant",
+        "content": "Exact persisted final.\nSecond line.",
+        "finish_reason": "stop",
+    }
+    assert successful_final_text(row) == "Exact persisted final.\nSecond line."
+
+    runner = object.__new__(GatewayRunner)
+    analysis = runner._analyze_startup_resume_rows(
+        [
+            {"role": "user", "content": "Do work", "message_id": "48330"},
+            row,
+        ],
+        source_message_id="48330",
+    )
+    assert analysis == {
+        "disposition": "terminal_checkpoint",
+        "safe_dangling_calls": [],
+        "effect_fence": {},
+        "terminal_response": "Exact persisted final.\nSecond line.",
+        "terminal_row_id": 118182,
+    }
 
 
 @pytest.fixture

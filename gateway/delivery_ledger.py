@@ -372,9 +372,11 @@ def sweep_recoverable(
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
 
-    Claiming atomically re-stamps the owner to THIS process and increments
-    ``attempts``, so a second gateway racing the same sweep cannot
+    Claiming atomically re-stamps the owner to THIS process and assigns an
+    exact runtime token, so a second gateway racing the same sweep cannot
     double-claim (the UPDATE is guarded on the previous owner stamp).
+    It does not increment ``attempts``: the budget is consumed by
+    :func:`begin_redelivery_attempt` immediately before the wire send.
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
@@ -456,12 +458,15 @@ def sweep_recoverable(
                     route_envelope = decoded if isinstance(decoded, dict) else None
                 except (TypeError, ValueError):
                     route_envelope = None
+            runtime_claim_token = uuid.uuid4().hex
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                   SET owner_pid=?, owner_started_at=?, runtime_claim_token=?,
                        updated_at=?
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid),
+                   WHERE obligation_id=? AND owner_pid IS ?
+                     AND owner_started_at IS ?""",
+                (pid, started, runtime_claim_token, now, oid, owner_pid,
+                 owner_started_at),
             )
             if cursor.rowcount:
                 claimed.append({
@@ -474,7 +479,8 @@ def sweep_recoverable(
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
-                    "attempts": attempts + 1,
+                    "attempts": attempts,
+                    "runtime_claim_token": runtime_claim_token,
                     "resume_task_id": str(resume_task_id or ""),
                     "continuation_generation": int(continuation_generation or 0),
                     "continuation_claim_owner": str(continuation_owner or ""),
@@ -482,6 +488,28 @@ def sweep_recoverable(
                     "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def begin_redelivery_attempt(obligation_id: str, claim_token: str) -> bool:
+    """Spend one attempt only when the exact runtime claim is about to send."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', attempts=attempts+1, updated_at=?
+               WHERE obligation_id=? AND runtime_claim_token=?
+                 AND owner_pid=? AND owner_started_at IS ?
+                 AND state IN ('pending','attempting','failed')
+                 AND attempts < ?""",
+            (
+                time.time(),
+                obligation_id,
+                claim_token,
+                pid,
+                started,
+                MAX_ATTEMPTS,
+            ),
+        ).rowcount)
 
 
 def sweep_failed_for_runtime(
@@ -500,18 +528,18 @@ def sweep_failed_for_runtime(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, attempts, created_at, owner_pid, owner_started_at,
+                      content, state, attempts, created_at, owner_pid, owner_started_at,
                       resume_task_id, continuation_generation,
                       continuation_claim_owner, continuation_claim_token,
                       route_envelope_json
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?
+               WHERE state IN ('failed','attempting') AND platform=?
                ORDER BY created_at, obligation_id""",
             (str(platform),),
         ).fetchall()
         for row in rows:
             (oid, session_key, platform_name, chat_id, thread_id, content,
-             attempts, created_at, owner_pid, owner_started_at, resume_task_id,
+             state, attempts, created_at, owner_pid, owner_started_at, resume_task_id,
              continuation_generation, continuation_owner,
              continuation_token, route_envelope_json) = row
             route_envelope = None
@@ -578,8 +606,8 @@ def sweep_failed_for_runtime(
                         conn.execute(
                             "UPDATE delivery_obligations SET state='abandoned', "
                             "updated_at=?, last_error='ambiguous_route_envelope' "
-                            "WHERE obligation_id=? AND state='failed'",
-                            (now, oid),
+                            "WHERE obligation_id=? AND state=?",
+                            (now, oid, state),
                         )
                     continue
                 if (
@@ -592,25 +620,27 @@ def sweep_failed_for_runtime(
                 or started is None
                 or int(owner_started_at) == int(started)
             )
-            if _owner_alive(owner_pid, owner_started_at) and not exact_current_owner:
-                continue
+            if _owner_alive(owner_pid, owner_started_at):
+                if not (exact_current_owner and state == "failed"):
+                    continue
             if int(attempts or 0) >= MAX_ATTEMPTS or (
                 now - float(created_at or now)
             ) > STALE_AFTER_SECONDS:
                 conn.execute(
                     "UPDATE delivery_obligations SET state='abandoned', "
-                    "updated_at=? WHERE obligation_id=? AND state='failed'",
-                    (now, oid),
+                    "updated_at=? WHERE obligation_id=? AND state=?",
+                    (now, oid, state),
                 )
                 continue
             claim_token = uuid.uuid4().hex
             changed = conn.execute(
                 """UPDATE delivery_obligations
                    SET state='attempting', owner_pid=?, owner_started_at=?,
-                       attempts=attempts+1, runtime_claim_token=?, updated_at=?
-                   WHERE obligation_id=? AND state='failed'
+                       runtime_claim_token=?, updated_at=?
+                   WHERE obligation_id=? AND state=?
                      AND owner_pid IS ? AND owner_started_at IS ?""",
-                (pid, started, claim_token, now, oid, owner_pid, owner_started_at),
+                (pid, started, claim_token, now, oid, state, owner_pid,
+                 owner_started_at),
             ).rowcount
             if changed:
                 if platform_name != "telegram" and route_envelope_json:
@@ -629,7 +659,7 @@ def sweep_failed_for_runtime(
                     "thread_id": thread_id,
                     "content": content,
                     "needs_marker": True,
-                    "attempts": int(attempts or 0) + 1,
+                    "attempts": int(attempts or 0),
                     "runtime_claim_token": claim_token,
                     "resume_task_id": str(resume_task_id or ""),
                     "continuation_generation": int(continuation_generation or 0),

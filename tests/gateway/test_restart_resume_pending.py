@@ -1607,6 +1607,87 @@ async def test_startup_scheduler_is_admission_only_and_never_reads_transcript(
     assert event.metadata["startup_resume_effect_fence"] == {}
 
 
+def test_startup_scheduler_defers_to_claimed_delivery_obligation(monkeypatch):
+    """Boot redelivery owns the exact session until delivery is settled."""
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(
+        restart_loop_guard,
+        "check_and_record",
+        MagicMock(side_effect=AssertionError("delivery-only boot counted")),
+    )
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(message_id="restart-message-delivery")
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-delivery-only",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-delivery-only",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._startup_delivery_pending_continuations = {
+        (
+            entry.session_key,
+            entry.resume_task_id,
+            entry.continuation_generation,
+            entry.continuation_claim_owner,
+            entry.continuation_claim_token,
+        )
+    }
+    runner._run_startup_resume_event = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    runner._run_startup_resume_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_delivery_fence_does_not_block_newer_resume(monkeypatch):
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(message_id="restart-message-new-generation")
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-new-generation",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-new-generation",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._startup_delivery_pending_continuations = {
+        (
+            entry.session_key,
+            "task-old-generation",
+            max(1, entry.continuation_generation - 1),
+            "gateway:old-owner",
+            "old-token",
+        )
+    }
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    runner._run_startup_resume_event.assert_awaited_once()
+
+
 def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
     runner = make_agent_runner(monkeypatch, tmp_path)
     source = replace(
@@ -1638,6 +1719,219 @@ def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
     runner.session_store.load_transcript.return_value = history
     event = runner._build_startup_resume_event(entry, source)
     return runner, event, source, entry
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_recovers_delivery_before_settling_resume(
+    monkeypatch,
+    tmp_path,
+):
+    history = [
+        {
+            "role": "user",
+            "content": "Run the canary",
+            "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": None,
+                    "media": [],
+                }
+            },
+        },
+        {
+            "id": 118182,
+            "role": "assistant",
+            "content": "Persisted but not delivered",
+            "finish_reason": "stop",
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+    recover = AsyncMock(return_value=True)
+    direct_settle = AsyncMock(return_value=True)
+    runner._recover_terminal_checkpoint_delivery = recover
+    runner._settle_startup_resume_claim = direct_settle
+
+    assert not await runner._validate_and_seal_startup_resume(
+        event, source, entry, history
+    )
+    recover.assert_awaited_once()
+    recovered_event, recovered_entry, recovered_identity, recovered_analysis = (
+        recover.await_args.args
+    )
+    assert recovered_event is event
+    assert recovered_entry is entry
+    assert recovered_identity["continuation_generation"] > 0
+    assert recovered_analysis["terminal_response"] == "Persisted but not delivered"
+    direct_settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_delivery_is_outboxed_before_exact_route_send(
+    monkeypatch,
+    tmp_path,
+):
+    import gateway.delivery_ledger as ledger
+    import gateway.telegram_egress_policy as egress
+
+    runner = make_agent_runner(monkeypatch, tmp_path)
+    source = replace(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            user_id="12345",
+            thread_id="1751",
+            profile="main",
+            transport_profile="default",
+        ),
+        message_id="48330",
+    )
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-1001:1751",
+        session_id="sess-terminal-delivery",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    event = MessageEvent(text="", source=source, message_id="48330")
+    identity = {
+        "resume_task_id": "task-7",
+        "continuation_generation": 7,
+        "continuation_claim_owner": "gateway:new",
+        "continuation_claim_token": "claim-7",
+    }
+    recorded = MagicMock(disposition="created", claim_token="")
+    record = MagicMock(return_value=recorded)
+    mark_attempting = MagicMock()
+    mark_delivered = MagicMock()
+    # Real mark_delivered() is a no-exception mutator and returns None.
+    settle_with_retry = AsyncMock(return_value=None)
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "record_obligation", record)
+    monkeypatch.setattr(ledger, "mark_attempting", mark_attempting)
+    monkeypatch.setattr(ledger, "mark_delivered", mark_delivered)
+    monkeypatch.setattr(ledger, "settle_with_retry", settle_with_retry)
+    monkeypatch.setattr(egress, "assert_recipient_allowed", lambda _peer: None)
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="77"))
+    runner._adapter_for_delivery_replay = MagicMock(return_value=adapter)
+    runner._resolve_profile_home_for_source = MagicMock(return_value=tmp_path)
+    settle_resume = AsyncMock(return_value=True)
+    runner._settle_startup_resume_claim = settle_resume
+
+    assert await runner._recover_terminal_checkpoint_delivery(
+        event,
+        entry,
+        identity,
+        {
+            "disposition": "terminal_checkpoint",
+            "terminal_response": "Persisted but not delivered",
+            "terminal_row_id": 118182,
+        },
+    )
+    assert mark_attempting.call_count == 1
+    record_kwargs = record.call_args.kwargs
+    assert record_kwargs["session_key"] == entry.session_key
+    assert record_kwargs["thread_id"] == "1751"
+    assert record_kwargs["content"] == "Persisted but not delivered"
+    assert record_kwargs["continuation_generation"] == 7
+    adapter.send.assert_awaited_once_with(
+        chat_id="-1001",
+        content="Persisted but not delivered",
+        metadata={
+            "thread_id": "1751",
+            "profile": "main",
+            "transport_profile": "default",
+        },
+    )
+    settle_with_retry.assert_awaited_once_with(
+        mark_delivered,
+        record_kwargs["obligation_id"],
+    )
+    settle_resume.assert_awaited_once_with(
+        entry.session_key,
+        identity,
+        disposition="terminal_checkpoint",
+        event=event,
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_send_failure_keeps_resume_claim_for_retry(
+    monkeypatch,
+    tmp_path,
+):
+    import gateway.delivery_ledger as ledger
+    import gateway.telegram_egress_policy as egress
+
+    runner = make_agent_runner(monkeypatch, tmp_path)
+    source = replace(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            user_id="12345",
+            thread_id="1751",
+            profile="main",
+            transport_profile="default",
+        ),
+        message_id="48330",
+    )
+    entry = SessionEntry(
+        session_key="agent:main:telegram:group:-1001:1751",
+        session_id="sess-terminal-delivery-failure",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    event = MessageEvent(text="", source=source, message_id="48330")
+    identity = {
+        "resume_task_id": "task-7",
+        "continuation_generation": 7,
+        "continuation_claim_owner": "gateway:new",
+        "continuation_claim_token": "claim-7",
+    }
+    mark_failed = MagicMock()
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(
+        ledger,
+        "record_obligation",
+        MagicMock(return_value=MagicMock(disposition="created", claim_token="")),
+    )
+    monkeypatch.setattr(ledger, "mark_attempting", MagicMock())
+    monkeypatch.setattr(ledger, "mark_failed", mark_failed)
+    monkeypatch.setattr(egress, "assert_recipient_allowed", lambda _peer: None)
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="telegram unavailable")
+    )
+    runner._adapter_for_delivery_replay = MagicMock(return_value=adapter)
+    runner._resolve_profile_home_for_source = MagicMock(return_value=tmp_path)
+    settle_resume = AsyncMock(return_value=True)
+    runner._settle_startup_resume_claim = settle_resume
+
+    assert not await runner._recover_terminal_checkpoint_delivery(
+        event,
+        entry,
+        identity,
+        {
+            "disposition": "terminal_checkpoint",
+            "terminal_response": "Persisted but not delivered",
+            "terminal_row_id": 118182,
+        },
+    )
+    adapter.send.assert_awaited_once()
+    assert mark_failed.call_args.args[1] == "telegram unavailable"
+    settle_resume.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2846,6 +3140,55 @@ async def test_startup_wrapper_settles_claim_after_handler_releases_slot(
         continuation_claim_token=entry.continuation_claim_token,
         reason=expected_reason,
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_wrapper_retains_exact_claim_for_terminal_delivery_retry():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="terminal-delivery-retry",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:terminal-delivery-retry",
+            session_id="sid-terminal-delivery-retry",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-terminal-delivery-retry",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+
+    async def _handler_left_failed_delivery(_event):
+        _event.metadata["startup_resume_claim_outcome"] = (
+            "retain_for_delivery_retry"
+        )
+        runner._release_running_agent_state(entry.session_key)
+
+    adapter.handle_message = _handler_left_failed_delivery
+    clear = AsyncMock(return_value=True)
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.clear_resume_pending_exact = clear
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    clear.assert_not_awaited()
+    abandon.assert_not_awaited()
+    assert entry.resume_pending is True
+    assert entry.resume_task_id == event.resume_task_id
+    assert entry.continuation_generation == event.continuation_generation
+    assert entry.session_key not in runner._running_agents
 
 
 @pytest.mark.asyncio

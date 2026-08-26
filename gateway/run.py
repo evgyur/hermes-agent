@@ -12985,12 +12985,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and _runner_agent is not _AGENT_PENDING_SENTINEL
                 )
             )
+            retain_claim_for_delivery_retry = bool(
+                event.metadata.get("startup_resume_claim_outcome")
+                == "retain_for_delivery_retry"
+            )
             if (
                 not child_in_flight
                 and (_pre_state.turn.agent if _pre_state else None)
                 is _AGENT_PENDING_SENTINEL
             ):
-                if _claim_owned:
+                if _claim_owned and not retain_claim_for_delivery_retry:
                     await self._settle_startup_resume_claim(
                         session_key,
                         {
@@ -13020,7 +13024,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # failure can all exit after ownership transfer but before the
             # normal success/refusal CAS.  If the exact routing projection is
             # still present, close it here at the wrapper boundary.
-            if _claim_owned and not _settlement_attempted and not child_in_flight:
+            if (
+                _claim_owned
+                and not _settlement_attempted
+                and not child_in_flight
+                and not retain_claim_for_delivery_retry
+            ):
                 try:
                     with self.session_store._lock:  # noqa: SLF001
                         self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -13381,14 +13390,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         uses: on timeout we return and let the sends finish in the
         background. Tasks are not cancelled.
 
-        The ledger claim + ``resume_pending`` clear happen INLINE here,
-        before the send task exists: they are pure DB work (no network,
-        bounded by claimed-row count), and deferring them into the send
-        task left a window where a hung restart notification ahead of the
-        redelivery step let the gate expire with zero rows claimed — the
-        resume scheduler then replayed turns whose answers were already in
-        the ledger, and the background task later redelivered them too
-        (duplicate delivery + re-paid turn).
+        The ledger claim + in-memory delivery fence happen INLINE here,
+        before the send task exists.  The durable ``resume_pending`` claim
+        remains intact until the answer is actually delivered and settled;
+        the in-memory fence prevents the resume scheduler from replaying the
+        model turn while a hung boot send continues in the background.
         """
         claimed = await self._claim_pending_obligations()
 
@@ -13432,17 +13438,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task, "background boot-path send failed after gate release: see traceback"
         )
 
+    @staticmethod
+    def _delivery_continuation_key(row) -> Optional[tuple]:
+        """Return the exact continuation identity protected by an outbox row."""
+        key = (
+            str(row.get("session_key") or ""),
+            str(row.get("resume_task_id") or ""),
+            int(row.get("continuation_generation") or 0),
+            str(row.get("continuation_claim_owner") or ""),
+            str(row.get("continuation_claim_token") or ""),
+        )
+        return key if all(key) else None
+
+    def _retain_startup_delivery_fence(self, row) -> Optional[tuple]:
+        key = self._delivery_continuation_key(row)
+        if key is None:
+            return None
+        fences = getattr(self, "_startup_delivery_pending_continuations", None)
+        if fences is None:
+            fences = set()
+            self._startup_delivery_pending_continuations = fences
+        fences.add(key)
+        return key
+
+    def _release_startup_delivery_fence(self, row) -> None:
+        key = self._delivery_continuation_key(row)
+        if key is not None:
+            getattr(
+                self, "_startup_delivery_pending_continuations", set()
+            ).discard(key)
+
     async def _claim_pending_obligations(self) -> list:
-        """Claim recoverable delivery-ledger rows and clear their
-        ``resume_pending`` flags. Pure DB work — no network sends.
+        """Claim recoverable delivery-ledger rows and fence their sessions.
+
+        Pure DB work — no network sends.
 
         Runs INLINE at startup BEFORE ``_schedule_resume_pending_sessions``
         and before the (bounded, abandonable) boot-send task exists. A
-        session with a recoverable obligation already produced its answer —
-        the turn completed and only delivery is owed — so clearing
-        ``resume_pending`` here prevents the resume path from re-running
-        (and re-paying for) a turn whose output we hold, regardless of how
-        long the sends ahead of redelivery take (#91969).
+        session with a recoverable obligation already produced its answer,
+        so the process-local fence prevents the resume path from re-running
+        (and re-paying for) that turn regardless of how long sends ahead of
+        redelivery take (#91969).  The durable claim is deliberately retained
+        until delivery succeeds, so a crash before send cannot lose the task.
 
         Crash-ambiguity contract (see gateway/delivery_ledger.py):
         rows that were mid-send or previously rejected carry a visible
@@ -13497,23 +13534,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_runner_config, "multiplex_profiles", False):
                             row["_ledger_profile"] = profile_name
                             row["_ledger_home"] = str(profile_home)
-                        session_key = row.get("session_key") or ""
-                        identity = {
-                            "resume_task_id": str(row.get("resume_task_id") or ""),
-                            "continuation_generation": int(
-                                row.get("continuation_generation") or 0
-                            ),
-                            "continuation_claim_owner": str(
-                                row.get("continuation_claim_owner") or ""
-                            ),
-                            "continuation_claim_token": str(
-                                row.get("continuation_claim_token") or ""
-                            ),
-                        }
-                        if session_key and all(identity.values()):
-                            await self.async_session_store.clear_resume_pending_exact(
-                                session_key, **identity
-                            )
+                        self._retain_startup_delivery_fence(row)
                     claimed_all.extend(scoped_rows)
             except Exception:
                 logger.debug(
@@ -13629,8 +13650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return adapter
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
-        """Redeliver final responses for rows already claimed (and
-        resume-cleared) by :meth:`_claim_pending_obligations`.
+        """Redeliver final responses for rows claimed and delivery-fenced by
+        :meth:`_claim_pending_obligations`.
 
         Network half of the split — runs inside the bounded boot-send task,
         so a flood-limited send can be abandoned by the restore gate without
@@ -13641,9 +13662,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
+                begin_redelivery_attempt,
                 mark_abandoned,
-                mark_delivered,
                 mark_failed,
+                settle_runtime_claim,
                 settle_with_retry,
             )
         except Exception:
@@ -13688,6 +13710,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             row["obligation_id"],
                             "ambiguous_route_envelope",
                         )
+                        self._release_startup_delivery_fence(row)
                     except Exception:
                         logger.debug(
                             "delivery ledger quarantine update failed",
@@ -13740,6 +13763,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from contextlib import nullcontext
                     scope = nullcontext()
                 with scope:
+                    attempt_started = await asyncio.to_thread(
+                        begin_redelivery_attempt,
+                        row["obligation_id"],
+                        str(row.get("runtime_claim_token") or ""),
+                    )
+                    if not attempt_started:
+                        continue
+                    row["attempts"] = int(row.get("attempts") or 0) + 1
                     try:
                         result = await adapter.send(
                             chat_id=row["chat_id"],
@@ -13753,8 +13784,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         result = None
                     if result is not None and getattr(result, "success", False):
-                        await settle_with_retry(mark_delivered, row["obligation_id"])
+                        settled = await settle_with_retry(
+                            settle_runtime_claim,
+                            row["obligation_id"],
+                            str(row.get("runtime_claim_token") or ""),
+                            delivered=True,
+                        )
                         redelivered += 1
+                        session_key = str(row.get("session_key") or "")
+                        identity = {
+                            "resume_task_id": str(
+                                row.get("resume_task_id") or ""
+                            ),
+                            "continuation_generation": int(
+                                row.get("continuation_generation") or 0
+                            ),
+                            "continuation_claim_owner": str(
+                                row.get("continuation_claim_owner") or ""
+                            ),
+                            "continuation_claim_token": str(
+                                row.get("continuation_claim_token") or ""
+                            ),
+                        }
+                        if (
+                            settled is not False
+                            and session_key
+                            and all(identity.values())
+                        ):
+                            await self.async_session_store.clear_resume_pending_exact(
+                                session_key, **identity
+                            )
+                            self._release_startup_delivery_fence(row)
                         logger.info(
                             "Redelivered recovered final response to %s:%s "
                             "(obligation %s, attempt %d)",
@@ -13763,9 +13823,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         await settle_with_retry(
-                            mark_failed,
+                            settle_runtime_claim,
                             row["obligation_id"],
-                            str(getattr(result, "error", "") or "send failed"),
+                            str(row.get("runtime_claim_token") or ""),
+                            delivered=False,
+                            error=str(
+                                getattr(result, "error", "") or "send failed"
+                            ),
                         )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
@@ -14132,13 +14196,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 isinstance(row, dict)
                 and row.get("role") == "assistant"
             ):
-                from gateway.visible_final import is_successful_final
+                from gateway.visible_final import successful_final_text
 
-                if is_successful_final(row):
+                terminal_response = successful_final_text(row)
+                if terminal_response is not None:
                     return {
                         "disposition": "terminal_checkpoint",
                         "safe_dangling_calls": safe_dangling,
                         "effect_fence": effect_fence,
+                        "terminal_response": terminal_response,
+                        "terminal_row_id": (
+                            row.get("id") if type(row.get("id")) is int else None
+                        ),
                     }
         return {
             "disposition": "continue",
@@ -14400,6 +14469,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
             route_valid_candidates.append((entry, source))
         candidates = route_valid_candidates
+
+        # A claimed outbox row is authoritative proof that the model turn
+        # already produced its answer and only delivery remains.  Keep the
+        # durable resume claim for crash recovery, but do not replay the model
+        # while boot redelivery owns the session in this process.
+        delivery_pending = getattr(
+            self, "_startup_delivery_pending_continuations", set()
+        )
+        candidates = [
+            (entry, source)
+            for entry, source in candidates
+            if (
+                str(entry.session_key),
+                str(getattr(entry, "resume_task_id", "") or ""),
+                int(getattr(entry, "continuation_generation", 0) or 0),
+                str(getattr(entry, "continuation_claim_owner", "") or ""),
+                str(getattr(entry, "continuation_claim_token", "") or ""),
+            )
+            not in delivery_pending
+        ]
 
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
@@ -15643,7 +15732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # visible for manual recovery on the next user message.
         #
         # Delivery-obligation redelivery already ran inside
-        # _await_startup_boot_sends (and clears resume_pending before send):
+        # _await_startup_boot_sends (and fences model replay until delivery):
         # a session whose final response was generated but never
         # confirmed-delivered has its answer in the ledger — redelivering it
         # is strictly cheaper and more correct than re-running the whole turn.
@@ -16795,6 +16884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.delivery_ledger import (
             RECOVERED_MARKER,
             abandon_runtime_claim,
+            begin_redelivery_attempt,
             settle_runtime_claim,
             settle_with_retry,
             sweep_failed_for_runtime,
@@ -16857,9 +16947,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         str(row["runtime_claim_token"]),
                         str(exc) or "ambiguous_route_envelope",
                     )
+                    self._release_startup_delivery_fence(row)
                     continue
             elif row.get("thread_id"):
                 metadata = {"thread_id": str(row["thread_id"])}
+            attempt_started = await asyncio.to_thread(
+                begin_redelivery_attempt,
+                str(row["obligation_id"]),
+                str(row["runtime_claim_token"]),
+            )
+            if not attempt_started:
+                continue
+            row["attempts"] = int(row.get("attempts") or 0) + 1
             try:
                 result = await target_adapter.send(
                     chat_id=send_chat_id,
@@ -16910,6 +17009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             str(row.get("session_key") or ""),
                             **continuation_identity,
                         )
+                self._release_startup_delivery_fence(row)
         return delivered_count
 
     async def _redeliver_failed_telegram_for_transport(
@@ -22312,6 +22412,193 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return bool(settled)
 
+    async def _recover_terminal_checkpoint_delivery(
+        self,
+        event: "MessageEvent",
+        session_entry: SessionEntry,
+        identity: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> bool:
+        """Deliver one persisted terminal checkpoint before settling resume.
+
+        A model final can reach the transcript while the gateway is draining,
+        then lose the race to the platform-delivery wrapper.  Transcript
+        completion is therefore not delivery proof.  Reconstruct one exact,
+        route-bound outbox row from the persisted final and settle the resume
+        claim only after that row is durably ``delivered``.
+        """
+        terminal_response = analysis.get("terminal_response")
+        if not isinstance(terminal_response, str):
+            logger.error(
+                "Cannot recover terminal checkpoint for %s: exact final text missing",
+                session_entry.session_key,
+            )
+            return False
+        if not terminal_response:
+            return await self._settle_startup_resume_claim(
+                session_entry.session_key,
+                identity,
+                disposition="terminal_checkpoint",
+                event=event,
+            )
+
+        source = getattr(event, "source", None)
+        if source is None or source.platform is None:
+            return False
+        sealed_message_id = str(getattr(event, "message_id", "") or "")
+        if not sealed_message_id:
+            return False
+        event_metadata = getattr(event, "metadata", None) or {}
+        event_metadata["startup_resume_claim_outcome"] = (
+            "retain_for_delivery_retry"
+        )
+        event.metadata = event_metadata
+
+        try:
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER,
+                compute_obligation_id,
+                ledger_enabled,
+                mark_attempting,
+                mark_delivered,
+                mark_failed,
+                record_obligation,
+                settle_runtime_claim,
+                settle_with_retry,
+            )
+            from gateway.session import build_route_envelope
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                if not await asyncio.to_thread(ledger_enabled):
+                    logger.error(
+                        "Cannot recover terminal checkpoint for %s: delivery ledger disabled",
+                        session_entry.session_key,
+                    )
+                    return False
+                obligation_id = compute_obligation_id(
+                    session_entry.session_key,
+                    sealed_message_id,
+                    terminal_response,
+                )
+                recorded = await asyncio.to_thread(
+                    record_obligation,
+                    obligation_id=obligation_id,
+                    session_key=session_entry.session_key,
+                    platform=str(getattr(source.platform, "value", source.platform)),
+                    chat_id=source.chat_id,
+                    thread_id=getattr(source, "thread_id", None),
+                    content=terminal_response,
+                    resume_task_id=str(identity["resume_task_id"]),
+                    continuation_generation=int(identity["continuation_generation"]),
+                    continuation_claim_owner=str(
+                        identity["continuation_claim_owner"]
+                    ),
+                    continuation_claim_token=str(
+                        identity["continuation_claim_token"]
+                    ),
+                    route_envelope=build_route_envelope(source),
+                )
+                disposition = str(getattr(recorded, "disposition", "") or "")
+                runtime_claim_token = str(
+                    getattr(recorded, "claim_token", "") or ""
+                )
+                if disposition == "delivered":
+                    return await self._settle_startup_resume_claim(
+                        session_entry.session_key,
+                        identity,
+                        disposition="terminal_checkpoint",
+                        event=event,
+                    )
+                if disposition not in {"created", "retry_claimed"}:
+                    logger.warning(
+                        "Terminal checkpoint delivery for %s is already owned (%s)",
+                        session_entry.session_key,
+                        disposition or "unknown",
+                    )
+                    return False
+                if disposition == "created":
+                    await asyncio.to_thread(mark_attempting, obligation_id)
+
+                if source.platform == Platform.TELEGRAM:
+                    from gateway.platforms.base import (
+                        _thread_metadata_for_source as _route_metadata_for_source,
+                    )
+                    from gateway.telegram_egress_policy import assert_recipient_allowed
+
+                    assert_recipient_allowed(source.chat_id)
+                    if (
+                        source.user_id is not None
+                        and str(source.user_id) != str(source.chat_id)
+                    ):
+                        assert_recipient_allowed(source.user_id)
+                    adapter = self._adapter_for_delivery_replay(source)
+                    metadata = _route_metadata_for_source(source)
+                else:
+                    adapter = (getattr(self, "adapters", {}) or {}).get(
+                        source.platform
+                    )
+                    metadata = (
+                        {"thread_id": str(source.thread_id)}
+                        if getattr(source, "thread_id", None)
+                        else None
+                    )
+                if adapter is None:
+                    await asyncio.to_thread(
+                        mark_failed, obligation_id, "delivery_route_unavailable"
+                    )
+                    return False
+
+                wire_content = (
+                    RECOVERED_MARKER + terminal_response
+                    if disposition == "retry_claimed"
+                    else terminal_response
+                )
+                result = await adapter.send(
+                    chat_id=source.chat_id,
+                    content=wire_content,
+                    metadata=metadata,
+                )
+                delivered = bool(result is not None and getattr(result, "success", False))
+                error = str(getattr(result, "error", "") or "send failed")
+                if runtime_claim_token:
+                    delivery_settled = await settle_with_retry(
+                        settle_runtime_claim,
+                        obligation_id,
+                        runtime_claim_token,
+                        delivered=delivered,
+                        error=error,
+                    )
+                elif delivered:
+                    delivery_settled = await settle_with_retry(
+                        mark_delivered, obligation_id
+                    )
+                else:
+                    await asyncio.to_thread(mark_failed, obligation_id, error)
+                    delivery_settled = True
+                if not delivered:
+                    return False
+                if delivery_settled is False:
+                    logger.error(
+                        "Terminal checkpoint wire send for %s succeeded but "
+                        "delivery receipt did not settle",
+                        session_entry.session_key,
+                    )
+                    return False
+        except Exception:
+            logger.exception(
+                "Terminal checkpoint delivery recovery failed for %s",
+                session_entry.session_key,
+            )
+            return False
+
+        return await self._settle_startup_resume_claim(
+            session_entry.session_key,
+            identity,
+            disposition="terminal_checkpoint",
+            event=event,
+        )
+
     async def _validate_and_seal_startup_resume(
         self,
         event: "MessageEvent",
@@ -22432,11 +22719,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         analysis = self._analyze_startup_resume_rows(history, **analysis_kwargs)
         disposition = str(analysis.get("disposition") or "unsafe_unknown")
         if disposition == "terminal_checkpoint":
-            await self._settle_startup_resume_claim(
-                session_entry.session_key,
+            await self._recover_terminal_checkpoint_delivery(
+                event,
+                session_entry,
                 expected_resume_identity,
-                disposition="terminal_checkpoint",
-                event=event,
+                analysis,
             )
             return False
         unknown_effects = analysis.get("unknown_effects")

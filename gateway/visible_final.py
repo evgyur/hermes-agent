@@ -103,6 +103,19 @@ def _visible_text(row: Mapping[str, Any]) -> tuple[str, _VISIBLE_FINAL_SOURCES]:
     return str(row.get("content") or ""), "content"
 
 
+def successful_final_text(row: Mapping[str, Any]) -> str | None:
+    """Return the exact persisted final text, or ``None`` if not terminal.
+
+    Unlike the bounded conversational-context extractor below, delivery
+    recovery must never truncate a response: this value is the durable wire
+    payload that was authorized by the completed turn.
+    """
+    if not is_successful_final(row):
+        return None
+    text, _source = _visible_text(row)
+    return text
+
+
 def extract_bounded_visible_final(
     rows: Sequence[Mapping[str, Any]],
     *,
