@@ -10532,8 +10532,6 @@ class TelegramAdapter(BasePlatformAdapter):
             user_name = str(
                 getattr(getattr(message, "from_user", None), "username", "") or ""
             )
-            if user_name.casefold() == "vladisfom":
-                return False
             try:
                 from gateway.telegram_egress_policy import assert_recipient_allowed
 
