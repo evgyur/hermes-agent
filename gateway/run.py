@@ -19988,6 +19988,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        _adopt_startup_preclaim = self._owns_exact_startup_resume_preclaim(
+            event,
+            _quick_key,
+        )
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
         if (
@@ -20256,7 +20260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
-        if self._is_session_running(_quick_key):
+        if self._is_session_running(_quick_key) and not _adopt_startup_preclaim:
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -21255,6 +21259,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        # The startup scheduler deliberately claimed this exact local slot
+        # before spawning the adapter task.  Replace that sentinel atomically
+        # at the final claim boundary; keeping it through all preprocessing
+        # awaits prevents a second inbound turn from entering meanwhile.
+        if _adopt_startup_preclaim:
+            _adopt_state = self._peek_session_state(_quick_key)
+            if (
+                _adopt_state is not None
+                and _adopt_state.turn.agent is _AGENT_PENDING_SENTINEL
+            ):
+                self._release_running_agent_state(_quick_key)
         _active_session_lease, _limit_message = self._claim_active_session_slot(
             _quick_key,
             source,
@@ -22945,6 +22960,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
             )
         return True
+
+    def _owns_exact_startup_resume_preclaim(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+    ) -> bool:
+        """Return whether this adapter task owns the scheduler's runner slot.
+
+        Startup scheduling claims the runner slot before it creates the
+        adapter task.  The adapter task must adopt that exact sentinel rather
+        than treat it as another turn and bounce itself through the pending
+        queue.  Require the process-local handoff task plus the complete sealed
+        route/claim tuple so ordinary internal events cannot take this path.
+        """
+        handoff = getattr(event, "_gateway_startup_dispatch_handoff", None)
+        authority = getattr(event, "_gateway_startup_resume_authority", None)
+        metadata = getattr(event, "metadata", None) or {}
+        state = self._peek_session_state(session_key)
+        if (
+            not bool(getattr(event, "startup_resume", False))
+            or not bool(getattr(event, "internal", False))
+            or not isinstance(handoff, StartupResumeDispatchHandoff)
+            or handoff.expected_session_key != session_key
+            or handoff.accepted_task is not asyncio.current_task()
+            or not isinstance(authority, dict)
+            or set(authority)
+            != {
+                "session_key",
+                "session_id",
+                "source",
+                "resume_task_id",
+                "continuation_generation",
+                "continuation_claim_owner",
+                "continuation_claim_token",
+            }
+            or authority.get("session_key") != session_key
+            or metadata.get("gateway_session_strict") is not True
+            or metadata.get("gateway_session_key") != session_key
+            or metadata.get("gateway_session_id") != authority.get("session_id")
+            or state is None
+            or state.turn.agent is not _AGENT_PENDING_SENTINEL
+        ):
+            return False
+        return bool(
+            authority.get("source") == canonical_resume_origin(event.source)
+            and authority.get("resume_task_id")
+            == str(getattr(event, "resume_task_id", "") or "")
+            and authority.get("continuation_generation")
+            == getattr(event, "continuation_generation", 0)
+            and authority.get("continuation_claim_owner")
+            == str(getattr(event, "continuation_claim_owner", "") or "")
+            and authority.get("continuation_claim_token")
+            == str(getattr(event, "continuation_claim_token", "") or "")
+        )
 
     @classmethod
     def _restore_startup_raw_semantic_envelope(

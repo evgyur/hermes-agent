@@ -3593,16 +3593,12 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
                 -> _handle_message                (real)
 
     The risk the pre-claim introduces is a *self-bounce*: the resume
-    turn's own ``_handle_message`` sees the sentinel it pre-claimed at
-    the early running-agent guard, queues the event into
-    ``_pending_messages`` and returns ``None`` without running the
-    agent.  The adapter's late-arrival drain (in
-    ``_process_message_background``'s ``finally``) re-dispatches the
-    queued event, and because the guard wrapper's ``finally`` releases
-    the pre-claim before the spawned drain task starts, the agent runs
-    exactly once.  This test locks that invariant in: the resume agent
-    must run once — never zero (regression) and never twice (the bug
-    the fix targets).
+    turn's own ``_handle_message`` can mistake the sentinel it pre-claimed
+    for another owner, queue itself, and let the startup wrapper quarantine
+    the durable claim before the late adapter drain starts the agent.  This
+    test locks in the required handoff: the exact adapter task adopts its own
+    pre-claim, starts the agent while the durable claim is live, and settles
+    that claim exactly once.
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(
@@ -3645,11 +3641,43 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._post_turn_goal_continuation = AsyncMock()
     runner.session_store.get_or_create_session.return_value = None
 
-    # Count how many times an actual agent run is started for this session.
+    # Count how many times an actual agent run is started for this session and
+    # preserve the durable-claim ordering.  The startup wrapper must not
+    # quarantine its own claim before a late adapter drain starts the agent.
     agent_runs: list[str] = []
+    settlements: list[str] = []
+    settlements_at_agent_start: list[tuple[str, ...]] = []
+
+    async def _record_settlement(
+        _session_key,
+        _identity,
+        *,
+        disposition,
+        event=None,
+    ):
+        settlements.append(disposition)
+        if event is not None:
+            event.metadata["startup_resume_settlement_disposition"] = disposition
+        pending_entry.resume_pending = False
+        return True
+
+    runner._settle_startup_resume_claim = _record_settlement
 
     async def _fake_run(event, source, _quick_key, run_generation):
+        settlements_at_agent_start.append(tuple(settlements))
         agent_runs.append(_quick_key)
+        event.metadata["startup_resume_agent_started"] = True
+        await runner._settle_startup_resume_claim(
+            _quick_key,
+            {
+                "resume_task_id": event.resume_task_id,
+                "continuation_generation": event.continuation_generation,
+                "continuation_claim_owner": event.continuation_claim_owner,
+                "continuation_claim_token": event.continuation_claim_token,
+            },
+            disposition="success",
+            event=event,
+        )
         return "RESUMED OK"
 
     runner._handle_message_with_agent = _fake_run
@@ -3678,6 +3706,8 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # Exactly one agent run for the resumed session — not zero (the
     # pre-claim did not swallow the resume) and not two (no duplicate).
     assert agent_runs == [session_key]
+    assert settlements_at_agent_start == [()]
+    assert settlements == ["success"]
     # No leaked sentinel and no orphaned queued event.
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})
