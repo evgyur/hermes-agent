@@ -138,6 +138,7 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 _GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY = "gateway_raw_semantic_v1"
 _GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES = 8 * 1024
+_GATEWAY_REPLY_SNIPPET_MAX_CHARS = 500
 _GATEWAY_RAW_MEDIA_REF_MAX_BYTES = 4 * 1024
 _GATEWAY_RAW_MEDIA_TYPE_MAX_BYTES = 256
 _GATEWAY_RAW_MEDIA_MAX_ITEMS = 16
@@ -21243,7 +21244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            reply_snippet = event.reply_to_text[:_GATEWAY_REPLY_SNIPPET_MAX_CHARS]
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
@@ -21723,6 +21724,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply = None
         raw_quote = getattr(event, "reply_to_text", None)
         quote = raw_quote.strip() if type(raw_quote) is str else ""
+        # Reply text is only a disambiguation snippet in the live prompt. Rich
+        # Telegram messages can contain much more plaintext than Telegram's
+        # legacy message limit, so seal the exact semantic prefix that the
+        # downstream prompt consumes instead of rejecting the whole turn.
+        quote = quote[:_GATEWAY_REPLY_SNIPPET_MAX_CHARS]
         if quote:
             message_id = cls._bounded_gateway_semantic_text(
                 getattr(event, "reply_to_message_id", None),
