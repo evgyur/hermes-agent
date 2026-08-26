@@ -2894,6 +2894,66 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert runner._startup_restore_in_progress is False
 
 
+@pytest.mark.asyncio
+async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human():
+    """The interrupted A update must not suppress its own synthetic resume."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_priority_session_keys = set()
+    runner._startup_resume_scheduled_session_keys = set()
+
+    source = make_restart_source(
+        chat_id="-1003971448755",
+        chat_type="group",
+        thread_id="26452",
+        message_id="48397",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="20260825_195529_1397bfb1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="shutdown_timeout",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="0e71afab8d1a4c81a0ce8ca1a0d54025",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = _ResumeObligationDB(entry)
+    runner._session_db.get_messages = lambda *_args, **_kwargs: [
+        {
+            "role": "user",
+            "content": "A5-CANARY-1787777773",
+            "platform_message_id": "48397",
+        }
+    ]
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    redelivery = MessageEvent(
+        text="A5-CANARY-1787777773",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="48397",
+    )
+    assert await runner._handle_message(redelivery) is None
+
+    assert entry.session_key not in runner._startup_restore_priority_session_keys
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    assert runner._run_startup_resume_event.await_count == 1
+
+    adapter.handle_message = AsyncMock()
+    assert await runner._drain_startup_restore_queue() == 1
+    adapter.handle_message.assert_not_awaited()
+    assert runner._startup_restore_queue == []
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

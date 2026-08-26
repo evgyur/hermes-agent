@@ -7913,6 +7913,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._platform_lock_takeover_on_start = False
         self._startup_restore_queue: List[MessageEvent] = []
         self._startup_restore_tasks: List[asyncio.Task] = []
+        self._startup_restore_priority_session_keys: set[str] = set()
+        self._startup_resume_scheduled_session_keys: set[str] = set()
         # LRU cache of live SessionSources keyed by session_key. Used by
         # fallback routing paths (shutdown notifications, synthetic
         # background-process events) when the persisted origin is missing
@@ -13180,6 +13182,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             session_key = self._session_key_for_source(source)
+            if (
+                getattr(event, "_hermes_exact_startup_resume_redelivery", False)
+                and session_key
+                in getattr(self, "_startup_resume_scheduled_session_keys", set())
+            ):
+                # The synthetic startup turn owns this exact immutable
+                # Telegram update.  Replaying the transport copy would create
+                # a second owner after the durable continuation has run.
+                drained += 1
+                continue
             priority_keys = getattr(
                 self, "_startup_restore_priority_session_keys", set()
             )
@@ -14746,6 +14758,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            scheduled_keys = getattr(
+                self, "_startup_resume_scheduled_session_keys", None
+            )
+            if scheduled_keys is None:
+                scheduled_keys = set()
+                self._startup_resume_scheduled_session_keys = scheduled_keys
+            scheduled_keys.add(entry.session_key)
             if getattr(self, "_startup_restore_in_progress", False):
                 tasks = getattr(self, "_startup_restore_tasks", None)
                 if tasks is None:
@@ -19721,13 +19740,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            session_key = self._session_key_for_source(source)
+            exact_resume_redelivery = False
+            if getattr(source, "platform", None) == Platform.TELEGRAM:
+                try:
+                    entry = self.session_store._entries.get(session_key)
+                    sealed_source = (
+                        resume_origin_from_snapshot(entry)
+                        if entry is not None
+                        else None
+                    )
+                    route_is_exact = bool(
+                        sealed_source is not None
+                        and canonical_resume_origin(sealed_source)
+                        == canonical_resume_origin(source)
+                    )
+                    if route_is_exact:
+                        source_message_id = str(sealed_source.message_id or "")
+                        rows = await self._startup_resume_raw_semantic_rows(
+                            entry.session_id,
+                            source_message_id,
+                        )
+                        exact_resume_redelivery = bool(
+                            len(rows or []) == 1
+                            and type(event.text) is str
+                            and rows[0].get("content") == event.text
+                        )
+                except Exception:
+                    exact_resume_redelivery = False
             priority_keys = getattr(
                 self, "_startup_restore_priority_session_keys", None
             )
             if priority_keys is None:
                 priority_keys = set()
                 self._startup_restore_priority_session_keys = priority_keys
-            priority_keys.add(self._session_key_for_source(source))
+            if exact_resume_redelivery:
+                setattr(event, "_hermes_exact_startup_resume_redelivery", True)
+            else:
+                priority_keys.add(session_key)
             self._queue_startup_restore_event(event)
             return None
 
