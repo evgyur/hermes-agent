@@ -2689,6 +2689,47 @@ async def test_cancelled_startup_wrapper_keeps_claim_while_shielded_child_runs()
 
 
 @pytest.mark.asyncio
+async def test_startup_wrapper_keeps_claim_for_runner_owned_multiplex_child():
+    """A profile adapter may transfer work without exposing its child task map."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="multiplex-runner-child",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:multiplex-runner-child",
+            session_id="sid-multiplex-runner-child",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-multiplex-runner-child",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+
+    async def _transfer_to_runner(_event):
+        runner._session_state(entry.session_key).turn.agent = object()
+
+    adapter.handle_message = _transfer_to_runner
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    abandon.assert_not_awaited()
+    assert runner._is_session_running(entry.session_key)
+
+
+@pytest.mark.asyncio
 async def test_wrapper_retries_success_settlement_without_changing_disposition():
     runner, adapter = make_restart_runner()
     source = make_restart_source(

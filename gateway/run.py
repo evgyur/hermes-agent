@@ -12969,7 +12969,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before _handle_message takes ownership, release that pre-claim;
             # otherwise the real run's normal cleanup owns the slot.
             _pre_state = self._peek_session_state(session_key)
-            child_in_flight = task is not None and not task.done()
+            _runner_agent = _pre_state.turn.agent if _pre_state else None
+            child_in_flight = bool(
+                (task is not None and not task.done())
+                or (
+                    _runner_agent is not None
+                    and _runner_agent is not _AGENT_PENDING_SENTINEL
+                )
+            )
             if (
                 not child_in_flight
                 and (_pre_state.turn.agent if _pre_state else None)
