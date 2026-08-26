@@ -21715,6 +21715,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError(f"{field} exceeds its durable semantic boundary")
         return normalized
 
+    @staticmethod
+    def _bounded_gateway_reply_quote(value: Any) -> str:
+        """Validate a prompt-ready reply prefix without changing its text."""
+        if type(value) is not str:
+            raise ValueError("reply quote must be an exact string")
+        if not value:
+            raise ValueError("reply quote must be non-empty")
+        if len(value) > _GATEWAY_REPLY_SNIPPET_MAX_CHARS:
+            raise ValueError("reply quote exceeds its durable semantic boundary")
+        if len(value.encode("utf-8")) > _GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES:
+            raise ValueError("reply quote exceeds its durable semantic boundary")
+        return value
+
     @classmethod
     def _gateway_raw_semantic_envelope(cls, event: "MessageEvent") -> Dict[str, Any]:
         """Build bounded reply/media provenance before any preprocessing."""
@@ -21723,7 +21736,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("message type must be a canonical MessageType")
         reply = None
         raw_quote = getattr(event, "reply_to_text", None)
-        quote = raw_quote.strip() if type(raw_quote) is str else ""
+        quote = raw_quote if type(raw_quote) is str else ""
         # Reply text is only a disambiguation snippet in the live prompt. Rich
         # Telegram messages can contain much more plaintext than Telegram's
         # legacy message limit, so seal the exact semantic prefix that the
@@ -21741,11 +21754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply = {
                 "message_id": message_id,
                 "is_own": is_own,
-                "quote": cls._bounded_gateway_semantic_text(
-                    quote,
-                    field="reply quote",
-                    max_bytes=_GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES,
-                ),
+                "quote": cls._bounded_gateway_reply_quote(quote),
             }
 
         raw_refs = getattr(event, "media_urls", None) or []
@@ -22077,11 +22086,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     field="reply message id",
                     max_bytes=512,
                 )
-                quote = cls._bounded_gateway_semantic_text(
-                    reply.get("quote"),
-                    field="reply quote",
-                    max_bytes=_GATEWAY_RAW_REPLY_QUOTE_MAX_BYTES,
-                )
+                quote = cls._bounded_gateway_reply_quote(reply.get("quote"))
             except ValueError:
                 return False
             if reply_id != reply.get("message_id") or quote != reply.get("quote"):
