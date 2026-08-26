@@ -79,6 +79,21 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+
+def _cap_compression_commit_watermark(agent, captured: int) -> int:
+    """Preserve a gateway-authority tail excluded from the summary snapshot."""
+    if type(captured) is not int or captured < 0:
+        raise ValueError("compression watermark must be a non-negative integer")
+    ceiling = getattr(agent, "_compression_commit_watermark_ceiling", None)
+    if type(ceiling) is not int or ceiling < 0:
+        return captured
+    return min(captured, ceiling)
+
+
+def _has_compression_commit_watermark_ceiling(agent) -> bool:
+    ceiling = getattr(agent, "_compression_commit_watermark_ceiling", None)
+    return type(ceiling) is int and ceiling >= 0
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -2261,6 +2276,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    bypass_ineffective_guard: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2280,6 +2296,10 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        bypass_ineffective_guard: If True, bypass only the durable
+            anti-thrash/ineffective breaker. Active provider-failure cooldowns
+            remain authoritative. Used by critical gateway hygiene when the
+            transcript has reached the model-window safety boundary.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -2370,14 +2390,47 @@ def compress_context(
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.
-    if not force:
-        _refresh_persisted_compression_guards(agent.context_compressor)
+    def _automatic_guard_blocks(*, include_cooldown: bool = True) -> bool:
+        """Evaluate the auto guard with a narrow critical-recovery escape.
+
+        Manual ``force`` retains its historical meaning and bypasses every
+        guard. Critical gateway hygiene is intentionally weaker: it may escape
+        an indefinite ``ineffective`` latch, but must not hammer a provider
+        while a transient-failure cooldown is active.
+        """
+        _refresh_persisted_compression_guards(
+            agent.context_compressor,
+            include_cooldown=include_cooldown,
+        )
         blocked = getattr(
             type(agent.context_compressor),
             "_automatic_compression_blocked",
             None,
         )
-        if callable(blocked) and blocked(agent.context_compressor):
+        if not callable(blocked) or not blocked(agent.context_compressor):
+            return False
+        if bypass_ineffective_guard:
+            reason_fn = getattr(
+                type(agent.context_compressor),
+                "_compression_block_reason",
+                None,
+            )
+            reason = (
+                reason_fn(agent.context_compressor)
+                if callable(reason_fn)
+                else None
+            )
+            if reason == "ineffective":
+                logger.warning(
+                    "critical compression recovery bypassing ineffective "
+                    "breaker for session=%s",
+                    agent.session_id or "none",
+                )
+                return False
+        return True
+
+    if not force:
+        if _automatic_guard_blocks():
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -2475,6 +2528,7 @@ def compress_context(
     # Watermark captured at compression start (#75316); None = fall back to
     # archive-everything (no concurrent-tail preservation this cycle).
     _commit_watermark: Optional[int] = None
+    _authority_watermark_failed = False
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -2589,17 +2643,35 @@ def compress_context(
                         _commit_watermark = _lock_db.get_active_message_watermark(
                             _lock_sid
                         )
-                    except Exception as _wm_err:
-                        # Watermark capture is safety-additive: without it the
-                        # commit falls back to archive-everything (historical
-                        # behavior), so failure here must not abort compression.
-                        logger.warning(
-                            "compression watermark capture failed for "
-                            "session=%s (%s) — concurrent appends this cycle "
-                            "will be archived with the snapshot",
-                            _lock_sid, _wm_err,
+                        _commit_watermark = _cap_compression_commit_watermark(
+                            agent,
+                            _commit_watermark,
                         )
-                        _commit_watermark = None
+                    except Exception as _wm_err:
+                        if _has_compression_commit_watermark_ceiling(agent):
+                            # A gateway authority ceiling means the excluded
+                            # tail contains the durable authorization for this
+                            # turn. Falling back to watermark=None would archive
+                            # that row without cloning it. Latch the failure and
+                            # unwind after the lock release hook is installed.
+                            _authority_watermark_failed = True
+                            logger.error(
+                                "compression authority watermark capture failed "
+                                "for session=%s (%s) — preserving transcript",
+                                _lock_sid,
+                                _wm_err,
+                            )
+                        else:
+                            # Historical non-gateway behavior: watermark safety
+                            # is additive when no authority ceiling is active.
+                            logger.warning(
+                                "compression watermark capture failed for "
+                                "session=%s (%s) — concurrent appends this cycle "
+                                "will be archived with the snapshot",
+                                _lock_sid,
+                                _wm_err,
+                            )
+                            _commit_watermark = None
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -2746,6 +2818,21 @@ def compress_context(
     # fence. If no durable lock was acquired there is no hook to publish.
     _finish_lock_setup()
 
+    if _authority_watermark_failed:
+        agent._last_compaction_in_place = False
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="authority_watermark_unavailable",
+        )
+        _release_lock()
+        return messages, _existing_sp
+
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
     # not by itself prove that this stale agent still owns a live parent.
@@ -2814,17 +2901,7 @@ def compress_context(
     # after acquiring the session lock so this final gate cannot act on the
     # stale snapshot loaded by bind_session_state().
     if not force:
-        compressor = agent.context_compressor
-        _refresh_persisted_compression_guards(
-            compressor,
-            include_cooldown=False,
-        )
-        blocked = getattr(
-            type(compressor),
-            "_automatic_compression_blocked",
-            None,
-        )
-        if callable(blocked) and blocked(compressor):
+        if _automatic_guard_blocks(include_cooldown=False):
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -3290,6 +3367,38 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        # Remove stale continuity state unconditionally. If every task was
+        # completed since the previous boundary, retaining the old snapshot
+        # would resurrect finished work even though there is nothing fresh to
+        # append. System rows are canonical standalone snapshots; legacy user
+        # snapshots were suffix-merged and must preserve preceding human text.
+        compressed = [
+            row
+            for row in compressed
+            if not (
+                isinstance(row, dict)
+                and row.get("role") == "system"
+                and _message_text(row).lstrip().startswith(
+                    TODO_INJECTION_HEADER
+                )
+            )
+        ]
+        _tail = (
+            compressed[-1]
+            if compressed and isinstance(compressed[-1], dict)
+            else None
+        )
+        if _tail is not None and _tail.get("role") == "user":
+            _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
+            if _stripped != _tail.get("content"):
+                if _message_text({"role": "user", "content": _stripped}).strip():
+                    _tail["content"] = _stripped
+                    _tail.pop("_todo_snapshot_synthetic", None)
+                else:
+                    compressed.pop()
+
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             # Retention parity (#84718): the snapshot below re-injects the
@@ -3302,23 +3411,6 @@ def compress_context(
             _reload_notice = _pruned_skill_reload_notice(compressed)
             if _reload_notice:
                 todo_snapshot = f"{todo_snapshot}\n\n{_reload_notice}"
-            # A previous upstream boundary may have merged its snapshot into
-            # the trailing user turn. Remove only that stale suffix before
-            # writing the fresh system-owned row, preserving any real human
-            # text that preceded it.
-            _tail = (
-                compressed[-1]
-                if compressed and isinstance(compressed[-1], dict)
-                else None
-            )
-            if _tail is not None and _tail.get("role") == "user":
-                _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
-                if _stripped != _tail.get("content"):
-                    if _message_text({"role": "user", "content": _stripped}).strip():
-                        _tail["content"] = _stripped
-                        _tail.pop("_todo_snapshot_synthetic", None)
-                    else:
-                        compressed.pop()
             # Continuity state is system-owned metadata. Never merge or append
             # it as user-role text: chat surfaces and downstream audit paths
             # can otherwise render or reason about it as though the operator
@@ -3507,6 +3599,20 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
+                    _turn_lease_holder = getattr(
+                        agent, "_active_session_turn_lease_holder", None
+                    )
+                    _turn_lease_kwargs = {}
+                    if _turn_lease_holder is not None:
+                        _turn_lease_kwargs = {
+                            "turn_lease_holder": _turn_lease_holder,
+                            "turn_lease_ttl_seconds": getattr(
+                                agent,
+                                "_active_session_turn_lease_ttl_seconds",
+                                300.0,
+                            )
+                            or 300.0,
+                        }
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
@@ -3515,6 +3621,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        **_turn_lease_kwargs,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are

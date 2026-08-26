@@ -45,7 +45,13 @@ async def test_latest_user_correction_supersedes_old_assistant_effect():
 @pytest.mark.asyncio
 async def test_status_candidate_is_fail_closed_and_fuzzy_token_is_plain_text():
     status = "I can see the gateway is healthy. Next maintenance is Tuesday."
-    prepared = await _prepare("Go", [{"role": "assistant", "content": status}])
+    prepared = await _prepare(
+        "Go",
+        [
+            {"role": "user", "content": "How is the gateway?"},
+            {"role": "assistant", "content": status, "finish_reason": "stop"},
+        ],
+    )
     assert status in prepared
     assert "clarifying" in prepared.lower()
 
@@ -76,7 +82,11 @@ async def test_nonsemantic_flood_does_not_evict_visible_approval_antecedent():
     latest = "Compare the candidate with upstream, then report the differences."
     prepared = await _prepare(
         "Go",
-        [{"role": "assistant", "content": latest}, *_nonsemantic_noise()],
+        [
+            {"role": "user", "content": "What is the next action?"},
+            {"role": "assistant", "content": latest, "finish_reason": "stop"},
+            *_nonsemantic_noise(),
+        ],
     )
     assert latest in prepared
     assert "Short approval" in prepared
@@ -102,3 +112,75 @@ async def test_approval_without_visible_antecedent_is_explicitly_fail_closed():
     prepared = await _prepare("Го", _nonsemantic_noise())
     assert "clarifying" in prepared.lower()
     assert "no effect" in prepared.lower()
+
+
+@pytest.mark.asyncio
+async def test_short_approval_uses_successful_visible_final_not_codex_commentary():
+    action = "Compare candidate A with upstream and report the delta."
+    prepared = await _prepare(
+        "continue",
+        [
+            {"role": "user", "content": "What should we do?"},
+            {"role": "assistant", "content": action, "finish_reason": "stop"},
+            {
+                "role": "assistant",
+                "content": "Internal progress commentary",
+                "finish_reason": "stop",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": "still working"}
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+    assert action in prepared
+    assert "Internal progress commentary" not in prepared
+    assert "ambiguous" not in prepared.lower()
+
+
+@pytest.mark.asyncio
+async def test_prodolzhai_is_not_a_short_approval_token():
+    prepared = await _prepare(
+        "продолжай",
+        [
+            {"role": "user", "content": "What should we do?"},
+            {
+                "role": "assistant",
+                "content": "Deploy candidate A.",
+                "finish_reason": "stop",
+            },
+        ],
+    )
+    assert prepared == "продолжай"
+
+
+@pytest.mark.asyncio
+async def test_visible_final_limit_keeps_the_newest_candidates():
+    history = [{"role": "user", "content": "Choose the next action."}]
+    for index in range(25):
+        history.append(
+            {
+                "role": "assistant",
+                "content": f"Candidate {index}",
+                "finish_reason": "stop",
+            }
+        )
+        history.append({"role": "user", "content": f"Follow-up {index}"})
+    history.append(
+        {
+            "role": "assistant",
+            "content": "Newest candidate",
+            "finish_reason": "stop",
+        }
+    )
+
+    prepared = await _prepare("Го", history)
+    assert "Newest candidate" in prepared
+    assert "Candidate 0" not in prepared

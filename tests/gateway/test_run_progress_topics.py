@@ -535,6 +535,56 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_telegram_business_route_suppresses_progress_even_when_platform_verbose(
+    monkeypatch, tmp_path
+):
+    """External Business contacts must never inherit owner-facing progress."""
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {"display": {"platforms": {"telegram": {"tool_progress": "verbose"}}}}
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="777",
+        user_id="42",
+        chat_type="dm",
+        business_connection_id="biz-external",
+        external_safe_mode=True,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-business-progress",
+        session_key="agent:main:telegram:business:biz-external:777:42",
+        event_message_id="991",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
 async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path):
     """Relay Discord channel-initiate: the thread doesn't exist at ingest, so
     the connector auto-threads on the reply anchor and stamps
@@ -875,7 +925,9 @@ class QueuedCommentaryAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1 and self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
@@ -896,7 +948,9 @@ class QueuedMediaAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             final_response = f"first response\nMEDIA:{type(self).media_path}"
@@ -921,7 +975,9 @@ class QueuedSilenceAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         return {
             "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
@@ -938,7 +994,9 @@ class QueuedFailedEmptyAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             return {

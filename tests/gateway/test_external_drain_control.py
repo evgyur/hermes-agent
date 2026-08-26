@@ -284,6 +284,27 @@ class TestDrainStateMachine:
 class TestDrainWatcher:
 
     @pytest.mark.asyncio
+    async def test_watcher_reconciles_active_work_without_drain_marker(self, home):
+        runner, _ = _drain_runner()
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        runner._persist_active_agents = MagicMock()
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await asyncio.sleep(0.04)
+        runner._running = False
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert runner._external_drain_active is False
+        assert runner._persist_active_agents.call_count >= 2
+
+    @pytest.mark.asyncio
     async def test_watcher_enters_then_exits_with_marker(self, home):
         runner, _ = _drain_runner()
         runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
@@ -325,4 +346,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-

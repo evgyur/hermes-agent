@@ -2035,24 +2035,33 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(
+                messages,
+                conversation_history,
+            )
+            if (
+                self._session_db is not None
+                and not getattr(self, "_persist_disabled", False)
+                and persisted is not True
+            ):
+                raise RuntimeError("session transcript persistence failed")
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2384,6 +2393,7 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    "platform_message_id": msg.get("platform_message_id"),
                     # Standalone reference handoffs are always hidden, even
                     # when the summarized transcript contained a user turn —
                     # otherwise they occupy the active user slot in
@@ -3498,6 +3508,7 @@ class AIAgent:
                 getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
                 if not preserve_redirect:
                     self._pending_redirect = None
+                    self._pending_redirect_receipts = []
         else:
             if preserve_redirect and not getattr(self, "_pending_redirect", None):
                 return False
@@ -3507,6 +3518,7 @@ class AIAgent:
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
+                self._pending_redirect_receipts = []
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
@@ -3535,9 +3547,16 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_receipts = []
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(
+        self,
+        text: str,
+        *,
+        receipt_id: str = "",
+        receipt_transition: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3558,6 +3577,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        receipt = (
+            (str(receipt_id), receipt_transition)
+            if receipt_id and callable(receipt_transition)
+            else None
+        )
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3565,15 +3589,29 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_steer_receipts = pending
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_steer_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_steer_receipts = pending
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(
+        self,
+        text: str,
+        *,
+        receipt_id: str = "",
+        receipt_transition: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """Redirect the active turn without converting it into a new task.
 
         During a normal Hermes model request this cancels only that request;
@@ -3590,6 +3628,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        receipt = (
+            (str(receipt_id), receipt_transition)
+            if receipt_id and callable(receipt_transition)
+            else None
+        )
 
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
@@ -3605,7 +3648,10 @@ class AIAgent:
                 elif self._interrupt_requested:
                     return False
                 try:
-                    return bool(_native_steer(cleaned))
+                    accepted = bool(_native_steer(cleaned))
+                    if accepted and receipt is not None:
+                        receipt[1](receipt[0], "REQUEST_FENCED")
+                    return accepted
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
@@ -3614,7 +3660,11 @@ class AIAgent:
         # existing steer drain puts it on the final tool result before the next
         # model decision, including delegate_task children.
         if getattr(self, "_executing_tools", False):
-            return self.steer(cleaned)
+            return self.steer(
+                cleaned,
+                receipt_id=receipt_id,
+                receipt_transition=receipt_transition,
+            )
 
         _model_active = getattr(self, "_model_request_active", None)
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
@@ -3631,6 +3681,10 @@ class AIAgent:
             )
             self._interrupt_requested = True
             self._interrupt_message = None
+            if receipt is not None:
+                pending = list(getattr(self, "_pending_redirect_receipts", []) or [])
+                pending.append(receipt)
+                self._pending_redirect_receipts = pending
         else:
             with _redirect_lock:
                 if _model_active is None or not _model_active.is_set():
@@ -3648,6 +3702,10 @@ class AIAgent:
                     self._pending_redirect = cleaned
                 self._interrupt_requested = True
                 self._interrupt_message = None
+                if receipt is not None:
+                    pending = list(getattr(self, "_pending_redirect_receipts", []) or [])
+                    pending.append(receipt)
+                    self._pending_redirect_receipts = pending
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
@@ -3679,10 +3737,20 @@ class AIAgent:
         if _redirect_lock is None:
             text = getattr(self, "_pending_redirect", None)
             self._pending_redirect = None
+            drained = list(getattr(self, "_pending_redirect_receipts", []) or [])
+            self._drained_steer_receipts = (
+                list(getattr(self, "_drained_steer_receipts", []) or []) + drained
+            )
+            self._pending_redirect_receipts = []
             return text
         with _redirect_lock:
             text = self._pending_redirect
             self._pending_redirect = None
+            drained = list(getattr(self, "_pending_redirect_receipts", []) or [])
+            self._drained_steer_receipts = (
+                list(getattr(self, "_drained_steer_receipts", []) or []) + drained
+            )
+            self._pending_redirect_receipts = []
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
@@ -3695,11 +3763,33 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_drained_steer_receipts", []) or []
+            ) + list(getattr(self, "_pending_steer_receipts", []) or [])
+            self._pending_steer_receipts = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            self._drained_steer_receipts = list(
+                getattr(self, "_drained_steer_receipts", []) or []
+            ) + list(getattr(self, "_pending_steer_receipts", []) or [])
+            self._pending_steer_receipts = []
         return text
+
+    def _mark_drained_steer_request_fenced(self) -> None:
+        receipts = list(getattr(self, "_drained_steer_receipts", []) or [])
+        self._fenced_steer_receipts = receipts
+        self._drained_steer_receipts = []
+        for receipt_id, transition in receipts:
+            transition(receipt_id, "REQUEST_FENCED")
+
+    def _mark_fenced_steer_provider_result(self, *, accepted: bool) -> None:
+        receipts = list(getattr(self, "_fenced_steer_receipts", []) or [])
+        self._fenced_steer_receipts = []
+        state = "CONSUMED_CURRENT" if accepted else "AMBIGUOUS_PROVIDER_REQUEST"
+        for receipt_id, transition in receipts:
+            transition(receipt_id, state)
 
     def _record_file_mutation_result(
         self,
@@ -8176,6 +8266,7 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
+        bypass_ineffective_guard: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8185,6 +8276,10 @@ class AIAgent:
         so users can bypass the summary-failure cooldown after an
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
+
+        ``bypass_ineffective_guard=True`` is narrower: critical gateway
+        hygiene may retry after the anti-thrash breaker trips, but it still
+        honors provider failure cooldowns and remains an automatic attempt.
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
@@ -8241,6 +8336,7 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
+                    bypass_ineffective_guard=bypass_ineffective_guard,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -8656,6 +8752,10 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
+        after_user_row_commit: Optional[callable] = None,
+        precommitted_authority: bool = False,
+        precommitted_user_row_id: Optional[int] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -8704,6 +8804,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        durable_turn_lease_owned_here = False
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8745,12 +8846,71 @@ class AIAgent:
                 with redirect_lock:
                     _clear_if_owned()
 
+        def _bind_context_compressor_turn_lease(
+            holder: Optional[str],
+            ttl_seconds: float = 300.0,
+        ) -> None:
+            engine = getattr(self, "context_compressor", None)
+            binder = getattr(engine, "bind_turn_lease", None)
+            if callable(binder):
+                binder(holder, ttl_seconds=ttl_seconds)
+
         try:
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
             # process; this durable lease covers Desktop, CLI resume, gateway,
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
+            _external_turn_lease = bool(
+                getattr(
+                    self,
+                    "_gateway_preacquired_session_turn_lease_external",
+                    False,
+                )
+            )
+            _external_holder = getattr(
+                self,
+                "_gateway_preacquired_session_turn_lease_holder",
+                None,
+            )
+            _external_session_id = getattr(
+                self,
+                "_gateway_preacquired_session_turn_lease_session_id",
+                None,
+            )
+            if _external_turn_lease:
+                if (
+                    _turn_db is None
+                    or not session_id
+                    or _external_session_id != session_id
+                    or not _external_holder
+                ):
+                    raise RuntimeError(
+                        "gateway pre-acquired session turn lease is invalid"
+                    )
+                _external_ttl = float(
+                    getattr(
+                        self,
+                        "_gateway_preacquired_session_turn_lease_ttl_seconds",
+                        300.0,
+                    )
+                    or 300.0
+                )
+                if not _turn_db.refresh_session_turn_lease(
+                    session_id,
+                    _external_holder,
+                    ttl_seconds=_external_ttl,
+                ):
+                    raise RuntimeError(
+                        "gateway pre-acquired session turn lease was lost"
+                    )
+                durable_turn_lease = _external_holder
+                self._active_session_turn_lease_holder = _external_holder
+                self._active_session_turn_lease_ttl_seconds = _external_ttl
+                _bind_context_compressor_turn_lease(
+                    _external_holder,
+                    _external_ttl,
+                )
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -8773,6 +8933,7 @@ class AIAgent:
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
+                and not _external_turn_lease
                 # A fresh session id is process-unique and has no durable
                 # transcript to race over. More importantly, subagent/new-turn
                 # callers may intentionally supply an in-memory seed before the
@@ -8885,8 +9046,13 @@ class AIAgent:
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
+                durable_turn_lease_owned_here = True
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
+                _bind_context_compressor_turn_lease(
+                    _durable_holder,
+                    _lease_ttl,
+                )
                 if _lease_waited:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
@@ -9030,6 +9196,10 @@ class AIAgent:
                         stream_callback,
                         persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
+                        persist_user_message_id=persist_user_message_id,
+                        after_user_row_commit=after_user_row_commit,
+                        precommitted_authority=precommitted_authority,
+                        precommitted_user_row_id=precommitted_user_row_id,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
@@ -9097,7 +9267,7 @@ class AIAgent:
                     # the inner stop and this join. Must run AFTER join so a
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
-                    if durable_turn_lease is not None:
+                    if durable_turn_lease is not None and durable_turn_lease_owned_here:
                         try:
                             _turn_db.release_session_turn_lease(
                                 session_id, durable_turn_lease
@@ -9108,12 +9278,14 @@ class AIAgent:
                                 session_id,
                                 exc_info=True,
                             )
-                        if (
-                            getattr(self, "_active_session_turn_lease_holder", None)
-                            == durable_turn_lease
-                        ):
-                            self._active_session_turn_lease_holder = None
-                            self._active_session_turn_lease_ttl_seconds = None
+                    if (
+                        durable_turn_lease is not None
+                        and getattr(self, "_active_session_turn_lease_holder", None)
+                        == durable_turn_lease
+                    ):
+                        self._active_session_turn_lease_holder = None
+                        self._active_session_turn_lease_ttl_seconds = None
+                        _bind_context_compressor_turn_lease(None)
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

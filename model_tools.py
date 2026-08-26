@@ -1236,6 +1236,19 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    if enabled_tools is not None and function_name not in set(enabled_tools):
+        deferred_authority = None
+        try:
+            from tools.tool_search import get_active_scoped_deferred_tool_authority
+
+            deferred_authority = get_active_scoped_deferred_tool_authority()
+        except Exception:
+            pass
+        if deferred_authority != function_name:
+            return tool_error(
+                f"'{function_name}' is not available in this session's effective tool allowlist."
+            )
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
@@ -1328,23 +1341,24 @@ def handle_function_call(
                 return _return_bridge_result(_probe_err)
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
-            return handle_function_call(
-                function_name=underlying_name,
-                function_args=underlying_args,
-                task_id=task_id,
-                tool_call_id=tool_call_id,
-                session_id=session_id,
-                turn_id=turn_id,
-                api_request_id=api_request_id,
-                user_task=user_task,
-                enabled_tools=enabled_tools,
-                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
-                skip_tool_request_middleware=skip_tool_request_middleware,
-                skip_tool_execution_middleware=skip_tool_execution_middleware,
-                tool_request_middleware_trace=list(_tool_middleware_trace),
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-            )
+            with _ts_mod._bind_scoped_deferred_tool_authority(underlying_name):
+                return handle_function_call(
+                    function_name=underlying_name,
+                    function_args=underlying_args,
+                    task_id=task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
+                    enabled_tools=enabled_tools,
+                    skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                    skip_tool_request_middleware=skip_tool_request_middleware,
+                    skip_tool_execution_middleware=skip_tool_execution_middleware,
+                    tool_request_middleware_trace=list(_tool_middleware_trace),
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:

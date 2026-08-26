@@ -41,6 +41,19 @@ def _put_result(task_id, result):
     conn.close()
 
 
+def test_finalization_policy_delivers_when_storage_is_uninitialized(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    assert barrier.finalization_policy(
+        parent_session_id="ordinary-session",
+        root_turn_id="ordinary-turn",
+    ) == {"action": "deliver"}
+    assert not path.exists()
+
+
 def _accept(claim):
     assert barrier.accept_continuation(
         claim["barrier_id"],
@@ -841,3 +854,22 @@ def test_retention_prune_cascades_terminal_children(monkeypatch, tmp_path):
     ).fetchone()[0]
     conn.close()
     assert count == 0
+
+
+def test_finalization_policy_fails_closed_when_existing_storage_cannot_open(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    path.touch()
+    monkeypatch.setattr(barrier, "_db_path", lambda: path)
+
+    def cannot_open(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(barrier.sqlite3, "connect", cannot_open)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        barrier.finalization_policy(
+            parent_session_id="parent-with-durable-state",
+            root_turn_id="turn-with-required-child",
+        )

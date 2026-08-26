@@ -388,6 +388,110 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
 
 
+def _authority_fault_agent():
+    """Gateway-shaped agent plus spies for every forbidden downstream class."""
+
+    agent = _FakeAgent()
+    agent._cached_system_prompt = None
+    agent._session_db = MagicMock()
+    agent._session_db_created = False
+    agent._persist_disabled = False
+    agent._memory_store = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._compress_context = MagicMock()
+    agent._api_call = MagicMock()
+    agent._execute_tool = MagicMock()
+    return agent
+
+
+def _assert_authority_fault_stopped_downstream(
+    agent, *, restore_prompt, lifecycle_hook
+):
+    restore_prompt.assert_not_called()
+    lifecycle_hook.assert_not_called()
+    agent._memory_store.reset_consolidation_failures.assert_not_called()
+    agent._memory_manager.on_turn_start.assert_not_called()
+    agent._memory_manager.prefetch_all.assert_not_called()
+    agent._compress_context.assert_not_called()
+    agent._api_call.assert_not_called()
+    agent._execute_tool.assert_not_called()
+
+
+def test_authority_barrier_session_creation_failure_stops_all_turn_work():
+    agent = _authority_fault_agent()
+    agent._ensure_db_session = MagicMock()  # Mirrors AIAgent's swallowed failure.
+    agent._persist_session = MagicMock()
+    marker = MagicMock(return_value=True)
+    restore_prompt = MagicMock()
+
+    with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook:
+        with pytest.raises(RuntimeError, match="session row creation failed"):
+            _build(
+                agent,
+                persist_user_message_id="telegram:42",
+                after_user_row_commit=marker,
+                restore_or_build_system_prompt=restore_prompt,
+            )
+
+    agent._persist_session.assert_not_called()
+    marker.assert_not_called()
+    _assert_authority_fault_stopped_downstream(
+        agent, restore_prompt=restore_prompt, lifecycle_hook=lifecycle_hook
+    )
+
+
+def test_authority_barrier_user_row_failure_stops_all_turn_work():
+    agent = _authority_fault_agent()
+    agent._session_db_created = True
+    agent._ensure_db_session = MagicMock()
+    agent._persist_session = MagicMock(side_effect=OSError("disk full"))
+    marker = MagicMock(return_value=True)
+    restore_prompt = MagicMock()
+
+    with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook:
+        with pytest.raises(OSError, match="disk full"):
+            _build(
+                agent,
+                persist_user_message_id="telegram:43",
+                after_user_row_commit=marker,
+                restore_or_build_system_prompt=restore_prompt,
+            )
+
+    marker.assert_not_called()
+    _assert_authority_fault_stopped_downstream(
+        agent, restore_prompt=restore_prompt, lifecycle_hook=lifecycle_hook
+    )
+
+
+def test_authority_barrier_marker_failure_stops_all_turn_work():
+    agent = _authority_fault_agent()
+    agent._session_db_created = True
+    agent._ensure_db_session = MagicMock()
+
+    def _persist(messages, _history=None):
+        assert messages[-1]["platform_message_id"] == "telegram:44"
+        messages[-1]["_db_persisted"] = True
+        return True
+
+    agent._persist_session = MagicMock(side_effect=_persist)
+    marker = MagicMock(return_value=False)
+    restore_prompt = MagicMock()
+
+    with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook:
+        with pytest.raises(RuntimeError, match="active-turn marker commit failed"):
+            _build(
+                agent,
+                persist_user_message_id="telegram:44",
+                after_user_row_commit=marker,
+                restore_or_build_system_prompt=restore_prompt,
+            )
+
+    marker.assert_called_once_with()
+    _assert_authority_fault_stopped_downstream(
+        agent, restore_prompt=restore_prompt, lifecycle_hook=lifecycle_hook
+    )
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot

@@ -18,7 +18,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionCompressionInProgressError, SessionDB
+from hermes_state import (
+    SessionCompressionInProgressError,
+    SessionDB,
+    SessionTurnLeaseLostError,
+)
 
 
 @pytest.fixture
@@ -38,6 +42,45 @@ SUMMARY = [
     {"role": "user", "content": "[CONTEXT COMPACTION] summary of turns 0-5"},
     {"role": "assistant", "content": "Continuing from the summary."},
 ]
+
+
+def test_archive_and_compact_rejects_stale_turn_holder_without_changing_successor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    stale = SessionDB(path)
+    successor = SessionDB(path)
+    session_id = "turn-holder-fence"
+    holder_h = "pid=1:holder-H"
+    holder_h2 = "pid=2:holder-H2"
+    stale.create_session(session_id, source="telegram")
+    stale.append_message(session_id, role="user", content="original")
+    assert stale.try_acquire_session_turn_lease(session_id, holder_h, ttl_seconds=5)
+    stale.release_session_turn_lease(session_id, holder_h)
+    assert successor.try_acquire_session_turn_lease(
+        session_id,
+        holder_h2,
+        ttl_seconds=5,
+    )
+    successor.append_message(
+        session_id,
+        role="assistant",
+        content="H2 sentinel tail",
+        turn_lease_holder=holder_h2,
+    )
+    before = successor.get_messages_as_conversation(session_id)
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        stale.archive_and_compact(
+            session_id,
+            SUMMARY,
+            turn_lease_holder=holder_h,
+        )
+
+    assert successor.get_messages_as_conversation(session_id) == before
+    successor.release_session_turn_lease(session_id, holder_h2)
+    stale.close()
+    successor.close()
 
 
 class TestWatermarkCommit:

@@ -141,6 +141,41 @@ class TestTranscribeCallSitesReadDotenv:
         assert result["success"] is True
         assert seen_keys == ["groq-dotenv-key"]
 
+    def test_transcribe_groq_honours_configured_openai_compatible_base_url(self):
+        from tools import transcription_tools as tt
+
+        captured: dict = {}
+
+        class FakeOpenAIClient:
+            def __init__(self, *, api_key=None, base_url=None, timeout=None, max_retries=None):
+                captured["api_key"] = api_key
+                captured["base_url"] = base_url
+                self.audio = MagicMock()
+                self.audio.transcriptions.create.return_value = "hello"
+            def close(self):
+                pass
+
+        fake_openai_module = MagicMock()
+        fake_openai_module.OpenAI = FakeOpenAIClient
+        fake_openai_module.APIError = Exception
+        fake_openai_module.APIConnectionError = Exception
+        fake_openai_module.APITimeoutError = Exception
+
+        with patch.object(tt, "_resolve_provider_key", return_value="h20-consumer-key"), \
+             patch.object(tt, "_load_stt_config", return_value={
+                 "groq": {"base_url": "http://127.0.0.1:18750/proxy/groq/openai/v1/"}
+             }), \
+             patch.object(tt, "_HAS_OPENAI", True), \
+             patch.dict("sys.modules", {"openai": fake_openai_module}), \
+             patch("builtins.open", MagicMock()):
+            result = tt._transcribe_groq("/tmp/fake.mp3", "whisper-large-v3-turbo")
+
+        assert result["success"] is True
+        assert captured == {
+            "api_key": "h20-consumer-key",
+            "base_url": "http://127.0.0.1:18750/proxy/groq/openai/v1",
+        }
+
 
     def test_transcribe_xai_forwards_dotenv_key(self):
         """An explicit XAI_API_KEY must win over Grok subscription OAuth for STT."""

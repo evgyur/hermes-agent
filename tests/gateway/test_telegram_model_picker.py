@@ -17,6 +17,32 @@ def _make_adapter():
 
 class TestTelegramModelPicker:
     @pytest.mark.asyncio
+    async def test_model_picker_callback_rejects_unauthorized_caller_before_state_lookup(self):
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized = MagicMock(return_value=False)
+        adapter._handle_model_picker_callback = AsyncMock()
+        query = SimpleNamespace(
+            data="mb",
+            message=SimpleNamespace(
+                chat_id=12345,
+                chat=SimpleNamespace(type="private"),
+                message_thread_id=None,
+                business_connection_id=None,
+            ),
+            from_user=SimpleNamespace(id=999, first_name="Mallory"),
+            answer=AsyncMock(),
+        )
+
+        await adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+
+        adapter._is_callback_user_authorized.assert_called_once()
+        adapter._handle_model_picker_callback.assert_not_awaited()
+        query.answer.assert_awaited_once()
+        assert "not authorized" in query.answer.await_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
         sent = {}

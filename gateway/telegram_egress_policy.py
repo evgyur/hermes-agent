@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -19,11 +18,6 @@ from hermes_constants import get_hermes_home
 
 class TelegramEgressDenied(RuntimeError):
     """Raised before a Telegram API call when a recipient/route is unsafe."""
-
-
-# Owner-requested, compiled fail-safe.  The external registry may add peers,
-# but removing or corrupting it can never re-enable this recipient.
-_BUILTIN_DENIED_RECIPIENTS = frozenset({"268754981", "@vladisfom"})
 
 
 def _deny_registry_path() -> Path:
@@ -45,17 +39,17 @@ def _normalise_recipient(value: Any) -> str:
     return "@" + text.lstrip("@").casefold()
 
 
-@lru_cache(maxsize=1)
 def denied_recipients() -> frozenset[str]:
-    """Return the union of the durable registry and emergency env fence.
+    """Return the current operator registry plus the emergency env fence.
 
     A malformed existing registry fails closed: allowing egress after an
     operator-created safety file becomes unreadable would silently remove the
-    very control it is meant to provide.  A missing file is permitted for
-    normal installations; the production pre-start guard pins its presence.
+    very control it is meant to provide.  Required registries also fail closed
+    when missing.  The file is read on every decision so an operator edit takes
+    effect without a process restart or a best-effort watcher.
     """
 
-    denied: set[str] = set(_BUILTIN_DENIED_RECIPIENTS)
+    denied: set[str] = set()
     denied.update({
         _normalise_recipient(value)
         for value in os.getenv("HERMES_TELEGRAM_EGRESS_DENY_IDS", "").split(",")
@@ -65,21 +59,56 @@ def denied_recipients() -> frozenset[str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
+        if os.getenv("HERMES_TELEGRAM_EGRESS_DENY_REQUIRED", "").strip() == "1":
+            raise TelegramEgressDenied(
+                "telegram_egress_deny_registry_missing"
+            )
         return frozenset(denied)
     except (OSError, ValueError, TypeError) as exc:
         raise TelegramEgressDenied("telegram_egress_deny_registry_unreadable") from exc
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    required_keys = {"version", "blocked_user_ids", "blocked_usernames"}
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != required_keys
+        or type(payload.get("version")) is not int
+        or payload.get("version") != 1
+    ):
         raise TelegramEgressDenied("telegram_egress_deny_registry_invalid")
-    for key in ("blocked_user_ids", "blocked_usernames"):
-        values = payload.get(key, [])
-        if not isinstance(values, list):
-            raise TelegramEgressDenied("telegram_egress_deny_registry_invalid")
-        denied.update(
-            _normalise_recipient(value)
-            for value in values
-            if _normalise_recipient(value)
+    blocked_ids = payload["blocked_user_ids"]
+    blocked_usernames = payload["blocked_usernames"]
+    if not isinstance(blocked_ids, list) or not isinstance(blocked_usernames, list):
+        raise TelegramEgressDenied("telegram_egress_deny_registry_invalid")
+    if any(
+        (type(value) is not int and not isinstance(value, str))
+        or (
+            isinstance(value, str)
+            and (not value.strip() or value != value.strip())
         )
+        for value in blocked_ids
+    ):
+        raise TelegramEgressDenied("telegram_egress_deny_registry_invalid")
+    if any(
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        for value in blocked_usernames
+    ):
+        raise TelegramEgressDenied("telegram_egress_deny_registry_invalid")
+    denied.update(_normalise_recipient(value) for value in blocked_ids)
+    denied.update(
+        _normalise_recipient("@" + value.lstrip("@"))
+        for value in blocked_usernames
+    )
     return frozenset(denied)
+
+
+def _clear_denied_recipients_cache() -> None:
+    """Compatibility hook for callers that previously cleared an LRU cache."""
+
+
+# Function attributes keep the public test/operator surface compatible while
+# deliberately avoiding a process-lifetime policy cache.
+denied_recipients.cache_clear = _clear_denied_recipients_cache  # type: ignore[attr-defined]
 
 
 def assert_recipient_allowed(chat_id: Any, *, username: Optional[str] = None) -> None:
@@ -128,39 +157,78 @@ def assert_route_allowed(
         ):
             raise TelegramEgressDenied("unsafe_telegram_business_route")
         return
-    # Ordinary bot-DM policy remains the connector's existing authorization
-    # responsibility. The shared choke point only adds the absolute recipient
-    # deny and prevents Business metadata from degrading into that route.
+    if plain_dm_allowlist is not None:
+        allowed = {
+            _normalise_recipient(value)
+            for value in plain_dm_allowlist
+            if _normalise_recipient(value)
+        }
+        if _normalise_recipient(chat_id) not in allowed:
+            raise TelegramEgressDenied("unsafe_plain_telegram_dm")
     return
 
 
 def canonical_route_envelope(route: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize the durable Telegram route envelope."""
 
-    if not isinstance(route, Mapping) or route.get("version") != 1:
+    required = {
+        "version",
+        "platform",
+        "runtime_profile",
+        "transport_profile",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "business_connection_id",
+        "external_safe_mode",
+    }
+    if (
+        not isinstance(route, Mapping)
+        or set(route) != required
+        or type(route.get("version")) is not int
+        or route.get("version") != 1
+        or type(route.get("external_safe_mode")) is not bool
+    ):
         raise ValueError("invalid_route_envelope")
-    platform = str(route.get("platform") or "")
-    chat_id = str(route.get("chat_id") or "")
-    if platform != "telegram" or not chat_id:
+    platform = route.get("platform")
+    chat_id = route.get("chat_id")
+    runtime_profile = route.get("runtime_profile")
+    transport_profile = route.get("transport_profile")
+    if (
+        platform != "telegram"
+        or not isinstance(chat_id, str)
+        or not chat_id
+        or chat_id != chat_id.strip()
+        or not isinstance(runtime_profile, str)
+        or not runtime_profile
+        or runtime_profile != runtime_profile.strip()
+        or not isinstance(transport_profile, str)
+        or not transport_profile
+        or transport_profile != transport_profile.strip()
+    ):
+        raise ValueError("invalid_route_envelope")
+    optional_text = ("thread_id", "user_id", "business_connection_id")
+    if any(
+        value is not None
+        and (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        )
+        for key in optional_text
+        if (value := route.get(key)) is not None
+    ):
         raise ValueError("invalid_route_envelope")
     result = {
         "version": 1,
         "platform": platform,
-        "runtime_profile": str(
-            route.get("runtime_profile") or route.get("profile") or "default"
-        ),
-        "transport_profile": str(route.get("transport_profile") or "default"),
+        "runtime_profile": runtime_profile,
+        "transport_profile": transport_profile,
         "chat_id": chat_id,
-        "thread_id": (
-            str(route["thread_id"]) if route.get("thread_id") is not None else None
-        ),
-        "user_id": str(route["user_id"]) if route.get("user_id") else None,
-        "business_connection_id": (
-            str(route["business_connection_id"])
-            if route.get("business_connection_id")
-            else None
-        ),
-        "external_safe_mode": bool(route.get("external_safe_mode", False)),
+        "thread_id": route.get("thread_id"),
+        "user_id": route.get("user_id"),
+        "business_connection_id": route.get("business_connection_id"),
+        "external_safe_mode": route["external_safe_mode"],
     }
     if result["external_safe_mode"] and not result["business_connection_id"]:
         raise ValueError("ambiguous_route_envelope")

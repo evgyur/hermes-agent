@@ -24,6 +24,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from hermes_state import GatewayUserAuthorityWrite
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,76 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hygiene_from_durable_authority(monkeypatch):
+    """Give legacy hygiene fixtures a committed outer authority boundary.
+
+    This module intentionally constructs partial runners, often without a
+    SessionDB, to exercise compression only. Durable-authority failures and
+    ordering are covered by test_outer_durable_authority_barrier.py.
+    """
+    from gateway.run import GatewayRunner
+
+    async def _mark(*_args, **_kwargs):
+        return True
+
+    async def _acquire(self, event, _source, entry, *, run_generation):
+        authority = {
+            "db": MagicMock(),
+            "session_id": entry.session_id,
+            "holder": f"hygiene-test-{run_generation}",
+            "ttl_seconds": 300.0,
+            "lost": False,
+            "released": False,
+            "agent": None,
+            "refresh_task": None,
+        }
+        event._gateway_durable_turn_authority = authority
+        return authority
+
+    async def _persist(*_args, **_kwargs):
+        return GatewayUserAuthorityWrite(row_id=4242, inserted=True)
+
+    async def _enrich(_self, _entry, _authority, row_id, **_kwargs):
+        return row_id
+
+    async def _validate(*_args, **_kwargs):
+        return True
+
+    async def _release(_self, event):
+        authority = getattr(event, "_gateway_durable_turn_authority", None)
+        if isinstance(authority, dict):
+            authority["released"] = True
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_mark_durable_active_turn", _mark)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_acquire_gateway_durable_turn_authority",
+        _acquire,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_persist_gateway_triggering_user_row",
+        _persist,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_enrich_gateway_triggering_user_row",
+        _enrich,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_validate_and_seal_startup_resume",
+        _validate,
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_release_gateway_durable_turn_authority",
+        _release,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +509,12 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "test-model",
+            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
+        )
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -451,8 +528,8 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
 
@@ -658,6 +735,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    compressor_bind_order = []
     async_session_db = SimpleNamespace(
         _db=fake_db,
         get_session=AsyncMock(
@@ -679,7 +757,16 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             self.compression_in_place = False
             self._last_compaction_in_place = False
             self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
+                bind_session_state=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "session"
+                    )
+                ),
+                bind_turn_lease=MagicMock(
+                    side_effect=lambda *_args, **_kwargs: compressor_bind_order.append(
+                        "lease"
+                    )
+                ),
                 _last_compress_aborted=False,
                 _last_aux_model_failure_model=None,
             )
@@ -693,8 +780,17 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             assert self._session_db is fake_db
             assert self.platform == "gateway_hygiene"
             assert self._cached_system_prompt == stored_system_prompt
+            # At >=95% of the model context, hygiene must bypass a stale
+            # anti-thrash/fallback breaker. Otherwise a persisted fallback
+            # streak can strand the session until the next API request exceeds
+            # the model window (regression: 398,608-token Telegram context).
+            assert _kwargs.get("force") is not True
+            assert _kwargs.get("bypass_ineffective_guard") is True
             self._last_compaction_in_place = True
-            return ([{"role": "assistant", "content": "compressed in place"}], None)
+            # Persisted compaction happened, but the remaining payload is still
+            # above the 95% safety boundary; gateway must apply its bounded
+            # retry cooldown instead of compressing again on the next turn.
+            return ([{"role": "assistant", "content": "x" * 500}], None)
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
@@ -730,6 +826,15 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._session_db = async_session_db
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    # Force the real hygiene branch to be eligible. The old regression only
+    # patched a legacy global resolver, so it could pass without ever invoking
+    # the helper agent (and therefore never exercised its ``force`` assertion).
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "test-model",
+            {"api_key": "fake", "provider": "openai", "base_url": "https://example.invalid"},
+        )
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -745,8 +850,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
     )
 
     event = MessageEvent(
@@ -779,6 +884,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert agent is not None
     async_session_db.get_session.assert_awaited_once_with("sess-1")
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
+    assert compressor_bind_order == ["session", "lease"]
+    assert agent._last_compaction_in_place is True
+    assert fake_db.record_compression_failure_cooldown.called
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.

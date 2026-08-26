@@ -871,15 +871,201 @@ async def test_legacy_send_records_visible_text_for_business_reply_recovery(
     assert result.success is True
     assert rich_sent_store.lookup_scoped(
         platform="telegram",
+        runtime_profile="default",
         transport_profile="default",
         business_connection_id="biz-1",
         chat_id="12345",
+        thread_id=None,
         message_id="679",
     ) == "Legacy answer: CI is green."
     assert rich_sent_store.lookup_scoped(
         platform="telegram",
+        runtime_profile="default",
         transport_profile="other-profile",
         business_connection_id="biz-1",
         chat_id="12345",
+        thread_id=None,
         message_id="679",
     ) is None
+
+
+def test_business_reply_recovery_requires_exact_transport_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway import rich_sent_store
+    from gateway.platforms.base import MessageType
+
+    rich_sent_store.record(
+        "12345",
+        "680",
+        "text from another transport",
+        business_connection_id="biz-1",
+        platform="telegram",
+        transport_profile="other-profile",
+    )
+    adapter = _make_adapter()
+    adapter._owner_profile = "default"
+    message = _reply_message("680")
+    message.business_connection_id = "biz-1"
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.reply_to_message_id == "680"
+    assert event.reply_to_text is None
+
+
+def test_concurrent_scoped_records_do_not_lose_route(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway import rich_sent_store
+
+    def write(index: int) -> bool:
+        return rich_sent_store.record_scoped(
+            platform="telegram",
+            runtime_profile=f"runtime-{index % 3}",
+            transport_profile=f"profile-{index % 4}",
+            business_connection_id=f"biz-{index}",
+            chat_id=f"chat-{index}",
+            thread_id=f"thread-{index % 5}",
+            message_id=f"msg-{index}",
+            text=f"text-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        assert all(pool.map(write, range(80)))
+
+    for index in range(80):
+        assert rich_sent_store.lookup_scoped(
+            platform="telegram",
+            runtime_profile=f"runtime-{index % 3}",
+            transport_profile=f"profile-{index % 4}",
+            business_connection_id=f"biz-{index}",
+            chat_id=f"chat-{index}",
+            thread_id=f"thread-{index % 5}",
+            message_id=f"msg-{index}",
+        ) == f"text-{index}"
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("platform", "other-platform"),
+        ("runtime_profile", "other-runtime"),
+        ("transport_profile", "other-profile"),
+        ("business_connection_id", "other-business"),
+        ("chat_id", "other-chat"),
+        ("thread_id", "other-thread"),
+        ("message_id", "other-message"),
+    ],
+)
+def test_scoped_reply_text_isolated_by_every_route_field(
+    monkeypatch, tmp_path, field, wrong_value
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway import rich_sent_store
+
+    route = {
+        "platform": "telegram",
+        "runtime_profile": "default",
+        "transport_profile": "default",
+        "business_connection_id": "biz-1",
+        "chat_id": "12345",
+        "thread_id": "topic-7",
+        "message_id": "681",
+    }
+    assert rich_sent_store.record_scoped(**route, text="exact route") is True
+    wrong_route = {**route, field: wrong_value}
+
+    assert rich_sent_store.lookup_scoped(**wrong_route) is None
+    assert rich_sent_store.lookup_scoped(**route) == "exact route"
+
+
+def test_scoped_reply_text_never_falls_back_to_legacy_cross_profile_key(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway import rich_sent_store
+
+    assert rich_sent_store.record(
+        "12345", "682", "legacy text", business_connection_id="biz-1"
+    ) is True
+
+    assert rich_sent_store.lookup_scoped(
+        platform="telegram",
+        runtime_profile="default",
+        transport_profile="default",
+        business_connection_id="biz-1",
+        chat_id="12345",
+        thread_id=None,
+        message_id="682",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_business_send_fails_closed_when_reply_index_commit_fails(
+    monkeypatch, tmp_path
+):
+    adapter = _make_adapter({"rich_messages": False})
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=683)
+    )
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(rich_sent_store, "record_scoped", lambda **_kwargs: False)
+    metadata = {
+        "business_connection_id": "biz-1",
+        "external_safe_mode": True,
+        "telegram_business_external_contact": True,
+        "route_envelope": {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": "12345",
+            "thread_id": None,
+            "user_id": "42",
+            "business_connection_id": "biz-1",
+            "external_safe_mode": True,
+        },
+    }
+
+    result = await adapter.send("12345", "must be receipted", metadata=metadata)
+
+    adapter._bot.send_message.assert_awaited_once()
+    assert result.success is False
+    assert result.message_id == "683"
+    assert result.error == "telegram_business_receipt_persist_failed"
+    assert result.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_rich_business_send_fails_closed_when_reply_index_commit_fails(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(rich_sent_store, "record_scoped", lambda **_kwargs: False)
+    metadata = {
+        "business_connection_id": "biz-1",
+        "external_safe_mode": True,
+        "telegram_business_external_contact": True,
+        "route_envelope": {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": "12345",
+            "thread_id": None,
+            "user_id": "42",
+            "business_connection_id": "biz-1",
+            "external_safe_mode": True,
+        },
+    }
+
+    result = await adapter.send("12345", RICH_CONTENT, metadata=metadata)
+
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert result.success is False
+    assert result.message_id == "123"
+    assert result.error == "telegram_business_receipt_persist_failed"
+    assert result.retryable is False

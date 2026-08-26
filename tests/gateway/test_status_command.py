@@ -75,6 +75,105 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
+async def test_status_command_preserves_operator_grade_snapshot():
+    """The private /status contract must not regress to the legacy summary."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-rich",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._gateway_started_at = time.time() - 331
+    runner._busy_input_mode = "interrupt"
+    runner._service_tier = None
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 1_000,
+        "output_tokens": 250,
+        "cache_read_tokens": 500,
+        "cache_write_tokens": 100,
+        "reasoning_tokens": 50,
+        "api_call_count": 7,
+        "actual_cost_usd": 0.125,
+        "model": "gpt-test",
+        "billing_provider": "openai-codex",
+    }
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="gpt-test",
+        provider="openai-codex",
+        base_url="",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+            compression_count=2,
+        ),
+        interrupt=MagicMock(),
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert result.startswith("🪽 **Hermes ")
+    for expected in (
+        "⏱️ Uptime:",
+        "🧠 Model: openai-codex/gpt-test",
+        "🔄 Fallbacks:",
+        "🧮 Tokens: 1k in / 250 out · total 1.9k",
+        "🗄️ Cache: 33% hit · 500 cached, 100 new",
+        "📚 Context: 12.3k/100k (12%) · 🧹 Compactions: 2",
+        "🧵 Session:",
+        "⚙️ Execution:",
+        "🪢 Queue: interrupt (depth 0) · Agent: running ⚡ · Calls: 7",
+        "🔌 Platforms: telegram",
+        "🆔 Session ID: `sess-rich`",
+    ):
+        assert expected in result
+
+
+@pytest.mark.asyncio
+async def test_status_resolves_provider_context_when_compressor_limit_is_zero(
+    monkeypatch,
+):
+    """The cockpit must not render a known model's context window as zero."""
+    import gateway.run as gateway_run
+    from hermes_cli import model_switch
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-context-fallback",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        base_url="",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=143_189,
+            context_length=0,
+            compression_count=0,
+        ),
+        interrupt=MagicMock(),
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    resolver = AsyncMock(return_value=272_000)
+    monkeypatch.setattr(
+        model_switch,
+        "resolve_display_context_length_async",
+        resolver,
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "📚 Context: 143.2k/272k (53%)" in result
+    resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
@@ -100,7 +199,9 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Lifetime tokens billed:** 1,900" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
+    assert "🗄️ Cache: 33% hit · 500 cached, 100 new" in result
+    assert "**Cumulative API tokens (re-sent each call):** 1,900" in result
 
 
 @pytest.mark.asyncio
@@ -138,7 +239,7 @@ async def test_status_command_includes_live_agent_model_and_context():
 
     assert "**Model:** `openai/gpt-test` (openai)" in result
     assert "**Context:** 12,345 / 100,000 (12%)" in result
-    assert "**Lifetime tokens billed:** 1,250" in result
+    assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
 
 
 @pytest.mark.asyncio
@@ -273,6 +374,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
     runner = _make_runner(session_entry, platform=Platform.SLACK)
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = False
+    runner._session_db = MagicMock()
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -337,6 +439,7 @@ async def test_handle_message_stale_result_keeps_newer_generation_callback(monke
     )
     runner = _make_runner(session_entry)
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
+    runner._session_db = MagicMock()
     session_key = session_entry.session_key
     adapter = _Adapter()
     runner.adapters[Platform.TELEGRAM] = adapter

@@ -10,7 +10,15 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
 )
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    _bind_resume_origin_snapshot,
+    canonical_resume_origin,
+)
+
+
+RESTART_MESSAGE_ID = "restart-message-1"
 
 
 class RestartTestAdapter(BasePlatformAdapter):
@@ -41,14 +49,35 @@ def make_restart_source(
     chat_id: str = "123456",
     chat_type: str = "dm",
     thread_id: str | None = None,
+    message_id: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id=chat_id,
         chat_type=chat_type,
-        user_id="u1",
+        user_id=chat_id,
         thread_id=thread_id,
+        message_id=message_id,
     )
+
+
+def bind_restart_origin_snapshot(
+    entry: SessionEntry,
+    source: SessionSource | None = None,
+) -> SessionEntry:
+    """Seal a synthetic pending entry like SessionStore does in production."""
+    entry.continuation_generation = entry.continuation_generation or 1
+    entry.continuation_claim_owner = (
+        entry.continuation_claim_owner or "gateway:test"
+    )
+    entry.continuation_claim_token = (
+        entry.continuation_claim_token or "test-claim-token"
+    )
+    _bind_resume_origin_snapshot(
+        entry,
+        canonical_resume_origin(source or entry.origin),
+    )
+    return entry
 
 
 def make_restart_runner(
@@ -163,7 +192,11 @@ def make_restart_runner(
     # risk-specific tests replace this with tool-call rows.
     runner._session_db = MagicMock()
     runner._session_db.get_messages.return_value = [
-        {"role": "user", "content": "pending request"}
+        {
+            "role": "user",
+            "content": "pending request",
+            "platform_message_id": RESTART_MESSAGE_ID,
+        }
     ]
     runner.delivery_router = MagicMock()
 
