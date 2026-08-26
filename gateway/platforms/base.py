@@ -790,17 +790,24 @@ class StartupResumeDispatchHandoff:
     task is created.
     """
 
-    __slots__ = ("expected_session_key", "_accepted_task", "_revoked")
+    __slots__ = (
+        "expected_session_key",
+        "_accepted_task",
+        "_blocking_task",
+        "_revoked",
+    )
 
     def __init__(self, expected_session_key: str):
         self.expected_session_key = str(expected_session_key)
         self._accepted_task: Optional[asyncio.Task] = None
+        self._blocking_task: Optional[asyncio.Task] = None
         self._revoked = False
 
     def is_open_for(self, session_key: str) -> bool:
         return bool(
             not self._revoked
             and self._accepted_task is None
+            and self._blocking_task is None
             and str(session_key) == self.expected_session_key
         )
 
@@ -808,6 +815,13 @@ class StartupResumeDispatchHandoff:
         if not self.is_open_for(session_key):
             return False
         self._accepted_task = task
+        return True
+
+    def defer_to_existing(self, session_key: str, task: asyncio.Task) -> bool:
+        """Fence startup resume behind an already-owned exact-route task."""
+        if not self.is_open_for(session_key):
+            return False
+        self._blocking_task = task
         return True
 
     def revoke(self) -> bool:
@@ -819,6 +833,10 @@ class StartupResumeDispatchHandoff:
     @property
     def accepted_task(self) -> Optional[asyncio.Task]:
         return self._accepted_task
+
+    @property
+    def blocking_task(self) -> Optional[asyncio.Task]:
+        return self._blocking_task
 
 
 def streaming_tts_turn_key(session_key: str | None, turn_marker: Any = None, *, event: Any = None) -> str | None:
@@ -6544,6 +6562,20 @@ class BasePlatformAdapter(ABC):
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+
+        # A Telegram update can be redelivered while startup restore is being
+        # assembled.  If that exact route already has a concrete owner task,
+        # do not feed the synthetic resume through the ordinary busy-message
+        # path and do not abandon its durable claim.  The startup wrapper will
+        # wait for this exact task, then re-dispatch against durable state.
+        handoff = getattr(event, "_gateway_startup_dispatch_handoff", None)
+        if session_key in self._active_sessions and isinstance(
+            handoff, StartupResumeDispatchHandoff
+        ):
+            owner_task = self._session_tasks.get(session_key)
+            if isinstance(owner_task, asyncio.Task) and not owner_task.done():
+                if handoff.defer_to_existing(session_key, owner_task):
+                    return owner_task
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:

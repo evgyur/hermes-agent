@@ -3315,6 +3315,75 @@ async def test_startup_wrapper_revokes_deferred_adapter_child_registration():
     )
 
 
+@pytest.mark.asyncio
+async def test_startup_wrapper_waits_for_exact_existing_adapter_task_then_retries():
+    """A redelivered inbound owner cannot make startup abandon its claim."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="existing-adapter-owner",
+        message_id="restart-message-existing-owner",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:existing-adapter-owner",
+            session_id="sid-existing-adapter-owner",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-existing-adapter-owner",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+
+    release_existing = asyncio.Event()
+    existing_started = asyncio.Event()
+    resumed_started = asyncio.Event()
+
+    async def _existing_owner():
+        existing_started.set()
+        await release_existing.wait()
+
+    async def _resumed_owner(_event, _session_key):
+        _event.metadata["startup_resume_claim_outcome"] = (
+            "retain_for_delivery_retry"
+        )
+        resumed_started.set()
+
+    existing_task = asyncio.create_task(_existing_owner())
+    await existing_started.wait()
+    guard = asyncio.Event()
+    adapter._active_sessions[entry.session_key] = guard
+    adapter._session_tasks[entry.session_key] = existing_task
+    adapter._process_message_background = _resumed_owner
+    claim_is_current = AsyncMock(return_value=True)
+    runner._startup_resume_claim_is_current = claim_is_current
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    wrapper = asyncio.create_task(
+        runner._run_startup_resume_event(adapter, event, entry.session_key)
+    )
+    await asyncio.sleep(0)
+    assert not resumed_started.is_set()
+    assert not wrapper.done()
+
+    release_existing.set()
+    await wrapper
+
+    assert resumed_started.is_set()
+    claim_is_current.assert_awaited_once_with(entry, event)
+    abandon.assert_not_awaited()
+    runner._release_running_agent_state(entry.session_key)
+
+
 def test_startup_handoff_is_one_shot_and_route_exact():
     handoff = StartupResumeDispatchHandoff("expected-route")
     task = MagicMock(spec=asyncio.Task)

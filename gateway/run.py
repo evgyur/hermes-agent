@@ -12967,19 +12967,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     return
                 _claim_owned = True
-            handoff = StartupResumeDispatchHandoff(session_key)
-            setattr(event, "_gateway_startup_dispatch_handoff", handoff)
-            try:
-                await adapter.handle_message(event)
-            finally:
-                # No adapter may publish a child after returning without
-                # having accepted this exact handoff.  Revocation happens
-                # before claim abandonment, and BasePlatformAdapter checks it
-                # before creating a delayed child task.
-                handoff.revoke()
-            task = handoff.accepted_task
-            if task is not None:
-                await asyncio.shield(task)
+            observed_blockers: set[asyncio.Task] = set()
+            while True:
+                handoff = StartupResumeDispatchHandoff(session_key)
+                setattr(event, "_gateway_startup_dispatch_handoff", handoff)
+                try:
+                    await adapter.handle_message(event)
+                finally:
+                    # No adapter may publish a child after returning without
+                    # having accepted this exact handoff.  Revocation happens
+                    # before claim abandonment, and BasePlatformAdapter checks
+                    # it before creating a delayed child task.
+                    handoff.revoke()
+                task = handoff.accepted_task
+                if task is not None:
+                    await asyncio.shield(task)
+                    break
+                blocker = handoff.blocking_task
+                if blocker is None or blocker in observed_blockers:
+                    task = None
+                    break
+                observed_blockers.add(blocker)
+                task = blocker
+                try:
+                    await asyncio.shield(blocker)
+                except asyncio.CancelledError:
+                    # A second shutdown, or cancellation of the inbound owner,
+                    # must leave the exact durable claim for the next boot.
+                    event.metadata["startup_resume_claim_outcome"] = (
+                        "retain_for_delivery_retry"
+                    )
+                    raise
+                task = None
+                try:
+                    with self.session_store._lock:  # noqa: SLF001
+                        self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                        entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                except Exception:
+                    entry = None
+                if entry is None or not await self._startup_resume_claim_is_current(
+                    entry,
+                    event,
+                ):
+                    # The blocker may have settled or superseded this
+                    # continuation.  Never dispatch a child from stale
+                    # in-memory authority and never settle the newer state.
+                    _claim_owned = False
+                    break
+                event.metadata["startup_resume_revalidated_after_blocker"] = True
         finally:
             # _schedule_resume_pending_sessions pre-claims the runner slot
             # before spawning this task.  If adapter.handle_message raises
@@ -13293,6 +13328,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             return False
+
+    async def _startup_resume_claim_is_current(
+        self,
+        entry: SessionEntry,
+        event: MessageEvent,
+    ) -> bool:
+        """Revalidate exact durable ownership immediately before dispatch."""
+        if not bool(getattr(entry, "resume_pending", False)):
+            return False
+        if (
+            str(getattr(entry, "resume_task_id", "") or "")
+            != str(getattr(event, "resume_task_id", "") or "")
+            or getattr(entry, "continuation_generation", 0)
+            != getattr(event, "continuation_generation", 0)
+            or str(getattr(entry, "continuation_claim_owner", "") or "")
+            != str(getattr(event, "continuation_claim_owner", "") or "")
+            or str(getattr(entry, "continuation_claim_token", "") or "")
+            != str(getattr(event, "continuation_claim_token", "") or "")
+        ):
+            return False
+        return await self._claim_startup_resume_obligation(
+            entry,
+            allow_existing_claim=True,
+        )
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
@@ -22718,6 +22777,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
             )
             await _abandon("quarantined_invalid_envelope")
+            return False
+
+        # Re-check the durable lease in the child immediately before any
+        # transcript analysis or agent work.  This closes the blocker-to-child
+        # handoff gap if another owner settled or superseded the continuation.
+        if (
+            event_metadata.get("startup_resume_revalidated_after_blocker") is True
+            and not await self._startup_resume_claim_is_current(session_entry, event)
+        ):
+            logger.info(
+                "Skipping stale startup continuation for %s: durable claim "
+                "is no longer exact",
+                session_entry.session_key,
+            )
             return False
 
         analysis_kwargs: dict[str, Any] = {
