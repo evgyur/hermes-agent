@@ -15033,6 +15033,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def list_nonterminal_gateway_resume_obligations(self) -> list[Dict[str, Any]]:
+        """Return the bounded set of obligations that still own route keys."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT * FROM gateway_resume_obligations
+                    WHERE state IN ('PENDING','CLAIMED')
+                    ORDER BY updated_at, session_key"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_gateway_resume_obligations(self) -> list[Dict[str, Any]]:
+        """Return the authoritative projection rows for startup reconciliation."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT * FROM gateway_resume_obligations
+                    ORDER BY updated_at, session_key"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def admit_gateway_resume_obligation(
         self, *, session_key: str, resume_task_id: str,
         expected_generation: int, origin_json: str, origin_sha256: str,
@@ -15135,7 +15154,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (time.time(), str(session_key), str(resume_task_id),
                  int(expected_generation), str(claim_token)),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return True
+            row = conn.execute(
+                """SELECT state, claim_token
+                     FROM gateway_resume_obligations
+                    WHERE session_key=? AND resume_task_id=? AND generation=?""",
+                (
+                    str(session_key),
+                    str(resume_task_id),
+                    int(expected_generation),
+                ),
+            ).fetchone()
+            return bool(
+                row
+                and row["state"] == "TERMINAL"
+                and row["claim_token"] == str(claim_token)
+            )
+        return bool(self._execute_write(_do))
+
+    def abandon_gateway_resume_obligation(
+        self, *, session_key: str, resume_task_id: str,
+        expected_generation: int, claim_owner: str, claim_token: str,
+        reason: str,
+    ) -> bool:
+        """Cancel one exact claimed continuation without replaying it.
+
+        Startup recovery can fail closed after claiming an obligation (for
+        example, when an effect outcome is unknown).  That refusal is terminal
+        for the old task, but it must not strand the session key in CLAIMED and
+        block a later, independently authorized turn from receiving the next
+        generation.
+        """
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason or len(normalized_reason) > 160:
+            raise ValueError("invalid gateway resume abandonment reason")
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE gateway_resume_obligations
+                      SET state='CANCELLED', reason=?, updated_at=?
+                    WHERE session_key=? AND resume_task_id=? AND generation=?
+                      AND state='CLAIMED' AND claim_owner=? AND claim_token=?""",
+                (
+                    normalized_reason,
+                    time.time(),
+                    str(session_key),
+                    str(resume_task_id),
+                    int(expected_generation),
+                    str(claim_owner),
+                    str(claim_token),
+                ),
+            )
+            if cursor.rowcount == 1:
+                return True
+            row = conn.execute(
+                """SELECT state, reason, claim_owner, claim_token
+                     FROM gateway_resume_obligations
+                    WHERE session_key=? AND resume_task_id=? AND generation=?""",
+                (
+                    str(session_key),
+                    str(resume_task_id),
+                    int(expected_generation),
+                ),
+            ).fetchone()
+            return bool(
+                row
+                and row["state"] == "CANCELLED"
+                and row["reason"] == normalized_reason
+                and row["claim_owner"] == str(claim_owner)
+                and row["claim_token"] == str(claim_token)
+            )
+
         return bool(self._execute_write(_do))
 
     def cancel_gateway_resume_obligation(
@@ -15143,15 +15233,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expected_generation: int, reason: str,
     ) -> bool:
         def _do(conn):
+            normalized_reason = str(reason)
             cursor = conn.execute(
                 """UPDATE gateway_resume_obligations
                       SET state='CANCELLED', reason=?, updated_at=?
                     WHERE session_key=? AND resume_task_id=? AND generation=?
                       AND state='PENDING'""",
-                (str(reason), time.time(), str(session_key), str(resume_task_id),
+                (normalized_reason, time.time(), str(session_key), str(resume_task_id),
                  int(expected_generation)),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return True
+            row = conn.execute(
+                """SELECT state, reason
+                     FROM gateway_resume_obligations
+                    WHERE session_key=? AND resume_task_id=? AND generation=?""",
+                (
+                    str(session_key),
+                    str(resume_task_id),
+                    int(expected_generation),
+                ),
+            ).fetchone()
+            return bool(
+                row
+                and row["state"] == "CANCELLED"
+                and row["reason"] == normalized_reason
+            )
         return bool(self._execute_write(_do))
 
     _GATEWAY_BUSY_STATES = frozenset({

@@ -26,6 +26,12 @@ def test_stale_store_cannot_clear_or_overwrite_new_generation(tmp_path):
             expected_generation=1,
             reason="superseded",
         )
+        assert stale.cancel_gateway_resume_obligation(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            reason="superseded",
+        )
         second = _admit(current, expected_generation=1, task="task-2", origin="two")
         assert second["generation"] == 2
 
@@ -72,8 +78,77 @@ def test_resume_claim_and_clear_require_exact_generation_and_token(tmp_path):
             session_key="telegram:chat:1", resume_task_id="task",
             expected_generation=1, claim_token="token",
         )
+        assert db.clear_gateway_resume_obligation(
+            session_key="telegram:chat:1", resume_task_id="task",
+            expected_generation=1, claim_token="token",
+        )
         row = db.get_gateway_resume_obligation("telegram:chat:1")
         assert row["state"] == "TERMINAL"
         assert row["generation"] == 1
+    finally:
+        db.close()
+
+
+def test_claimed_obligation_can_be_abandoned_exactly_then_next_generation_admits(
+    tmp_path,
+):
+    """A refused startup turn must not strand the session key forever."""
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        first = _admit(db, expected_generation=0, task="task-1", origin="one")
+        assert first["generation"] == 1
+        assert db.claim_gateway_resume_obligation(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            claim_owner="gateway:old",
+            claim_token="token-1",
+        )
+
+        abandon = getattr(db, "abandon_gateway_resume_obligation", None)
+        assert callable(abandon), "claimed obligations need an exact abandon CAS"
+        assert not abandon(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            claim_owner="gateway:old",
+            claim_token="wrong-token",
+            reason="quarantined_unsafe_unknown",
+        )
+        assert abandon(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            claim_owner="gateway:old",
+            claim_token="token-1",
+            reason="quarantined_unsafe_unknown",
+        )
+        # Exact retries are idempotent, but a different owner/token is not.
+        assert abandon(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            claim_owner="gateway:old",
+            claim_token="token-1",
+            reason="quarantined_unsafe_unknown",
+        )
+        assert not abandon(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            claim_owner="gateway:other",
+            claim_token="token-1",
+            reason="quarantined_unsafe_unknown",
+        )
+
+        cancelled = db.get_gateway_resume_obligation("telegram:chat:1")
+        assert cancelled["state"] == "CANCELLED"
+        assert cancelled["reason"] == "quarantined_unsafe_unknown"
+        assert cancelled["generation"] == 1
+
+        second = _admit(db, expected_generation=1, task="task-2", origin="two")
+        assert second["state"] == "PENDING"
+        assert second["generation"] == 2
+        assert second["resume_task_id"] == "task-2"
     finally:
         db.close()

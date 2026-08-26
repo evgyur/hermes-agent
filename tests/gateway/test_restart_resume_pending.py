@@ -27,6 +27,7 @@ PRs #9850, #9934, #7536):
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -270,6 +271,403 @@ def test_resume_projection_mirrors_only_committed_db_obligation(tmp_path):
     assert store.clear_resume_pending_exact(entry.session_key, **identity) is True
     assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "TERMINAL"
     assert entry.resume_pending is False
+
+
+def test_duplicate_premark_projects_authoritative_pending_or_claimed_row(
+    tmp_path,
+    monkeypatch,
+):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="duplicate-premark", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    first = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "restart_timeout",
+    )
+    assert first
+    first_row = store._db.get_gateway_resume_obligation(entry.session_key)
+    first_marked_at = entry.last_resume_marked_at
+    monkeypatch.setattr(
+        "gateway.session._now",
+        lambda: first_marked_at + timedelta(minutes=10),
+    )
+
+    pending_repeat = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "restart_timeout",
+    )
+    assert pending_repeat == first
+    assert entry.last_resume_marked_at == first_marked_at
+    assert store._db.get_gateway_resume_obligation(entry.session_key) == first_row
+
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=first["resume_task_id"],
+        expected_generation=first["continuation_generation"],
+        claim_owner=first["continuation_claim_owner"],
+        claim_token=first["continuation_claim_token"],
+    )
+    claimed_repeat = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "restart_timeout",
+    )
+    assert claimed_repeat == first
+    assert entry.last_resume_marked_at == first_marked_at
+
+
+def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_path):
+    """A reset/new task must not inherit a claimed obligation from an old boot."""
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="incident-1751", user_id="owner")
+    entry = store.get_or_create_session(source)
+    first_task = store.mark_turn_active(entry.session_key, source)
+    assert first_task
+    first_receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert first_receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=first_receipt["resume_task_id"],
+        expected_generation=first_receipt["continuation_generation"],
+        claim_owner=first_receipt["continuation_claim_owner"],
+        claim_token=first_receipt["continuation_claim_token"],
+    )
+
+    # Mirrors /new or a completed newer human task: routing no longer carries
+    # the old continuation identity, while the DB claim survived the boot.
+    entry.resume_pending = False
+    entry.resume_reason = None
+    entry.last_resume_marked_at = None
+    entry.resume_task_id = ""
+    entry.continuation_claim_owner = ""
+    entry.continuation_claim_token = ""
+    entry.resume_origin_snapshot = None
+    store._save()
+
+    reconcile = getattr(store, "reconcile_orphaned_resume_obligations", None)
+    assert callable(reconcile), "startup needs a canonical orphan-claim reconciler"
+    receipt = reconcile(max_age_seconds=3600)
+    assert receipt == {
+        "cancelled_pending": 0,
+        "abandoned_claimed": 1,
+        "cleared_terminal_projection": 0,
+        "kept": 0,
+    }
+    old_row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert old_row["state"] == "CANCELLED"
+    assert old_row["reason"] == "orphaned_claim"
+
+    second_task = store.mark_turn_active(entry.session_key, source)
+    assert second_task and second_task != first_task
+    second_receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert second_receipt
+    assert second_receipt["continuation_generation"] == 2
+    assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
+
+
+def test_startup_reconciles_stale_exact_claim_and_clears_only_its_marker(
+    tmp_path,
+    monkeypatch,
+):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="incident-26452", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    monkeypatch.setattr(
+        "gateway.session._now",
+        lambda: entry.last_resume_marked_at + timedelta(hours=2),
+    )
+
+    original_save = store._save
+
+    def _assert_locked_save():
+        acquired = store._lock.acquire(blocking=False)
+        if acquired:
+            store._lock.release()
+        assert not acquired
+        original_save()
+
+    store._save = _assert_locked_save
+    result = store.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+
+    assert result == {
+        "cancelled_pending": 0,
+        "abandoned_claimed": 1,
+        "cleared_terminal_projection": 0,
+        "kept": 0,
+    }
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "CANCELLED"
+    assert row["reason"] == "stale_claim"
+    assert entry.resume_pending is False
+
+
+@pytest.mark.parametrize("terminal_state", ["TERMINAL", "CANCELLED"])
+def test_startup_clears_exact_routing_projection_after_db_settlement_crash(
+    tmp_path,
+    terminal_state,
+):
+    """A crash between DB CAS and routing save must heal on the next boot."""
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id=f"crash-window-{terminal_state}", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    if terminal_state == "TERMINAL":
+        assert store._db.clear_gateway_resume_obligation(
+            session_key=entry.session_key,
+            resume_task_id=receipt["resume_task_id"],
+            expected_generation=receipt["continuation_generation"],
+            claim_token=receipt["continuation_claim_token"],
+        )
+    else:
+        assert store._db.abandon_gateway_resume_obligation(
+            session_key=entry.session_key,
+            resume_task_id=receipt["resume_task_id"],
+            expected_generation=receipt["continuation_generation"],
+            claim_owner=receipt["continuation_claim_owner"],
+            claim_token=receipt["continuation_claim_token"],
+            reason="quarantined_unsafe_unknown",
+        )
+    assert entry.resume_pending is True
+
+    restarted = _make_store(tmp_path)
+    healed = restarted.reconcile_orphaned_resume_obligations(
+        max_age_seconds=3600
+    )
+
+    assert healed == {
+        "cancelled_pending": 0,
+        "abandoned_claimed": 0,
+        "cleared_terminal_projection": 1,
+        "kept": 0,
+    }
+    healed_entry = restarted._entries[entry.session_key]
+    assert healed_entry.resume_pending is False
+
+
+def test_startup_quarantines_claim_with_corrupt_route_envelope(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="route-origin", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    entry.resume_origin_snapshot["source"]["chat_id"] = "wrong-recipient"
+    store._save()
+
+    result = store.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+
+    assert result == {
+        "cancelled_pending": 0,
+        "abandoned_claimed": 1,
+        "cleared_terminal_projection": 0,
+        "kept": 0,
+    }
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "CANCELLED"
+    assert row["reason"] == "quarantined_invalid_envelope"
+    assert entry.resume_pending is False
+
+
+def test_startup_quarantines_fresh_projection_with_mismatched_marked_at(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="timestamp-mismatch", user_id="owner")
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    entry.last_resume_marked_at = entry.last_resume_marked_at + timedelta(
+        seconds=30
+    )
+    store._save()
+
+    result = store.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+
+    assert result["abandoned_claimed"] == 1
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "CANCELLED"
+    assert row["reason"] == "quarantined_invalid_envelope"
+    assert entry.resume_pending is False
+
+
+def test_reconciliation_isolates_topics_and_profiles(tmp_path):
+    def _assert_one_lane_does_not_mutate_the_other(store, sources):
+        entries = []
+        for source in sources:
+            entry = store.get_or_create_session(source)
+            store.mark_turn_active(entry.session_key, source)
+            receipt = store.mark_resume_pending_with_receipt(
+                entry.session_key,
+                "shutdown_timeout",
+            )
+            assert receipt
+            assert store._db.claim_gateway_resume_obligation(
+                session_key=entry.session_key,
+                resume_task_id=receipt["resume_task_id"],
+                expected_generation=receipt["continuation_generation"],
+                claim_owner=receipt["continuation_claim_owner"],
+                claim_token=receipt["continuation_claim_token"],
+            )
+            entries.append(entry)
+        assert entries[0].session_key != entries[1].session_key
+        entries[0].resume_origin_snapshot["source"]["chat_id"] = "wrong-route"
+        store._save()
+
+        result = store.reconcile_orphaned_resume_obligations(
+            max_age_seconds=3600
+        )
+
+        assert result["abandoned_claimed"] == 1
+        assert result["kept"] == 1
+        first_row = store._db.get_gateway_resume_obligation(
+            entries[0].session_key
+        )
+        second_row = store._db.get_gateway_resume_obligation(
+            entries[1].session_key
+        )
+        assert first_row["state"] == "CANCELLED"
+        assert entries[0].resume_pending is False
+        assert second_row["state"] == "CLAIMED"
+        assert entries[1].resume_pending is True
+        return entries
+
+    topic_store = _make_store(tmp_path / "topics")
+    topic_entries = _assert_one_lane_does_not_mutate_the_other(
+        topic_store,
+        [
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1003971448755",
+                chat_type="group",
+                user_id="owner",
+                thread_id=thread_id,
+            )
+            for thread_id in ("1751", "26452")
+        ],
+    )
+
+    profile_store = SessionStore(
+        sessions_dir=tmp_path / "profiles",
+        config=GatewayConfig(multiplex_profiles=True),
+    )
+    _assert_one_lane_does_not_mutate_the_other(
+        profile_store,
+        [
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="same-chat",
+                chat_type="group",
+                user_id="owner",
+                thread_id="same-thread",
+                profile=profile,
+            )
+            for profile in ("hermesdev", "main")
+        ],
+    )
+    assert topic_store._db.get_gateway_resume_obligation(
+        topic_entries[1].session_key
+    )["state"] == "CLAIMED"
+
+
+def test_abandon_resume_pending_rejects_empty_claim_token_before_db(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="invalid-token", user_id="owner")
+    entry = store.get_or_create_session(source)
+    entry.resume_pending = True
+    entry.resume_task_id = "task-1"
+    entry.continuation_generation = 1
+    entry.continuation_claim_owner = "gateway:1"
+    entry.continuation_claim_token = ""
+    abandon = MagicMock(return_value=True)
+    store._db.abandon_gateway_resume_obligation = abandon
+
+    assert not store.abandon_resume_pending_exact(
+        entry.session_key,
+        resume_task_id="task-1",
+        continuation_generation=1,
+        continuation_claim_owner="gateway:1",
+        continuation_claim_token="",
+        reason="quarantined_invalid_envelope",
+    )
+    abandon.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runs_resume_obligation_reconciler_before_scheduling():
+    runner, _adapter = make_restart_runner()
+    reconcile = AsyncMock(
+        return_value={
+            "cancelled_pending": 1,
+            "abandoned_claimed": 2,
+            "cleared_terminal_projection": 4,
+            "kept": 3,
+        }
+    )
+    runner.async_session_store.reconcile_orphaned_resume_obligations = reconcile
+
+    run_reconciler = getattr(runner, "_reconcile_startup_resume_obligations", None)
+    assert callable(run_reconciler), "gateway startup needs an obligation reconciler"
+    receipt = await run_reconciler()
+
+    reconcile.assert_awaited_once_with(
+        max_age_seconds=_auto_continue_freshness_window()
+    )
+    assert receipt == {
+        "cancelled_pending": 1,
+        "abandoned_claimed": 2,
+        "cleared_terminal_projection": 4,
+        "kept": 3,
+    }
 
 
 def test_crash_recovery_admits_before_clearing_active_marker(tmp_path):
@@ -673,11 +1071,12 @@ class TestFreshnessHelpers:
 
 
 @pytest.mark.asyncio
-async def test_drain_timeout_marks_resume_pending():
+async def test_drain_timeout_marks_resume_pending(caplog, tmp_path, monkeypatch):
     """End-to-end: a drain timeout during gateway stop should flag every
     active session as resume_pending BEFORE the interrupt fires, so the
     next startup's suspend_recently_active() does not destroy them."""
     runner, adapter = make_restart_runner()
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     adapter.disconnect = AsyncMock()
     runner._restart_drain_timeout = 0.05
 
@@ -691,9 +1090,11 @@ async def test_drain_timeout_marks_resume_pending():
 
     # Plug a mock session_store that records marks.
     session_store = MagicMock()
+    session_store.mark_resume_pending_with_receipt = MagicMock(return_value=None)
     session_store.mark_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
+    caplog.set_level(logging.ERROR, logger="gateway.run")
     with patch("gateway.status.remove_pid_file"), patch(
         "gateway.status.write_runtime_status"
     ):
@@ -705,6 +1106,83 @@ async def test_drain_timeout_marks_resume_pending():
     assert marked == {session_key_one, session_key_two}
     for args in calls:
         assert args[0][1] == "shutdown_timeout"
+    assert sum(
+        "could not persist exact pre-drain resume marker" in record.message
+        for record in caplog.records
+    ) == 2
+    assert not (tmp_path / ".clean_shutdown").exists()
+
+
+@pytest.mark.asyncio
+async def test_user_restart_aborts_before_stop_when_active_claim_is_unprotected():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="restart-owner")
+    runner._restart_command_source = source
+    runner._restart_after_turn_timeout = 0
+    runner._running_agents = {
+        "agent:main:telegram:dm:protected": MagicMock(),
+        "agent:main:telegram:dm:restart-owner": MagicMock(),
+    }
+    protected_receipt = {
+        "resume_task_id": "protected-task",
+        "continuation_generation": 2,
+        "continuation_claim_owner": "gateway:test",
+        "continuation_claim_token": "protected-token",
+    }
+    runner.session_store.mark_resume_pending_with_receipt = MagicMock(
+        side_effect=[protected_receipt, None]
+    )
+    clear = AsyncMock(return_value=True)
+    runner.async_session_store.clear_resume_pending_exact = clear
+    runner.stop = AsyncMock()
+
+    assert runner.request_restart(via_service=True)
+    await runner._restart_task
+
+    runner.stop.assert_not_awaited()
+    assert runner._restart_requested is False
+    assert runner._restart_task_started is False
+    assert runner._draining is False
+    clear.assert_awaited_once_with(
+        "agent:main:telegram:dm:protected",
+        **protected_receipt,
+    )
+    assert any(
+        "restart cancelled" in message.lower()
+        and "recovery marker" in message.lower()
+        for message in adapter.sent
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_restart_abort_stays_drained_if_marker_cleanup_fails():
+    runner, adapter = make_restart_runner()
+    runner._restart_command_source = make_restart_source(chat_id="restart-owner")
+    runner._restart_after_turn_timeout = 0
+    runner._running_agents = {
+        "agent:main:telegram:dm:protected": MagicMock(),
+        "agent:main:telegram:dm:unprotected": MagicMock(),
+    }
+    protected_receipt = {
+        "resume_task_id": "protected-task",
+        "continuation_generation": 2,
+        "continuation_claim_owner": "gateway:test",
+        "continuation_claim_token": "protected-token",
+    }
+    runner.session_store.mark_resume_pending_with_receipt = MagicMock(
+        side_effect=[protected_receipt, None]
+    )
+    clear = AsyncMock(return_value=False)
+    runner.async_session_store.clear_resume_pending_exact = clear
+    runner.stop = AsyncMock()
+
+    assert runner.request_restart(via_service=True)
+    await runner._restart_task
+
+    runner.stop.assert_not_awaited()
+    assert clear.await_count >= 2
+    assert runner._draining is True
+    assert any("remains drained" in message.lower() for message in adapter.sent)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +1282,8 @@ async def test_leased_startup_rejects_legacy_text_without_raw_semantic_envelope(
     runner, event, source, entry = _leased_startup_agent_runner(
         monkeypatch, tmp_path, history
     )
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
 
     assert not runner._restore_startup_raw_semantic_envelope(
         event,
@@ -815,6 +1295,14 @@ async def test_leased_startup_rejects_legacy_text_without_raw_semantic_envelope(
         source,
         entry,
         history,
+    )
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason="quarantined_invalid_envelope",
     )
 
 
@@ -1159,6 +1647,69 @@ async def test_leased_startup_unknown_effect_gets_one_reconciliation_only_turn(
 
 
 @pytest.mark.asyncio
+async def test_interrupted_reconciliation_only_turn_abandons_exact_claim(
+    monkeypatch,
+    tmp_path,
+):
+    history = [
+        {
+            "role": "user",
+            "content": "deploy it",
+            "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": None,
+                    "media": [],
+                }
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-unknown",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"deploy candidate"}',
+                    },
+                }
+            ],
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, history
+    )
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "",
+            "messages": history,
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "interrupted": True,
+        }
+    )
+
+    await runner._handle_message_with_agent(event, source, entry.session_key, 1)
+
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason="quarantined_unsafe_unknown",
+    )
+
+
+@pytest.mark.asyncio
 async def test_unknown_effect_does_not_bypass_raw_semantic_envelope_rejection(
     monkeypatch,
     tmp_path,
@@ -1222,11 +1773,21 @@ async def test_leased_startup_handler_rejects_later_human_before_agent(
     analyzer = MagicMock(wraps=runner._analyze_startup_resume_rows)
     runner._analyze_startup_resume_rows = analyzer
     runner._run_agent = AsyncMock()
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
 
     await runner._handle_message_with_agent(event, source, entry.session_key, 1)
 
     analyzer.assert_called_once_with(history, source_message_id="msg-42")
     runner._run_agent.assert_not_awaited()
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason="superseded_by_human",
+    )
 
 
 @pytest.mark.asyncio
@@ -1764,6 +2325,221 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
 
     # After the task completes, the sentinel should be cleaned up.
     assert pending_entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_startup_adapter_failure_settles_preclaimed_obligation():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="adapter-failure",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:adapter-failure",
+            session_id="sid-adapter-failure",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-adapter-failure",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("adapter failed"))
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    with pytest.raises(RuntimeError, match="adapter failed"):
+        await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason="quarantined_invalid_envelope",
+    )
+    assert entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_started", "expected_reason"),
+    [
+        (False, "quarantined_invalid_envelope"),
+        (True, "quarantined_unsafe_unknown"),
+    ],
+)
+async def test_startup_wrapper_settles_claim_after_handler_releases_slot(
+    agent_started,
+    expected_reason,
+):
+    """Handler early-return/exception cannot strand a transferred claim."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id=f"handler-failure-{agent_started}",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=f"agent:main:telegram:dm:handler-failure-{agent_started}",
+            session_id="sid-handler-failure",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-handler-failure",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    if agent_started:
+        event.metadata["startup_resume_agent_started"] = True
+
+    async def _handler_released_slot(_event):
+        runner._release_running_agent_state(entry.session_key)
+
+    adapter.handle_message = _handler_released_slot
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason=expected_reason,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_startup_wrapper_keeps_claim_while_shielded_child_runs():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="live-shielded-child",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:live-shielded-child",
+            session_id="sid-live-child",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-live-child",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    child_started = asyncio.Event()
+    release_child = asyncio.Event()
+
+    async def _child():
+        child_started.set()
+        await release_child.wait()
+
+    async def _start_child(_event):
+        adapter._session_tasks[entry.session_key] = asyncio.create_task(_child())
+
+    adapter.handle_message = _start_child
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    wrapper = asyncio.create_task(
+        runner._run_startup_resume_event(adapter, event, entry.session_key)
+    )
+    await child_started.wait()
+    wrapper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper
+
+    abandon.assert_not_awaited()
+    assert not adapter._session_tasks[entry.session_key].done()
+
+    release_child.set()
+    await adapter._session_tasks[entry.session_key]
+    runner._release_running_agent_state(entry.session_key)
+
+
+@pytest.mark.asyncio
+async def test_wrapper_retries_success_settlement_without_changing_disposition():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="transient-success-settlement",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:transient-success-settlement",
+            session_id="sid-transient-success",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-transient-success",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    clear = AsyncMock(side_effect=[False, True])
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.clear_resume_pending_exact = clear
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    identity = {
+        "resume_task_id": entry.resume_task_id,
+        "continuation_generation": entry.continuation_generation,
+        "continuation_claim_owner": entry.continuation_claim_owner,
+        "continuation_claim_token": entry.continuation_claim_token,
+    }
+
+    async def _handler_attempted_success(_event):
+        _event.metadata["startup_resume_agent_started"] = True
+        await runner._settle_startup_resume_claim(
+            entry.session_key,
+            identity,
+            disposition="success",
+            event=_event,
+        )
+        runner._release_running_agent_state(entry.session_key)
+
+    adapter.handle_message = _handler_attempted_success
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    assert clear.await_count == 2
+    abandon.assert_not_awaited()
 
 
 @pytest.mark.asyncio

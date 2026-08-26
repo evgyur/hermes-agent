@@ -12769,6 +12769,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
+            # An in-band user restart is still cancellable at this point.  If
+            # any live agent lacks an exact durable continuation marker, do
+            # not enter stop(): interruption without recovery authority would
+            # silently discard already-authorized work.  External SIGTERM is
+            # handled separately in stop(), where shutdown cannot be refused.
+            if self._restart_command_source is not None:
+                unprotected: list[str] = []
+                protected: dict[str, dict[str, Any]] = {}
+                reason = "restart_timeout"
+                for session_key, agent in list(self._running_agents.items()):
+                    if agent is _AGENT_PENDING_SENTINEL:
+                        continue
+                    try:
+                        receipt = (
+                            await self.async_session_store.mark_resume_pending_with_receipt(
+                                session_key,
+                                reason,
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "User restart preflight could not persist exact "
+                            "recovery marker for %s",
+                            session_key,
+                        )
+                        receipt = None
+                    if not (
+                        isinstance(receipt, dict)
+                        and receipt
+                        and all(receipt.values())
+                    ):
+                        unprotected.append(session_key)
+                    else:
+                        protected[session_key] = dict(receipt)
+                if unprotected:
+                    logger.error(
+                        "User restart cancelled: %d active session(s) lack an "
+                        "exact recovery marker: %s",
+                        len(unprotected),
+                        ", ".join(unprotected),
+                    )
+                    # The restart is no longer happening, so undo every exact
+                    # marker admitted by this preflight.  Leaving even one
+                    # behind could resurrect a turn that later completes
+                    # normally while the gateway remains online.
+                    cleanup_failed: list[str] = []
+                    for session_key, receipt in protected.items():
+                        cleared = False
+                        for attempt in range(2):
+                            try:
+                                cleared = bool(
+                                    await self.async_session_store.clear_resume_pending_exact(
+                                        session_key,
+                                        **receipt,
+                                    )
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Could not roll back exact restart-preflight "
+                                    "marker for %s (attempt %d/2)",
+                                    session_key,
+                                    attempt + 1,
+                                )
+                            if cleared:
+                                break
+                            await asyncio.sleep(0)
+                        if not cleared:
+                            cleanup_failed.append(session_key)
+                            logger.error(
+                                "Could not roll back exact restart-preflight "
+                                "marker for %s: identity no longer matched",
+                                session_key,
+                            )
+                    source = self._restart_command_source
+                    adapter = self._adapter_for_source(source)
+                    if adapter is not None:
+                        try:
+                            metadata = self._thread_metadata_for_source(source)
+                            await adapter.send(
+                                source.chat_id,
+                                "⚠️ Gateway restart cancelled: an active task "
+                                "could not be protected by an exact recovery "
+                                "marker. "
+                                + (
+                                    "Recovery-marker cleanup also failed; "
+                                    "the gateway remains drained."
+                                    if cleanup_failed
+                                    else "The gateway remains running."
+                                ),
+                                metadata=metadata,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not notify restart requester about "
+                                "recovery-marker failure"
+                            )
+                    self._restart_requested = False
+                    self._restart_task_started = False
+                    self._restart_detached = False
+                    self._restart_via_service = False
+                    self._draining = bool(cleanup_failed)
+                    try:
+                        self._update_runtime_status(
+                            "draining" if cleanup_failed else "running"
+                        )
+                    except Exception:
+                        pass
+                    return
             # Launch the detached helper only AFTER the after-turn wait.
             # Its deadline is drain_timeout+5 and covers stop() teardown —
             # launching earlier would fire `hermes gateway restart` while
@@ -12820,8 +12928,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message can race the restore turn immediately after ``handle_message``
         returns.
         """
+        _claim_owned = (
+            event.metadata.get("startup_resume_after_priority_reply") is True
+        )
+        _settlement_attempted = False
+        task = None
         try:
-            if event.metadata.get("startup_resume_after_priority_reply") is not True:
+            if not _claim_owned:
                 try:
                     with self.session_store._lock:  # noqa: SLF001
                         self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -12833,6 +12946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     allow_existing_claim=True,
                 ):
                     return
+                _claim_owned = True
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -12844,8 +12958,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before _handle_message takes ownership, release that pre-claim;
             # otherwise the real run's normal cleanup owns the slot.
             _pre_state = self._peek_session_state(session_key)
-            if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
+            child_in_flight = task is not None and not task.done()
+            if (
+                not child_in_flight
+                and (_pre_state.turn.agent if _pre_state else None)
+                is _AGENT_PENDING_SENTINEL
+            ):
+                if _claim_owned:
+                    await self._settle_startup_resume_claim(
+                        session_key,
+                        {
+                            "resume_task_id": str(
+                                getattr(event, "resume_task_id", "") or ""
+                            ),
+                            "continuation_generation": getattr(
+                                event, "continuation_generation", 0
+                            ),
+                            "continuation_claim_owner": str(
+                                getattr(event, "continuation_claim_owner", "")
+                                or ""
+                            ),
+                            "continuation_claim_token": str(
+                                getattr(event, "continuation_claim_token", "")
+                                or ""
+                            ),
+                        },
+                        disposition="quarantined_invalid_envelope",
+                        event=event,
+                    )
+                    _settlement_attempted = True
                 self._release_running_agent_state(session_key)
+            # The adapter/handler normally releases the runner slot itself.
+            # That release is not proof that the durable claim was settled:
+            # strict-route refusal, preprocessing exceptions, or an agent
+            # failure can all exit after ownership transfer but before the
+            # normal success/refusal CAS.  If the exact routing projection is
+            # still present, close it here at the wrapper boundary.
+            if _claim_owned and not _settlement_attempted and not child_in_flight:
+                try:
+                    with self.session_store._lock:  # noqa: SLF001
+                        self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                        entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                        projection_still_live = bool(
+                            entry is not None
+                            and entry.resume_pending
+                            and entry.resume_task_id
+                            == str(getattr(event, "resume_task_id", "") or "")
+                            and entry.continuation_generation
+                            == getattr(event, "continuation_generation", 0)
+                            and entry.continuation_claim_owner
+                            == str(
+                                getattr(event, "continuation_claim_owner", "")
+                                or ""
+                            )
+                            and entry.continuation_claim_token
+                            == str(
+                                getattr(event, "continuation_claim_token", "")
+                                or ""
+                            )
+                        )
+                except Exception:
+                    projection_still_live = False
+                    logger.exception(
+                        "Could not inspect startup continuation projection "
+                        "after handler exit for %s",
+                        session_key,
+                    )
+                if projection_still_live:
+                    await self._settle_startup_resume_claim(
+                        session_key,
+                        {
+                            "resume_task_id": str(
+                                getattr(event, "resume_task_id", "") or ""
+                            ),
+                            "continuation_generation": getattr(
+                                event, "continuation_generation", 0
+                            ),
+                            "continuation_claim_owner": str(
+                                getattr(event, "continuation_claim_owner", "")
+                                or ""
+                            ),
+                            "continuation_claim_token": str(
+                                getattr(event, "continuation_claim_token", "")
+                                or ""
+                            ),
+                        },
+                        disposition=(
+                            str(
+                                event.metadata.get(
+                                    "startup_resume_settlement_disposition"
+                                )
+                                or ""
+                            )
+                            or (
+                                "quarantined_unsafe_unknown"
+                                if event.metadata.get(
+                                    "startup_resume_agent_started"
+                                )
+                                is True
+                                else "quarantined_invalid_envelope"
+                            )
+                        ),
+                        event=event,
+                    )
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
@@ -14466,6 +14681,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    async def _reconcile_startup_resume_obligations(self) -> dict[str, int]:
+        """Release stale/orphaned route claims before scheduling continuations."""
+        empty = {
+            "cancelled_pending": 0,
+            "abandoned_claimed": 0,
+            "cleared_terminal_projection": 0,
+            "kept": 0,
+        }
+        try:
+            receipt = (
+                await self.async_session_store.reconcile_orphaned_resume_obligations(
+                    max_age_seconds=_auto_continue_freshness_window()
+                )
+            )
+        except Exception:
+            logger.exception("Startup resume-obligation reconciliation failed")
+            return empty
+        normalized = {
+            key: int(receipt.get(key, 0) or 0)
+            for key in empty
+        } if isinstance(receipt, dict) else empty
+        if any(normalized[key] for key in empty if key != "kept"):
+            logger.warning(
+                "Reconciled startup resume obligations: cancelled_pending=%d "
+                "abandoned_claimed=%d cleared_terminal_projection=%d kept=%d",
+                normalized["cancelled_pending"],
+                normalized["abandoned_claimed"],
+                normalized["cleared_terminal_projection"],
+                normalized["kept"],
+            )
+        return normalized
+
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (#66892), idempotent.
 
@@ -15351,6 +15598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # a session whose final response was generated but never
         # confirmed-delivered has its answer in the ledger — redelivering it
         # is strictly cheaper and more correct than re-running the whole turn.
+        await self._reconcile_startup_resume_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -17145,8 +17393,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if isinstance(_receipt, dict) and all(_receipt.values()):
                         _pre_drain_receipts[_sk] = dict(_receipt)
+                    else:
+                        logger.error(
+                            "Shutdown could not persist exact pre-drain resume "
+                            "marker for %s; recovery is not guaranteed",
+                            _sk,
+                        )
                 except Exception as _e:
-                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+                    logger.error(
+                        "Shutdown could not persist exact pre-drain resume "
+                        "marker for %s: %s",
+                        _sk,
+                        _e,
+                    )
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
@@ -21842,6 +22101,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return row_id
         raise RuntimeError("triggering user row enrichment did not commit")
 
+    async def _settle_startup_resume_claim(
+        self,
+        session_key: str,
+        identity: dict[str, Any],
+        *,
+        disposition: str,
+        event: Optional["MessageEvent"] = None,
+    ) -> bool:
+        """Settle one exact claimed startup continuation through one CAS path."""
+        if event is not None and bool(getattr(event, "startup_resume", False)):
+            metadata = getattr(event, "metadata", None) or {}
+            metadata["startup_resume_settlement_disposition"] = disposition
+            event.metadata = metadata
+        required = {
+            "resume_task_id",
+            "continuation_generation",
+            "continuation_claim_owner",
+            "continuation_claim_token",
+        }
+        if (
+            not isinstance(identity, dict)
+            or set(identity) != required
+            or type(identity.get("continuation_generation")) is not int
+            or identity["continuation_generation"] <= 0
+            or any(
+                not isinstance(identity.get(key), str) or not identity[key]
+                for key in required - {"continuation_generation"}
+            )
+        ):
+            logger.error(
+                "Cannot settle startup continuation for %s: exact "
+                "continuation identity is incomplete",
+                session_key,
+            )
+            return False
+
+        terminal = disposition in {"terminal", "terminal_checkpoint", "success"}
+        cancel_reasons = {
+            "superseded_by_human",
+            "quarantined_unsafe_unknown",
+            "quarantined_invalid_envelope",
+        }
+        if not terminal and disposition not in cancel_reasons:
+            logger.error(
+                "Cannot settle startup continuation for %s: unknown disposition %s",
+                session_key,
+                disposition,
+            )
+            return False
+        try:
+            if terminal:
+                settled = await self.async_session_store.clear_resume_pending_exact(
+                    session_key,
+                    **identity,
+                )
+            else:
+                settled = await self.async_session_store.abandon_resume_pending_exact(
+                    session_key,
+                    **identity,
+                    reason=disposition,
+                )
+        except Exception:
+            logger.exception(
+                "Could not settle startup continuation for %s (%s)",
+                session_key,
+                disposition,
+            )
+            return False
+        if not settled:
+            logger.error(
+                "Could not settle startup continuation for %s (%s): exact "
+                "claim no longer matched",
+                session_key,
+                disposition,
+            )
+        return bool(settled)
+
     async def _validate_and_seal_startup_resume(
         self,
         event: "MessageEvent",
@@ -21877,6 +22213,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(session_entry, "continuation_claim_token", "") or ""
             ),
         }
+
+        async def _abandon(reason: str) -> bool:
+            return await self._settle_startup_resume_claim(
+                session_entry.session_key,
+                expected_resume_identity,
+                disposition=reason,
+                event=event,
+            )
+
         event_resume_identity = {
             "resume_task_id": str(getattr(event, "resume_task_id", "") or ""),
             "continuation_generation": getattr(
@@ -21910,6 +22255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "continuation identity is not exact",
                 session_entry.session_key,
             )
+            await _abandon("quarantined_invalid_envelope")
             return False
 
         analysis_kwargs: dict[str, Any] = {
@@ -21920,17 +22266,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         analysis = self._analyze_startup_resume_rows(history, **analysis_kwargs)
         disposition = str(analysis.get("disposition") or "unsafe_unknown")
         if disposition == "terminal_checkpoint":
-            try:
-                await self.async_session_store.clear_resume_pending_exact(
-                    session_entry.session_key,
-                    **expected_resume_identity,
-                )
-            except Exception:
-                logger.warning(
-                    "Could not settle terminal startup continuation for %s",
-                    session_entry.session_key,
-                    exc_info=True,
-                )
+            await self._settle_startup_resume_claim(
+                session_entry.session_key,
+                expected_resume_identity,
+                disposition="terminal_checkpoint",
+                event=event,
+            )
             return False
         unknown_effects = analysis.get("unknown_effects")
         effect_fence = analysis.get("effect_fence")
@@ -21955,6 +22296,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 disposition,
             )
+            reason = (
+                "superseded_by_human"
+                if disposition == "new_human_turn"
+                else "quarantined_unsafe_unknown"
+            )
+            await _abandon(reason)
             return False
 
         raw_semantic_rows = await self._startup_resume_raw_semantic_rows(
@@ -21973,6 +22320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "semantics are missing, corrupt, or irretrievable",
                 session_entry.session_key,
             )
+            await _abandon("quarantined_invalid_envelope")
             return False
 
         event_metadata["startup_safe_dangling_calls"] = list(
@@ -24019,6 +24367,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if all(_candidate_resume_identity.values()):
                     _turn_resume_identity = dict(_candidate_resume_identity)
             _turn_started_monotonic = time.monotonic()
+            if bool(getattr(event, "startup_resume", False)):
+                event_metadata["startup_resume_agent_started"] = True
+                event.metadata = event_metadata
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -24056,6 +24407,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _trusted_parent_task_continuation=_parent_continuation_start,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+
+            # A reconciliation-only turn is the one bounded exception to the
+            # normal retry-on-next-boot rule: its source task contains an
+            # unresolved pre-restart external effect, so another blind retry
+            # is unsafe.  If that bounded readback turn itself returns without
+            # completing, release the exact durable claim and quarantine it.
+            # The exact CAS keeps a newer task generation untouched.
+            if (
+                _turn_resume_identity
+                and bool(
+                    event_metadata.get("startup_resume_reconciliation_only")
+                )
+                and not _should_clear_resume_pending_after_turn(agent_result)
+            ):
+                await self._settle_startup_resume_claim(
+                    session_key,
+                    _turn_resume_identity,
+                    disposition="quarantined_unsafe_unknown",
+                    event=event,
+                )
 
             _parent_continuation = getattr(
                 event, "_hermes_parent_task_continuation", None
@@ -24252,15 +24623,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 await self._clear_restart_failure_count(session_key)
-                try:
-                    if _turn_resume_identity:
-                        await self.async_session_store.clear_resume_pending_exact(
-                            session_key, **_turn_resume_identity
-                        )
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
+                if _turn_resume_identity:
+                    await self._settle_startup_resume_claim(
+                        session_key,
+                        _turn_resume_identity,
+                        disposition="success",
+                        event=event,
                     )
 
             # Normalize empty responses: surface errors, partial failures, and
