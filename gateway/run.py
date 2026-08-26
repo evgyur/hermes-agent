@@ -17368,20 +17368,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             await self._cancel_secondary_profile_reconnect_tasks()
 
-            # Notify all chats with active agents BEFORE draining.
-            # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
-            logger.info(
-                "Shutdown phase: notify_active_sessions done at +%.2fs",
-                _phase_elapsed(),
-            )
-
-            timeout = self._restart_drain_timeout
-
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
-            # If the process is killed by the service manager during the
-            # drain, the durable marker is already written so the next
-            # gateway boot can recover in-flight sessions (#27856).
+            # This must also happen BEFORE the notification await: an active
+            # turn can complete while Telegram is delivering the notice and
+            # clear its active-turn marker before leaving _running_agents.
+            # Marking after that await loses the exact continuation authority
+            # even though shutdown still observes the turn as running.
+            #
+            # If the process is killed by the service manager during either
+            # notification or drain, the durable marker is already written so
+            # the next gateway boot can recover in-flight sessions (#27856).
             _pre_drain_receipts: dict[str, dict] = {}
             for _sk, _agent in list(self._running_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
@@ -17406,6 +17402,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _sk,
                         _e,
                     )
+
+            # Notify all chats with active agents before draining.  Adapters
+            # are still connected here, so messages can be delivered.  The
+            # durable continuation fence above is intentionally independent of
+            # notification latency or recipient-policy failures.
+            await self._notify_active_sessions_of_shutdown()
+            logger.info(
+                "Shutdown phase: notify_active_sessions done at +%.2fs",
+                _phase_elapsed(),
+            )
+
+            timeout = self._restart_drain_timeout
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()

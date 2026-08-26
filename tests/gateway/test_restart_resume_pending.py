@@ -1167,6 +1167,55 @@ async def test_drain_timeout_marks_resume_pending(caplog, tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_shutdown_persists_resume_marker_before_notification_await(
+    tmp_path, monkeypatch
+):
+    """A completing turn must not escape the durable pre-drain fence.
+
+    Production regression: the shutdown notification awaited Telegram before
+    persisting the continuation.  A turn that finished during that await
+    cleared its active-turn marker while it was still present in the gateway's
+    running-agent map, so the later premark failed and restart abandoned the
+    authorized task.
+    """
+    runner, adapter = make_restart_runner()
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.01
+    session_key = "agent:hermesdev:telegram:group:-1003971448755:1751"
+    runner._running_agents = {session_key: MagicMock()}
+
+    order: list[str] = []
+    receipt = {
+        "resume_task_id": "turn-token",
+        "continuation_generation": 1,
+        "continuation_claim_owner": "gateway:test",
+        "continuation_claim_token": "claim-token",
+    }
+
+    def mark_before_notify(*_args, **_kwargs):
+        order.append("mark")
+        return receipt
+
+    async def notification_await():
+        order.append("notify")
+
+    runner.session_store.mark_resume_pending_with_receipt = MagicMock(
+        side_effect=mark_before_notify
+    )
+    runner._notify_active_sessions_of_shutdown = AsyncMock(
+        side_effect=notification_await
+    )
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    assert order[:2] == ["mark", "notify"]
+
+
+@pytest.mark.asyncio
 async def test_user_restart_aborts_before_stop_when_active_claim_is_unprotected():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="restart-owner")
