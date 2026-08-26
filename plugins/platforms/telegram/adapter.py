@@ -2334,7 +2334,47 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(payload, dict):
             return None
         exact = payload.get(self._business_connection_store_key(chat_id))
-        return str(exact) if exact else None
+        if exact:
+            return str(exact)
+
+        # Older Hermes versions stored only ``chat_id -> connection_id``.
+        # Never trust that unscoped binding by itself: this state file can be
+        # shared across transport profiles and bot identities.  It is safe to
+        # promote only when the same connection has already been observed in a
+        # scoped entry for this exact profile + bot.  This preserves restart
+        # continuity for legacy peers without reviving cross-profile route
+        # borrowing.
+        legacy = payload.get(str(chat_id))
+        if not legacy:
+            return None
+        try:
+            current_scope = json.loads(
+                self._business_connection_store_key(chat_id).removeprefix(
+                    "scope:v1:"
+                )
+            )[:2]
+        except (TypeError, ValueError):
+            return None
+        trusted_connection_ids: set[str] = set()
+        for key, connection_id in payload.items():
+            if not isinstance(key, str) or not key.startswith("scope:v1:"):
+                continue
+            try:
+                stored_scope = json.loads(key.removeprefix("scope:v1:"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(stored_scope, list)
+                and len(stored_scope) == 3
+                and stored_scope[:2] == current_scope
+                and connection_id
+            ):
+                trusted_connection_ids.add(str(connection_id))
+        legacy_connection_id = str(legacy)
+        if legacy_connection_id not in trusted_connection_ids:
+            return None
+        self._remember_business_connection_id(chat_id, legacy_connection_id)
+        return legacy_connection_id
 
     def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
         """Persist only a Telegram-supplied peer→connection binding."""
@@ -2607,7 +2647,7 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]],
     ) -> bool:
-        """Persist optional reply text without redefining transport success."""
+        """Persist reply ownership; Business delivery requires a durable receipt."""
         business_connection_id = (metadata or {}).get("business_connection_id")
         try:
             from gateway import rich_sent_store
@@ -2782,9 +2822,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
-            self._record_sent_reply_text(
+            receipted = self._record_sent_reply_text(
                 str(chat_id), str(message_id), content, metadata
             )
+            if (metadata or {}).get("business_connection_id") and not receipted:
+                return SendResult(
+                    success=False,
+                    message_id=str(message_id),
+                    error="telegram_business_receipt_persist_failed",
+                    retryable=False,
+                    raw_response={"wire_delivered": True, "receipt_persisted": False},
+                )
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
@@ -6029,9 +6077,23 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_id = str(msg.message_id)
                 message_ids.append(message_id)
-                self._record_sent_reply_text(
+                receipted = self._record_sent_reply_text(
                     str(chat_id), message_id, _strip_mdv2(chunk), metadata
                 )
+                if (metadata or {}).get("business_connection_id") and not receipted:
+                    return SendResult(
+                        success=False,
+                        message_id=message_id,
+                        error="telegram_business_receipt_persist_failed",
+                        retryable=False,
+                        raw_response={
+                            "wire_delivered": True,
+                            "receipt_persisted": False,
+                            "message_ids": list(message_ids),
+                            "requested_thread_id": requested_thread_id,
+                            "thread_fallback": used_thread_fallback,
+                        },
+                    )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,

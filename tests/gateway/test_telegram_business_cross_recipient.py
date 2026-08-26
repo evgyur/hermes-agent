@@ -364,6 +364,62 @@ def test_cached_business_connections_are_isolated_by_transport_profile(
     assert adapter_b._known_business_connection_id(SAFE_CUSTOMER_ID) == "biz-b"
 
 
+def test_legacy_business_route_is_promoted_only_from_current_scoped_connection(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter()
+    store = adapter._business_connection_store_path()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    confirmed_peer = "700000777"
+    store.write_text(
+        json.dumps(
+            {
+                confirmed_peer: BUSINESS_CONNECTION_ID,
+                SAFE_CUSTOMER_ID: BUSINESS_CONNECTION_ID,
+                adapter._business_connection_store_key(confirmed_peer): (
+                    BUSINESS_CONNECTION_ID
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert adapter._known_business_connection_id(SAFE_CUSTOMER_ID) == (
+        BUSINESS_CONNECTION_ID
+    )
+    persisted = json.loads(store.read_text(encoding="utf-8"))
+    assert persisted[adapter._business_connection_store_key(SAFE_CUSTOMER_ID)] == (
+        BUSINESS_CONNECTION_ID
+    )
+
+
+def test_legacy_business_route_from_another_transport_profile_stays_closed(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter()
+    other = _adapter()
+    other._owner_profile = "other-transport"
+    store = adapter._business_connection_store_path()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(
+        json.dumps(
+            {
+                SAFE_CUSTOMER_ID: BUSINESS_CONNECTION_ID,
+                other._business_connection_store_key("700000777"): (
+                    BUSINESS_CONNECTION_ID
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert adapter._known_business_connection_id(SAFE_CUSTOMER_ID) is None
+    persisted = json.loads(store.read_text(encoding="utf-8"))
+    assert adapter._business_connection_store_key(SAFE_CUSTOMER_ID) not in persisted
+
+
 def test_business_source_round_trip_and_connection_isolation() -> None:
     source_a = SessionSource(
         platform=Platform.TELEGRAM,
