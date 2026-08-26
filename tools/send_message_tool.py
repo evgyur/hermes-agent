@@ -169,8 +169,6 @@ def _prepare_telegram_egress(chat_id, thread_id=None, route_envelope=None) -> di
     recipient and Business trust lane must also survive exactly; the returned
     kwargs are shared by text, media, and their existing retry paths.
     """
-    if str(chat_id).strip().lstrip("@").casefold() == "vladisfom":
-        raise TelegramEgressDenied("telegram_recipient_denied")
     if route_envelope is None:
         assert_recipient_allowed(chat_id)
         return {}

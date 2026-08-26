@@ -292,13 +292,3 @@ def test_runtime_bound_origin_and_recipient_allow_exact_business_route(monkeypat
 
     assert result["success"] is True
     bot.send_message.assert_awaited_once()
-
-
-def test_absolute_vladisfom_target_is_denied_before_bot(monkeypatch) -> None:
-    bot_factory = MagicMock(return_value=_bot_with_successful_senders())
-    monkeypatch.setattr(telegram, "Bot", bot_factory)
-
-    result = asyncio.run(_send_telegram("token", "@VladisFom", "must not send"))
-
-    assert result == {"error": "Telegram send failed: telegram_recipient_denied"}
-    bot_factory.assert_not_called()
