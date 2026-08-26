@@ -1424,6 +1424,51 @@ def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
 
 
 @pytest.mark.asyncio
+async def test_leased_startup_keeps_claim_when_profile_projection_has_no_cas(
+    monkeypatch,
+    tmp_path,
+):
+    """Multiplex profile lookup must not erase the root-store continuation."""
+    history = [
+        {
+            "role": "user",
+            "content": "continue exact work",
+            "platform_message_id": "msg-42",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": None,
+                    "media": [],
+                }
+            },
+        }
+    ]
+    runner, event, source, root_entry = _leased_startup_agent_runner(
+        monkeypatch,
+        tmp_path,
+        history,
+    )
+    profile_entry = replace(
+        root_entry,
+        resume_pending=False,
+        resume_reason=None,
+        last_resume_marked_at=None,
+        resume_task_id="",
+        continuation_claim_owner="",
+        continuation_claim_token="",
+        resume_origin_snapshot=None,
+    )
+
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        profile_entry,
+        history,
+    )
+
+
+@pytest.mark.asyncio
 async def test_leased_startup_rejects_legacy_text_without_raw_semantic_envelope(
     monkeypatch,
     tmp_path,

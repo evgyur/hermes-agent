@@ -14189,6 +14189,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or persisted_identity.get("continuation_claim_token", "")
             or f"{event.resume_task_id}:{event.continuation_generation}"
         )
+        # Process-local authority carried across the multiplex adapter scope.
+        # The root routing store owns the continuation claim, while the
+        # profile store owns the transcript.  Re-resolving the profile entry
+        # cannot be allowed to erase the already verified root-store CAS.
+        setattr(
+            event,
+            "_gateway_startup_resume_authority",
+            {
+                "session_key": entry.session_key,
+                "session_id": entry.session_id,
+                "source": canonical_resume_origin(source),
+                "resume_task_id": event.resume_task_id,
+                "continuation_generation": event.continuation_generation,
+                "continuation_claim_owner": event.continuation_claim_owner,
+                "continuation_claim_token": event.continuation_claim_token,
+            },
+        )
         event.metadata.update(
             {
                 # The scheduler owns one exact interrupted session.  Use the
@@ -22215,27 +22232,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
 
         event_metadata = getattr(event, "metadata", None) or {}
-        sealed_source = resume_origin_from_snapshot(session_entry)
+        sealed_authority = getattr(
+            event,
+            "_gateway_startup_resume_authority",
+            None,
+        )
+        authority_keys = {
+            "session_key",
+            "session_id",
+            "source",
+            "resume_task_id",
+            "continuation_generation",
+            "continuation_claim_owner",
+            "continuation_claim_token",
+        }
+        sealed_origin = (
+            sealed_authority.get("source")
+            if isinstance(sealed_authority, dict)
+            else None
+        )
         sealed_message_id = (
-            str(getattr(sealed_source, "message_id", "") or "").strip()
-            if sealed_source is not None
+            str(sealed_origin.get("message_id") or "").strip()
+            if isinstance(sealed_origin, dict)
             else ""
         )
         event_message_id = str(getattr(event, "message_id", "") or "").strip()
         expected_resume_identity = {
             "resume_task_id": str(
-                getattr(session_entry, "resume_task_id", "") or ""
+                sealed_authority.get("resume_task_id", "")
+                if isinstance(sealed_authority, dict)
+                else ""
             ),
-            "continuation_generation": getattr(
-                session_entry,
-                "continuation_generation",
-                0,
+            "continuation_generation": (
+                sealed_authority.get("continuation_generation", 0)
+                if isinstance(sealed_authority, dict)
+                else 0
             ),
             "continuation_claim_owner": str(
-                getattr(session_entry, "continuation_claim_owner", "") or ""
+                sealed_authority.get("continuation_claim_owner", "")
+                if isinstance(sealed_authority, dict)
+                else ""
             ),
             "continuation_claim_token": str(
-                getattr(session_entry, "continuation_claim_token", "") or ""
+                sealed_authority.get("continuation_claim_token", "")
+                if isinstance(sealed_authority, dict)
+                else ""
             ),
         }
 
@@ -22262,7 +22303,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
         valid = bool(
-            sealed_source is not None
+            isinstance(sealed_authority, dict)
+            and set(sealed_authority) == authority_keys
+            and isinstance(sealed_origin, dict)
+            and sealed_authority.get("session_key") == session_entry.session_key
+            and sealed_authority.get("session_id") == session_entry.session_id
+            and event_metadata.get("gateway_session_strict") is True
+            and event_metadata.get("gateway_session_key")
+            == sealed_authority.get("session_key")
+            and event_metadata.get("gateway_session_id")
+            == sealed_authority.get("session_id")
             and sealed_message_id
             and event_message_id == sealed_message_id
             and type(expected_resume_identity["continuation_generation"]) is int
@@ -22271,8 +22321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and event_resume_identity["continuation_generation"] > 0
             and expected_resume_identity == event_resume_identity
             and all(expected_resume_identity.values())
-            and canonical_resume_origin(sealed_source)
-            == canonical_resume_origin(source)
+            and sealed_origin == canonical_resume_origin(source)
         )
         if not valid:
             logger.warning(
