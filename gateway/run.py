@@ -3379,10 +3379,8 @@ def _event_media_is_audio(event, index: int) -> bool:
 def _event_media_is_stt_input(event, index: int) -> bool:
     """True when an audio attachment should enter the automatic STT pipeline."""
     message_type = getattr(event, "message_type", None)
-    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
-        return False
     return (
-        message_type == MessageType.VOICE
+        message_type in {MessageType.VOICE, MessageType.AUDIO}
         or _event_media_type_at(event, index).startswith("audio/")
     )
 
@@ -21036,12 +21034,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # mis-routed here as an image and the provider 400s.
                 if _event_media_is_image(event, i):
                     image_paths.append(path)
-                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
-                # MessageType.VOICE = voice message (Opus/OGG) — always STT
-                if event.message_type == MessageType.AUDIO:
-                    audio_file_paths.append(path)
-                elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
+                # Every incoming audio shape enters the same automatic STT
+                # pipeline: voice notes, audio attachments, replied-to audio,
+                # and documents whose per-file MIME is audio/*.
+                if not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                     audio_paths.append(path)
+                elif _event_media_is_audio(event, i):
+                    audio_file_paths.append(path)
                 if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
                     video_paths.append(path)
 
