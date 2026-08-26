@@ -14191,6 +14191,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         event.metadata.update(
             {
+                # The scheduler owns one exact interrupted session.  Use the
+                # handler's strict lookup path so mutable lane routing cannot
+                # substitute another session and discard this continuation.
+                "gateway_session_strict": True,
+                "gateway_session_key": entry.session_key,
+                "gateway_session_id": entry.session_id,
                 "resume_task_id": event.resume_task_id,
                 "continuation_generation": event.continuation_generation,
                 "continuation_claim_owner": event.continuation_claim_owner,
@@ -22802,7 +22808,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
         # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        recovered = None
+        if _should_follow_telegram_topic_binding(event):
+            recovered = await asyncio.to_thread(
+                self._recover_telegram_topic_thread_id,
+                source,
+            )
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",

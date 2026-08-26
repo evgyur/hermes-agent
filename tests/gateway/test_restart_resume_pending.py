@@ -87,6 +87,37 @@ def test_startup_resume_keeps_exact_session_instead_of_stale_topic_binding():
     assert _should_follow_telegram_topic_binding(ordinary) is True
 
 
+def test_startup_resume_event_pins_exact_interrupted_session():
+    """A synthetic resume must not re-resolve to another session in the lane."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="-1003971448755",
+        thread_id="1751",
+        message_id="48266",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:hermesdev:telegram:group:-1003971448755:1751",
+            session_id="20260826_143448_0768b70d",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="shutdown_timeout",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-resume-1751",
+        )
+    )
+
+    event = runner._build_startup_resume_event(entry, source)
+
+    assert event.metadata["gateway_session_strict"] is True
+    assert event.metadata["gateway_session_key"] == entry.session_key
+    assert event.metadata["gateway_session_id"] == entry.session_id
+
+
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
     return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
 
@@ -1386,6 +1417,7 @@ def _leased_startup_agent_runner(monkeypatch, tmp_path, history):
         )
     )
     runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.lookup_by_session_key.return_value = entry
     runner.session_store.load_transcript.return_value = history
     event = runner._build_startup_resume_event(entry, source)
     return runner, event, source, entry
