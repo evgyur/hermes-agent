@@ -1,3 +1,5 @@
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -150,6 +152,41 @@ def test_claimed_obligation_can_be_abandoned_exactly_then_next_generation_admits
         assert second["state"] == "PENDING"
         assert second["generation"] == 2
         assert second["resume_task_id"] == "task-2"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "contains spaces",
+        "UPPERCASE",
+        "contains-dash",
+        "x" * 81,
+        "_leading_underscore",
+    ],
+)
+def test_abandonment_reason_must_be_bounded_machine_readable(tmp_path, reason):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        assert _admit(db, expected_generation=0, task="task", origin="origin")
+        assert db.claim_gateway_resume_obligation(
+            session_key="telegram:chat:1",
+            resume_task_id="task",
+            expected_generation=1,
+            claim_owner="gateway:test",
+            claim_token="token",
+        )
+        with pytest.raises(ValueError, match="abandonment reason"):
+            db.abandon_gateway_resume_obligation(
+                session_key="telegram:chat:1",
+                resume_task_id="task",
+                expected_generation=1,
+                claim_owner="gateway:test",
+                claim_token="token",
+                reason=reason,
+            )
+        assert db.get_gateway_resume_obligation("telegram:chat:1")["state"] == "CLAIMED"
     finally:
         db.close()
 

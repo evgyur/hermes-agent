@@ -674,8 +674,12 @@ def test_reconciliation_isolates_topics_and_profiles(tmp_path):
             max_age_seconds=3600
         )
 
-        assert result["abandoned_claimed"] == 1
-        assert result["kept"] == 1
+        # Reconciliation is DB-wide. Other live stores sharing this DB may
+        # contribute their own exact kept/cancelled rows to the receipt; prove
+        # isolation from the authoritative target rows below rather than
+        # assuming this store is the only registered owner.
+        assert result["abandoned_claimed"] >= 1
+        assert result["kept"] >= 1
         first_row = store._db.get_gateway_resume_obligation(
             entries[0].session_key
         )
@@ -918,6 +922,15 @@ class TestResumePendingSystemNote:
         assert "do NOT re-execute or verify it" not in note
         assert "do not re-run or re-execute" in note.lower()
         assert "establish its outcome" in note.lower()
+
+    def test_startup_resume_never_replays_restart_or_shutdown_command(self):
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True, startup_resume=True
+        )
+
+        assert "restart/shutdown command" in note
+        assert "has already run" in note
+        assert "do not re-run or re-execute it" in note
 
     def test_unknown_effect_resume_is_reconciliation_only(self):
         note = build_resume_recovery_note(
@@ -1267,6 +1280,210 @@ async def test_shutdown_persists_resume_marker_before_notification_await(
         await runner.stop()
 
     assert order[:2] == ["mark", "notify"]
+
+
+@pytest.mark.asyncio
+async def test_failed_premark_graceful_drain_never_writes_clean_shutdown(
+    tmp_path, monkeypatch, caplog
+):
+    """A graceful drain cannot erase evidence that recovery authority failed."""
+    runner, adapter = make_restart_runner()
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    adapter.disconnect = AsyncMock()
+    session_key = "agent:hermesdev:telegram:group:-1003971448755:26452"
+    runner._running_agents = {session_key: MagicMock()}
+    runner.session_store.mark_resume_pending_with_receipt = MagicMock(
+        side_effect=RuntimeError("db down")
+    )
+
+    async def graceful_drain(*_args, **_kwargs):
+        snapshot = dict(runner._running_agents)
+        runner._running_agents.clear()
+        return snapshot, False
+
+    caplog.set_level(logging.ERROR, logger="gateway.run")
+    with patch.object(runner, "_drain_active_agents", side_effect=graceful_drain), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert not (tmp_path / ".clean_shutdown").exists()
+    assert any("recovery is not guaranteed" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_writes_one_categorical_premark_record_per_active_session(
+    tmp_path, monkeypatch
+):
+    runner, adapter = make_restart_runner()
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    adapter.disconnect = AsyncMock()
+    outcomes = [
+        "marked_exact",
+        "already_owned_exact",
+        "failed_missing_active_origin",
+        "failed_nonterminal_previous_generation",
+        "failed_db",
+    ]
+    keys = [f"agent:main:telegram:dm:receipt-{index}" for index in range(5)]
+    runner._running_agents = {key: MagicMock() for key in keys}
+    exact = {
+        "resume_task_id": "task",
+        "continuation_generation": 1,
+        "continuation_claim_owner": "gateway:test",
+        "continuation_claim_token": "token",
+    }
+    runner.async_session_store.mark_resume_pending_with_outcome = AsyncMock(
+        side_effect=[
+            {"outcome": outcome, "receipt": dict(exact) if outcome in {"marked_exact", "already_owned_exact"} else None}
+            for outcome in outcomes
+        ]
+    )
+
+    async def graceful_drain(*_args, **_kwargs):
+        snapshot = dict(runner._running_agents)
+        runner._running_agents.clear()
+        return snapshot, False
+
+    with patch.object(runner, "_drain_active_agents", side_effect=graceful_drain), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    record = json.loads(
+        (tmp_path / "state" / "gateway.shutdown-resume.json").read_text(encoding="utf-8")
+    )
+    assert record["schema"] == "hermes.gateway.shutdown-resume.v1"
+    assert record["all_active_sessions_protected"] is False
+    assert record["sessions"] == [
+        {"session_key": key, "outcome": outcome}
+        for key, outcome in zip(keys, outcomes)
+    ]
+    assert not (tmp_path / ".clean_shutdown").exists()
+
+
+def test_startup_reconciles_claim_without_any_routing_projection(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="literal-orphan", user_id=None)
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(entry.session_key, "shutdown_timeout")
+    assert receipt
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+    with store._lock:
+        store._entries.pop(entry.session_key)
+        store._save()
+
+    reopened = _make_store(tmp_path)
+    assert entry.session_key not in reopened._entries
+    result = reopened.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+
+    assert result["abandoned_claimed"] == 1
+    row = reopened._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "CANCELLED"
+    assert row["reason"] == "orphaned_claim"
+
+
+@pytest.mark.parametrize("foreign_exact", [False, True])
+def test_cross_scope_projection_without_live_owner_is_always_orphaned(
+    tmp_path, foreign_exact
+):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="cross-scope-orphan", user_id=None)
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key, source)
+    receipt = store.mark_resume_pending_with_receipt(entry.session_key, "shutdown_timeout")
+    assert receipt
+    scope = store._routing_scope()
+    projection = json.loads(
+        store._db.load_gateway_routing_entries(scope=scope)[entry.session_key]
+    )
+    if not foreign_exact:
+        projection["resume_task_id"] = "different-task"
+    store._db.save_gateway_routing_entry(
+        entry.session_key,
+        json.dumps(projection),
+        scope="foreign-profile-scope",
+    )
+    store._db.delete_gateway_routing_entries([entry.session_key], scope=scope)
+    with store._lock:
+        store._entries.pop(entry.session_key)
+        store._save()
+    cross_scope = store._db.list_gateway_routing_projections(entry.session_key)
+    assert len(cross_scope) == 1
+    assert json.loads(cross_scope[0])["resume_task_id"] == (
+        receipt["resume_task_id"] if foreign_exact else "different-task"
+    )
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=receipt["resume_task_id"],
+        expected_generation=receipt["continuation_generation"],
+        claim_owner=receipt["continuation_claim_owner"],
+        claim_token=receipt["continuation_claim_token"],
+    )
+
+    reopened = _make_store(tmp_path)
+    reopened._ensure_loaded()
+    assert entry.session_key not in reopened._entries
+    result = reopened.reconcile_orphaned_resume_obligations(max_age_seconds=3600)
+    row = reopened._db.get_gateway_resume_obligation(entry.session_key)
+
+    assert result["abandoned_claimed"] == 1
+    assert row["state"] == "CANCELLED"
+    assert row["reason"] == "orphaned_claim"
+
+
+def test_premark_outcome_api_distinguishes_exact_missing_previous_and_db(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source(chat_id="premark-outcomes", user_id=None)
+    entry = store.get_or_create_session(source)
+
+    missing = store.mark_resume_pending_with_outcome(entry.session_key)
+    assert missing == {"outcome": "failed_missing_active_origin", "receipt": None}
+
+    first_token = store.mark_turn_active(entry.session_key, source)
+    marked = store.mark_resume_pending_with_outcome(entry.session_key)
+    assert marked["outcome"] == "marked_exact"
+    assert marked["receipt"]["resume_task_id"] == first_token
+    owned = store.mark_resume_pending_with_outcome(entry.session_key)
+    assert owned["outcome"] == "already_owned_exact"
+    assert owned["receipt"] == marked["receipt"]
+
+    # Lose only the routing projection while the DB still owns generation 1,
+    # then start a different active turn. Admission must report the competing
+    # nonterminal generation, not collapse it into an opaque DB failure.
+    with store._lock:
+        entry.resume_pending = False
+        entry.resume_task_id = ""
+        entry.continuation_generation = 0
+        entry.continuation_claim_owner = ""
+        entry.continuation_claim_token = ""
+        entry.resume_origin_snapshot = None
+        entry.active_turn_token = None
+        entry.active_turn_started_at = None
+        entry.active_turn_origin_snapshot = None
+    assert store.mark_turn_active(entry.session_key, source)
+    previous = store.mark_resume_pending_with_outcome(entry.session_key)
+    assert previous == {
+        "outcome": "failed_nonterminal_previous_generation",
+        "receipt": None,
+    }
+
+    original_admit = store._db.admit_gateway_resume_obligation
+    store._db.admit_gateway_resume_obligation = MagicMock(
+        side_effect=RuntimeError("db down")
+    )
+    try:
+        failed = store.mark_resume_pending_with_outcome(entry.session_key)
+    finally:
+        store._db.admit_gateway_resume_obligation = original_admit
+    assert failed == {"outcome": "failed_db", "receipt": None}
 
 
 @pytest.mark.asyncio
@@ -2396,8 +2613,7 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "⚠️ Gateway restarting."
     ]
 
 

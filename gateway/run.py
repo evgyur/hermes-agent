@@ -11802,16 +11802,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        home_msg = f"⚠️ Gateway {action}."
+        premark_outcomes = getattr(self, "_shutdown_premark_outcomes", {})
 
         notified: set[tuple[str, str, Optional[str], Optional[str]]] = set()
         for session_key in active:
+            protected = premark_outcomes.get(session_key) in {
+                "marked_exact",
+                "already_owned_exact",
+            }
+            hint = (
+                "Your current task will be interrupted. The gateway will "
+                "attempt an automatic continuation after it starts."
+                if protected
+                else "Your current task will be interrupted. Automatic "
+                "continuation could not be secured."
+            )
+            msg = f"⚠️ Gateway {action} — {hint}"
             source = None
             parsed_source = None
             try:
@@ -11981,6 +11988,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            msg = home_msg
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -17420,29 +17428,101 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # notification or drain, the durable marker is already written so
             # the next gateway boot can recover in-flight sessions (#27856).
             _pre_drain_receipts: dict[str, dict] = {}
+            _pre_drain_sessions: list[dict[str, str]] = []
+            _all_active_sessions_protected = True
             for _sk, _agent in list(self._running_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
-                    _receipt = await self.async_session_store.mark_resume_pending_with_receipt(
-                        _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                    _reason = (
+                        "restart_timeout"
+                        if self._restart_requested
+                        else "shutdown_timeout"
                     )
-                    if isinstance(_receipt, dict) and all(_receipt.values()):
+                    _async_store = self.async_session_store
+                    _explicit_async = _get_declared_adapter_hook(
+                        _async_store,
+                        "mark_resume_pending_with_outcome",
+                    )
+                    _declared_sync = _get_declared_adapter_hook(
+                        self.session_store,
+                        "mark_resume_pending_with_outcome",
+                    )
+                    if callable(_explicit_async) or callable(_declared_sync):
+                        _premark = await _async_store.mark_resume_pending_with_outcome(
+                            _sk,
+                            _reason,
+                        )
+                    else:
+                        # Compatibility for narrow embedders/test doubles that
+                        # expose only the legacy receipt method.
+                        _legacy_receipt = (
+                            await _async_store.mark_resume_pending_with_receipt(
+                                _sk,
+                                _reason,
+                            )
+                        )
+                        _premark = {
+                            "outcome": (
+                                "marked_exact"
+                                if isinstance(_legacy_receipt, dict)
+                                and _legacy_receipt
+                                and all(_legacy_receipt.values())
+                                else "failed_db"
+                            ),
+                            "receipt": _legacy_receipt,
+                        }
+                    _outcome = str((_premark or {}).get("outcome") or "failed_db")
+                    _receipt = (_premark or {}).get("receipt")
+                    _pre_drain_sessions.append(
+                        {"session_key": _sk, "outcome": _outcome}
+                    )
+                    if (
+                        _outcome in {"marked_exact", "already_owned_exact"}
+                        and isinstance(_receipt, dict)
+                        and all(_receipt.values())
+                    ):
                         _pre_drain_receipts[_sk] = dict(_receipt)
                     else:
+                        _all_active_sessions_protected = False
                         logger.error(
                             "Shutdown could not persist exact pre-drain resume "
-                            "marker for %s; recovery is not guaranteed",
+                            "marker for %s (%s); recovery is not guaranteed",
                             _sk,
+                            _outcome,
                         )
                 except Exception as _e:
+                    _all_active_sessions_protected = False
+                    _pre_drain_sessions.append(
+                        {"session_key": _sk, "outcome": "failed_db"}
+                    )
                     logger.error(
                         "Shutdown could not persist exact pre-drain resume "
-                        "marker for %s: %s",
+                        "marker for %s: %s; recovery is not guaranteed",
                         _sk,
                         _e,
                     )
+
+            self._shutdown_premark_outcomes = {
+                item["session_key"]: item["outcome"]
+                for item in _pre_drain_sessions
+            }
+            _shutdown_resume_record = {
+                "schema": "hermes.gateway.shutdown-resume.v1",
+                "recorded_at": time.time(),
+                "restart_requested": bool(self._restart_requested),
+                "all_active_sessions_protected": _all_active_sessions_protected,
+                "sessions": _pre_drain_sessions,
+            }
+            try:
+                atomic_json_write(
+                    _hermes_home / "state" / "gateway.shutdown-resume.json",
+                    _shutdown_resume_record,
+                    mode=0o600,
+                )
+            except Exception:
+                _all_active_sessions_protected = False
+                logger.exception("Could not persist shutdown resume lifecycle receipt")
 
             # Notify all chats with active agents before draining.  Adapters
             # are still connected here, so messages can be delivered.  The
@@ -17799,16 +17879,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message).  Skip the marker in that case so the next startup
             # suspends those sessions — giving users a clean slate instead
             # of resuming a half-finished tool loop.
-            if not timed_out:
+            if not timed_out and _all_active_sessions_protected:
                 try:
                     (_hermes_home / ".clean_shutdown").touch()
                 except Exception:
                     pass
             else:
+                try:
+                    (_hermes_home / ".clean_shutdown").unlink(missing_ok=True)
+                except Exception:
+                    pass
                 logger.info(
-                    "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
+                    "Skipping .clean_shutdown marker — drain timed_out=%s, "
+                    "all_active_sessions_protected=%s",
+                    timed_out,
+                    _all_active_sessions_protected,
                 )
 
             # Track sessions that were active at shutdown for stuck-loop

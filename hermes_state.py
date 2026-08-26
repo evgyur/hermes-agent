@@ -15196,7 +15196,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         generation.
         """
         normalized_reason = str(reason or "").strip()
-        if not normalized_reason or len(normalized_reason) > 160:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", normalized_reason):
             raise ValueError("invalid gateway resume abandonment reason")
 
         def _do(conn):
@@ -15236,6 +15236,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         return bool(self._execute_write(_do))
+
+    def list_gateway_routing_projections(self, session_key: str) -> list[str]:
+        """Return every scoped routing projection for one exact session key."""
+        key = str(session_key or "")
+        if not key:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE session_key = ? ORDER BY scope",
+                (key,),
+            ).fetchall()
+        return [str(row["entry_json"] or "") for row in rows]
+
+    def list_gateway_routing_projection_records(
+        self, session_key: str
+    ) -> list[Dict[str, str]]:
+        """Return scoped routing records used for exact owner reconciliation."""
+        key = str(session_key or "")
+        if not key:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT scope, entry_json FROM gateway_routing "
+                "WHERE session_key = ? ORDER BY scope",
+                (key,),
+            ).fetchall()
+        return [
+            {
+                "scope": str(row["scope"] or ""),
+                "entry_json": str(row["entry_json"] or ""),
+            }
+            for row in rows
+        ]
 
     def cancel_gateway_resume_obligation(
         self, *, session_key: str, resume_task_id: str,
