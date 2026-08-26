@@ -89,6 +89,17 @@ def _get_declared_adapter_hook(adapter: Any, name: str):
         return None
     return getattr(adapter, name, None)
 
+
+def _should_follow_telegram_topic_binding(event: Any) -> bool:
+    """Return whether a turn may follow the mutable topic-session binding.
+
+    Startup recovery is already bound to one exact interrupted session and its
+    continuation CAS tuple.  Rebinding that synthetic event to another session
+    in the same Telegram topic drops the tuple and can resume unrelated history.
+    Normal inbound turns retain the existing topic-binding behavior.
+    """
+    return not bool(getattr(event, "startup_resume", False))
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -22855,7 +22866,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if (
+            _should_follow_telegram_topic_binding(event)
+            and await asyncio.to_thread(self._is_telegram_topic_lane, source)
+        ):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),

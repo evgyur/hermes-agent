@@ -44,6 +44,7 @@ from gateway.run import (
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _prepare_resume_pending_message,
+    _should_follow_telegram_topic_binding,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -76,6 +77,14 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+
+
+def test_startup_resume_keeps_exact_session_instead_of_stale_topic_binding():
+    startup = MagicMock(startup_resume=True)
+    ordinary = MagicMock(startup_resume=False)
+
+    assert _should_follow_telegram_topic_binding(startup) is False
+    assert _should_follow_telegram_topic_binding(ordinary) is True
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
@@ -319,7 +328,7 @@ def test_duplicate_premark_projects_authoritative_pending_or_claimed_row(
 def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_path):
     """A reset/new task must not inherit a claimed obligation from an old boot."""
     store = _make_store(tmp_path)
-    source = _make_source(chat_id="incident-1751", user_id="owner")
+    source = _make_source(chat_id="incident-1751", user_id=None)
     entry = store.get_or_create_session(source)
     first_task = store.mark_turn_active(entry.session_key, source)
     assert first_task
@@ -374,6 +383,15 @@ def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_pa
     assert second_receipt
     assert second_receipt["continuation_generation"] == 2
     assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
+
+    reopened = _make_store(tmp_path)
+    assert reopened.reconcile_orphaned_resume_obligations(max_age_seconds=3600) == {
+        "cancelled_pending": 0,
+        "abandoned_claimed": 0,
+        "cleared_terminal_projection": 0,
+        "kept": 1,
+    }
+    assert reopened._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
 
 
 def test_startup_reconciles_stale_exact_claim_and_clears_only_its_marker(
