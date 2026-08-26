@@ -12829,7 +12829,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         entry = self.session_store._entries.get(session_key)  # noqa: SLF001
                 except Exception:
                     entry = None
-                if entry is None or not await self._claim_startup_resume_obligation(entry):
+                if entry is None or not await self._claim_startup_resume_obligation(
+                    entry,
+                    allow_existing_claim=True,
+                ):
                     return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
@@ -12970,7 +12973,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await sealed_adapter.handle_message(event)
         return True
 
-    async def _claim_startup_resume_obligation(self, entry: SessionEntry) -> bool:
+    async def _claim_startup_resume_obligation(
+        self,
+        entry: SessionEntry,
+        *,
+        allow_existing_claim: bool = False,
+    ) -> bool:
         """Claim the exact committed continuation mirrored by ``entry``."""
         snapshot = getattr(entry, "resume_origin_snapshot", None) or {}
         source_payload = snapshot.get("source")
@@ -12986,9 +12994,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return False
         expected_generation = int(getattr(entry, "continuation_generation", 0) or 0)
+        row_state = row.get("state") if isinstance(row, dict) else None
+        exact_existing_claim = bool(
+            allow_existing_claim
+            and row_state == "CLAIMED"
+            and row.get("claim_owner") == entry.continuation_claim_owner
+            and row.get("claim_token") == entry.continuation_claim_token
+        )
         if (
             not isinstance(row, dict)
-            or row.get("state") != "PENDING"
+            or (row_state != "PENDING" and not exact_existing_claim)
             or row.get("resume_task_id") != entry.resume_task_id
             or row.get("generation") != expected_generation
             or row.get("origin_sha256") != source_digest
@@ -13564,6 +13579,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
         return None
+
+    async def _startup_resume_raw_semantic_rows(
+        self,
+        session_id: str,
+        source_message_id: str,
+    ) -> Optional[list]:
+        """Read exact raw ingress authority, including compacted source rows."""
+        try:
+            rows = await self._await_db_call(
+                self._session_db,
+                "get_messages",
+                session_id,
+                include_inactive=True,
+            )
+        except Exception:
+            logger.warning(
+                "Startup raw semantic authority read failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+        exact_rows = []
+        for row in rows or []:
+            if not isinstance(row, dict) or row.get("role") != "user":
+                continue
+            identities = [
+                row.get(key)
+                for key in ("platform_message_id", "message_id")
+                if row.get(key) is not None
+            ]
+            if identities and all(
+                type(value) is str and value == source_message_id
+                for value in identities
+            ):
+                exact_rows.append(row)
+        return exact_rows
 
     @staticmethod
     def _canonical_startup_tool_call(call: dict) -> Optional[tuple[str, str, str]]:
@@ -21892,9 +21943,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
+        raw_semantic_rows = await self._startup_resume_raw_semantic_rows(
+            session_entry.session_id,
+            sealed_message_id,
+        )
+        if not raw_semantic_rows:
+            raw_semantic_rows = history
         if not self._restore_startup_raw_semantic_envelope(
             event,
-            history,
+            raw_semantic_rows,
             source_message_id=sealed_message_id,
         ):
             logger.warning(
@@ -21960,9 +22017,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         matches = [row for row in history if _matches_source_row(row)]
-        if len(matches) != 1:
+        authoritative_matches = []
+        for row in matches:
+            metadata = row.get("display_metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get(_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY) is not None
+            ):
+                authoritative_matches.append(row)
+        if len(authoritative_matches) != 1:
             return False
-        source_row = matches[0]
+        source_row = authoritative_matches[0]
         metadata = source_row.get("display_metadata")
         envelope = (
             metadata.get(_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY)

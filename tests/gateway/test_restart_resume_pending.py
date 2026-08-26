@@ -858,6 +858,69 @@ async def test_leased_startup_restores_direct_reply_semantics_before_preprocessi
 
 
 @pytest.mark.asyncio
+async def test_leased_startup_restores_archived_authoritative_raw_semantics(
+    monkeypatch,
+    tmp_path,
+):
+    """Compaction may archive the trigger row without revoking its authority."""
+    active_history = [
+        {
+            "role": "user",
+            "content": "Fix",
+            "platform_message_id": "msg-42",
+            "display_metadata": None,
+        }
+    ]
+    archived_rows = [
+        {
+            "role": "user",
+            "content": "Fix",
+            "platform_message_id": "msg-42",
+            "active": 0,
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": {
+                        "message_id": "guardian-report",
+                        "is_own": True,
+                        "quote": "Use the sealed production reply context.",
+                    },
+                    "media": [],
+                }
+            },
+        },
+        {
+            "role": "user",
+            "content": "Fix",
+            "platform_message_id": "msg-42",
+            "active": 0,
+            "display_metadata": None,
+        },
+    ]
+    runner, event, source, entry = _leased_startup_agent_runner(
+        monkeypatch, tmp_path, active_history
+    )
+
+    class ArchivedAuthorityDB:
+        def get_messages(self, session_id, *, include_inactive=False):
+            assert session_id == entry.session_id
+            assert include_inactive is True
+            return archived_rows
+
+    runner._session_db = ArchivedAuthorityDB()
+
+    assert await runner._validate_and_seal_startup_resume(
+        event,
+        source,
+        entry,
+        active_history,
+    )
+    assert event.reply_to_message_id == "guardian-report"
+    assert event.reply_to_text == "Use the sealed production reply context."
+
+
+@pytest.mark.asyncio
 async def test_leased_startup_restores_existing_media_and_rejects_missing_ref(
     monkeypatch,
     tmp_path,
@@ -1846,6 +1909,56 @@ class _ResumeObligationDB:
         self.row["claim_owner"] = kwargs["claim_owner"]
         self.row["claim_token"] = kwargs["claim_token"]
         return True
+
+
+@pytest.mark.asyncio
+async def test_new_gateway_reclaims_exact_previously_claimed_startup_obligation():
+    """A crash after CLAIMED must not strand the continuation forever."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="claimed-across-restart",
+        message_id="message-a",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-claimed-across-restart",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-a",
+        )
+    )
+    obligation_db = _ResumeObligationDB(entry)
+    obligation_db.row.update(
+        {
+            "state": "CLAIMED",
+            "claim_owner": entry.continuation_claim_owner,
+            "claim_token": entry.continuation_claim_token,
+        }
+    )
+
+    def claim_exact(**kwargs):
+        obligation_db.claim_calls += 1
+        return (
+            obligation_db.row["state"] == "CLAIMED"
+            and kwargs["claim_owner"] == obligation_db.row["claim_owner"]
+            and kwargs["claim_token"] == obligation_db.row["claim_token"]
+        )
+
+    obligation_db.claim_gateway_resume_obligation = claim_exact
+    runner._session_db = obligation_db
+
+    assert await runner._claim_startup_resume_obligation(
+        entry,
+        allow_existing_claim=True,
+    )
+    assert obligation_db.claim_calls == 1
 
 
 @pytest.mark.asyncio
