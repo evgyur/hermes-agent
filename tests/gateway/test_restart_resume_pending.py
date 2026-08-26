@@ -2929,18 +2929,20 @@ async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human(
     runner._session_db.get_messages = lambda *_args, **_kwargs: [
         {
             "role": "user",
-            "content": "A5-CANARY-1787777773",
+            "content": "[Owner|owner]\nA5-CANARY-1787777773",
             "platform_message_id": "48397",
         }
     ]
     runner._run_startup_resume_event = AsyncMock(return_value=None)
 
+    shared_source = replace(source, user_id=None, user_name=None, user_id_alt=None)
     redelivery = MessageEvent(
-        text="A5-CANARY-1787777773",
+        text="[Owner|owner]\nA5-CANARY-1787777773",
         message_type=MessageType.TEXT,
-        source=source,
+        source=shared_source,
         message_id="48397",
     )
+    redelivery._hermes_turn_authority_source = source
     assert await runner._handle_message(redelivery) is None
 
     assert entry.session_key not in runner._startup_restore_priority_session_keys

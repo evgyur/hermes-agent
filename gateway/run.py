@@ -19750,10 +19750,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if entry is not None
                         else None
                     )
+                    authority_source = self._validated_turn_authority_source(
+                        event,
+                        session_key,
+                    )
                     route_is_exact = bool(
                         sealed_source is not None
+                        and authority_source is not None
                         and canonical_resume_origin(sealed_source)
-                        == canonical_resume_origin(source)
+                        == canonical_resume_origin(authority_source)
                     )
                     if route_is_exact:
                         source_message_id = str(sealed_source.message_id or "")
@@ -23072,6 +23077,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _validated_turn_authority_source(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+    ) -> Optional[SessionSource]:
+        """Return the trusted source for a turn, or fail closed on mismatch."""
+        source = event.source
+        authority_source = getattr(
+            event,
+            "_hermes_turn_authority_source",
+            None,
+        )
+        if authority_source is None:
+            return source
+        # Telegram observed-group mode intentionally anonymizes the shared
+        # session source.  Accept its process-local principal carrier only when
+        # removing that principal reproduces the exact current route.  Raw/model
+        # metadata cannot mint this authority, and any mismatch fails closed.
+        try:
+            if not (
+                isinstance(authority_source, SessionSource)
+                and source.platform == Platform.TELEGRAM
+                and authority_source.platform == Platform.TELEGRAM
+                and source.chat_type == "group"
+                and authority_source.chat_type == "group"
+                and source.user_id is None
+                and isinstance(authority_source.user_id, str)
+                and bool(authority_source.user_id)
+                and canonical_resume_origin(
+                    dataclasses.replace(
+                        authority_source,
+                        user_id=None,
+                        user_name=None,
+                        user_id_alt=None,
+                    )
+                )
+                == canonical_resume_origin(source)
+                and self._is_user_authorized(authority_source)
+            ):
+                logger.warning(
+                    "Rejected mismatched active-turn authority carrier for %s",
+                    session_key,
+                )
+                return None
+        except Exception as exc:
+            logger.warning(
+                "Could not validate active-turn authority carrier for %s: %s",
+                session_key,
+                exc,
+            )
+            return None
+        return authority_source
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
@@ -23085,52 +23143,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable admission when the source cannot possibly mint a marker; the
         real marker is committed immediately after the triggering user row.
         """
-        source = event.source
-        authority_source = getattr(
-            event,
-            "_hermes_turn_authority_source",
-            None,
-        )
-        if authority_source is not None:
-            # Telegram observed-group mode intentionally anonymizes the shared
-            # session source.  Accept its process-local principal carrier only
-            # when removing that principal reproduces the exact current route.
-            # Raw/model metadata cannot mint this authority, and any mismatch
-            # fails before the active-turn marker is admitted.
-            try:
-                if not (
-                    isinstance(authority_source, SessionSource)
-                    and source.platform == Platform.TELEGRAM
-                    and authority_source.platform == Platform.TELEGRAM
-                    and source.chat_type == "group"
-                    and authority_source.chat_type == "group"
-                    and source.user_id is None
-                    and isinstance(authority_source.user_id, str)
-                    and bool(authority_source.user_id)
-                    and canonical_resume_origin(
-                        dataclasses.replace(
-                            authority_source,
-                            user_id=None,
-                            user_name=None,
-                            user_id_alt=None,
-                        )
-                    )
-                    == canonical_resume_origin(source)
-                    and self._is_user_authorized(authority_source)
-                ):
-                    logger.warning(
-                        "Rejected mismatched active-turn authority carrier for %s",
-                        session_key,
-                    )
-                    return False
-            except Exception as exc:
-                logger.warning(
-                    "Could not validate active-turn authority carrier for %s: %s",
-                    session_key,
-                    exc,
-                )
-                return False
-            source = authority_source
+        source = self._validated_turn_authority_source(event, session_key)
+        if source is None:
+            return False
         try:
             message_id = self._turn_platform_message_id(event)
         except (TypeError, ValueError) as exc:
