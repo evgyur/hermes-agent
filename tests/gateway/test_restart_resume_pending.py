@@ -342,6 +342,11 @@ def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_pa
     entry.resume_reason = None
     entry.last_resume_marked_at = None
     entry.resume_task_id = ""
+    # Production startup can reconstruct the routing projection without the
+    # terminal DB generation.  The DB row remains authoritative and the next
+    # independently authorized active turn must advance from it, not deadlock
+    # forever on the projection's stale generation zero.
+    entry.continuation_generation = 0
     entry.continuation_claim_owner = ""
     entry.continuation_claim_token = ""
     entry.resume_origin_snapshot = None

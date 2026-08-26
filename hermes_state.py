@@ -15091,10 +15091,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and existing["origin_sha256"] == origin_sha256
                 ):
                     return existing
-                if int(existing["generation"]) != expected:
-                    return None
                 if existing["state"] not in ("TERMINAL", "CANCELLED"):
                     return None
+                existing_generation = int(existing["generation"])
+                # The routing projection is a cache of durable continuation
+                # identity.  Startup can legitimately reconstruct it without a
+                # terminal generation that already exists in the DB (for
+                # example after quarantining an old claim).  A fresh active-turn
+                # token is new authorization, so advance from the DB's terminal
+                # generation when the projection is behind.  Never accept a
+                # projection ahead of the database.
+                if expected > existing_generation:
+                    return None
+                next_generation = existing_generation + 1
                 cursor = conn.execute(
                     """UPDATE gateway_resume_obligations
                           SET resume_task_id=?, generation=?, state='PENDING',
@@ -15102,8 +15111,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                               claim_owner=NULL, claim_token=NULL, updated_at=?
                         WHERE session_key=? AND generation=?
                           AND state IN ('TERMINAL','CANCELLED')""",
-                    (task, expected + 1, origin_json, origin_sha256, str(reason),
-                     float(marked_at), now, key, expected),
+                    (task, next_generation, origin_json, origin_sha256, str(reason),
+                     float(marked_at), now, key, existing_generation),
                 )
                 if cursor.rowcount != 1:
                     return None

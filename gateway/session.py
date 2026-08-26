@@ -3803,6 +3803,18 @@ class SessionStore:
                 marked_at=candidate.last_resume_marked_at.timestamp(),
             )
             committed_state = committed.get("state") if isinstance(committed, dict) else None
+            if isinstance(committed, dict) and committed_state == "PENDING":
+                try:
+                    committed_generation = int(committed["generation"])
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if committed_generation < candidate.continuation_generation:
+                    return None
+                candidate.continuation_generation = committed_generation
+                # The immutable snapshot binds the generation as well as the
+                # route.  Re-seal it when the authoritative DB advanced from a
+                # terminal generation absent from the routing projection.
+                _bind_resume_origin_snapshot(candidate, origin_payload)
             exact_existing_claim = bool(
                 committed_state == "CLAIMED"
                 and committed.get("claim_owner")

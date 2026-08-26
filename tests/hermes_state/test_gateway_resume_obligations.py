@@ -152,3 +152,28 @@ def test_claimed_obligation_can_be_abandoned_exactly_then_next_generation_admits
         assert second["resume_task_id"] == "task-2"
     finally:
         db.close()
+
+
+def test_terminal_db_generation_advances_when_routing_projection_is_behind(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        first = _admit(db, expected_generation=0, task="task-1", origin="one")
+        assert first["generation"] == 1
+        assert db.cancel_gateway_resume_obligation(
+            session_key="telegram:chat:1",
+            resume_task_id="task-1",
+            expected_generation=1,
+            reason="quarantined_invalid_envelope",
+        )
+
+        # A reconstructed routing entry may still say generation zero.  The
+        # durable terminal row is authoritative for the next monotonic value.
+        second = _admit(db, expected_generation=0, task="task-2", origin="two")
+        assert second["state"] == "PENDING"
+        assert second["generation"] == 2
+        assert second["resume_task_id"] == "task-2"
+
+        # A projection ahead of the durable DB is never accepted.
+        assert _admit(db, expected_generation=3, task="future", origin="future") is None
+    finally:
+        db.close()
