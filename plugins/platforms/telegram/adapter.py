@@ -10187,7 +10187,15 @@ class TelegramAdapter(BasePlatformAdapter):
             elif cached.kind == "video":
                 event.message_type = MessageType.VIDEO
             elif cached.kind == "audio":
-                event.message_type = MessageType.AUDIO
+                # Preserve Telegram's voice-note semantics for replied-to
+                # media.  Generic audio attachments intentionally bypass STT,
+                # but a reply to ``message.voice`` must enter the same Groq/
+                # Whisper path as a directly received voice note.
+                event.message_type = (
+                    MessageType.VOICE
+                    if getattr(reply_msg, "voice", None)
+                    else MessageType.AUDIO
+                )
         event.text = self._append_observed_note(
             event.text,
             f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
