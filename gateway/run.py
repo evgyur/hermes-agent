@@ -23086,6 +23086,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         real marker is committed immediately after the triggering user row.
         """
         source = event.source
+        authority_source = getattr(
+            event,
+            "_hermes_turn_authority_source",
+            None,
+        )
+        if authority_source is not None:
+            # Telegram observed-group mode intentionally anonymizes the shared
+            # session source.  Accept its process-local principal carrier only
+            # when removing that principal reproduces the exact current route.
+            # Raw/model metadata cannot mint this authority, and any mismatch
+            # fails before the active-turn marker is admitted.
+            try:
+                if not (
+                    isinstance(authority_source, SessionSource)
+                    and source.platform == Platform.TELEGRAM
+                    and authority_source.platform == Platform.TELEGRAM
+                    and source.chat_type == "group"
+                    and authority_source.chat_type == "group"
+                    and source.user_id is None
+                    and isinstance(authority_source.user_id, str)
+                    and bool(authority_source.user_id)
+                    and canonical_resume_origin(
+                        dataclasses.replace(
+                            authority_source,
+                            user_id=None,
+                            user_name=None,
+                            user_id_alt=None,
+                        )
+                    )
+                    == canonical_resume_origin(source)
+                    and self._is_user_authorized(authority_source)
+                ):
+                    logger.warning(
+                        "Rejected mismatched active-turn authority carrier for %s",
+                        session_key,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "Could not validate active-turn authority carrier for %s: %s",
+                    session_key,
+                    exc,
+                )
+                return False
+            source = authority_source
         try:
             message_id = self._turn_platform_message_id(event)
         except (TypeError, ValueError) as exc:

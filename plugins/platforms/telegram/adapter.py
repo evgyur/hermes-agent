@@ -10226,12 +10226,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 event,
                 channel_prompt=channel_prompt,
             )
-        return dataclasses.replace(
+        attributed = dataclasses.replace(
             event,
             text=self._telegram_group_observe_attributed_text(event),
             source=shared_source,
             channel_prompt=channel_prompt,
         )
+        # The shared source deliberately removes the sender from model/session
+        # context, but restart authority must still bind to the exact human who
+        # authorized this turn.  Keep that source process-local: the gateway
+        # validates the route equivalence before sealing it and never persists
+        # this private carrier as user/model-authored metadata.
+        setattr(attributed, "_hermes_turn_authority_source", event.source)
+        return attributed
 
     def _media_message_type(self, msg: Message) -> MessageType:
         """Classify a Telegram media message into a MessageType."""

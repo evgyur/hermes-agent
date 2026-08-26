@@ -1,7 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
@@ -228,6 +228,60 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
         assert "Existing topic prompt" in event.channel_prompt
         assert "observed Telegram group context" in event.channel_prompt
         assert "current new message" in event.channel_prompt
+
+    asyncio.run(_run())
+
+
+def test_observed_group_turn_keeps_exact_sender_for_restart_authority():
+    """Shared model context must not erase the active turn's real principal."""
+
+    async def _run():
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        text = "@hermes_bot run the release canary"
+        message = _group_message(
+            text,
+            from_user_id=222,
+            from_user_name="Bob Example",
+            thread_id=7,
+            entities=[_mention_entity(text)],
+        )
+        event = adapter._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=1004,
+        )
+        event = adapter._apply_telegram_group_observe_attribution(event)
+        assert event.source.user_id is None
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        runner._is_user_authorized = lambda source: source.user_id == "222"
+        runner.session_store = MagicMock()
+        mark_active = AsyncMock(return_value="turn-token")
+        runner._async_session_store = SimpleNamespace(
+            _store=runner.session_store,
+            mark_turn_active=mark_active,
+        )
+
+        assert await runner._mark_durable_active_turn(
+            event,
+            "agent:main:telegram:group:-100:7",
+        )
+        authority_source = mark_active.await_args.args[1]
+        assert authority_source.chat_id == "-100"
+        assert authority_source.thread_id == "7"
+        assert authority_source.message_id == "42"
+        assert authority_source.user_id == "222"
 
     asyncio.run(_run())
 
