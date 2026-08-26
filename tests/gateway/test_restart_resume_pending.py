@@ -36,7 +36,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SendResult,
+    StartupResumeDispatchHandoff,
+)
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -3224,8 +3229,10 @@ async def test_cancelled_startup_wrapper_keeps_claim_while_shielded_child_runs()
         child_started.set()
         await release_child.wait()
 
+    adapter._process_message_background = lambda *_args: _child()
+
     async def _start_child(_event):
-        adapter._session_tasks[entry.session_key] = asyncio.create_task(_child())
+        return adapter._start_session_processing(_event, entry.session_key)
 
     adapter.handle_message = _start_child
     abandon = AsyncMock(return_value=True)
@@ -3245,6 +3252,101 @@ async def test_cancelled_startup_wrapper_keeps_claim_while_shielded_child_runs()
     release_child.set()
     await adapter._session_tasks[entry.session_key]
     runner._release_running_agent_state(entry.session_key)
+
+
+@pytest.mark.asyncio
+async def test_startup_wrapper_revokes_deferred_adapter_child_registration():
+    """A child published after handler return cannot outrun claim refusal."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="deferred-child-registration",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:deferred-child-registration",
+            session_id="sid-deferred-child-registration",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-deferred-child-registration",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    child_started = asyncio.Event()
+    deferred_done = asyncio.Event()
+
+    async def _install_child_after_return():
+        await asyncio.sleep(0)
+        adapter._start_session_processing(event, entry.session_key)
+        deferred_done.set()
+
+    async def _defer_child_registration(_event):
+        asyncio.create_task(_install_child_after_return())
+
+    adapter.handle_message = _defer_child_registration
+    adapter._process_message_background = AsyncMock(
+        side_effect=lambda *_args: child_started.set()
+    )
+    abandon = AsyncMock(return_value=True)
+    runner.async_session_store.abandon_resume_pending_exact = abandon
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+    await deferred_done.wait()
+    await asyncio.sleep(0)
+
+    assert not child_started.is_set()
+    assert entry.session_key not in adapter._session_tasks
+    abandon.assert_awaited_once_with(
+        entry.session_key,
+        resume_task_id=entry.resume_task_id,
+        continuation_generation=entry.continuation_generation,
+        continuation_claim_owner=entry.continuation_claim_owner,
+        continuation_claim_token=entry.continuation_claim_token,
+        reason="quarantined_invalid_envelope",
+    )
+
+
+def test_startup_handoff_is_one_shot_and_route_exact():
+    handoff = StartupResumeDispatchHandoff("expected-route")
+    task = MagicMock(spec=asyncio.Task)
+
+    assert handoff.is_open_for("other-route") is False
+    assert handoff.accept("other-route", task) is False
+    assert handoff.is_open_for("expected-route") is True
+    assert handoff.accept("expected-route", task) is True
+    assert handoff.accepted_task is task
+    assert handoff.revoke() is False
+    assert handoff.accept("expected-route", MagicMock(spec=asyncio.Task)) is False
+
+
+@pytest.mark.asyncio
+async def test_start_session_processing_cleans_guard_when_task_creation_raises():
+    _runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:create-task-failure"
+    event = MagicMock()
+    event._gateway_startup_dispatch_handoff = StartupResumeDispatchHandoff(
+        session_key
+    )
+    adapter._process_message_background = AsyncMock()
+
+    with patch(
+        "gateway.platforms.base.asyncio.create_task",
+        side_effect=RuntimeError("task factory failed"),
+    ):
+        with pytest.raises(RuntimeError, match="task factory failed"):
+            adapter._start_session_processing(event, session_key)
+
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
 
 
 @pytest.mark.asyncio

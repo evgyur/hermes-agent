@@ -780,6 +780,47 @@ class StreamingTTSHandle:
     aborted: bool = False
 
 
+class StartupResumeDispatchHandoff:
+    """One-shot fence for an adapter accepting a synthetic resume event.
+
+    ``handle_message`` normally installs its session task synchronously before
+    returning.  Multiplex wrappers may defer that call, though, so the gateway
+    needs an exact way to revoke the event before abandoning its durable claim.
+    A late ``_start_session_processing`` call must then fail before its child
+    task is created.
+    """
+
+    __slots__ = ("expected_session_key", "_accepted_task", "_revoked")
+
+    def __init__(self, expected_session_key: str):
+        self.expected_session_key = str(expected_session_key)
+        self._accepted_task: Optional[asyncio.Task] = None
+        self._revoked = False
+
+    def is_open_for(self, session_key: str) -> bool:
+        return bool(
+            not self._revoked
+            and self._accepted_task is None
+            and str(session_key) == self.expected_session_key
+        )
+
+    def accept(self, session_key: str, task: asyncio.Task) -> bool:
+        if not self.is_open_for(session_key):
+            return False
+        self._accepted_task = task
+        return True
+
+    def revoke(self) -> bool:
+        if self._accepted_task is not None:
+            return False
+        self._revoked = True
+        return True
+
+    @property
+    def accepted_task(self) -> Optional[asyncio.Task]:
+        return self._accepted_task
+
+
 def streaming_tts_turn_key(session_key: str | None, turn_marker: Any = None, *, event: Any = None) -> str | None:
     """Return a per-turn streaming-TTS suppression key.
 
@@ -6254,18 +6295,35 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         *,
         interrupt_event: Optional[asyncio.Event] = None,
-    ) -> bool:
+    ) -> Optional[asyncio.Task]:
         """Spawn a background processing task under the given session guard.
 
-        Returns True on success.  If the runtime stubs ``create_task`` with a
+        Returns the exact owner task on success.  If the runtime stubs
+        ``create_task`` with a
         non-Task sentinel (some tests do this), the guard is rolled back and
-        False is returned so the caller isn't left holding a half-installed
+        ``None`` is returned so the caller isn't left holding a half-installed
         session lock.
         """
+        handoff = getattr(event, "_gateway_startup_dispatch_handoff", None)
+        if handoff is not None and (
+            not isinstance(handoff, StartupResumeDispatchHandoff)
+            or not handoff.is_open_for(session_key)
+        ):
+            return None
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        background = self._process_message_background(event, session_key)
+        try:
+            task = asyncio.create_task(background)
+        except BaseException:
+            # Fail closed without stranding the per-session guard.  The
+            # coroutine was never transferred to a task, so close it here.
+            close = getattr(background, "close", None)
+            if callable(close):
+                close()
+            self._release_session_guard(session_key, guard=guard)
+            raise
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -6274,11 +6332,20 @@ class BasePlatformAdapter(ABC):
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
-            return False
+            close = getattr(background, "close", None)
+            if callable(close):
+                close()
+            return None
+        if handoff is not None and not handoff.accept(session_key, task):
+            task.cancel()
+            self._background_tasks.discard(task)
+            self._session_tasks.pop(session_key, None)
+            self._release_session_guard(session_key, guard=guard)
+            return None
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-        return True
+        return task
 
     async def cancel_session_processing(
         self,
@@ -6426,7 +6493,9 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(
+        self, event: MessageEvent
+    ) -> Optional[asyncio.Task]:
         """
         Process an incoming message.
         
@@ -6645,7 +6714,7 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        return self._start_session_processing(event, session_key)
     
     @staticmethod
     def _get_human_delay() -> float:

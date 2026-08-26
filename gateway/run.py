@@ -2936,6 +2936,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    StartupResumeDispatchHandoff,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -12966,9 +12967,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     return
                 _claim_owned = True
-            await adapter.handle_message(event)
-            session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+            handoff = StartupResumeDispatchHandoff(session_key)
+            setattr(event, "_gateway_startup_dispatch_handoff", handoff)
+            try:
+                await adapter.handle_message(event)
+            finally:
+                # No adapter may publish a child after returning without
+                # having accepted this exact handoff.  Revocation happens
+                # before claim abandonment, and BasePlatformAdapter checks it
+                # before creating a delayed child task.
+                handoff.revoke()
+            task = handoff.accepted_task
             if task is not None:
                 await asyncio.shield(task)
         finally:
