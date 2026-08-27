@@ -30038,10 +30038,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
 
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
-            text,
-            audio_paths,
-        )
+
+        async def _transcribe_in_current_scope():
+            return await self._enrich_message_with_transcription(
+                text,
+                audio_paths,
+            )
+
+        # Fresh inbound turns enter their routed profile scope through
+        # ``_prepare_profile_scoped_inbound_message_text``. Busy-steer,
+        # interrupt-monitor, and pending-drain voice events intentionally call
+        # this helper before the next agent turn exists, so they need the same
+        # profile boundary here. Context variables propagate through
+        # ``asyncio.to_thread`` to the synchronous STT provider. Never let a
+        # multiplexed provider fall back to process-global credentials.
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            source = getattr(event, "source", None)
+            if source is None:
+                raise RuntimeError(
+                    "Pending voice transcription requires an exact routed source "
+                    "while multiplexing is enabled"
+                )
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                enriched_text, successful_transcripts = await _transcribe_in_current_scope()
+        else:
+            enriched_text, successful_transcripts = await _transcribe_in_current_scope()
         setattr(event, "_gateway_pending_stt_text", enriched_text)
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
