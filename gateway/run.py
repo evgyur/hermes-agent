@@ -23220,6 +23220,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable admission when the source cannot possibly mint a marker; the
         real marker is committed immediately after the triggering user row.
         """
+        # Preflight proves the route that produced ``session_key``.  The
+        # separately validated authority source may retain a principal that an
+        # observed Telegram group deliberately omits from its shared route.
+        route_source = event.source
         source = self._validated_turn_authority_source(event, session_key)
         if source is None:
             return False
@@ -23237,10 +23241,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if preflight:
             try:
                 persisted_profile = (
-                    str(getattr(source, "profile", "") or "").strip() or None
+                    str(getattr(route_source, "profile", "") or "").strip()
+                    or None
                 )
                 rebuilt_key = build_session_key(
-                    source,
+                    route_source,
                     group_sessions_per_user=getattr(
                         self.config,
                         "group_sessions_per_user",
