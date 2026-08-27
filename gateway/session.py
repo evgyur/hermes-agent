@@ -3786,13 +3786,43 @@ class SessionStore:
                 return None
 
             active_task_id = str(entry.active_turn_token or "")
-            already_owned = bool(entry.resume_pending)
+            already_owned = False
+            rollover_identity: Optional[Dict[str, Any]] = None
             if entry.resume_pending:
-                if not active_task_id or active_task_id != entry.resume_task_id:
-                    fail("failed_nonterminal_previous_generation")
-                    return None
-                expected_generation = int(entry.continuation_generation) - 1
-                candidate = replace(entry)
+                if active_task_id and active_task_id == entry.resume_task_id:
+                    already_owned = True
+                    expected_generation = int(entry.continuation_generation) - 1
+                    candidate = replace(entry)
+                else:
+                    snapshot = entry.resume_origin_snapshot or {}
+                    previous_payload = snapshot.get("source")
+                    if (
+                        not active_task_id
+                        or resume_origin_from_snapshot(entry) is None
+                        or previous_payload != origin_payload
+                    ):
+                        fail("failed_nonterminal_previous_generation")
+                        return None
+                    rollover_identity = {
+                        "previous_resume_task_id": str(entry.resume_task_id or ""),
+                        "previous_generation": int(
+                            entry.continuation_generation or 0
+                        ),
+                        "previous_claim_owner": str(
+                            entry.continuation_claim_owner or ""
+                        ),
+                        "previous_claim_token": str(
+                            entry.continuation_claim_token or ""
+                        ),
+                    }
+                    expected_generation = int(entry.continuation_generation)
+                    candidate = replace(entry)
+                    candidate.resume_task_id = active_task_id
+                    candidate.continuation_generation = expected_generation + 1
+                    candidate.continuation_claim_owner = f"gateway:{os.getpid()}"
+                    candidate.continuation_claim_token = uuid.uuid4().hex
+                    candidate.resume_reason = reason
+                    candidate.last_resume_marked_at = _now()
             else:
                 if not active_task_id:
                     fail("failed_missing_active_origin")
@@ -3822,18 +3852,37 @@ class SessionStore:
 
             db = self._db
             admit = getattr(db, "admit_gateway_resume_obligation", None) if db else None
-            if not callable(admit):
+            rollover = (
+                getattr(db, "rollover_claimed_gateway_resume_obligation", None)
+                if db
+                else None
+            )
+            if rollover_identity is not None:
+                if not callable(rollover):
+                    fail("failed_db")
+                    return None
+                committed = rollover(
+                    session_key=session_key,
+                    **rollover_identity,
+                    resume_task_id=candidate.resume_task_id,
+                    origin_json=source_json,
+                    origin_sha256=source_digest,
+                    reason=reason,
+                    marked_at=candidate.last_resume_marked_at.timestamp(),
+                )
+            elif not callable(admit):
                 fail("failed_db")
                 return None
-            committed = admit(
-                session_key=session_key,
-                resume_task_id=candidate.resume_task_id,
-                expected_generation=expected_generation,
-                origin_json=source_json,
-                origin_sha256=source_digest,
-                reason=reason,
-                marked_at=candidate.last_resume_marked_at.timestamp(),
-            )
+            else:
+                committed = admit(
+                    session_key=session_key,
+                    resume_task_id=candidate.resume_task_id,
+                    expected_generation=expected_generation,
+                    origin_json=source_json,
+                    origin_sha256=source_digest,
+                    reason=reason,
+                    marked_at=candidate.last_resume_marked_at.timestamp(),
+                )
             committed_state = committed.get("state") if isinstance(committed, dict) else None
             if committed is None:
                 get_obligation = getattr(db, "get_gateway_resume_obligation", None)

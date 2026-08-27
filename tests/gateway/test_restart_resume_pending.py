@@ -361,6 +361,100 @@ def test_duplicate_premark_projects_authoritative_pending_or_claimed_row(
     assert entry.last_resume_marked_at == first_marked_at
 
 
+def test_second_shutdown_rolls_exact_running_resume_into_next_generation(tmp_path):
+    """A recovered turn must remain resumable across a second gateway restart."""
+    store = _make_store(tmp_path)
+    source = replace(
+        _make_source(chat_id="repeated-restart", user_id="owner"),
+        chat_type="group",
+        thread_id="9623",
+        message_id="48648",
+    )
+    entry = store.get_or_create_session(source)
+
+    first_task = store.mark_turn_active(entry.session_key, source)
+    assert first_task
+    first = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert first
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=first["resume_task_id"],
+        expected_generation=first["continuation_generation"],
+        claim_owner=first["continuation_claim_owner"],
+        claim_token=first["continuation_claim_token"],
+    )
+
+    # Startup resumed the exact sealed Telegram turn and committed a fresh
+    # active marker before the gateway received another shutdown.
+    resumed_task = store.mark_turn_active(entry.session_key, source)
+    assert resumed_task and resumed_task != first_task
+
+    second = store.mark_resume_pending_with_outcome(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+
+    assert second["outcome"] == "marked_exact"
+    assert second["receipt"]["resume_task_id"] == resumed_task
+    assert second["receipt"]["continuation_generation"] == 2
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == resumed_task
+    assert row["generation"] == 2
+    assert json.loads(row["origin_json"])["message_id"] == "48648"
+    assert store._db.clear_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=first["resume_task_id"],
+        expected_generation=first["continuation_generation"],
+        claim_token=first["continuation_claim_token"],
+    ) is False
+    assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
+
+
+def test_second_shutdown_does_not_roll_new_human_turn_over_claimed_resume(tmp_path):
+    """A different Telegram message cannot supersede an in-flight claim."""
+    store = _make_store(tmp_path)
+    original = replace(
+        _make_source(chat_id="repeated-restart-isolation", user_id="owner"),
+        chat_type="group",
+        thread_id="9623",
+        message_id="48648",
+    )
+    entry = store.get_or_create_session(original)
+    store.mark_turn_active(entry.session_key, original)
+    first = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert first
+    assert store._db.claim_gateway_resume_obligation(
+        session_key=entry.session_key,
+        resume_task_id=first["resume_task_id"],
+        expected_generation=first["continuation_generation"],
+        claim_owner=first["continuation_claim_owner"],
+        claim_token=first["continuation_claim_token"],
+    )
+
+    newer_human = replace(original, message_id="48702")
+    assert store.mark_turn_active(entry.session_key, newer_human)
+    second = store.mark_resume_pending_with_outcome(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+
+    assert second == {
+        "outcome": "failed_nonterminal_previous_generation",
+        "receipt": None,
+    }
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "CLAIMED"
+    assert row["resume_task_id"] == first["resume_task_id"]
+    assert row["generation"] == 1
+
+
 def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_path):
     """A reset/new task must not inherit a claimed obligation from an old boot."""
     store = _make_store(tmp_path)

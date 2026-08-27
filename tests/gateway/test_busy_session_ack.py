@@ -100,6 +100,52 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_observed_group_busy_message_uses_validated_principal_carrier(self):
+        """An anonymized shared route must not discard its exact owner follow-up."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._is_user_authorized = lambda source: source.user_id == "617744661"
+        adapter = _make_adapter()
+
+        authority_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="9623",
+            user_id="617744661",
+            message_id="48702",
+        )
+        shared_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="9623",
+            user_id=None,
+            message_id="48702",
+        )
+        event = MessageEvent(
+            text="продолжаешь?",
+            message_type=MessageType.TEXT,
+            source=shared_source,
+            message_id="48702",
+        )
+        event._hermes_turn_authority_source = authority_source
+        session_key = build_session_key(shared_source)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[session_key] = agent
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        handled = await runner._handle_active_session_busy_message(
+            event,
+            session_key,
+        )
+
+        assert handled is True
+        agent.steer.assert_called_once_with("продолжаешь?")
+
+
+    @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
         """Rapid Telegram text follow-ups in queue mode must not merge."""
         from gateway.run import GatewayRunner
@@ -469,4 +515,3 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
