@@ -23281,10 +23281,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return False
         try:
-            token = await self.async_session_store.mark_turn_active(
-                session_key,
-                source,
-            )
+            if route_source == source:
+                token = await self.async_session_store.mark_turn_active(
+                    session_key,
+                    source,
+                )
+            else:
+                token = await self.async_session_store.mark_turn_active(
+                    session_key,
+                    source,
+                    route_source=route_source,
+                )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",

@@ -3576,6 +3576,8 @@ class SessionStore:
         self,
         session_key: str,
         source: Optional[SessionSource] = None,
+        *,
+        route_source: Optional[SessionSource] = None,
     ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
@@ -3595,8 +3597,37 @@ class SessionStore:
             # under the store's effective session policy.
             if source is None:
                 return None
+            # Observed Telegram groups deliberately use an anonymized shared
+            # route while retaining the authenticated sender in ``source`` for
+            # restart authority.  Validate that narrow projection here, then
+            # bind the marker to the route without discarding its principal.
+            key_source = route_source or source
+            if route_source is not None and route_source != source:
+                try:
+                    observed_group_projection = (
+                        source.platform == Platform.TELEGRAM
+                        and route_source.platform == Platform.TELEGRAM
+                        and source.chat_type == "group"
+                        and route_source.chat_type == "group"
+                        and route_source.user_id is None
+                        and isinstance(source.user_id, str)
+                        and bool(source.user_id)
+                        and canonical_resume_origin(
+                            replace(
+                                source,
+                                user_id=None,
+                                user_name=None,
+                                user_id_alt=None,
+                            )
+                        )
+                        == canonical_resume_origin(route_source)
+                    )
+                except (TypeError, ValueError):
+                    return None
+                if not observed_group_projection:
+                    return None
             try:
-                if self._generate_session_key(source) != session_key:
+                if self._generate_session_key(key_source) != session_key:
                     return None
             except Exception:
                 return None
