@@ -5,10 +5,12 @@ message must join the already-owned turn chain; it must never start a second
 turn or reacquire the durable session lease from its own outer owner.
 """
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import importlib
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -101,17 +103,26 @@ async def test_queued_followup_reuses_authority_and_exact_ingress_identity(
         chat_type="group",
         thread_id="47770",
         user_id="617744661",
+        message_id="47773",
     )
     session_key = "agent:main:telegram:group:-1003971448755:47770"
     queued_at = datetime(2026, 8, 25, 10, 52, 27, tzinfo=timezone.utc)
-    adapter._pending_messages[session_key] = MessageEvent(
+    queued_event = MessageEvent(
         text="part two",
         message_type=MessageType.TEXT,
-        source=source,
+        # The route carrier can be copied from the running turn before the
+        # adapter's exact inbound ID is attached.  The immutable PTB message
+        # and MessageEvent both identify the real queued follow-up.
+        source=replace(source),
+        raw_message=SimpleNamespace(message_id=47774),
         message_id="47774",
         reply_to_message_id="47770",
         timestamp=queued_at,
     )
+    assert runner._queue_or_replace_pending_event(
+        session_key,
+        queued_event,
+    ) is True
     authority = {
         "session_id": "session-exact",
         "holder": "gateway-holder-exact",
@@ -151,3 +162,29 @@ async def test_queued_followup_reuses_authority_and_exact_ingress_identity(
     # reply to the topic-root envelope as if it were semantic content.
     assert followup["source"].thread_id == "47770"
     assert followup["event_message_id"] is None
+
+
+def test_queued_followup_rejects_unverifiable_message_identity() -> None:
+    """A mismatched source cannot be repaired without exact adapter evidence."""
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        user_id="617744661",
+        message_id="22943",
+    )
+    session_key = "agent:main:telegram:group:-1003770669948:5413"
+    event = MessageEvent(
+        text="next correction",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(message_id=99999),
+        message_id="22948",
+    )
+
+    assert runner._queue_or_replace_pending_event(session_key, event) is False
+    assert session_key not in adapter._pending_messages

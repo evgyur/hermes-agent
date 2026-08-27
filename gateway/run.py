@@ -11047,7 +11047,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _normalize_queued_event_platform_message_identity(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Seal a queued event to its adapter-owned inbound message ID.
+
+        A busy Telegram follow-up can retain a copied routing source from the
+        running turn while the event and its immutable PTB ``Message`` already
+        identify the newer inbound message.  Letting that stale carrier reach
+        the post-final recursive turn raises after the first response was
+        delivered, producing a second generic error bubble.
+
+        Rebind only from exact native evidence.  Other mismatches remain
+        fail-closed; neither model-authored metadata nor route state can mint a
+        platform message identity.
+        """
+        try:
+            self._turn_platform_message_id(event)
+            return True
+        except (TypeError, ValueError):
+            pass
+
+        source = getattr(event, "source", None)
+        event_message_id = getattr(event, "message_id", None)
+        raw_message = getattr(event, "raw_message", None)
+        raw_message_id = getattr(raw_message, "message_id", None)
+        if not (
+            isinstance(source, SessionSource)
+            and source.platform == Platform.TELEGRAM
+            and type(event_message_id) is str
+            and event_message_id.strip() == event_message_id
+            and event_message_id
+            and raw_message_id is not None
+            and str(raw_message_id) == event_message_id
+        ):
+            logger.warning(
+                "Rejecting queued event for %s: unverifiable platform message identity",
+                session_key,
+            )
+            return False
+
+        event.source = dataclasses.replace(
+            source,
+            message_id=event_message_id,
+        )
+        try:
+            return self._turn_platform_message_id(event) == event_message_id
+        except (TypeError, ValueError):
+            logger.warning(
+                "Rejecting queued event for %s: platform identity rebind failed",
+                session_key,
+            )
+            return False
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+        if not self._normalize_queued_event_platform_message_identity(
+            event,
+            session_key,
+        ):
+            return False
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False
