@@ -222,6 +222,29 @@ async def test_debounce_resets_timer_on_new_arrival():
 
 
 @pytest.mark.asyncio
+async def test_debounce_keeps_source_and_event_message_identity_in_sync():
+    """A merged follow-up must retain one authoritative platform message id."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.1
+
+    first = _make_event("one")
+    second = _make_event("two")
+    first.source.message_id = first.message_id
+    second.source.message_id = second.message_id
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(first)
+    await adapter.handle_message(second)
+
+    merged = _debounced_event(adapter, session_key)
+    assert merged.message_id == second.message_id
+    assert merged.source.message_id == second.message_id
+
+    await asyncio.sleep(0.2)
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []
@@ -260,5 +283,4 @@ def test_command_messages_bypass_debounce_even_in_queue_mode():
     adapter = _make_adapter()
     assert not adapter._is_queue_text_debounce_candidate(_make_event(""))
     assert not adapter._is_queue_text_debounce_candidate(_make_event("/stop"))
-
 

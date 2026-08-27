@@ -6175,7 +6175,9 @@ class BasePlatformAdapter(ABC):
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
-                state.event.message_id = str(latest_message_id)
+                latest_message_id = str(latest_message_id)
+                state.event.message_id = latest_message_id
+                state.event.source.message_id = latest_message_id
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
