@@ -6,6 +6,7 @@ after the agent finishes its current task — not silently dropped.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
@@ -17,6 +18,7 @@ from gateway.platforms.base import (
     PlatformConfig,
     Platform,
 )
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +131,20 @@ class TestQueueConsumptionAfterCompletion:
 
         # /queue once — lands in slot. Second /queue — overflow.
         for text in ("Q1", "Q2"):
+            message_id = f"q-{text}"
             runner._enqueue_fifo(
                 session_key,
                 MessageEvent(
                     text=text,
                     message_type=MessageType.TEXT,
-                    source=MagicMock(),
-                    message_id=f"q-{text}",
+                    source=SessionSource(
+                        platform=Platform.TELEGRAM,
+                        chat_id="123",
+                        chat_type="dm",
+                        message_id=message_id,
+                    ),
+                    raw_message=SimpleNamespace(message_id=message_id),
+                    message_id=message_id,
                 ),
                 adapter,
             )
@@ -192,12 +201,20 @@ class TestBusyInputModeQueueFifo:
     def _text_event(self, text: str) -> MessageEvent:
         # profile=None: a MagicMock auto-attribute reads as a truthy stamped
         # profile and trips fail-closed adapter resolution (AGENTS.md #17).
-        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
+        message_id = f"m-{text}"
+        source = SessionSource(
+            chat_id="c1",
+            chat_type="dm",
+            platform=Platform.TELEGRAM,
+            profile=None,
+            message_id=message_id,
+        )
         return MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
-            message_id=f"m-{text}",
+            raw_message=SimpleNamespace(message_id=message_id),
+            message_id=message_id,
         )
 
     def test_rapid_text_followups_are_queued_in_fifo_order(self):
@@ -218,5 +235,4 @@ class TestBusyInputModeQueueFifo:
             "five",
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
-
 

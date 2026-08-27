@@ -2949,13 +2949,47 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def seal_pending_message_event_identity(event: MessageEvent) -> bool:
+    """Seal one pending event to adapter-owned native message identity.
+
+    Pending events are consumed after the outer turn has already delivered its
+    final response.  Rejecting an unverifiable mismatch here prevents that
+    completed turn from being retroactively followed by a generic session
+    error.  Telegram may repair a copied/stale ``SessionSource`` only when the
+    event ID exactly matches the immutable native PTB message ID.
+    """
+    source = getattr(event, "source", None)
+    source_id = getattr(source, "message_id", None)
+    event_id = getattr(event, "message_id", None)
+    for value in (source_id, event_id):
+        if value is not None and (
+            type(value) is not str or not value or value != value.strip()
+        ):
+            return False
+    if source_id == event_id:
+        return True
+    if source_id is None and event_id is None:
+        return True
+    if not (
+        isinstance(source, SessionSource)
+        and source.platform == Platform.TELEGRAM
+        and type(event_id) is str
+        and event_id
+        and str(getattr(getattr(event, "raw_message", None), "message_id", ""))
+        == event_id
+    ):
+        return False
+    event.source = dataclasses.replace(source, message_id=event_id)
+    return True
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2967,6 +3001,12 @@ def merge_pending_message_event(
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
     """
+    if not seal_pending_message_event_identity(event):
+        logger.warning(
+            "Rejecting pending event for %s: unverifiable platform message identity",
+            session_key,
+        )
+        return False
     existing = pending_messages.get(session_key)
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
@@ -2980,7 +3020,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -2999,7 +3039,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -3008,9 +3048,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
     pending_messages[session_key] = event
+    return True
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -6515,6 +6556,7 @@ class BasePlatformAdapter(ABC):
                 release_guard=False,
                 discard_pending=False,
             )
+            await self._settle_durable_ingress_acceptance(event)
         except Exception:
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
@@ -6526,6 +6568,24 @@ class BasePlatformAdapter(ABC):
             raise
 
         await self._drain_pending_after_session_command(session_key, command_guard)
+
+    async def _settle_durable_ingress_acceptance(
+        self, event: MessageEvent
+    ) -> bool:
+        """Run a trusted one-shot durable-ingress callback after acceptance."""
+        callback = getattr(event, "_gateway_drain_processing_callback", None)
+        if not callable(callback):
+            return True
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                result = await result
+            return result is not False
+        except Exception:
+            logger.exception(
+                "[%s] Durable ingress acceptance callback failed", self.name
+            )
+            return False
 
     async def handle_message(
         self, event: MessageEvent
@@ -6655,6 +6715,7 @@ class BasePlatformAdapter(ABC):
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    await self._settle_durable_ingress_acceptance(event)
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -7441,6 +7502,8 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            if processing_ok:
+                await self._settle_durable_ingress_acceptance(event)
             if _is_parent_task_delivery:
                 if _parent_obligation_id is not None:
                     from gateway.delivery_ledger import (

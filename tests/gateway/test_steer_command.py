@@ -34,9 +34,12 @@ def _make_source() -> SessionSource:
 
 
 def _make_event(text: str, channel_context: str | None = None) -> MessageEvent:
+    source = _make_source()
+    source.message_id = "m1"
     return MessageEvent(
         text=text,
-        source=_make_source(),
+        source=source,
+        raw_message=SimpleNamespace(message_id="m1"),
         message_id="m1",
         channel_context=channel_context,
     )

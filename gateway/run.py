@@ -2941,6 +2941,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    seal_pending_message_event_identity,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -9938,6 +9939,445 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mode = busy_input_mode or self._busy_input_mode
         return self._restart_requested and mode in {"queue", "steer"}
 
+    @staticmethod
+    def _drain_inbox_json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _serialize_gateway_drain_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> tuple[str, str, str, str]:
+        """Return immutable canonical origin/payload JSON and their digests."""
+        if not self._normalize_queued_event_platform_message_identity(
+            event,
+            session_key,
+        ):
+            raise ValueError("unverifiable platform message identity")
+        message_id = self._turn_platform_message_id(event)
+        if message_id is None:
+            raise ValueError("planned-restart input requires a native message id")
+        source = event.source
+        origin = canonical_resume_origin(source)
+        if origin.get("message_id") != message_id:
+            raise ValueError("drain origin and event message ids disagree")
+
+        metadata_keys = (
+            "telegram_transport_sender_user_id",
+            "telegram_route_profile",
+            "telegram_media_recovery",
+            "telegram_business_external_contact",
+            "preserve_command_args",
+        )
+        metadata = {
+            key: event.metadata[key]
+            for key in metadata_keys
+            if key in (event.metadata or {})
+        }
+        # Reject a non-JSON trusted envelope rather than stringifying an object
+        # whose process-local representation cannot be verified after restart.
+        self._drain_inbox_json(metadata)
+        payload = {
+            "version": 1,
+            "text": event.text,
+            "message_type": event.message_type.value,
+            "user_id": event.user_id,
+            "user_name": event.user_name,
+            "message_id": message_id,
+            "platform_update_id": event.platform_update_id,
+            "media_urls": list(event.media_urls or []),
+            "media_types": list(event.media_types or []),
+            "reply_to_message_id": event.reply_to_message_id,
+            "reply_to_text": event.reply_to_text,
+            "reply_to_author_id": event.reply_to_author_id,
+            "reply_to_author_name": event.reply_to_author_name,
+            "reply_to_is_own_message": bool(event.reply_to_is_own_message),
+            "prompt_response": event.prompt_response,
+            "auto_skill": event.auto_skill,
+            "channel_prompt": event.channel_prompt,
+            "channel_context": event.channel_context,
+            "metadata": metadata,
+            "timestamp": self._turn_platform_message_timestamp(event),
+            "allow_gateway_control": bool(event.allow_gateway_control),
+        }
+        origin_json = self._drain_inbox_json(origin)
+        payload_json = self._drain_inbox_json(payload)
+        return (
+            origin_json,
+            hashlib.sha256(origin_json.encode("utf-8")).hexdigest(),
+            payload_json,
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        )
+
+    @staticmethod
+    def _source_from_drain_origin(origin: Dict[str, Any]) -> SessionSource:
+        """Rebuild only the canonical origin shape used by restart authority."""
+        source = SessionSource(
+            platform=Platform(origin["platform"]),
+            chat_id=origin["chat_id"],
+            chat_type=origin["chat_type"],
+            user_id=origin.get("user_id"),
+            thread_id=origin.get("thread_id"),
+            user_id_alt=origin.get("user_id_alt"),
+            chat_id_alt=origin.get("chat_id_alt"),
+            scope_id=origin.get("scope_id"),
+            parent_chat_id=origin.get("parent_chat_id"),
+            message_id=origin.get("message_id"),
+            profile=origin.get("profile"),
+            transport_profile=origin.get("transport_profile"),
+            business_connection_id=origin.get("business_connection_id"),
+            external_safe_mode=origin.get("external_safe_mode"),
+            auto_thread_created=origin.get("auto_thread_created"),
+            prospective_thread_id=origin.get("prospective_thread_id"),
+        )
+        if canonical_resume_origin(source) != origin:
+            raise ValueError("non-canonical drain origin")
+        return source
+
+    def _deserialize_gateway_drain_event(
+        self,
+        row: Dict[str, Any],
+    ) -> MessageEvent:
+        origin_json = str(row.get("origin_json") or "")
+        payload_json = str(row.get("payload_json") or "")
+        if (
+            not origin_json
+            or not payload_json
+            or hashlib.sha256(origin_json.encode("utf-8")).hexdigest()
+            != row.get("origin_sha256")
+            or hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            != row.get("payload_sha256")
+        ):
+            raise ValueError("drain inbox digest mismatch")
+        origin = json.loads(origin_json)
+        payload = json.loads(payload_json)
+        if (
+            self._drain_inbox_json(origin) != origin_json
+            or self._drain_inbox_json(payload) != payload_json
+            or payload.get("version") != 1
+        ):
+            raise ValueError("non-canonical drain inbox payload")
+        source = self._source_from_drain_origin(origin)
+        message_id = str(payload.get("message_id") or "")
+        if (
+            not message_id
+            or message_id != str(row.get("message_id") or "")
+            or message_id != str(source.message_id or "")
+        ):
+            raise ValueError("drain inbox platform identity mismatch")
+        timestamp = payload.get("timestamp")
+        event = MessageEvent(
+            text=str(payload.get("text") or ""),
+            message_type=MessageType(payload["message_type"]),
+            user_id=payload.get("user_id"),
+            user_name=payload.get("user_name"),
+            source=source,
+            message_id=message_id,
+            platform_update_id=payload.get("platform_update_id"),
+            media_urls=list(payload.get("media_urls") or []),
+            media_types=list(payload.get("media_types") or []),
+            reply_to_message_id=payload.get("reply_to_message_id"),
+            reply_to_text=payload.get("reply_to_text"),
+            reply_to_author_id=payload.get("reply_to_author_id"),
+            reply_to_author_name=payload.get("reply_to_author_name"),
+            reply_to_is_own_message=bool(
+                payload.get("reply_to_is_own_message", False)
+            ),
+            prompt_response=payload.get("prompt_response"),
+            auto_skill=payload.get("auto_skill"),
+            channel_prompt=payload.get("channel_prompt"),
+            channel_context=payload.get("channel_context"),
+            internal=False,
+            metadata=dict(payload.get("metadata") or {}),
+            timestamp=(
+                datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+                if timestamp is not None
+                else datetime.now(timezone.utc)
+            ),
+            allow_gateway_control=bool(
+                payload.get("allow_gateway_control", True)
+            ),
+        )
+        setattr(event, "_hermes_startup_restore_replay", True)
+        event.metadata.update(
+            {
+                "gateway_drain_inbox_id": str(row["inbox_id"]),
+                "gateway_drain_ingress_ledger_id": int(
+                    row["ingress_ledger_id"]
+                ),
+            }
+        )
+        if not seal_pending_message_event_identity(event):
+            raise ValueError("rehydrated drain event identity is not sealed")
+        return event
+
+    async def _admit_planned_restart_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> str:
+        """Commit one authorized Telegram event before acknowledging it."""
+        task = asyncio.current_task()
+        admissions = self.__dict__.setdefault(
+            "_drain_ingress_admission_tasks", set()
+        )
+        if task is not None:
+            admissions.add(task)
+        try:
+            origin_json, origin_sha, payload_json, payload_sha = (
+                self._serialize_gateway_drain_event(event, session_key)
+            )
+            session_id = None
+            peek_session_id = getattr(self.session_store, "peek_session_id", None)
+            if callable(peek_session_id):
+                try:
+                    session_id = peek_session_id(session_key)
+                except Exception:
+                    session_id = None
+            row = await self._await_db_call(
+                self._session_db,
+                "admit_gateway_drain_inbox",
+                platform=event.source.platform.value,
+                chat_id=event.source.chat_id,
+                thread_id=event.source.thread_id,
+                message_id=event.message_id,
+                user_id=event.source.user_id,
+                session_key=session_key,
+                session_id=session_id,
+                origin_json=origin_json,
+                origin_sha256=origin_sha,
+                payload_json=payload_json,
+                payload_sha256=payload_sha,
+                busy_mode=self._effective_busy_input_mode(event.source),
+            )
+            if not row.get("accepted"):
+                logger.error(
+                    "Planned-restart inbox rejected %s: %s",
+                    session_key,
+                    row.get("reason") or "unknown",
+                )
+                return (
+                    "⚠️ Gateway restarting — message was not accepted because "
+                    "the restart inbox is full. Please resend after startup."
+                )
+            return "⏳ Gateway restarting — message safely queued."
+        except Exception as exc:
+            logger.exception(
+                "Planned-restart inbox admission failed for %s", session_key
+            )
+            return (
+                "⚠️ Gateway restarting — message was not safely queued "
+                f"({type(exc).__name__}). Please resend after startup."
+            )
+        finally:
+            if task is not None:
+                admissions.discard(task)
+
+    async def _await_drain_ingress_admissions(self, timeout: float = 5.0) -> None:
+        """Wait until every Telegram handler already inside admission settles."""
+        current = asyncio.current_task()
+        deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout))
+        while True:
+            tasks = [
+                task
+                for task in list(
+                    getattr(self, "_drain_ingress_admission_tasks", set())
+                )
+                if task is not current and not task.done()
+            ]
+            if not tasks:
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("planned-restart ingress admission did not settle")
+            done, _ = await asyncio.wait(tasks, timeout=remaining)
+            if not done:
+                raise TimeoutError("planned-restart ingress admission did not settle")
+
+    async def _quiesce_planned_restart_ingress(self) -> None:
+        """Stop Telegram polling, then close the already-entered commit barrier."""
+        if not self._restart_requested:
+            return
+        adapters = []
+        for adapter in self._iter_unique_adapters():
+            if getattr(adapter, "platform", None) == Platform.TELEGRAM:
+                adapters.append(adapter)
+        for adapter in adapters:
+            quiesce = getattr(adapter, "quiesce_inbound", None)
+            if callable(quiesce):
+                await quiesce()
+        await self._await_drain_ingress_admissions()
+
+    async def _replay_gateway_drain_inbox(self) -> int:
+        """Admit committed planned-restart inputs to the canonical router."""
+        from hermes_constants import get_hermes_home
+
+        lock = self.__dict__.get("_gateway_drain_replay_lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            self._gateway_drain_replay_lock = lock
+        async with lock:
+            return await self._replay_gateway_drain_inbox_locked(get_hermes_home)
+
+    async def _replay_gateway_drain_inbox_locked(self, get_hermes_home) -> int:
+        ambient_home = Path(get_hermes_home()).resolve()
+        scopes = [("default", ambient_home)]
+        if getattr(self.config, "multiplex_profiles", False):
+            scopes = [
+                (str(name), Path(home).resolve())
+                for name, home in _multiplex_profile_homes(self.config)
+            ]
+        owner = f"gateway-drain-replay:{os.getpid()}:{time.time_ns()}"
+        admitted = 0
+        seen_homes: set[Path] = set()
+        for profile_name, profile_home in scopes:
+            if profile_home in seen_homes:
+                continue
+            seen_homes.add(profile_home)
+            failed: set[str] = set()
+            with _profile_runtime_scope(profile_home):
+                db = self._session_db
+                await self._await_db_call(
+                    db,
+                    "reclaim_gateway_drain_inbox",
+                    now=time.time(),
+                )
+                while True:
+                    rows = await self._await_db_call(
+                        db,
+                        "list_gateway_drain_inbox_ready",
+                        limit=4096,
+                    )
+                    rows = [
+                        row
+                        for row in rows
+                        if str(row.get("inbox_id") or "") not in failed
+                    ]
+                    if not rows:
+                        break
+                    made_progress = False
+                    for row in rows:
+                        inbox_id = str(row["inbox_id"])
+                        lease_token = hashlib.sha256(
+                            f"{owner}:{inbox_id}:lease".encode("utf-8")
+                        ).hexdigest()
+                        try:
+                            if not await self._await_db_call(
+                                db,
+                                "claim_gateway_drain_inbox",
+                                inbox_id,
+                                owner=owner,
+                                token=lease_token,
+                                lease_expires_at=time.time() + 120.0,
+                            ):
+                                continue
+                            try:
+                                event = self._deserialize_gateway_drain_event(row)
+                                source = event.source
+                                if getattr(self.config, "multiplex_profiles", False):
+                                    expected_profile = str(profile_name or "default")
+                                    actual_profile = str(source.profile or "default")
+                                    if actual_profile != expected_profile:
+                                        raise ValueError("drain inbox profile mismatch")
+                            except (KeyError, TypeError, ValueError) as exc:
+                                reason = f"invalid_envelope:{type(exc).__name__}"
+                                cancelled = await self._await_db_call(
+                                    db,
+                                    "cancel_gateway_drain_inbox",
+                                    inbox_id,
+                                    reason=reason,
+                                    owner=owner,
+                                    token=lease_token,
+                                )
+                                if not cancelled:
+                                    raise RuntimeError(
+                                        "drain inbox quarantine CAS failed"
+                                    ) from exc
+                                logger.error(
+                                    "Quarantined invalid planned-restart inbox "
+                                    "row for %s/%s: %s",
+                                    profile_name,
+                                    inbox_id,
+                                    type(exc).__name__,
+                                )
+                                made_progress = True
+                                continue
+                            adapter = self._startup_resume_adapter_for_source(source)
+                            if adapter is None:
+                                raise RuntimeError("drain inbox transport unavailable")
+                            event._gateway_drain_inbox_claim = {
+                                "inbox_id": inbox_id,
+                                "owner": owner,
+                                "token": lease_token,
+                            }
+                            event._gateway_drain_processing_callback = (
+                                lambda replay_event=event: (
+                                    self._complete_gateway_drain_router_event(
+                                        replay_event
+                                    )
+                                )
+                            )
+                            event._hermes_require_busy_admission = True
+                            event._hermes_drain_replay_force_queue = True
+                            if getattr(self, "_startup_restore_in_progress", False):
+                                command = event.get_command()
+                                canonical_command = command
+                                if command:
+                                    try:
+                                        from hermes_cli.commands import resolve_command
+
+                                        command_def = resolve_command(command)
+                                        if command_def is not None:
+                                            canonical_command = command_def.name
+                                    except Exception:
+                                        canonical_command = command
+                                if (
+                                    str(row.get("busy_mode") or "") == "interrupt"
+                                    or canonical_command in {"stop", "new"}
+                                ):
+                                    priority = self.__dict__.setdefault(
+                                        "_startup_restore_priority_session_keys",
+                                        set(),
+                                    )
+                                    priority.add(str(row["session_key"]))
+                                self._queue_startup_restore_event(event)
+                                accepted = True
+                            else:
+                                task = await adapter.handle_message(event)
+                                accepted = bool(
+                                    isinstance(task, asyncio.Task)
+                                    or getattr(event, "_hermes_busy_admitted", False)
+                                )
+                            if not accepted:
+                                raise RuntimeError(
+                                    "drain inbox dispatch was not admitted"
+                                )
+                            admitted += 1
+                            made_progress = True
+                        except Exception:
+                            failed.add(inbox_id)
+                            logger.exception(
+                                "Planned-restart inbox replay failed for %s/%s",
+                                profile_name,
+                                inbox_id,
+                            )
+                            await self._await_db_call(
+                                db,
+                                "reclaim_gateway_drain_inbox",
+                                now=time.time(),
+                                dead_owners=(owner,),
+                            )
+                    if not made_progress:
+                        break
+        if admitted:
+            logger.info("Admitted %d planned-restart inbox message(s)", admitted)
+        return admitted
+
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
     # order, with no merging.  The adapter's _pending_messages dict is a
@@ -9949,19 +10389,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
-            return
+            return False
+        if not self._normalize_queued_event_platform_message_identity(
+            queued_event,
+            session_key,
+        ):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -11070,37 +11516,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         fail-closed; neither model-authored metadata nor route state can mint a
         platform message identity.
         """
-        try:
-            self._turn_platform_message_id(event)
-            return True
-        except (TypeError, ValueError):
-            pass
-
-        source = getattr(event, "source", None)
-        event_message_id = getattr(event, "message_id", None)
-        raw_message = getattr(event, "raw_message", None)
-        raw_message_id = getattr(raw_message, "message_id", None)
-        if not (
-            isinstance(source, SessionSource)
-            and source.platform == Platform.TELEGRAM
-            and type(event_message_id) is str
-            and event_message_id.strip() == event_message_id
-            and event_message_id
-            and raw_message_id is not None
-            and str(raw_message_id) == event_message_id
-        ):
+        if not seal_pending_message_event_identity(event):
             logger.warning(
                 "Rejecting queued event for %s: unverifiable platform message identity",
                 session_key,
             )
             return False
-
-        event.source = dataclasses.replace(
-            source,
-            message_id=event_message_id,
-        )
         try:
-            return self._turn_platform_message_id(event) == event_message_id
+            self._turn_platform_message_id(event)
+            return True
         except (TypeError, ValueError):
             logger.warning(
                 "Rejecting queued event for %s: platform identity rebind failed",
@@ -11151,13 +11575,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(getattr(event, "media_urls", None))
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
-            merge_pending_message_event(
+            return merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -11167,8 +11590,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
-        self._enqueue_fifo(session_key, event, adapter)
-        return True
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -11226,6 +11648,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        # A restart-inbox row remains durable until the normal turn commits
+        # its canonical user row.  Never consume such a row only inside an
+        # in-memory steer/redirect: another crash between that call and the
+        # inbox acknowledgement would make its outcome ambiguous.  Queue it
+        # behind the current owner; the eventual ordinary turn is the durable
+        # consumer and preserves the exact platform identity.
+        if getattr(event, "_hermes_drain_replay_force_queue", False):
+            effective_mode = "queue"
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -15882,6 +16312,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             planned_restart_notification_pending=planned_restart_notification_pending,
         )
 
+        # Real input committed by the old process precedes synthetic recovery.
+        await self._replay_gateway_drain_inbox()
+
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
@@ -17840,6 +18273,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_api_run_count(),
             )
 
+            # Stop fetching Telegram updates only after the normal drain
+            # window, then close the commit barrier for handlers already
+            # inside authorized admission. Later updates remain server-side
+            # because planned starts preserve pending updates.
+            try:
+                await self._quiesce_planned_restart_ingress()
+            except Exception:
+                logger.exception(
+                    "Planned-restart Telegram ingress did not quiesce cleanly"
+                )
+
             if not timed_out:
                 # Drain completed gracefully — all running sessions finished.
                 # Clear the pre-drain resume_pending markers so sessions that
@@ -19613,7 +20057,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 internal=event.internal,
                 timestamp=event.timestamp,
             )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
+            if not self._enqueue_fifo(quick_key, queued_event, adapter):
+                return "⚠️ Queue rejected: inbound message identity could not be verified."
         depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
             return "Queued for the next turn."
@@ -19642,7 +20087,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                self._enqueue_fifo(quick_key, queued_event, adapter)
+                if not self._enqueue_fifo(quick_key, queued_event, adapter):
+                    return (
+                        "⚠️ /steer fallback rejected: inbound message identity "
+                        "could not be verified."
+                    )
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -19665,7 +20114,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
+            if not self._enqueue_fifo(quick_key, queued_event, adapter):
+                return (
+                    "⚠️ /steer fallback rejected: inbound message identity "
+                    "could not be verified."
+                )
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -19976,6 +20429,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # A planned restart is a lifecycle boundary, not a rejection boundary.
+        # Authorization and exact profile/route binding above have completed;
+        # commit a real Telegram input before telling the user it is safe.
+        if (
+            self._draining
+            and self._restart_requested
+            and not is_internal
+            and source.platform == Platform.TELEGRAM
+            and not getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            drain_command = event.get_command()
+            if drain_command == "restart":
+                return "⏳ Gateway restart is already in progress."
+            if drain_command not in {"status", "context", "help", "whoami"}:
+                return await self._admit_planned_restart_event(
+                    event,
+                    self._session_key_for_source(source),
+                )
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
@@ -22403,12 +22875,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         row_id = getattr(result, "row_id", None)
         inserted = getattr(result, "inserted", None)
         if type(row_id) is int and row_id > 0 and type(inserted) is bool:
+            claim = getattr(event, "_gateway_drain_inbox_claim", None)
+            if claim is not None:
+                if not isinstance(claim, dict):
+                    raise RuntimeError("invalid gateway drain inbox claim")
+                accepted = await self._await_db_call(
+                    authority["db"],
+                    "accept_gateway_drain_materialization",
+                    str(claim.get("inbox_id") or ""),
+                    owner=str(claim.get("owner") or ""),
+                    token=str(claim.get("token") or ""),
+                    session_id=str(session_entry.session_id),
+                    message_row_id=row_id,
+                )
+                if not accepted:
+                    raise RuntimeError(
+                        "gateway drain inbox materialization was not accepted"
+                    )
+                event._gateway_drain_inbox_claim = None
+                self._schedule_gateway_drain_replay()
             return result
         if type(authority["db"]).__module__.startswith("unittest.mock"):
             return None
         raise RuntimeError(
             "triggering user row did not return an explicit durable write outcome"
         )
+
+    def _schedule_gateway_drain_replay(self) -> None:
+        """Continue per-route FIFO after a row reaches durable turn authority."""
+        task = asyncio.create_task(self._replay_gateway_drain_inbox())
+        try:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except (AttributeError, TypeError):
+            pass
+        task.add_done_callback(
+            lambda done: self._log_late_background_failure(
+                done,
+                "planned-restart inbox continuation failed",
+            )
+        )
+
+    async def _complete_gateway_drain_router_event(
+        self, event: "MessageEvent"
+    ) -> bool:
+        """Settle a claimed row consumed by a gateway command/router path."""
+        claim = getattr(event, "_gateway_drain_inbox_claim", None)
+        if claim is None:
+            return True
+        if not isinstance(claim, dict):
+            return False
+        command = event.get_command()
+        if not command:
+            # Ordinary agent turns settle earlier at the canonical user-row
+            # write.  A non-command that returned before that boundary stays
+            # leased for fail-closed reconciliation.
+            return False
+        canonical = command
+        try:
+            from hermes_cli.commands import resolve_command
+
+            command_def = resolve_command(command)
+            if command_def is not None:
+                canonical = command_def.name
+        except Exception:
+            canonical = command
+        accepted = await self._await_db_call(
+            self._session_db,
+            "accept_gateway_drain_processing",
+            str(claim.get("inbox_id") or ""),
+            owner=str(claim.get("owner") or ""),
+            token=str(claim.get("token") or ""),
+            consumer_kind=f"gateway-command:{canonical}",
+        )
+        if accepted:
+            event._gateway_drain_inbox_claim = None
+            self._schedule_gateway_drain_replay()
+        return bool(accepted)
 
     @staticmethod
     def _bounded_gateway_semantic_text(

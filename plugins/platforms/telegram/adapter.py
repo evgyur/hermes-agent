@@ -904,6 +904,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._post_connect_task: Optional[asyncio.Task] = None
 
     def _mark_connected(self) -> None:
+        self._planned_ingress_quiesced = False
         self._drop_delayed_deliveries = False
         super()._mark_connected()
         # Drain anything held while we were down. PTB will not redeliver —
@@ -2531,7 +2532,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_bounded_business_resume_directive(message: Any) -> bool:
-        """Recognize only exact, low-entropy continuation directives."""
+        """Recognize only exact, low-entropy continuation directives.
+
+        These phrases carry no safe recipient context on their own.  The
+        caller must additionally prove a recent persisted Hermes session for
+        the exact Telegram Business route before admitting the message.
+        """
         text = str(
             getattr(message, "text", None)
             or getattr(message, "caption", None)
@@ -2551,7 +2557,13 @@ class TelegramAdapter(BasePlatformAdapter):
         }
 
     def _has_recent_business_session(self, message: Any) -> bool:
-        """Prove that the exact Business route recently belonged to Hermes."""
+        """Return whether this exact Business route recently belonged to Hermes.
+
+        A bare continuation must never open a new lane in an arbitrary private
+        conversation.  Requiring the exact persisted session key keeps the
+        convenience limited to routes where Hermes already handled work, and
+        survives gateway restarts without trusting warm adapter memory.
+        """
         store = getattr(self, "_session_store", None)
         lookup = getattr(store, "lookup_by_session_key", None) if store else None
         if not callable(lookup):
@@ -2569,11 +2581,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not connection_id:
             return False
 
+        thread_id = self._effective_message_thread_id(message)
         source = self.build_source(
             chat_id=chat_id,
             chat_type="dm",
             user_id=user_id,
-            thread_id=self._effective_message_thread_id(message),
+            thread_id=thread_id,
         )
         source.business_connection_id = str(connection_id)
         source.external_safe_mode = True
@@ -2607,11 +2620,10 @@ class TelegramAdapter(BasePlatformAdapter):
             updated_ts = float(updated_at.timestamp())
         except (AttributeError, TypeError, ValueError, OverflowError):
             return False
+        business_cfg = self._telegram_business_config()
         try:
             configured_window = float(
-                self._telegram_business_config().get(
-                    "short_resume_window_seconds", 7 * 24 * 60 * 60
-                )
+                business_cfg.get("short_resume_window_seconds", 7 * 24 * 60 * 60)
             )
         except (TypeError, ValueError):
             configured_window = 7 * 24 * 60 * 60
@@ -4964,7 +4976,29 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
     def _drop_pending_updates_on_connect(self, *, is_reconnect: bool) -> bool:
-        """Drop only for an explicit operator reset on a non-reconnect start."""
+        """Drop only for an explicit operator reset on an unrelated cold start.
+
+        The restart notification markers are written by the old gateway and
+        consumed only after the new process connects.  Their presence proves
+        this cold start belongs to a planned lifecycle restart, so Telegram
+        updates received while the process was down must remain queued even
+        when the persistent config normally requests a stale-update reset.
+        """
+        if not is_reconnect:
+            try:
+                from hermes_constants import get_hermes_home
+
+                home = get_hermes_home()
+                if any(
+                    (home / marker).exists()
+                    for marker in (".restart_notify.json", ".restart_pending.json")
+                ):
+                    return False
+            except Exception:
+                logger.debug(
+                    "Could not inspect planned-restart Telegram markers",
+                    exc_info=True,
+                )
         return bool(
             not is_reconnect
             and self.config.extra.get("drop_pending_updates") is True
@@ -5694,6 +5728,74 @@ class TelegramAdapter(BasePlatformAdapter):
             timeout,
         )
         return False
+
+    async def quiesce_inbound(self) -> None:
+        """Stop planned-restart intake after already-entered events settle.
+
+        The bot client remains initialized for final outbound delivery.  New
+        updates stay in Telegram's server-side queue, while delayed batches
+        already accepted by this process flush through the gateway's durable
+        drain-inbox admission before ``disconnect()`` closes the client.
+        """
+        if getattr(self, "_planned_ingress_quiesced", False):
+            return
+        app = self._app
+        if app is None:
+            self._planned_ingress_quiesced = True
+            return
+        if app.updater and app.updater.running:
+            stopped = await self._await_disconnect_step(
+                app.updater.stop(),
+                _UPDATER_STOP_TIMEOUT,
+                "planned-restart updater quiesce",
+            )
+            if not stopped:
+                raise RuntimeError("Telegram updater did not quiesce")
+
+        # Application.stop waits for update-handler tasks already accepted by
+        # PTB. A handler can create a delayed text/photo/media batch while stop
+        # is waiting, so settle Application handlers before snapshotting those
+        # task registries. Bot API egress remains usable until shutdown.
+        if app.running:
+            stopped = await self._await_disconnect_step(
+                app.stop(),
+                _DISCONNECT_STEP_TIMEOUT,
+                "planned-restart application quiesce",
+            )
+            if not stopped:
+                raise RuntimeError("Telegram update handlers did not quiesce")
+
+        # Every PTB handler has now exited and polling is stopped, so no new
+        # delayed batches can be created. Existing batches own acknowledged
+        # updates and must dispatch into the gateway's durable admission
+        # barrier instead of being moved to the process-local reconnect hold.
+        batch_tasks: list[asyncio.Task] = []
+        seen: set[int] = set()
+        for task_map in (
+            getattr(self, "_pending_text_batch_tasks", {}),
+            getattr(self, "_pending_photo_batch_tasks", {}),
+            getattr(self, "_media_group_tasks", {}),
+        ):
+            for task in list(task_map.values()):
+                if task is None or task.done() or id(task) in seen:
+                    continue
+                seen.add(id(task))
+                batch_tasks.append(task)
+        if batch_tasks:
+            settled = await self._await_disconnect_step(
+                asyncio.gather(*batch_tasks, return_exceptions=True),
+                max(
+                    _DISCONNECT_STEP_TIMEOUT,
+                    float(getattr(self, "_text_batch_split_delay_seconds", 0.0))
+                    + 2.0,
+                ),
+                "planned-restart inbound batch flush",
+            )
+            if not settled:
+                raise RuntimeError("Telegram inbound batches did not quiesce")
+        self._polling_teardown_started = True
+        self._polling_progress_accepting = False
+        self._planned_ingress_quiesced = True
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""

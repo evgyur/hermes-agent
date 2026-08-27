@@ -15023,6 +15023,647 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result["metadata"] = {}
         return result
 
+    def admit_gateway_drain_inbox(
+        self, *, platform: Any, chat_id: Any, thread_id: Any = None,
+        message_id: Any, user_id: Any = None, session_key: str,
+        session_id: Optional[str], origin_json: str, origin_sha256: str,
+        payload_json: str, payload_sha256: str, busy_mode: str,
+        received_at: Optional[float] = None, max_route_pending: int = 256,
+        max_total_pending: int = 4096,
+    ) -> Dict[str, Any]:
+        """Atomically admit one authorized planned-restart input.
+
+        The message ledger row and executable inbox row are committed in the
+        same transaction.  The platform lookup key is the dedupe authority;
+        an exact redelivery returns the original row while a different
+        envelope under the same native identity fails closed.
+        """
+        platform_s = str(platform)
+        chat_s = str(chat_id)
+        thread_s = str(thread_id) if thread_id is not None else None
+        message_s = str(message_id)
+        user_s = str(user_id) if user_id is not None else None
+        session_key_s = str(session_key)
+        session_id_s = str(session_id) if session_id is not None else None
+        origin_s = str(origin_json)
+        origin_digest = str(origin_sha256)
+        payload_s = str(payload_json)
+        payload_digest = str(payload_sha256)
+        mode = str(busy_mode).lower()
+        lookup = self._gateway_ledger_lookup_key(
+            platform_s, chat_s, thread_s, message_s
+        )
+        if (
+            not lookup
+            or not session_key_s
+            or not origin_s
+            or not payload_s
+            or mode not in {"interrupt", "queue", "steer"}
+            or not re.fullmatch(r"[0-9a-f]{64}", origin_digest)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload_digest)
+            or hashlib.sha256(origin_s.encode("utf-8")).hexdigest() != origin_digest
+            or hashlib.sha256(payload_s.encode("utf-8")).hexdigest() != payload_digest
+        ):
+            raise ValueError("invalid gateway drain inbox identity")
+        route_limit = int(max_route_pending)
+        total_limit = int(max_total_pending)
+        if route_limit <= 0 or total_limit <= 0:
+            raise ValueError("gateway drain inbox limits must be positive")
+        now = float(time.time() if received_at is None else received_at)
+        inbox_id = hashlib.sha256(f"drain-inbox:{lookup}".encode("utf-8")).hexdigest()
+        expected = (
+            lookup, platform_s, chat_s, thread_s, message_s, user_s,
+            session_key_s, session_id_s, origin_s, origin_digest, payload_s,
+            payload_digest, mode,
+        )
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE lookup_key=?", (lookup,)
+            ).fetchone()
+            if existing is not None:
+                actual = (
+                    existing["lookup_key"], existing["platform"],
+                    existing["chat_id"], existing["thread_id"],
+                    existing["message_id"], existing["user_id"],
+                    existing["session_key"], existing["session_id"],
+                    existing["origin_json"], existing["origin_sha256"],
+                    existing["payload_json"], existing["payload_sha256"],
+                    existing["busy_mode"],
+                )
+                # A terminal row deliberately scrubs payload_json.  Its hash
+                # remains sufficient to recognize the same native delivery.
+                terminal_expected = expected[:10] + (None,) + expected[11:]
+                if actual not in (expected, terminal_expected):
+                    raise ValueError("gateway drain inbox identity collision")
+                result = dict(existing)
+                result.update({"accepted": True, "duplicate": True})
+                return result
+
+            nonterminal = "('READY','LEASED','MATERIALIZED','DISPATCHED')"
+            route_count = conn.execute(
+                f"SELECT COUNT(*) FROM gateway_drain_inbox "
+                f"WHERE session_key=? AND state IN {nonterminal}",
+                (session_key_s,),
+            ).fetchone()[0]
+            if int(route_count) >= route_limit:
+                return {"accepted": False, "reason": "route_limit"}
+            total_count = conn.execute(
+                f"SELECT COUNT(*) FROM gateway_drain_inbox WHERE state IN {nonterminal}"
+            ).fetchone()[0]
+            if int(total_count) >= total_limit:
+                return {"accepted": False, "reason": "total_limit"}
+
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE lookup_key=?", (lookup,)
+            ).fetchone()
+            if ledger is None:
+                cursor = conn.execute(
+                    """INSERT INTO gateway_message_ledger (
+                           lookup_key, platform, chat_id, thread_id, message_id,
+                           user_id, session_key, session_id, status, origin_type,
+                           received_at, updated_at, reason, metadata, snippet
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'received', 'real_user',
+                                 ?, ?, 'planned-restart-drain', NULL, NULL)""",
+                    (lookup, platform_s, chat_s, thread_s, message_s, user_s,
+                     session_key_s, session_id_s, now, now),
+                )
+                ledger_id = int(cursor.lastrowid)
+            else:
+                ledger_id = int(ledger["id"])
+                ledger_identity = (
+                    ledger["platform"], ledger["chat_id"], ledger["thread_id"],
+                    ledger["message_id"], ledger["user_id"], ledger["session_key"],
+                )
+                if ledger_identity != (
+                    platform_s, chat_s, thread_s, message_s, user_s, session_key_s
+                ):
+                    raise ValueError("gateway message ledger identity collision")
+
+            cursor = conn.execute(
+                """INSERT INTO gateway_drain_inbox (
+                       inbox_id, ingress_ledger_id, lookup_key, platform, chat_id,
+                       thread_id, message_id, user_id, session_key, session_id,
+                       origin_json, origin_sha256, payload_json, payload_sha256,
+                       busy_mode, state, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             'READY', ?, ?)""",
+                (inbox_id, ledger_id, lookup, platform_s, chat_s, thread_s,
+                 message_s, user_s, session_key_s, session_id_s, origin_s,
+                 origin_digest, payload_s, payload_digest, mode, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE sequence=?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+            result = dict(row)
+            result.update({"accepted": True, "duplicate": False})
+            return result
+
+        return self._execute_write(_do)
+
+    def get_gateway_drain_inbox(self, inbox_id: str) -> Optional[Dict[str, Any]]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?",
+                (str(inbox_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_gateway_drain_inbox_ready(self, *, limit: int = 4096) -> List[Dict[str, Any]]:
+        if int(limit) <= 0:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT * FROM gateway_drain_inbox
+                     WHERE state='READY' ORDER BY sequence LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_gateway_drain_inbox(
+        self, inbox_id: str, *, owner: str, token: str, lease_expires_at: float,
+    ) -> bool:
+        row_id, owner_s, token_s = str(inbox_id), str(owner), str(token)
+        expiry = float(lease_expires_at)
+        if not row_id or not owner_s or not token_s:
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "LEASED":
+                return bool(
+                    row["lease_owner"] == owner_s
+                    and row["lease_token"] == token_s
+                    and row["lease_expires_at"] == expiry
+                )
+            if row["state"] != "READY":
+                return False
+            older = conn.execute(
+                """SELECT 1 FROM gateway_drain_inbox
+                     WHERE session_key=? AND sequence<?
+                       AND state NOT IN ('TERMINAL','CANCELLED') LIMIT 1""",
+                (row["session_key"], int(row["sequence"])),
+            ).fetchone()
+            if older is not None:
+                return False
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='LEASED', lease_owner=?, lease_token=?,
+                          lease_expires_at=?, updated_at=?
+                    WHERE inbox_id=? AND state='READY'""",
+                (owner_s, token_s, expiry, time.time(), row_id),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def ack_gateway_drain_inbox_materialized(
+        self, inbox_id: str, *, owner: str, token: str,
+    ) -> bool:
+        row_id, owner_s, token_s = str(inbox_id), str(owner), str(token)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "MATERIALIZED":
+                return row["lease_owner"] == owner_s and row["lease_token"] == token_s
+            return bool(
+                row["state"] == "LEASED"
+                and row["lease_owner"] == owner_s
+                and row["lease_token"] == token_s
+                and conn.execute(
+                    """UPDATE gateway_drain_inbox SET state='MATERIALIZED', updated_at=?
+                         WHERE inbox_id=? AND state='LEASED'
+                           AND lease_owner=? AND lease_token=?""",
+                    (time.time(), row_id, owner_s, token_s),
+                ).rowcount == 1
+            )
+
+        return bool(self._execute_write(_do))
+
+    def accept_gateway_drain_materialization(
+        self,
+        inbox_id: str,
+        *,
+        owner: str,
+        token: str,
+        session_id: str,
+        message_row_id: int,
+    ) -> bool:
+        """Atomically hand one drain row to its canonical durable user row.
+
+        The normal gateway turn writes the raw user row before hooks, media
+        preprocessing, or model execution.  This transaction makes that exact
+        row the inbox consumer and scrubs the replay payload.  If the process
+        dies between the user-row commit and this call, the inbox remains
+        reclaimable and ``append_or_reuse_gateway_user_authority`` reuses the
+        same active tail on the next boot instead of appending a duplicate.
+        """
+        row_id = str(inbox_id)
+        owner_s = str(owner)
+        token_s = str(token)
+        session_s = str(session_id)
+        try:
+            message_id = int(message_row_id)
+        except (TypeError, ValueError):
+            return False
+        if not row_id or not owner_s or not token_s or not session_s or message_id <= 0:
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "TERMINAL":
+                return bool(
+                    row["materialized_session_id"] == session_s
+                    and row["materialized_message_row_id"] == message_id
+                )
+            if (
+                row["state"] != "LEASED"
+                or row["lease_owner"] != owner_s
+                or row["lease_token"] != token_s
+            ):
+                return False
+            message = conn.execute(
+                """SELECT id, session_id, role, active, platform_message_id
+                     FROM messages WHERE id=? AND session_id=? LIMIT 1""",
+                (message_id, session_s),
+            ).fetchone()
+            if (
+                message is None
+                or message["role"] != "user"
+                or int(message["active"] or 0) != 1
+                or str(message["platform_message_id"] or "") != str(row["message_id"])
+            ):
+                return False
+            tail = conn.execute(
+                "SELECT id FROM messages WHERE session_id=? AND active=1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_s,),
+            ).fetchone()
+            if tail is None or int(tail["id"]) != message_id:
+                return False
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?",
+                (int(row["ingress_ledger_id"]),),
+            ).fetchone()
+            if ledger is None or ledger["status"] not in {"received", "requeued"}:
+                return False
+            now = time.time()
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='completed', session_id=?, dispatch_started_at=?,
+                          completed_at=?, updated_at=?, reason='drain-inbox-materialized'
+                    WHERE id=? AND status=?""",
+                (
+                    session_s,
+                    now,
+                    now,
+                    now,
+                    int(row["ingress_ledger_id"]),
+                    ledger["status"],
+                ),
+            ).rowcount != 1:
+                return False
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='TERMINAL', session_id=?,
+                          materialized_session_id=?, materialized_message_row_id=?,
+                          payload_json=NULL, terminal_at=?, updated_at=?
+                    WHERE inbox_id=? AND state='LEASED'
+                      AND lease_owner=? AND lease_token=?""",
+                (
+                    session_s,
+                    session_s,
+                    message_id,
+                    now,
+                    now,
+                    row_id,
+                    owner_s,
+                    token_s,
+                ),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def accept_gateway_drain_processing(
+        self,
+        inbox_id: str,
+        *,
+        owner: str,
+        token: str,
+        consumer_kind: str,
+    ) -> bool:
+        """Complete an inbox row consumed by a non-transcript router path."""
+        row_id = str(inbox_id)
+        owner_s = str(owner)
+        token_s = str(token)
+        kind = str(consumer_kind or "")[:120]
+        if not row_id or not owner_s or not token_s or not kind:
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "TERMINAL":
+                return row["consumer_kind"] == kind
+            if (
+                row["state"] != "LEASED"
+                or row["lease_owner"] != owner_s
+                or row["lease_token"] != token_s
+            ):
+                return False
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?",
+                (int(row["ingress_ledger_id"]),),
+            ).fetchone()
+            if ledger is None or ledger["status"] not in {"received", "requeued"}:
+                return False
+            now = time.time()
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='completed', dispatch_started_at=?, completed_at=?,
+                          updated_at=?, reason=?
+                    WHERE id=? AND status=?""",
+                (
+                    now,
+                    now,
+                    now,
+                    f"drain-inbox-consumed:{kind}",
+                    int(row["ingress_ledger_id"]),
+                    ledger["status"],
+                ),
+            ).rowcount != 1:
+                return False
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='TERMINAL', consumer_kind=?, payload_json=NULL,
+                          terminal_at=?, updated_at=?
+                    WHERE inbox_id=? AND state='LEASED'
+                      AND lease_owner=? AND lease_token=?""",
+                (kind, now, now, row_id, owner_s, token_s),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def handoff_gateway_drain_inbox(
+        self, inbox_id: str, *, owner: str, token: str,
+        dispatch_token: str, dispatch_expires_at: float,
+    ) -> bool:
+        row_id, owner_s, token_s = str(inbox_id), str(owner), str(token)
+        dispatch, expiry = str(dispatch_token), float(dispatch_expires_at)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?",
+                (int(row["ingress_ledger_id"]),),
+            ).fetchone()
+            reason = f"drain-inbox:{row_id}:{dispatch}"
+            if row["state"] == "DISPATCHED":
+                return bool(
+                    row["lease_owner"] == owner_s
+                    and row["lease_token"] == token_s
+                    and row["dispatch_token"] == dispatch
+                    and row["dispatch_expires_at"] == expiry
+                    and ledger is not None
+                    and ledger["status"] == "in_progress"
+                    and ledger["reason"] == reason
+                )
+            if (
+                row["state"] != "MATERIALIZED"
+                or row["lease_owner"] != owner_s
+                or row["lease_token"] != token_s
+                or ledger is None
+                or ledger["status"] not in ("received", "requeued")
+                or ledger["dispatch_started_at"] is not None
+            ):
+                return False
+            now = time.time()
+            prior = ledger["status"]
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='in_progress', dispatch_started_at=?, updated_at=?, reason=?
+                    WHERE id=? AND status=? AND dispatch_started_at IS NULL""",
+                (now, now, reason, int(row["ingress_ledger_id"]), prior),
+            ).rowcount != 1:
+                return False
+            if conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='DISPATCHED', dispatch_token=?, dispatch_expires_at=?,
+                          ingress_prior_status=?, updated_at=?
+                    WHERE inbox_id=? AND state='MATERIALIZED'
+                      AND lease_owner=? AND lease_token=?""",
+                (dispatch, expiry, prior, now, row_id, owner_s, token_s),
+            ).rowcount != 1:
+                raise RuntimeError("drain inbox handoff lost its serialized CAS")
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def accept_gateway_drain_dispatch(
+        self, inbox_id: str, *, dispatch_token: str, consumer_owner: str,
+        consumer_token: str, consumer_expires_at: float,
+    ) -> bool:
+        row_id, dispatch = str(inbox_id), str(dispatch_token)
+        owner, token = str(consumer_owner), str(consumer_token)
+        expiry = float(consumer_expires_at)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None or row["state"] != "DISPATCHED" or row["dispatch_token"] != dispatch:
+                return False
+            if row["consumer_token"] is not None:
+                return bool(
+                    row["consumer_owner"] == owner
+                    and row["consumer_token"] == token
+                    and row["consumer_expires_at"] == expiry
+                )
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET consumer_owner=?, consumer_token=?, consumer_expires_at=?, updated_at=?
+                    WHERE inbox_id=? AND state='DISPATCHED'
+                      AND dispatch_token=? AND consumer_token IS NULL""",
+                (owner, token, expiry, time.time(), row_id, dispatch),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def complete_gateway_drain_inbox(
+        self, inbox_id: str, *, dispatch_token: str, consumer_token: str,
+    ) -> bool:
+        row_id, dispatch, consumer = (
+            str(inbox_id), str(dispatch_token), str(consumer_token)
+        )
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "TERMINAL":
+                return bool(
+                    row["dispatch_token"] == dispatch
+                    and row["consumer_token"] == consumer
+                )
+            if (
+                row["state"] != "DISPATCHED"
+                or row["dispatch_token"] != dispatch
+                or row["consumer_token"] != consumer
+            ):
+                return False
+            now = time.time()
+            reason = f"drain-inbox:{row_id}:{dispatch}"
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='completed', completed_at=?, updated_at=?, reason='drain-inbox-completed'
+                    WHERE id=? AND status='in_progress' AND reason=?""",
+                (now, now, int(row["ingress_ledger_id"]), reason),
+            ).rowcount != 1:
+                return False
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='TERMINAL', payload_json=NULL, updated_at=?, terminal_at=?
+                    WHERE inbox_id=? AND state='DISPATCHED'
+                      AND dispatch_token=? AND consumer_token=?""",
+                (now, now, row_id, dispatch, consumer),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def cancel_gateway_drain_inbox(
+        self, inbox_id: str, *, reason: str,
+        owner: Optional[str] = None, token: Optional[str] = None,
+    ) -> bool:
+        """Quarantine one invalid inbox row without reopening its identity.
+
+        READY rows may be cancelled before a claim. Claimed rows require the
+        exact lease owner/token so a stale startup process cannot cancel work
+        owned by a newer process. The payload is scrubbed but its digest and
+        immutable ingress identity remain as bounded forensic evidence.
+        """
+        row_id = str(inbox_id)
+        reason_s = str(reason or "")[:500]
+        owner_s = str(owner) if owner is not None else None
+        token_s = str(token) if token is not None else None
+        if not row_id or not reason_s:
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM gateway_drain_inbox WHERE inbox_id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "CANCELLED":
+                return row["failure_reason"] == reason_s
+            if row["state"] == "TERMINAL":
+                return False
+            if row["state"] == "READY":
+                if owner_s is not None or token_s is not None:
+                    return False
+            elif (
+                row["state"] not in {"LEASED", "MATERIALIZED"}
+                or row["lease_owner"] != owner_s
+                or row["lease_token"] != token_s
+            ):
+                # DISPATCHED work already crossed the consumer handoff. Its
+                # outcome must be reclaimed/reconciled, never quarantined as
+                # malformed input by a producer-side validator.
+                return False
+            ledger = conn.execute(
+                "SELECT * FROM gateway_message_ledger WHERE id=?",
+                (int(row["ingress_ledger_id"]),),
+            ).fetchone()
+            if ledger is None or ledger["status"] not in {"received", "requeued"}:
+                return False
+            now = time.time()
+            if conn.execute(
+                """UPDATE gateway_message_ledger
+                      SET status='failed', updated_at=?, reason=?
+                    WHERE id=? AND status=?""",
+                (now, f"drain-inbox-quarantined:{reason_s}",
+                 int(row["ingress_ledger_id"]), ledger["status"]),
+            ).rowcount != 1:
+                return False
+            return conn.execute(
+                """UPDATE gateway_drain_inbox
+                      SET state='CANCELLED', payload_json=NULL,
+                          failure_reason=?, updated_at=?, terminal_at=?
+                    WHERE inbox_id=? AND state=?""",
+                (reason_s, now, now, row_id, row["state"]),
+            ).rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def reclaim_gateway_drain_inbox(
+        self, *, now: float, dead_owners: Tuple[str, ...] = (),
+    ) -> Dict[str, int]:
+        now_f = float(now)
+        dead = frozenset(str(owner) for owner in dead_owners)
+
+        def _do(conn):
+            counts = {"leased": 0, "materialized": 0, "dispatched": 0}
+            rows = conn.execute(
+                """SELECT * FROM gateway_drain_inbox
+                     WHERE state IN ('LEASED','MATERIALIZED','DISPATCHED')
+                     ORDER BY sequence"""
+            ).fetchall()
+            for row in rows:
+                state = str(row["state"])
+                expiry = row["lease_expires_at"]
+                owner_dead = row["lease_owner"] in dead
+                if state == "DISPATCHED":
+                    expiry = row["consumer_expires_at"] or row["dispatch_expires_at"]
+                    owner_dead = owner_dead or row["consumer_owner"] in dead
+                if not (owner_dead or (expiry is not None and float(expiry) <= now_f)):
+                    continue
+                if state == "DISPATCHED":
+                    reason = f"drain-inbox:{row['inbox_id']}:{row['dispatch_token']}"
+                    if conn.execute(
+                        """UPDATE gateway_message_ledger
+                              SET status=?, dispatch_started_at=NULL, updated_at=?,
+                                  reason='drain-inbox-reclaimed'
+                            WHERE id=? AND status='in_progress' AND reason=?""",
+                        (row["ingress_prior_status"], now_f,
+                         int(row["ingress_ledger_id"]), reason),
+                    ).rowcount != 1:
+                        continue
+                cursor = conn.execute(
+                    """UPDATE gateway_drain_inbox
+                          SET state='READY', lease_owner=NULL, lease_token=NULL,
+                              lease_expires_at=NULL, dispatch_token=NULL,
+                              dispatch_expires_at=NULL, ingress_prior_status=NULL,
+                              consumer_owner=NULL, consumer_token=NULL,
+                              consumer_expires_at=NULL, updated_at=?
+                        WHERE inbox_id=? AND state=?""",
+                    (now_f, row["inbox_id"], state),
+                )
+                counts[state.lower()] += int(cursor.rowcount or 0)
+            return counts
+
+        return self._execute_write(_do)
+
     def get_gateway_resume_obligation(
         self, session_key: str
     ) -> Optional[Dict[str, Any]]:

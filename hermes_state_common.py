@@ -454,6 +454,50 @@ CREATE INDEX IF NOT EXISTS idx_gateway_busy_receipts_state
     ON gateway_busy_receipts(state, sequence);
 CREATE INDEX IF NOT EXISTS idx_gateway_busy_queue_ready
     ON gateway_busy_queue(state, sequence);
+
+CREATE TABLE IF NOT EXISTS gateway_drain_inbox (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    inbox_id TEXT NOT NULL UNIQUE,
+    ingress_ledger_id INTEGER NOT NULL UNIQUE,
+    lookup_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    message_id TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT NOT NULL,
+    session_id TEXT,
+    origin_json TEXT NOT NULL,
+    origin_sha256 TEXT NOT NULL,
+    payload_json TEXT,
+    payload_sha256 TEXT NOT NULL,
+    busy_mode TEXT NOT NULL CHECK (busy_mode IN ('interrupt','queue','steer')),
+    state TEXT NOT NULL CHECK (
+        state IN ('READY','LEASED','MATERIALIZED','DISPATCHED','TERMINAL','CANCELLED')
+    ),
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at REAL,
+    dispatch_token TEXT,
+    dispatch_expires_at REAL,
+    ingress_prior_status TEXT,
+    consumer_owner TEXT,
+    consumer_token TEXT,
+    consumer_expires_at REAL,
+    materialized_session_id TEXT,
+    materialized_message_row_id INTEGER,
+    consumer_kind TEXT,
+    failure_reason TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    terminal_at REAL,
+    FOREIGN KEY (ingress_ledger_id) REFERENCES gateway_message_ledger(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gateway_drain_inbox_ready
+    ON gateway_drain_inbox(state, sequence);
+CREATE INDEX IF NOT EXISTS idx_gateway_drain_inbox_route
+    ON gateway_drain_inbox(session_key, state, sequence);
 CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_lookup
     ON gateway_message_ledger(lookup_key);
 CREATE INDEX IF NOT EXISTS idx_gateway_message_ledger_session

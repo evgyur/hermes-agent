@@ -188,3 +188,95 @@ def test_queued_followup_rejects_unverifiable_message_identity() -> None:
 
     assert runner._queue_or_replace_pending_event(session_key, event) is False
     assert session_key not in adapter._pending_messages
+
+
+def test_direct_fifo_producer_seals_native_message_identity() -> None:
+    """Every FIFO producer must seal identity, not only the busy wrapper."""
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        user_id="617744661",
+        message_id="22943",
+    )
+    session_key = "agent:main:telegram:group:-1003770669948:5413"
+    event = MessageEvent(
+        text="verified follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(message_id=22948),
+        message_id="22948",
+    )
+
+    assert runner._enqueue_fifo(session_key, event, adapter) is True
+    queued = adapter._pending_messages[session_key]
+    assert queued.source.message_id == "22948"
+    assert runner._turn_platform_message_id(queued) == "22948"
+
+
+def test_busy_media_wrapper_propagates_merge_rejection(monkeypatch) -> None:
+    """The wrapper must not acknowledge a media event rejected by the sink."""
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        user_id="617744661",
+        message_id="22948",
+    )
+    session_key = "agent:main:telegram:group:-1003770669948:5413"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="first photo",
+        message_type=MessageType.PHOTO,
+        source=replace(source),
+        raw_message=SimpleNamespace(message_id=22948),
+        message_id="22948",
+        media_urls=["first.jpg"],
+        media_types=["image/jpeg"],
+    )
+    event = MessageEvent(
+        text="second photo",
+        message_type=MessageType.PHOTO,
+        source=replace(source, message_id="22949"),
+        raw_message=SimpleNamespace(message_id=22949),
+        message_id="22949",
+        media_urls=["second.jpg"],
+        media_types=["image/jpeg"],
+    )
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "merge_pending_message_event", lambda *_a, **_k: False)
+
+    assert runner._queue_or_replace_pending_event(session_key, event) is False
+
+
+def test_busy_fifo_wrapper_propagates_enqueue_rejection(monkeypatch) -> None:
+    """A failed FIFO sink must never be reported as successfully queued."""
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        user_id="617744661",
+        message_id="22948",
+    )
+    session_key = "agent:main:telegram:group:-1003770669948:5413"
+    event = MessageEvent(
+        text="queued correction",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(message_id=22948),
+        message_id="22948",
+    )
+    monkeypatch.setattr(runner, "_enqueue_fifo", lambda *_a, **_k: False)
+
+    assert runner._queue_or_replace_pending_event(session_key, event) is False
