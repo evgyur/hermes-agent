@@ -20338,6 +20338,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 return None
 
+            # The adapter normally routes established busy sessions through
+            # _handle_active_session_busy_message(), which both applies the
+            # configured queue/steer/redirect policy and sends its visible
+            # acknowledgement.  A sibling message can race the adapter's
+            # active-session snapshot and arrive here after the runner has
+            # already claimed the turn.  Rejoin the same canonical handler so
+            # that race cannot silently redirect or queue the follow-up.
+            if (
+                not self._draining
+                and await self._handle_active_session_busy_message(event, _quick_key)
+            ):
+                return None
+
             _ra_state = self._peek_session_state(_quick_key)
             running_agent = _ra_state.turn.agent if _ra_state else None
             if running_agent is _AGENT_PENDING_SENTINEL:

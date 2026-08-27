@@ -195,6 +195,53 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_running_turn_fast_path_redirects_and_sends_ack(self, monkeypatch):
+        """A post-start Telegram correction must use the canonical busy ack path."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        adapter = _make_adapter()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="30162",
+            user_id="617744661",
+        )
+        event = MessageEvent(
+            text="use shaw to fix blocker",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="48805",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "current_tool": None,
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 8
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        agent.redirect.assert_called_once_with("use shaw to fix blocker")
+        adapter._send_with_retry.assert_awaited_once()
+        assert "Redirected current run" in adapter._send_with_retry.call_args.kwargs["content"]
+
+    @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
         """First message during busy session should get a status ack."""
         runner, sentinel = _make_runner()
