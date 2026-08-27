@@ -9707,6 +9707,14 @@ class TelegramAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
             raw = _scoped_gate_env("TELEGRAM_ALLOWED_CHATS")
+        if isinstance(raw, str) and raw.lstrip().startswith("["):
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if isinstance(decoded, list):
+                    raw = decoded
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
