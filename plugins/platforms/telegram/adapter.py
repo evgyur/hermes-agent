@@ -10872,7 +10872,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         quoted_chat = urllib.parse.quote(str(chat_id), safe="")
         owned_dir = tempfile.mkdtemp(prefix="hermes-telegram-chip-media-")
-        owned_path = os.path.join(owned_dir, "media")
+        # Telegram voice notes are Ogg/Opus. Keep a supported suffix on the
+        # sidecar-owned path so STT validation does not reject valid audio
+        # before ffmpeg can inspect the container.
+        owned_path = os.path.join(owned_dir, "media.ogg")
         query = urllib.parse.urlencode({"output_path": owned_path})
         url = (
             f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"

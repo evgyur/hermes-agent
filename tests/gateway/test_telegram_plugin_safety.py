@@ -158,6 +158,7 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
             media_path = query["output_path"][0]
             requested_paths.append(media_path)
+            assert Path(media_path).suffix == ".ogg"
             assert not Path(media_path).exists()
             if os.name != "nt":
                 assert stat.S_IMODE(Path(media_path).parent.stat().st_mode) == 0o770
