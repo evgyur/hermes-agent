@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -324,6 +325,47 @@ async def test_owner_explicit_business_wake_preserves_connection_and_safe_lane()
     assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
     assert event.source.external_safe_mode is True
     assert ":telegram:business:" in build_session_key(event.source)
+
+
+@pytest.mark.asyncio
+async def test_owner_short_resume_requires_recent_exact_business_session() -> None:
+    """A bare ``go on`` resumes Hermes, but never opens an arbitrary owner DM."""
+    adapter = _adapter()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._cache_replied_media = AsyncMock()
+    adapter._has_recent_business_session = MagicMock(return_value=False)
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, text="go on")
+
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_not_called()
+
+    adapter._has_recent_business_session.return_value = True
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "go on"
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+
+
+def test_short_resume_session_proof_uses_exact_business_route() -> None:
+    adapter = _adapter()
+    lookup = MagicMock(
+        return_value=SimpleNamespace(updated_at=datetime.now(timezone.utc))
+    )
+    adapter._session_store = SimpleNamespace(lookup_by_session_key=lookup)
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, text="продолжай")
+
+    assert adapter._has_recent_business_session(message) is True
+    session_key = lookup.call_args.args[0]
+    assert session_key == (
+        f"agent:main:telegram:business:{BUSINESS_CONNECTION_ID}:"
+        f"{SAFE_CUSTOMER_ID}:{OWNER_ID}:external"
+    )
 
 
 @pytest.mark.asyncio

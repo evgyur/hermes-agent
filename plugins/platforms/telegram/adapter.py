@@ -2529,6 +2529,96 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _is_bounded_business_resume_directive(message: Any) -> bool:
+        """Recognize only exact, low-entropy continuation directives."""
+        text = str(
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or ""
+        ).casefold()
+        normalized = re.sub(r"\s+", " ", text).strip()
+        normalized = normalized.strip(" \t\r\n.,!?…:;—-")
+        return normalized in {
+            "go",
+            "go on",
+            "continue",
+            "давай",
+            "го",
+            "продолжай",
+            "продолжить",
+            "продолжаешь",
+        }
+
+    def _has_recent_business_session(self, message: Any) -> bool:
+        """Prove that the exact Business route recently belonged to Hermes."""
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None) if store else None
+        if not callable(lookup):
+            return False
+
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        chat_id = str(getattr(chat, "id", "") or "")
+        user_id = str(getattr(user, "id", "") or "")
+        if not chat_id or not user_id:
+            return False
+        connection_id = self._telegram_supplied_business_connection_id(message)
+        if not connection_id:
+            connection_id = self._known_business_connection_id(chat_id)
+        if not connection_id:
+            return False
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
+            thread_id=self._effective_message_thread_id(message),
+        )
+        source.business_connection_id = str(connection_id)
+        source.external_safe_mode = True
+        try:
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=self._session_key_profile(source),
+            )
+            entry = lookup(session_key)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to verify recent Business session for chat %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
+            return False
+        if entry is None:
+            return False
+
+        updated_at = getattr(entry, "updated_at", None)
+        try:
+            updated_ts = float(updated_at.timestamp())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        try:
+            configured_window = float(
+                self._telegram_business_config().get(
+                    "short_resume_window_seconds", 7 * 24 * 60 * 60
+                )
+            )
+        except (TypeError, ValueError):
+            configured_window = 7 * 24 * 60 * 60
+        window_seconds = min(max(configured_window, 60.0), 7 * 24 * 60 * 60)
+        age_seconds = time.time() - updated_ts
+        return -300.0 <= age_seconds <= window_seconds
+
     def _reply_index_runtime_profile(
         self,
         message: Any,
@@ -2576,10 +2666,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._telegram_business_config().get("auto_transcribe_voice", False)
             )
         )
+        short_resume_route = bool(
+            self._is_bounded_business_resume_directive(message)
+            and self._has_recent_business_session(message)
+        )
         return (
             self._has_explicit_business_wake(message)
             or self._is_reply_to_own_outbound_text(message)
             or owner_voice_route
+            or short_resume_route
         )
 
     def _strip_business_wake_trigger(self, text: Optional[str]) -> Optional[str]:
