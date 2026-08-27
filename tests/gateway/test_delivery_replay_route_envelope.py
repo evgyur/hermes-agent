@@ -56,6 +56,7 @@ def _row(*, route_envelope, chat_id: str = "700000321") -> dict:
         "content": "private final",
         "needs_marker": False,
         "attempts": 1,
+        "runtime_claim_token": "claim-token-1",
         "route_envelope": route_envelope,
     }
 
@@ -85,7 +86,16 @@ async def test_business_replay_uses_exact_transport_and_full_route_metadata():
         profile_adapters={"transport-b": {Platform.TELEGRAM: exact}},
     )
 
-    with patch("gateway.delivery_ledger.mark_delivered") as mark_delivered:
+    with (
+        patch(
+            "gateway.delivery_ledger.begin_redelivery_attempt",
+            return_value=True,
+        ) as begin_attempt,
+        patch(
+            "gateway.delivery_ledger.settle_runtime_claim",
+            return_value=True,
+        ) as settle_claim,
+    ):
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=_business_route())]
         )
@@ -102,7 +112,10 @@ async def test_business_replay_uses_exact_transport_and_full_route_metadata():
     assert sent["metadata"]["telegram_business_external_contact"] is True
     assert sent["metadata"]["profile"] == "runtime-a"
     assert sent["metadata"]["transport_profile"] == "transport-b"
-    mark_delivered.assert_called_once_with("business-replay")
+    begin_attempt.assert_called_once_with("business-replay", "claim-token-1")
+    settle_claim.assert_called_once_with(
+        "business-replay", "claim-token-1", delivered=True
+    )
 
 
 @pytest.mark.asyncio
@@ -116,7 +129,16 @@ async def test_default_transport_replay_uses_only_the_default_adapter():
         external_safe_mode=False,
     )
 
-    with patch("gateway.delivery_ledger.mark_delivered") as mark_delivered:
+    with (
+        patch(
+            "gateway.delivery_ledger.begin_redelivery_attempt",
+            return_value=True,
+        ) as begin_attempt,
+        patch(
+            "gateway.delivery_ledger.settle_runtime_claim",
+            return_value=True,
+        ) as settle_claim,
+    ):
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=route)]
         )
@@ -126,7 +148,10 @@ async def test_default_transport_replay_uses_only_the_default_adapter():
     assert sent["metadata"]["profile"] == "default"
     assert sent["metadata"]["transport_profile"] == "default"
     assert "business_connection_id" not in sent["metadata"]
-    mark_delivered.assert_called_once_with("business-replay")
+    begin_attempt.assert_called_once_with("business-replay", "claim-token-1")
+    settle_claim.assert_called_once_with(
+        "business-replay", "claim-token-1", delivered=True
+    )
 
 
 @pytest.mark.parametrize(
