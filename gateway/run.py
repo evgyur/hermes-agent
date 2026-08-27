@@ -13061,6 +13061,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         },
                         disposition="quarantined_invalid_envelope",
                         event=event,
+                        final_attempt=True,
                     )
                     _settlement_attempted = True
                 self._release_running_agent_state(session_key)
@@ -13141,6 +13142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         ),
                         event=event,
+                        final_attempt=True,
                     )
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
@@ -22480,8 +22482,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         disposition: str,
         event: Optional["MessageEvent"] = None,
+        final_attempt: bool = False,
     ) -> bool:
-        """Settle one exact claimed startup continuation through one CAS path."""
+        """Settle one exact claimed startup continuation through one CAS path.
+
+        The startup wrapper performs one authoritative retry after the handler
+        exits.  A failed handler CAS is therefore not an operational error by
+        itself; only the wrapper's final failed CAS is logged as one.
+        """
         if event is not None and bool(getattr(event, "startup_resume", False)):
             metadata = getattr(event, "metadata", None) or {}
             metadata["startup_resume_settlement_disposition"] = disposition
@@ -22541,7 +22549,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 disposition,
             )
             return False
-        if not settled:
+        if not settled and final_attempt:
             logger.error(
                 "Could not settle startup continuation for %s (%s): exact "
                 "claim no longer matched",

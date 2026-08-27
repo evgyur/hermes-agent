@@ -3522,7 +3522,9 @@ async def test_startup_wrapper_keeps_claim_for_runner_owned_multiplex_child():
 
 
 @pytest.mark.asyncio
-async def test_wrapper_retries_success_settlement_without_changing_disposition():
+async def test_wrapper_retries_success_settlement_without_changing_disposition(
+    caplog,
+):
     runner, adapter = make_restart_runner()
     source = make_restart_source(
         chat_id="transient-success-settlement",
@@ -3571,10 +3573,75 @@ async def test_wrapper_retries_success_settlement_without_changing_disposition()
 
     adapter.handle_message = _handler_attempted_success
 
-    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+    with caplog.at_level(logging.ERROR):
+        await runner._run_startup_resume_event(adapter, event, entry.session_key)
 
     assert clear.await_count == 2
     abandon.assert_not_awaited()
+    assert "Could not settle startup continuation" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_wrapper_logs_one_error_when_success_settlement_retry_also_fails(
+    caplog,
+):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="failed-success-settlement",
+        message_id="restart-message-1",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:dm:failed-success-settlement",
+            session_id="sid-failed-success",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-failed-success",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    clear = AsyncMock(return_value=False)
+    runner.async_session_store.clear_resume_pending_exact = clear
+
+    identity = {
+        "resume_task_id": entry.resume_task_id,
+        "continuation_generation": entry.continuation_generation,
+        "continuation_claim_owner": entry.continuation_claim_owner,
+        "continuation_claim_token": entry.continuation_claim_token,
+    }
+
+    async def _handler_attempted_success(_event):
+        _event.metadata["startup_resume_agent_started"] = True
+        await runner._settle_startup_resume_claim(
+            entry.session_key,
+            identity,
+            disposition="success",
+            event=_event,
+        )
+        runner._release_running_agent_state(entry.session_key)
+
+    adapter.handle_message = _handler_attempted_success
+
+    with caplog.at_level(logging.ERROR):
+        await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    assert clear.await_count == 2
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and "Could not settle startup continuation" in record.getMessage()
+    ]
+    assert len(errors) == 1
 
 
 @pytest.mark.asyncio
