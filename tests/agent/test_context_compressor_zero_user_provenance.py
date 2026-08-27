@@ -220,6 +220,84 @@ def test_max_iterations_nudge_is_synthetic_not_actionable():
     assert ContextCompressor._transcript_has_real_user_turn([human, nudge]) is True
 
 
+@pytest.mark.parametrize(
+    "startup_marker",
+    [
+        pytest.param(
+            "[Internal continuation marker: startup recovery turn.]",
+            id="durable_neutral_marker",
+        ),
+        pytest.param(
+            "[System note: The previous turn was interrupted by a gateway "
+            "shutdown; the gateway is now back online. Continue safely.]",
+            id="legacy_recovery_note",
+        ),
+    ],
+)
+def test_startup_recovery_marker_cannot_displace_telegram_authority_on_compaction(
+    startup_marker,
+    compressor,
+):
+    """A repeated restart must retain the exact human turn after compaction."""
+    authority = {
+        "role": "user",
+        "content": "Fix the exact deployment",
+        "message_id": "48847",
+        "timestamp": 1787831869.0,
+        "display_metadata": {
+            "gateway_raw_semantic_v1": {
+                "version": 1,
+                "message_type": "text",
+                "reply": {
+                    "message_id": "48846",
+                    "is_own": True,
+                    "quote": "Use H20 Keys and finish the rollout.",
+                },
+                "media": [],
+            }
+        },
+    }
+    original = [
+        authority,
+        {"role": "assistant", "content": "Continuing the rollout."},
+        {"role": "user", "content": startup_marker},
+    ]
+    assert compressor._find_last_user_message_idx(original, head_end=0) == 0
+    compressed = [
+        {
+            "role": "user",
+            "content": f"{SUMMARY_PREFIX}\nEarlier work was summarized here.",
+        },
+        {"role": "user", "content": startup_marker},
+    ]
+
+    _ensure_compressed_has_user_turn(original, compressed)
+
+    preserved = [row for row in compressed if row.get("message_id") == "48847"]
+    assert preserved == [authority]
+    assert preserved[0]["display_metadata"] == authority["display_metadata"]
+    assert ContextCompressor._is_synthetic_compression_user_turn(
+        {"role": "user", "content": startup_marker}
+    ) is True
+
+    # A second restart + compaction cycle must keep the same immutable source
+    # authority instead of gradually degrading it into unsealed text.
+    second_original = [
+        *compressed,
+        {"role": "assistant", "content": "Reconciliation still running."},
+        {"role": "user", "content": startup_marker},
+    ]
+    second_compressed = [
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\nSecond handoff."},
+        {"role": "user", "content": startup_marker},
+    ]
+    _ensure_compressed_has_user_turn(second_original, second_compressed)
+
+    assert [
+        row for row in second_compressed if row.get("message_id") == "48847"
+    ] == [authority]
+
+
 def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
     """The tail anchor must resolve to the human task, not the nudge that the
     runtime appended after it when iterations were exhausted."""
@@ -457,10 +535,6 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert len(todo_rows) == 1
     assert todo_rows[0]["role"] == "system"
     db.close()
-
-
-
-
 
 
 

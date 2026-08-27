@@ -2161,6 +2161,17 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
 
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
+    from agent.context_compressor import _is_startup_recovery_user_turn
+
+    # Startup recovery guidance is a capability for one synthetic turn. It is
+    # neither user intent nor durable context. Keeping it in a protected tail
+    # lets it displace the real Telegram authority row, and merging that row
+    # into the marker drops its platform message id and raw reply/media seal.
+    compressed[:] = [
+        message
+        for message in compressed
+        if not _is_startup_recovery_user_turn(message)
+    ]
     if any(_is_real_user_message(message) for message in compressed):
         return
     from agent.context_compressor import (
