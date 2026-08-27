@@ -5801,6 +5801,7 @@ class TelegramAdapter(BasePlatformAdapter):
             and preview_guard.get("enabled", False)
             and str(chat_id) in {str(value) for value in preview_guard.get("chats", [])}
             and bool((metadata or {}).get("notify"))
+            and not str((metadata or {}).get("gateway_command") or "").strip()
         ):
             content = (
                 "⚠️ превью заблокировано: готовая публикация должна пройти "

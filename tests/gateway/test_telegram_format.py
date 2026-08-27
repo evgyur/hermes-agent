@@ -138,6 +138,71 @@ async def test_final_send_does_not_retrigger_typing(adapter):
     adapter._bot.send_chat_action.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_inline_preview_guard_allows_gateway_command_confirmation():
+    """The /new acknowledgement is control-plane output, not a TG post preview."""
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={
+            "inline_preview_guard": {
+                "enabled": True,
+                "chats": ["-1003712304136"],
+            }
+        },
+    )
+    guarded = TelegramAdapter(config)
+    guarded._bot = MagicMock()
+    guarded._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=8064)
+    )
+    guarded._bot.send_chat_action = AsyncMock()
+    guarded._rich_messages_enabled = False
+
+    result = await guarded.send(
+        "-1003712304136",
+        "✨ New session started!",
+        metadata={"notify": True, "gateway_command": "new"},
+    )
+
+    assert result.success is True
+    sent_text = guarded._bot.send_message.await_args.kwargs["text"]
+    assert "New session started" in sent_text
+    assert "превью заблокировано" not in sent_text
+
+
+@pytest.mark.asyncio
+async def test_inline_preview_guard_still_blocks_agent_final():
+    """An ordinary agent final in a guarded /tg chat remains fail-closed."""
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={
+            "inline_preview_guard": {
+                "enabled": True,
+                "chats": ["-1003712304136"],
+            }
+        },
+    )
+    guarded = TelegramAdapter(config)
+    guarded._bot = MagicMock()
+    guarded._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=8065)
+    )
+    guarded._bot.send_chat_action = AsyncMock()
+    guarded._rich_messages_enabled = False
+
+    result = await guarded.send(
+        "-1003712304136",
+        "A finished publication draft",
+        metadata={"notify": True},
+    )
+
+    assert result.success is True
+    sent_text = guarded._bot.send_message.await_args.kwargs["text"]
+    assert "превью заблокировано" in sent_text
+
+
 # =========================================================================
 # format_message - bold and italic
 # =========================================================================

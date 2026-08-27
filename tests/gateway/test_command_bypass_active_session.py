@@ -48,6 +48,7 @@ def _make_adapter():
     adapter = _StubAdapter(config, Platform.TELEGRAM)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
+    adapter.sent_metadata = []
 
     async def _mock_handler(event):
         cmd = event.get_command()
@@ -57,6 +58,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        adapter.sent_metadata.append(kwargs.get("metadata") or {})
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -111,6 +113,7 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:new" in r for r in adapter.sent_responses)
+        assert adapter.sent_metadata[-1]["gateway_command"] == "new"
 
     @pytest.mark.asyncio
     async def test_reset_bypasses_guard(self):
@@ -392,6 +395,19 @@ class TestNoActiveSessionNormalDispatch:
         # and NOT be in _pending_messages (that's the queued-during-active path)
         assert sk not in adapter._pending_messages
 
+    @pytest.mark.asyncio
+    async def test_new_final_is_marked_as_gateway_command(self):
+        """A normal /new confirmation must remain distinguishable from agent output."""
+        adapter = _make_adapter()
+
+        task = await adapter.handle_message(_make_event("/new@chipshermesbot"))
+        assert task is not None
+        await task
+
+        assert adapter.sent_responses == ["handled:new"]
+        assert adapter.sent_metadata[-1]["notify"] is True
+        assert adapter.sent_metadata[-1]["gateway_command"] == "new"
+
 
 # ---------------------------------------------------------------------------
 # Tests: safety net in _run_agent discards command text from pending queue
@@ -438,4 +454,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-

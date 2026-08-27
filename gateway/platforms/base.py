@@ -285,10 +285,21 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
-def _mark_notify_metadata(metadata: dict | None) -> dict:
-    """Clone metadata and mark a user-visible reply as notify-worthy."""
+def _mark_notify_metadata(
+    metadata: dict | None,
+    *,
+    gateway_command: str | None = None,
+) -> dict:
+    """Clone metadata and mark a user-visible reply as notify-worthy.
+
+    ``gateway_command`` is derived from the trusted inbound command parser.
+    It lets platform policy distinguish control-plane acknowledgements from
+    model-authored content without inspecting or trusting response text.
+    """
     notify_metadata = dict(metadata) if metadata else {}
     notify_metadata["notify"] = True
+    if gateway_command:
+        notify_metadata["gateway_command"] = str(gateway_command)
     return notify_metadata
 
 
@@ -6486,7 +6497,10 @@ class BasePlatformAdapter(ABC):
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_mark_notify_metadata(
+                        thread_meta,
+                        gateway_command=cmd,
+                    ),
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -6630,7 +6644,10 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_mark_notify_metadata(
+                                _thread_meta,
+                                gateway_command=cmd,
+                            ),
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -6956,7 +6973,10 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _mark_notify_metadata(
+                    _thread_metadata,
+                    gateway_command=event.get_command(),
+                )
 
                 # Parent continuations require a text delivery obligation. This
                 # keeps restart recovery exact; media may accompany the text but
