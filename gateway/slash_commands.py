@@ -4196,6 +4196,10 @@ class GatewaySlashCommandsMixin:
                 tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
+            elif value == "ultrafast":
+                tier = "ultrafast"
+                saved_value = "ultrafast"
+                label = "ULTRAFAST"
             elif value in {"normal", "off"}:
                 tier = None
                 saved_value = "normal"
@@ -4221,8 +4225,15 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.session_only", label=label)
 
         if not args or args == "status":
+            is_ultrafast = self._service_tier == "ultrafast"
             is_fast = self._service_tier == "priority"
-            status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
+            status = (
+                "ultrafast"
+                if is_ultrafast
+                else t("gateway.fast.status_fast")
+                if is_fast
+                else t("gateway.fast.status_normal")
+            )
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
                 return _apply_fast_selection(value, persist=persist_global)
@@ -4233,6 +4244,11 @@ class GatewaySlashCommandsMixin:
                 title=t("gateway.fast.picker_title", mode=status),
                 choices=[
                     {
+                        "value": "ultrafast",
+                        "label": "ultrafast — Ultrafast Processing on",
+                        "is_current": is_ultrafast,
+                    },
+                    {
                         "value": "fast",
                         "label": t("gateway.fast.choice_fast"),
                         "is_current": is_fast,
@@ -4240,7 +4256,7 @@ class GatewaySlashCommandsMixin:
                     {
                         "value": "normal",
                         "label": t("gateway.fast.choice_normal"),
-                        "is_current": not is_fast,
+                        "is_current": not is_fast and not is_ultrafast,
                     },
                 ],
                 on_choice_selected=_on_fast_choice,

@@ -124,6 +124,50 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
+def test_turn_route_injects_ultrafast_processing_without_changing_runtime():
+    runner = _make_runner()
+    runner._service_tier = "ultrafast"
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", "gpt-5.6-sol", runtime_kwargs
+    )
+
+    assert route["request_overrides"] == {"service_tier": "ultrafast"}
+
+
+@pytest.mark.asyncio
+async def test_handle_fast_command_accepts_ultrafast(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.6-sol"
+    )
+
+    response = await runner._handle_fast_command(_make_event("/fast ultrafast"))
+
+    assert "ULTRAFAST" in response
+    assert runner._service_tier == "ultrafast"
+
+
+def test_load_service_tier_accepts_ultrafast(monkeypatch):
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"agent": {"service_tier": "ultrafast"}},
+    )
+
+    assert gateway_run.GatewayRunner._load_service_tier() == "ultrafast"
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()

@@ -9182,6 +9182,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not service_tier:
             route["request_overrides"] = {}
             return route
+        if service_tier == "ultrafast":
+            route["request_overrides"] = {"service_tier": "ultrafast"}
+            return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
@@ -10475,7 +10478,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve the effective service tier for a session.
 
         A session-scoped /fast override wins over the config default. The
-        override dict stores "priority" or None (explicit normal), so key
+        override stores "priority", "ultrafast", or None (explicit normal), so key
         presence — not value truthiness — decides whether it applies.
         """
         resolved_session_key = session_key
@@ -10503,12 +10506,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Set or clear the session-scoped /fast override.
 
-        ``service_tier`` is "priority" or None (explicit normal). Pass
+        ``service_tier`` is "priority", "ultrafast", or None (explicit normal). Pass
         ``clear=True`` to remove the override entirely (fall back to config).
         """
         if not session_key:
             return
-        # Presence-sensitive: "priority" or None (explicit normal) both count
+        # Presence-sensitive: a supported tier or None (explicit normal) both count
         # as an override; the sentinel means "no override".  Old code
         # wholesale-replaced the dict on lazy init (cross-session race) —
         # per-session field writes eliminate that class of bug.
@@ -10521,7 +10524,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load Priority Processing setting from config.yaml.
 
         Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
+        "fast"/"priority"/"on" => "priority", "ultrafast" => "ultrafast",
+        while "normal"/"off" disables it.
         Returns None when unset or unsupported.
         """
         cfg = _load_gateway_runtime_config()
@@ -10532,6 +10536,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         if value in {"fast", "priority", "on"}:
             return "priority"
+        if value == "ultrafast":
+            return "ultrafast"
         logger.warning("Unknown service_tier '%s', ignoring", raw)
         return None
 
