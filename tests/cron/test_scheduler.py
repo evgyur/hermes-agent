@@ -516,6 +516,64 @@ class TestDeliverResultWrapping:
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 
+    def test_multiplex_owner_transport_delivers_for_disabled_child_profile(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        child_platform = MagicMock(enabled=False)
+        child_config = MagicMock()
+        child_config.platforms = {Platform.TELEGRAM: child_platform}
+
+        owner_platform = MagicMock(enabled=True)
+        owner_config = MagicMock()
+        owner_config.platforms = {Platform.TELEGRAM: owner_platform}
+
+        adapter = AsyncMock()
+        adapter.send.return_value = {"success": True, "message_id": "sent-1"}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            future.set_result(_asyncio.run(coro))
+            return future
+
+        job = {"id": "multiplex", "deliver": "telegram:-100123:456"}
+        with (
+            patch("gateway.config.load_gateway_config", return_value=child_config),
+            patch(
+                "cron.scheduler.load_config",
+                return_value={"cron": {"wrap_response": False}},
+            ),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                "Output.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                transport_config=owner_config,
+            )
+
+        assert result is None
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.args[:2] == ("-100123", "Output.")
+        assert adapter.send.await_args.kwargs["metadata"]["thread_id"] == "456"
+
+    def test_preflight_uses_multiplex_owner_transport_config(self):
+        from cron.scheduler import _preflight_check_delivery
+        from gateway.config import Platform
+
+        owner_config = MagicMock()
+        owner_config.get_connected_platforms.return_value = {Platform.TELEGRAM}
+
+        assert _preflight_check_delivery(
+            {"id": "multiplex", "deliver": "telegram:-100123:456"},
+            transport_config=owner_config,
+        ) is None
+
     def test_returns_error_when_platform_disabled(self):
         from gateway.config import Platform
 

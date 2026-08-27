@@ -36834,6 +36834,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         isinstance(cron_provider, InProcessCronScheduler)
         and multiplex_cron
     ):
+        # Secondary profiles intentionally keep owner platforms disabled while
+        # the incumbent multiplex gateway owns the live transport. Give the
+        # ticker the owner's transport config alongside its live adapters so a
+        # profile-scoped cron can preflight and deliver through that incumbent
+        # adapter without creating a second platform owner.
+        cron_start_kwargs["transport_config"] = runner.config
         try:
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:

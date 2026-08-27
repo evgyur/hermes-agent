@@ -2853,7 +2853,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    transport_config=None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3025,7 +3031,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        # In multiplex mode the current HERMES_HOME belongs to the destination
+        # profile, where the incumbent platform is intentionally disabled. The
+        # live adapter belongs to the gateway owner, so resolve it against the
+        # owner's transport config supplied by the ticker rather than rejecting
+        # it against the destination profile's config.
+        effective_transport_config = transport_config or config
+        transport = resolve_delivery_transport(
+            platform, effective_transport_config, adapters
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3283,7 +3297,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(effective_transport_config, adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -4829,7 +4843,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(job: dict, transport_config=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
@@ -4866,9 +4880,12 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             )
         if connected is None:
             try:
-                from gateway.config import load_gateway_config
+                if transport_config is None:
+                    from gateway.config import load_gateway_config
 
-                gateway_config = load_gateway_config()
+                    gateway_config = load_gateway_config()
+                else:
+                    gateway_config = transport_config
                 connected = {
                     p.value for p in gateway_config.get_connected_platforms()
                 }
@@ -4944,7 +4961,11 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict,
+    cfg: dict,
+    transport_config=None,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -4963,7 +4984,10 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        (
+            "delivery",
+            lambda: _preflight_check_delivery(job, transport_config),
+        ),
     ):
         try:
             reason = check()
@@ -5107,6 +5131,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    transport_config=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5812,7 +5837,11 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job,
+                    _cfg,
+                    transport_config=transport_config,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -6700,6 +6729,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    transport_config=None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -6738,6 +6768,7 @@ def run_one_job(
                 loop=loop,
                 verbose=verbose,
                 extra_prompt=extra_prompt,
+                transport_config=transport_config,
                 fire_claim_lost=(
                     _CombinedCancelEvent(lost_ownership, cancel_event)
                     if cancel_event is not None
@@ -6764,6 +6795,7 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    transport_config=None,
 ) -> bool:
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -6854,6 +6886,7 @@ def _run_one_job_body(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
+                    transport_config=transport_config,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -6861,6 +6894,7 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
+                    transport_config=transport_config,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -7030,6 +7064,7 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            transport_config=transport_config,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7176,6 +7211,7 @@ def _run_one_job_body(
                     + _failure_streak_nudge(job),
                     adapters=adapters,
                     loop=loop,
+                    transport_config=transport_config,
                 )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
@@ -7299,6 +7335,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    transport_config=None,
 ):
     """
     Check and run all due jobs.
@@ -7518,6 +7555,7 @@ def tick(
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                transport_config=transport_config,
             )
 
         # Partition due jobs: those with a per-job workdir mutate
