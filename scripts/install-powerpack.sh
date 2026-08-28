@@ -264,8 +264,16 @@ if [[ "$SYNC_DEPS" == true ]]; then
     if [[ -z "$uv_bin" ]]; then
         uv_bin="$(command -v uv 2>/dev/null || true)"
     fi
-    if [[ -z "$uv_bin" && -x "$HERMES_HOME/uv/bin/uv" ]]; then
-        uv_bin="$HERMES_HOME/uv/bin/uv"
+    if [[ -z "$uv_bin" ]]; then
+        for uv_candidate in \
+            "$HERMES_HOME/bin/uv" \
+            "$HOME/.local/bin/uv" \
+            "$HERMES_HOME/uv/bin/uv"; do
+            if [[ -x "$uv_candidate" ]]; then
+                uv_bin="$uv_candidate"
+                break
+            fi
+        done
     fi
     [[ -n "$uv_bin" ]] || die "uv is required for locked dependency sync"
     UV_NO_CACHE=1 UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" \

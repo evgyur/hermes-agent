@@ -19,6 +19,8 @@ def test_locked_sync_preserves_the_configured_messaging_runtime():
 
     assert '"$uv_bin" sync --project "$INSTALL_DIR" --extra all --extra messaging --locked' in installer
     assert "UV_NO_CACHE=1" in installer
+    assert '"$HERMES_HOME/bin/uv"' in installer
+    assert '"$HOME/.local/bin/uv"' in installer
 
 
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
