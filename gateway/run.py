@@ -10336,17 +10336,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             canonical_command = command_def.name
                                     except Exception:
                                         canonical_command = command
-                                if (
+                                priority_replay = (
                                     str(row.get("busy_mode") or "") == "interrupt"
                                     or canonical_command in {"stop", "new"}
-                                ):
+                                )
+                                if priority_replay:
                                     priority = self.__dict__.setdefault(
                                         "_startup_restore_priority_session_keys",
                                         set(),
                                     )
                                     priority.add(str(row["session_key"]))
-                                self._queue_startup_restore_event(event)
-                                accepted = True
+                                    # A committed interrupt/control message is
+                                    # the recovery authority for this route.
+                                    # Dispatch it before synthetic startup
+                                    # resumes instead of parking it behind the
+                                    # restore gate, which would leave its DB
+                                    # claim LEASED while older work runs.
+                                    event._hermes_startup_restore_replay = True
+                                    task = await adapter.handle_message(event)
+                                    accepted = bool(
+                                        isinstance(task, asyncio.Task)
+                                        or getattr(
+                                            event,
+                                            "_hermes_busy_admitted",
+                                            False,
+                                        )
+                                    )
+                                else:
+                                    # Queue-mode input retains its contract:
+                                    # finish the restored turn first, then run
+                                    # this message in per-route FIFO order.
+                                    self._queue_startup_restore_event(event)
+                                    accepted = True
                             else:
                                 task = await adapter.handle_message(event)
                                 accepted = bool(

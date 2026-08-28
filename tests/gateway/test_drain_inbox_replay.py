@@ -214,7 +214,7 @@ async def test_drain_replay_accepts_busy_queue_without_owner_task(
 
 
 @pytest.mark.asyncio
-async def test_startup_drain_interrupt_is_priority_but_queue_waits_for_resume(
+async def test_startup_drain_interrupt_dispatches_before_queue_waits_for_resume(
     monkeypatch, tmp_path
 ):
     runner, db, adapter = _runner(monkeypatch, tmp_path)
@@ -237,10 +237,13 @@ async def test_startup_drain_interrupt_is_priority_but_queue_waits_for_resume(
         )
 
         assert await runner._replay_gateway_drain_inbox() == 2
-        assert adapter.events == []
+        await asyncio.sleep(0)
+        assert [item.source.thread_id for item in adapter.events] == [
+            "interrupt-topic"
+        ]
         assert [
             item.source.thread_id for item in runner._startup_restore_queue
-        ] == ["interrupt-topic", "queue-topic"]
+        ] == ["queue-topic"]
         assert runner._startup_restore_priority_session_keys == {interrupt_key}
     finally:
         db.close()
