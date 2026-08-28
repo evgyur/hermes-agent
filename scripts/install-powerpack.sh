@@ -302,10 +302,20 @@ fi
 POWERPACK_RECEIPT="$receipt" POWERPACK_VERSION="$init_version" \
 POWERPACK_SHA="$candidate_sha" POWERPACK_PREVIOUS_SHA="$current_sha" \
 POWERPACK_BACKUP_REF="$backup_ref" POWERPACK_INSTALL_DIR="$INSTALL_DIR" \
-POWERPACK_HERMES_HOME="$HERMES_HOME" "$receipt_python" - <<'PY'
+POWERPACK_HERMES_HOME="$HERMES_HOME" \
+POWERPACK_RELEASE_MANIFEST="$SOURCE_DIR/powerpack/release.json" \
+"$receipt_python" - <<'PY'
 import json
 import os
 from pathlib import Path
+
+component_pins = {}
+manifest_path = Path(os.environ["POWERPACK_RELEASE_MANIFEST"])
+if manifest_path.is_file():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_pins = manifest.get("component_pins", {})
+    if isinstance(raw_pins, dict):
+        component_pins = raw_pins
 
 payload = {
     "format": "hermes-powerpack-install-v1",
@@ -319,6 +329,7 @@ payload = {
     "data_action": "preserve",
     "database_action": "none",
     "telegram_chip_action": "preserve",
+    "component_pins": component_pins,
 }
 path = Path(os.environ["POWERPACK_RECEIPT"])
 tmp = path.with_suffix(path.suffix + ".tmp")

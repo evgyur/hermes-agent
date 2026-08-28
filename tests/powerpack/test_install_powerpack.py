@@ -147,6 +147,46 @@ def test_upgrade_switches_code_and_preserves_data(tmp_path: Path):
     assert before == {name: _digest(home / name) for name in before}
 
 
+def test_install_receipt_records_release_component_pins(tmp_path: Path):
+    source, install, home, _base, _candidate = _fixture(tmp_path)
+    pin = {
+        "repository": "https://example.invalid/component.git",
+        "commit": "a" * 40,
+        "asset_path": "assets/example",
+        "deployment": "preserve_profile_use_pinned_component",
+    }
+    manifest = source / "powerpack" / "release.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps({"component_pins": {"example": pin}}) + "\n",
+        encoding="utf-8",
+    )
+    _git(source, "add", "powerpack/release.json")
+    _git(source, "commit", "-m", "pin release component")
+
+    result = _run(
+        "--no-sync",
+        "--source-dir",
+        str(source),
+        "--repo-url",
+        str(source),
+        "--dir",
+        str(install),
+        "--hermes-home",
+        str(home),
+    )
+
+    receipt = Path(
+        next(
+            line.removeprefix("receipt=")
+            for line in result.stdout.splitlines()
+            if line.startswith("receipt=")
+        )
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["component_pins"] == {"example": pin}
+
+
 def test_diverged_checkout_fails_closed(tmp_path: Path):
     source, install, home, _base, _candidate = _fixture(tmp_path)
     _git(install, "config", "user.email", "powerpack-tests@example.invalid")

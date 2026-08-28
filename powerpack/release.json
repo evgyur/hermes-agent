@@ -1,12 +1,21 @@
 {
   "format": "hermes-powerpack-release-v1",
-  "version": "0.21.4",
+  "version": "0.21.5",
   "upstream_base": "c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc",
   "accepted_predecessors": [
     "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
     "63a56fb8ab29352ddd40d67aeaf37d3e355ee096",
-    "28f9cb18222e68c4a528df1d6ffe41e5a6b6446e"
+    "28f9cb18222e68c4a528df1d6ffe41e5a6b6446e",
+    "239b2658added37c861f44a058d7c196e3540cd0"
   ],
+  "component_pins": {
+    "hermesdev_exact_topic_checkpoint": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "0f5f820262b6926d6d4550b85b94bf1823cb9097",
+      "asset_path": "assets/hermesdev-topic-context",
+      "deployment": "preserve_profile_use_pinned_component"
+    }
+  },
   "data_policy": {
     "config": "preserve",
     "profiles": "preserve",
