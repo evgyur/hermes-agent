@@ -122,3 +122,31 @@ async def test_planned_quiesce_waits_for_handler_created_batch():
     updater.stop.assert_awaited_once()
     assert order == ["application", "batch"]
     assert adapter._planned_ingress_quiesced is True
+
+
+@pytest.mark.asyncio
+async def test_runner_planned_quiesce_uses_live_gateway_adapters(
+    monkeypatch, tmp_path
+):
+    """Production shutdown must quiesce the adapters the runner actually owns."""
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    telegram = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        quiesce_inbound=AsyncMock(),
+    )
+    api = SimpleNamespace(
+        platform=Platform.API_SERVER,
+        quiesce_inbound=AsyncMock(),
+    )
+    runner.adapters = {Platform.TELEGRAM: telegram, Platform.API_SERVER: api}
+    runner._profile_adapters = {
+        "hermesdev": {Platform.TELEGRAM: telegram},
+    }
+    runner._restart_requested = True
+    runner._drain_ingress_admission_tasks = set()
+
+    await runner._quiesce_planned_restart_ingress()
+
+    telegram.quiesce_inbound.assert_awaited_once()
+    api.quiesce_inbound.assert_not_awaited()

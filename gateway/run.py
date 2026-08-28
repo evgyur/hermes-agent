@@ -10204,7 +10204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._restart_requested:
             return
         adapters = []
-        for adapter in self._iter_unique_adapters():
+        for adapter in self._iter_gateway_adapters():
             if getattr(adapter, "platform", None) == Platform.TELEGRAM:
                 adapters.append(adapter)
         for adapter in adapters:
