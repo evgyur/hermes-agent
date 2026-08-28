@@ -31767,13 +31767,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery,
+                        completion_delivery_disposition,
+                    )
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                    # Events created before durable delegation rows existed are
+                    # still valid queue inputs.  They use the runner-local
+                    # delivery seam below, but cannot persist a wire receipt
+                    # against a row that does not exist.
+                    if (
+                        completion_delivery_disposition(durable_delegation_id)
+                        != "legacy"
                     ):
-                        return None
+                        durable_claim_id = (
+                            f"gateway:{id(self)}:"
+                            f"{__import__('uuid').uuid4().hex}"
+                        )
+                        if not claim_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        ):
+                            return None
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
@@ -32532,6 +32546,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if consumed is None:
                         _pr.completion_queue.put(evt)
                         continue
+                    # Normalize the durable scope before deriving the batch
+                    # key.  A failed first delivery annotates its primary
+                    # event with ``_durable_home``; without doing the same for
+                    # its siblings, a retry would split one logical batch into
+                    # multiple user-facing turns.
+                    event_home = self._completion_event_state_home(evt)
+                    if event_home is not None:
+                        evt["_durable_home"] = str(Path(event_home).resolve())
                     key = self._async_delegation_group_key(evt)
                     if key not in groups:
                         groups[key] = []

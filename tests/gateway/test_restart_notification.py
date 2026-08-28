@@ -387,7 +387,8 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
     adapter.send.assert_awaited_once_with(
         "parent-42",
-        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "⚠️ Gateway shutting down — Your current task will be interrupted. "
+        "Automatic continuation could not be secured.",
         metadata={"thread_id": "topic-7"},
     )
 
@@ -411,5 +412,4 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
 

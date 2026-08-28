@@ -202,7 +202,7 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
         # Keep the outer watchdog comfortably above the 20ms lease budget.
         # Cold executor startup on non-root/overlay CI can exceed one second
         # before dispatch reaches the lease without changing lease semantics.
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=3)
+        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=10)
     finally:
         assert runner._turn_leases.release(holder) is True
 
