@@ -15980,7 +15980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_busy_session_handler(self._primary_busy_session_handler())
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -17779,7 +17779,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    adapter.set_busy_session_handler(self._primary_busy_session_handler())
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -19352,6 +19352,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
+
+    def _make_default_profile_busy_session_handler(self):
+        """Scope shared-listener busy input to its routed profile store.
+
+        The primary Telegram adapter can route one credential across multiple
+        runtime profiles. Its normal message handler already enters the
+        selected profile scope, but BasePlatformAdapter sends follow-ups for an
+        active session directly to the busy handler. Without the same wrapper,
+        planned-restart admission writes a hermesdev envelope into the default
+        state.db; startup replay then correctly quarantines that cross-profile
+        row. Recompute the route key from the sealed source and use the same
+        profile scope as the cold path.
+        """
+
+        async def _handler(event, _session_key):
+            source = event.source
+            profile_home = self._resolve_profile_home_for_source(source)
+            routed_session_key = self._session_key_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_active_session_busy_message(
+                    event, routed_session_key
+                )
+
+        return _handler
+
+    def _primary_busy_session_handler(self):
+        """Return the correctly scoped busy handler for a primary adapter."""
+        if getattr(self.config, "multiplex_profiles", False):
+            return self._make_default_profile_busy_session_handler()
+        return self._handle_active_session_busy_message
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""

@@ -272,6 +272,48 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
 
 
 @pytest.mark.asyncio
+async def test_primary_adapter_busy_guard_enters_routed_profile_scope(
+    tmp_path,
+    monkeypatch,
+):
+    """A shared Telegram listener must persist busy input in the routed DB."""
+    runner = _runner(default_mode="interrupt")
+    profile_home = tmp_path / "hermesdev"
+    event = _event(profile="hermesdev")
+    entered = []
+    observed = []
+
+    class _Scope:
+        def __init__(self, home):
+            self.home = Path(home)
+
+        def __enter__(self):
+            entered.append(self.home)
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(
+        "gateway.run._profile_runtime_scope",
+        lambda home: _Scope(home),
+    )
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+
+    async def _record_busy(_event, session_key):
+        observed.append((_event.source.profile, session_key))
+        return True
+
+    runner._handle_active_session_busy_message = _record_busy
+    handler = runner._primary_busy_session_handler()
+
+    assert await handler(event, "agent:main:telegram:group:chat-1") is True
+    assert entered == [profile_home]
+    assert observed == [
+        ("hermesdev", "agent:hermesdev:telegram:dm:chat-1")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
