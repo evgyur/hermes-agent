@@ -344,6 +344,41 @@ def test_recurring_script_invocation_uses_runtime_timezone_when_job_omits_it(mon
     }
 
 
+def test_recurring_script_invocation_uses_claimed_occurrence_after_advance(monkeypatch):
+    """Recurring claim metadata survives next_run_at advancing to tomorrow."""
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 8, 28, 8, 32, tzinfo=timezone(timedelta(hours=3), "MSK"))
+    captured = {}
+
+    def _capture(_script_path: str, **kwargs):
+        captured.update(kwargs["invocation_context"])
+        return True, ""
+
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "_run_job_script", _capture)
+
+    job = {
+        "id": "daily-scout",
+        "schedule": {"kind": "cron", "expr": "30 8 * * *"},
+        "timezone": "Europe/Moscow",
+        "next_run_at": "2026-08-29T08:30:00+03:00",
+        "fire_claim": {
+            "at": now.isoformat(),
+            "by": "owner",
+            "scheduled_at": "2026-08-28T08:30:00+03:00",
+            "invocation_kind": "scheduled",
+        },
+    }
+    assert scheduler._run_job_script_with_claim_heartbeat(job, "scout.py") == (True, "")
+    assert captured == {
+        "job_id": "daily-scout",
+        "scheduled_at": "2026-08-28T08:30:00+03:00",
+        "timezone": "Europe/Moscow",
+        "invocation_kind": "scheduled",
+    }
+
+
 def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch):
     """The shared execute/save/deliver body keeps its durable fire claim alive."""
     import cron.jobs as jobs

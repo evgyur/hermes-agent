@@ -3181,7 +3181,23 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            scheduled_at = str(job.get("next_run_at") or "")
+            invocation_kind = "scheduled"
+            if force:
+                try:
+                    scheduled_instant = _ensure_aware(datetime.fromisoformat(scheduled_at))
+                    invocation_kind = "late" if scheduled_instant <= now else "manual_unbound"
+                except Exception:
+                    invocation_kind = "manual_unbound"
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": owner,
+                # Preserve the fire identity before recurring schedules advance.
+                # Pre-run scripts must bind to the occurrence that triggered
+                # this execution, not the next occurrence persisted below.
+                "scheduled_at": scheduled_at,
+                "invocation_kind": invocation_kind,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())

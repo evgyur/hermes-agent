@@ -4158,7 +4158,13 @@ def _run_job_script_with_claim_heartbeat(
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
     schedule = job.get("schedule")
-    scheduled_at = str(job.get("next_run_at") or "")
+    claim = job.get("fire_claim")
+    claim_context = claim if isinstance(claim, dict) else {}
+    scheduled_at = str(
+        claim_context.get("scheduled_at")
+        or job.get("next_run_at")
+        or ""
+    )
     cron_now = _hermes_now()
     cron_tz = cron_now.tzinfo
     timezone_name = str(
@@ -4173,14 +4179,17 @@ def _run_job_script_with_claim_heartbeat(
         ) <= datetime.now(timezone.utc)
     except (TypeError, ValueError):
         due_or_past = False
+    invocation_kind = str(claim_context.get("invocation_kind") or "")
+    if not invocation_kind:
+        invocation_kind = "scheduled" if due_or_past else "manual_unbound"
     invocation_context = {
         "job_id": str(job.get("id") or ""),
         "scheduled_at": scheduled_at,
         "timezone": timezone_name,
-        "invocation_kind": "scheduled" if due_or_past else "manual_unbound",
+        "invocation_kind": invocation_kind,
     }
-    claim = job.get("run_claim")
-    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    run_claim = job.get("run_claim")
+    owner = str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
