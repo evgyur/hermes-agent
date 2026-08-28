@@ -63,6 +63,12 @@ normalize_path() {
     fi
 }
 
+git_at() {
+    local repo="$1"
+    shift
+    git -c "safe.directory=$repo" -C "$repo" "$@"
+}
+
 SOURCE_DIR="$(normalize_path "$SOURCE_DIR")"
 HERMES_HOME="$(normalize_path "$HERMES_HOME")"
 if [[ -z "$INSTALL_DIR" ]]; then
@@ -77,7 +83,7 @@ fi
 INSTALL_DIR="$(normalize_path "$INSTALL_DIR")"
 
 [[ -d "$SOURCE_DIR/.git" ]] || die "source is not a git checkout: $SOURCE_DIR"
-candidate_sha="$(git -C "$SOURCE_DIR" rev-parse 'HEAD^{commit}')"
+candidate_sha="$(git_at "$SOURCE_DIR" rev-parse 'HEAD^{commit}')"
 [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve candidate SHA"
 
 init_version="$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$SOURCE_DIR/hermes_cli/__init__.py" | head -n1)"
@@ -86,7 +92,7 @@ project_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p'
     || die "candidate version metadata is missing or inconsistent"
 
 if [[ -z "$POWERPACK_REPO_URL" ]]; then
-    POWERPACK_REPO_URL="$(git -C "$SOURCE_DIR" remote get-url origin 2>/dev/null || true)"
+    POWERPACK_REPO_URL="$(git_at "$SOURCE_DIR" remote get-url origin 2>/dev/null || true)"
 fi
 [[ -n "$POWERPACK_REPO_URL" ]] || die "Powerpack repo URL is unknown; pass --repo-url"
 
@@ -96,14 +102,14 @@ current_branch=""
 if [[ -e "$INSTALL_DIR" ]]; then
     [[ -d "$INSTALL_DIR/.git" ]] || die "install directory is not a git checkout: $INSTALL_DIR"
     action=upgrade
-    dirty_status="$(git -C "$INSTALL_DIR" status --porcelain=v1 --untracked-files=all)"
+    dirty_status="$(git_at "$INSTALL_DIR" status --porcelain=v1 --untracked-files=all)"
     [[ -z "$dirty_status" ]] \
         || die "existing Hermes checkout is dirty; preserve/commit those changes first: $dirty_status"
-    current_sha="$(git -C "$INSTALL_DIR" rev-parse 'HEAD^{commit}')"
-    current_branch="$(git -C "$INSTALL_DIR" branch --show-current)"
+    current_sha="$(git_at "$INSTALL_DIR" rev-parse 'HEAD^{commit}')"
+    current_branch="$(git_at "$INSTALL_DIR" branch --show-current)"
     ancestry_ok=false
-    if git -C "$SOURCE_DIR" cat-file -e "$current_sha^{commit}" 2>/dev/null \
-       && git -C "$SOURCE_DIR" merge-base --is-ancestor "$current_sha" "$candidate_sha"; then
+    if git_at "$SOURCE_DIR" cat-file -e "$current_sha^{commit}" 2>/dev/null \
+       && git_at "$SOURCE_DIR" merge-base --is-ancestor "$current_sha" "$candidate_sha"; then
         ancestry_ok=true
     fi
     release_manifest="$SOURCE_DIR/powerpack/release.json"
@@ -116,6 +122,46 @@ if [[ -e "$INSTALL_DIR" ]]; then
         die "existing Hermes HEAD $current_sha is not an ancestor or registered predecessor of Powerpack $candidate_sha"
     fi
 fi
+
+check_upgrade_permissions() {
+    [[ "$action" == upgrade ]] || return 0
+    [[ "$(id -u)" != 0 ]] || return 0
+
+    local git_dir
+    git_dir="$(git_at "$INSTALL_DIR" rev-parse --git-dir)"
+    if [[ "$git_dir" != /* ]]; then
+        git_dir="$INSTALL_DIR/$git_dir"
+    fi
+    [[ -w "$git_dir" ]] || die \
+        "existing Hermes git metadata is not writable; rerun the same preflight/install with sudo"
+
+    if ! git_at "$SOURCE_DIR" cat-file -e "$current_sha^{commit}" 2>/dev/null; then
+        [[ -w "$INSTALL_DIR" ]] || die \
+            "existing Hermes checkout is not writable; rerun the same preflight/install with sudo"
+        return 0
+    fi
+
+    local rel target probe write_dir
+    while IFS= read -r -d '' rel; do
+        target="$INSTALL_DIR/$rel"
+        probe="$target"
+        while [[ ! -e "$probe" && ! -L "$probe" && "$probe" != "$INSTALL_DIR" ]]; do
+            probe="$(dirname "$probe")"
+        done
+        if [[ -d "$probe" ]]; then
+            write_dir="$probe"
+        else
+            write_dir="$(dirname "$probe")"
+        fi
+        [[ -w "$write_dir" ]] || die \
+            "existing Hermes path is not writable ($write_dir); rerun the same preflight/install with sudo"
+    done < <(git_at "$SOURCE_DIR" diff --name-only -z "$current_sha" "$candidate_sha")
+}
+
+# Permission failures during git checkout can leave a partially materialized
+# candidate even though HEAD never moved. Detect them before stopping a live
+# gateway, including during --dry-run.
+check_upgrade_permissions
 
 printf 'powerpack_version=%s\n' "$init_version"
 printf 'candidate_sha=%s\n' "$candidate_sha"
@@ -164,9 +210,14 @@ rollback() {
     trap - EXIT
     set +e
     if [[ "$mutated" == true && -n "$current_sha" && -d "$INSTALL_DIR/.git" ]]; then
-        git -C "$INSTALL_DIR" checkout -B "${current_branch:-main}" "$current_sha" >/dev/null 2>&1 || true
+        if [[ -n "$current_branch" ]]; then
+            git_at "$INSTALL_DIR" checkout -f -B "$current_branch" "$current_sha" >/dev/null 2>&1 || true
+        else
+            git_at "$INSTALL_DIR" checkout --detach -f "$current_sha" >/dev/null 2>&1 || true
+        fi
+        git_at "$INSTALL_DIR" clean -fd >/dev/null 2>&1 || true
         if [[ -n "$old_origin" ]]; then
-            git -C "$INSTALL_DIR" remote set-url origin "$old_origin" >/dev/null 2>&1 || true
+            git_at "$INSTALL_DIR" remote set-url origin "$old_origin" >/dev/null 2>&1 || true
         fi
     fi
     if [[ "$service_stopped" == true ]]; then
@@ -185,27 +236,27 @@ fi
 if [[ "$action" == fresh_install ]]; then
     mkdir -p "$(dirname "$INSTALL_DIR")"
     git clone --branch main "$POWERPACK_REPO_URL" "$INSTALL_DIR"
-    fetched_sha="$(git -C "$INSTALL_DIR" rev-parse 'HEAD^{commit}')"
+    fetched_sha="$(git_at "$INSTALL_DIR" rev-parse 'HEAD^{commit}')"
     [[ "$fetched_sha" == "$candidate_sha" ]] \
         || die "remote main $fetched_sha does not match packaged candidate $candidate_sha"
     mutated=true
 else
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_ref="backup/powerpack-$timestamp"
-    git -C "$INSTALL_DIR" branch "$backup_ref" "$current_sha"
-    old_origin="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
+    git_at "$INSTALL_DIR" branch "$backup_ref" "$current_sha"
+    old_origin="$(git_at "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
     mutated=true
     if [[ -n "$old_origin" && "$old_origin" != "$POWERPACK_REPO_URL" ]] \
-       && ! git -C "$INSTALL_DIR" remote get-url upstream >/dev/null 2>&1; then
-        git -C "$INSTALL_DIR" remote add upstream "$old_origin"
+       && ! git_at "$INSTALL_DIR" remote get-url upstream >/dev/null 2>&1; then
+        git_at "$INSTALL_DIR" remote add upstream "$old_origin"
     fi
-    git -C "$INSTALL_DIR" remote set-url origin "$POWERPACK_REPO_URL"
-    git -C "$INSTALL_DIR" fetch --no-tags origin main
-    remote_sha="$(git -C "$INSTALL_DIR" rev-parse 'origin/main^{commit}')"
+    git_at "$INSTALL_DIR" remote set-url origin "$POWERPACK_REPO_URL"
+    git_at "$INSTALL_DIR" fetch --no-tags origin main
+    remote_sha="$(git_at "$INSTALL_DIR" rev-parse 'origin/main^{commit}')"
     [[ "$remote_sha" == "$candidate_sha" ]] \
         || die "remote main $remote_sha does not match packaged candidate $candidate_sha"
-    git -C "$INSTALL_DIR" checkout -B main "$candidate_sha"
-    git -C "$INSTALL_DIR" branch --set-upstream-to=origin/main main >/dev/null
+    git_at "$INSTALL_DIR" checkout -B main "$candidate_sha"
+    git_at "$INSTALL_DIR" branch --set-upstream-to=origin/main main >/dev/null
 fi
 
 if [[ "$SYNC_DEPS" == true ]]; then

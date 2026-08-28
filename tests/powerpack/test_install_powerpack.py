@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install-powerpack.sh"
@@ -230,3 +232,47 @@ def test_remote_mismatch_rolls_back_code_and_origin(tmp_path: Path):
     assert "does not match packaged candidate" in result.stderr
     assert _git(install, "rev-parse", "HEAD") == base
     assert _git(install, "remote", "get-url", "origin") == original_origin
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="POSIX non-root permission semantics required",
+)
+def test_read_only_changed_path_fails_before_checkout_or_backup(tmp_path: Path):
+    source, install, home, base, _candidate = _fixture(tmp_path)
+    locked = install / "locked"
+    locked.mkdir()
+    (locked / "value.txt").write_text("base\n", encoding="utf-8")
+    _git(install, "add", "locked/value.txt")
+    _git(install, "config", "user.email", "powerpack-tests@example.invalid")
+    _git(install, "config", "user.name", "Powerpack Tests")
+    _git(install, "commit", "-m", "locked base")
+    predecessor = _git(install, "rev-parse", "HEAD")
+
+    _git(source, "fetch", str(install), predecessor)
+    _git(source, "merge", "--no-ff", "-m", "merge registered predecessor", predecessor)
+    (source / "locked" / "value.txt").write_text("candidate\n", encoding="utf-8")
+    _git(source, "add", "locked/value.txt")
+    _git(source, "commit", "-m", "change locked path")
+    locked.chmod(0o555)
+    try:
+        result = _run(
+            "--dry-run",
+            "--source-dir",
+            str(source),
+            "--repo-url",
+            str(source),
+            "--dir",
+            str(install),
+            "--hermes-home",
+            str(home),
+            check=False,
+        )
+    finally:
+        locked.chmod(0o755)
+
+    assert result.returncode != 0
+    assert "not writable" in result.stderr
+    assert _git(install, "rev-parse", "HEAD") == predecessor
+    assert _git(install, "status", "--porcelain") == ""
+    assert _git(install, "branch", "--list", "backup/powerpack-*") == ""

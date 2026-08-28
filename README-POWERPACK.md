@@ -17,13 +17,15 @@ cd hermes-agent-powerpack
 Preview the exact code transition without changing anything:
 
 ```bash
-bash scripts/install-powerpack.sh --dry-run --dir /opt/hermes-agent
+sudo -n env HOME="$HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
+  bash scripts/install-powerpack.sh --dry-run --dir /opt/hermes-agent
 ```
 
 Apply it and restart an already-running gateway in one controlled window:
 
 ```bash
-bash scripts/install-powerpack.sh --dir /opt/hermes-agent --restart
+sudo -n env HOME="$HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
+  bash scripts/install-powerpack.sh --dir /opt/hermes-agent --restart
 ```
 
 For a normal per-user install, omit `--dir`; the installer detects
@@ -56,6 +58,6 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.0` is based on upstream
+Powerpack `0.21.1` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
