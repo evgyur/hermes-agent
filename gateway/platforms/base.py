@@ -29,6 +29,38 @@ from utils import normalize_proxy_url
 logger = logging.getLogger(__name__)
 
 
+def _enter_source_profile_state_scope(source):
+    """Keep post-handler state writes in the source's trusted profile store.
+
+    GatewayRunner scopes the model turn, but the platform adapter owns final
+    delivery after that handler returns.  Without an outer state scope, the
+    delivery obligation falls back to the gateway root ``state.db`` while a
+    multiplex parent barrier remains in ``profiles/<name>/state.db``.
+    """
+    profile = str(getattr(source, "profile", None) or "").strip()
+    if not profile or profile == "default":
+        return None
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        profile_exists,
+        validate_profile_name,
+    )
+    from hermes_constants import set_hermes_home_override
+
+    validate_profile_name(profile)
+    if not profile_exists(profile):
+        raise RuntimeError(f"routed profile does not exist: {profile}")
+    return set_hermes_home_override(str(get_profile_dir(profile)))
+
+
+def _exit_source_profile_state_scope(token) -> None:
+    if token is None:
+        return
+    from hermes_constants import reset_hermes_home_override
+
+    reset_hermes_home_override(token)
+
+
 class _BoundedPostDeliveryChain:
     """Flat bounded callback batch; avoids recursive closure retention."""
 
@@ -7085,7 +7117,9 @@ class BasePlatformAdapter(ABC):
                 metadata=_thread_metadata,
             )
         
+        _profile_home_token = None
         try:
+            _profile_home_token = _enter_source_profile_state_scope(event.source)
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
@@ -7896,6 +7930,12 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            # The model handler installs its own nested runtime scope and then
+            # restores this outer token. Keep the outer token through the
+            # platform ACK / delivery-ledger settlement, then release it before
+            # callback cleanup or a pending-message handoff can raise.
+            _exit_source_profile_state_scope(_profile_home_token)
+            _profile_home_token = None
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

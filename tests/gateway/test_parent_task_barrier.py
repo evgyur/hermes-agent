@@ -297,6 +297,110 @@ async def test_platform_ack_settles_trusted_parent_delivery():
     assert snapshot["barrier"]["state"] == "closed"
 
 
+@pytest.mark.asyncio
+async def test_multiplex_parent_delivery_stays_in_exact_profile_store(tmp_path):
+    """Post-handler delivery must not fall back to the gateway root state.db."""
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    profile_home = tmp_path / "profiles" / "hermesdev"
+    profile_home.mkdir(parents=True)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        ad._reset_for_tests()
+        barrier.initialize_storage()
+        barrier_id = barrier.admit_required_child(
+            origin_session="agent:hermesdev:telegram:group:-1001:42",
+            parent_session_id="parent-profile-session",
+            root_turn_id="profile-root-turn",
+            task_id="profile-child",
+        )
+        barrier.finalization_policy(
+            parent_session_id="parent-profile-session",
+            root_turn_id="profile-root-turn",
+        )
+        conn = sqlite3.connect(barrier._db_path())
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS async_delegations(
+                   delegation_id TEXT PRIMARY KEY, result_json TEXT
+               )"""
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO async_delegations VALUES (?, ?)",
+            ("profile-child", '{"summary":"done"}'),
+        )
+        conn.commit()
+        conn.close()
+        barrier.record_child_terminal(
+            task_id="profile-child", state="completed", result={}
+        )
+        claim = barrier.claim_next_ready_continuation(owner="gateway")
+        assert claim is not None
+        assert barrier.accept_continuation(
+            barrier_id,
+            claim["continuation_claim"],
+            accepted_turn_id="profile-turn",
+            owner_pid=1,
+        )
+        delivery = barrier.TrustedParentTaskDelivery(
+            "profile final",
+            barrier_id=barrier_id,
+            continuation_claim=claim["continuation_claim"],
+            result={"final_response": "profile final"},
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    adapter = _CaptureParentBarrierAdapter()
+
+    async def _handler(_event):
+        return delivery
+
+    adapter.set_message_handler(_handler)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="42",
+        user_id="12345",
+        profile="hermesdev",
+    )
+    event = MessageEvent(text="callback", source=source, message_id="callback-profile")
+    await adapter._process_message_background(event, build_session_key(source))
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        snapshot = barrier.barrier_snapshot(barrier_id)
+        assert snapshot is not None
+        assert snapshot["barrier"]["state"] == "closed"
+        conn = sqlite3.connect(profile_home / "state.db")
+        states = [
+            row[0]
+            for row in conn.execute(
+                "SELECT state FROM delivery_obligations ORDER BY created_at"
+            )
+        ]
+        conn.close()
+        assert states == ["delivered"]
+    finally:
+        reset_hermes_home_override(token)
+
+    root_conn = sqlite3.connect(tmp_path / "state.db")
+    root_has_ledger = root_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_obligations'"
+    ).fetchone()
+    root_count = (
+        root_conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
+        if root_has_ledger
+        else 0
+    )
+    root_conn.close()
+    assert root_count == 0
+    assert [item["content"] for item in adapter.sent] == ["profile final"]
+
+
 def test_streaming_is_buffered_before_required_child_admission():
     from gateway.run import (
         _parent_task_stream_allowed,

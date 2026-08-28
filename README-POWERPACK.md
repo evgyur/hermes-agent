@@ -58,12 +58,18 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.6` is based on upstream
+Powerpack `0.21.7` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.6` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
+Release `0.21.7` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
 Keys Groq STT transport, and no-repeat Jyotish rectification intake to one
 verified server-doctor commit. The installer records these pins in its receipt
 while preserving profile files; the pinned component owner remains responsible
 for installing or updating those private assets and profile-scoped credentials.
+
+It also keeps the final Telegram delivery and its parent-task barrier in the
+same multiplex profile until platform acknowledgement. A completed `hermesdev`
+task therefore cannot write its delivery receipt into the default profile and
+surface a spurious `parent-task delivery obligation could not bind durably`
+error before the real final response.
