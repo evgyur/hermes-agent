@@ -64,6 +64,38 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
 
 class TestTextBatching:
     @pytest.mark.asyncio
+    async def test_short_text_uses_awaited_dispatch_not_background_batch(self):
+        """A normal text update must reach durable ingress before PTB returns.
+
+        Telegram advances the getUpdates offset before a detached batch task
+        necessarily runs.  Short messages therefore use the awaited dispatch
+        path; only probable 4096-character splits remain buffered.
+        """
+        adapter = _make_adapter()
+        event = _make_event("ordinary short message")
+
+        await adapter._dispatch_text_event(event)
+
+        adapter.handle_message.assert_awaited_once_with(event)
+        assert adapter._pending_text_batches == {}
+        assert adapter._pending_text_batch_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_short_continuation_joins_existing_long_text_batch(self):
+        """A short final chunk still joins a probable Telegram split."""
+        adapter = _make_adapter()
+        adapter._pending_text_batches[
+            build_session_key(_make_event("seed").source)
+        ] = _make_event("x" * adapter._SPLIT_THRESHOLD)
+
+        await adapter._dispatch_text_event(_make_event("tail"))
+
+        adapter.handle_message.assert_not_awaited()
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text.endswith("\ntail")
+
+    @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_adapter()
         event = _make_event("hello world")
@@ -445,7 +477,7 @@ class TestHoldInboundAcrossReconnect:
 
     @pytest.mark.asyncio
     async def test_production_text_handler_terminal_step_holds_when_disconnected(self):
-        """Production path: ``_handle_text_message`` ends in ``_enqueue_text_event``.
+        """Production path holds an acknowledged update during disconnect.
 
         Sweeper rejects helper-only coverage. This pins the call site that
         PTB invokes after the update is already acked (offset advanced).
@@ -453,7 +485,7 @@ class TestHoldInboundAcrossReconnect:
         adapter = _make_adapter()
         adapter._mark_disconnected()
         # Terminal step of _handle_text_message after event construction.
-        adapter._enqueue_text_event(_make_event("acked-by-ptb-then-held"))
+        await adapter._dispatch_text_event(_make_event("acked-by-ptb-then-held"))
         adapter.handle_message.assert_not_called()
         assert [e.text for e in adapter._held_inbound_events] == ["acked-by-ptb-then-held"]
 

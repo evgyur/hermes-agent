@@ -253,7 +253,7 @@ async def test_unauthorized_dm_with_pair_behavior_builds_event(monkeypatch):
         return original_build(*a, **kw)
 
     adapter._build_message_event = track_build
-    adapter._enqueue_text_event = lambda event: None
+    adapter._dispatch_text_event = AsyncMock()
     adapter._ensure_forum_commands = AsyncMock()
     adapter._cache_replied_media = AsyncMock()
     adapter._apply_telegram_group_observe_attribution = lambda event: event
@@ -267,6 +267,7 @@ async def test_unauthorized_dm_with_pair_behavior_builds_event(monkeypatch):
     )
     await adapter._handle_text_message(update, SimpleNamespace())
     assert build_called is True
+    adapter._dispatch_text_event.assert_awaited_once()
 
 
 def test_runner_auth_gets_group_user_allowlist_context(monkeypatch):

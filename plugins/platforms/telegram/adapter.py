@@ -11574,7 +11574,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata={"thread_id": event.source.thread_id},
             )
             return
-        self._enqueue_text_event(event)
+        await self._dispatch_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -11606,7 +11606,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # before dispatch; short commands (/stop, /approve, ...) keep the
         # immediate path and are never delayed.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._dispatch_text_event(event)
             return
         await self.handle_message(event)
 
@@ -11676,6 +11676,31 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+
+    async def _dispatch_text_event(self, event: MessageEvent) -> None:
+        """Await normal text ingress; buffer only probable Telegram splits.
+
+        PTB advances the Bot API update offset independently of detached tasks.
+        Handing every short message to ``asyncio.create_task`` therefore leaves
+        an acknowledged update with no durable gateway ledger entry if that
+        task is cancelled or lost during lifecycle churn.  A normal short text
+        is already a complete Telegram update, so dispatch it in the handler's
+        awaited path.  Keep batching when the current chunk is near Telegram's
+        split limit or a prior long chunk is already pending for this session.
+        """
+        if self._should_drop_delayed_delivery():
+            self._hold_inbound_event(event, where="text-dispatch")
+            return
+
+        key = self._text_batch_key(event)
+        if (
+            key in self._pending_text_batches
+            or len(event.text or "") >= self._SPLIT_THRESHOLD
+        ):
+            self._enqueue_text_event(event)
+            return
+
+        await self.handle_message(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
