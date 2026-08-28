@@ -1,6 +1,6 @@
 {
   "format": "hermes-powerpack-release-v1",
-  "version": "0.21.5",
+  "version": "0.21.6",
   "upstream_base": "c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc",
   "accepted_predecessors": [
     "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
@@ -11,8 +11,20 @@
   "component_pins": {
     "hermesdev_exact_topic_checkpoint": {
       "repository": "https://github.com/evgyur/server-doctor.git",
-      "commit": "0f5f820262b6926d6d4550b85b94bf1823cb9097",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
       "asset_path": "assets/hermesdev-topic-context",
+      "deployment": "preserve_profile_use_pinned_component"
+    },
+    "h20_keys_groq_stt_transport": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
+      "asset_path": "assets/h20-keys",
+      "deployment": "preserve_profile_use_pinned_component"
+    },
+    "jyotish_rectification_continuity": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
+      "asset_path": "assets/jyotish-rectification-intake",
       "deployment": "preserve_profile_use_pinned_component"
     }
   },
