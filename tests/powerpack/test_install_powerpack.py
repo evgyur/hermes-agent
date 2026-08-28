@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install-powerpack.sh"
 
 
+def test_locked_sync_preserves_the_configured_messaging_runtime():
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert '"$uv_bin" sync --project "$INSTALL_DIR" --extra all --extra messaging --locked' in installer
+
+
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash, "Git Bash/bash is required for the installer contract test"
