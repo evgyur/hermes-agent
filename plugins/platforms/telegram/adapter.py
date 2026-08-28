@@ -11532,6 +11532,15 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        logger.info(
+            "telegram_ingress stage=handler update_id=%s message_id=%s chat_id=%s "
+            "thread_id=%s user_id=%s",
+            getattr(update, "update_id", None),
+            getattr(msg, "message_id", None),
+            getattr(getattr(msg, "chat", None), "id", None),
+            self._effective_message_thread_id(msg),
+            getattr(getattr(msg, "from_user", None), "id", None),
+        )
         # Early user-level auth check: reject unauthorized users before any
         # text batching, observe-buffer persistence, event building, or response
         # generation. This prevents removed/blocked users from injecting prompts
@@ -11544,6 +11553,15 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         if not self._should_process_message(msg):
+            logger.info(
+                "telegram_ingress stage=filtered update_id=%s message_id=%s chat_id=%s "
+                "thread_id=%s user_id=%s",
+                getattr(update, "update_id", None),
+                getattr(msg, "message_id", None),
+                getattr(getattr(msg, "chat", None), "id", None),
+                self._effective_message_thread_id(msg),
+                getattr(getattr(msg, "from_user", None), "id", None),
+            )
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -11574,7 +11592,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata={"thread_id": event.source.thread_id},
             )
             return
+        logger.info(
+            "telegram_ingress stage=context_ready update_id=%s message_id=%s chat_id=%s "
+            "thread_id=%s user_id=%s",
+            getattr(update, "update_id", None),
+            getattr(event, "message_id", None),
+            getattr(event.source, "chat_id", None),
+            getattr(event.source, "thread_id", None),
+            getattr(event.source, "user_id", None),
+        )
         await self._dispatch_text_event(event)
+        logger.info(
+            "telegram_ingress stage=dispatch_return update_id=%s message_id=%s chat_id=%s "
+            "thread_id=%s user_id=%s",
+            getattr(update, "update_id", None),
+            getattr(event, "message_id", None),
+            getattr(event.source, "chat_id", None),
+            getattr(event.source, "thread_id", None),
+            getattr(event.source, "user_id", None),
+        )
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

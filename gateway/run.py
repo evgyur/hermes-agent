@@ -20592,6 +20592,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            logger.info(
+                "telegram_ingress stage=runner_entry message_id=%s chat_id=%s "
+                "thread_id=%s user_id=%s",
+                getattr(event, "message_id", None),
+                getattr(source, "chat_id", None),
+                getattr(source, "thread_id", None),
+                getattr(source, "user_id", None),
+            )
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning

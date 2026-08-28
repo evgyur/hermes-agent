@@ -4,6 +4,7 @@ Verifies that unauthorized users are blocked before any text batching,
 event building, or response generation occurs.
 """
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -268,6 +269,45 @@ async def test_unauthorized_dm_with_pair_behavior_builds_event(monkeypatch):
     await adapter._handle_text_message(update, SimpleNamespace())
     assert build_called is True
     adapter._dispatch_text_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authorized_text_emits_content_free_ingress_stage_markers(caplog):
+    """Live-only ingress stalls must be localizable without logging message text."""
+    adapter = _make_adapter(
+        group_allow_from=["111"],
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        free_response_chats=["-100"],
+    )
+    adapter._dispatch_text_event = AsyncMock()
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._cache_replied_media = AsyncMock()
+    adapter._apply_telegram_group_observe_attribution = lambda event: event
+    adapter._clean_bot_trigger_text = lambda text: text
+    adapter._recover_transcribe_route_tme_link_via_telegram_chip = AsyncMock(
+        return_value=False
+    )
+    adapter._resolve_telegram_chip_context = AsyncMock(return_value=False)
+    update = SimpleNamespace(
+        update_id=123,
+        message=_make_message(
+            text="PRIVATE CANARY CONTENT",
+            from_user_id=111,
+            chat_id=-100,
+            chat_type="group",
+        ),
+        effective_message=None,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("telegram_ingress stage=handler" in message for message in messages)
+    assert any("telegram_ingress stage=context_ready" in message for message in messages)
+    assert any("telegram_ingress stage=dispatch_return" in message for message in messages)
+    assert all("PRIVATE CANARY CONTENT" not in message for message in messages)
 
 
 def test_runner_auth_gets_group_user_allowlist_context(monkeypatch):

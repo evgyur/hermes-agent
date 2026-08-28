@@ -6776,6 +6776,16 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        if event.source.platform == Platform.TELEGRAM:
+            _owner = (getattr(self, "_session_tasks", None) or {}).get(session_key)
+            logger.info(
+                "telegram_ingress stage=base_entry message_id=%s session=%s "
+                "active=%s owner_done=%s",
+                getattr(event, "message_id", None),
+                session_key,
+                session_key in self._active_sessions,
+                None if _owner is None else _owner.done(),
+            )
         expected_session_key = str(
             (event.metadata or {}).get("gateway_session_key") or ""
         ).strip()
@@ -6793,6 +6803,12 @@ class BasePlatformAdapter(ABC):
         # normal dispatch so the user isn't trapped behind a dead guard —
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
+            if event.source.platform == Platform.TELEGRAM:
+                logger.info(
+                    "telegram_ingress stage=base_busy message_id=%s session=%s",
+                    getattr(event, "message_id", None),
+                    session_key,
+                )
             self._heal_stale_session_lock(session_key)
 
         # A Telegram update can be redelivered while startup restore is being
@@ -6982,6 +6998,12 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
+        if event.source.platform == Platform.TELEGRAM:
+            logger.info(
+                "telegram_ingress stage=base_start message_id=%s session=%s",
+                getattr(event, "message_id", None),
+                session_key,
+            )
         return self._start_session_processing(event, session_key)
     
     @staticmethod
@@ -7067,6 +7089,12 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
+            if event.source.platform == Platform.TELEGRAM:
+                logger.info(
+                    "telegram_ingress stage=runner_call message_id=%s session=%s",
+                    getattr(event, "message_id", None),
+                    session_key,
+                )
             response = await self._message_handler(event)
             _parent_delivery_response = response
             from tools.parent_task_barrier import TrustedParentTaskDelivery
