@@ -16,13 +16,20 @@ def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash, "Git Bash/bash is required for the installer contract test"
     installer = str(INSTALLER).replace("\\", "/")
-    return subprocess.run(
+    result = subprocess.run(
         [bash, installer, *args],
-        check=check,
+        check=False,
         capture_output=True,
         text=True,
         env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
     )
+    if check and result.returncode != 0:
+        raise AssertionError(
+            f"installer exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
 
 
 def _git(repo: Path, *args: str) -> str:
