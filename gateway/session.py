@@ -16,6 +16,7 @@ import os
 import json
 import threading
 import uuid
+import weakref
 from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -23,6 +24,12 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+
+_SESSION_STORE_SCOPE_OWNERS_LOCK = threading.Lock()
+_SESSION_STORE_SCOPE_OWNERS: "weakref.WeakValueDictionary[tuple[str, str], SessionStore]" = (
+    weakref.WeakValueDictionary()
+)
 
 
 def _now() -> datetime:
@@ -1790,13 +1797,24 @@ class SessionStore:
                 print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
                 raise
 
-        return self._db_handle_cache.get(
+        db = self._db_handle_cache.get(
             path,
             _open,
             non_cacheable=lambda exc: (
                 isinstance(exc, RuntimeError) and "live-system guard" in str(exc)
             ),
         )
+        if db is not None:
+            try:
+                owner_key = (
+                    str(Path(db.db_path).resolve()),
+                    self._routing_scope(),
+                )
+                with _SESSION_STORE_SCOPE_OWNERS_LOCK:
+                    _SESSION_STORE_SCOPE_OWNERS[owner_key] = self
+            except Exception:
+                logger.debug("Could not register SessionStore scope owner", exc_info=True)
+        return db
 
     @property
     def _db(self):
@@ -3576,6 +3594,8 @@ class SessionStore:
         self,
         session_key: str,
         source: Optional[SessionSource] = None,
+        *,
+        route_source: Optional[SessionSource] = None,
     ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
@@ -3595,8 +3615,37 @@ class SessionStore:
             # under the store's effective session policy.
             if source is None:
                 return None
+            # Observed Telegram groups deliberately use an anonymized shared
+            # route while retaining the authenticated sender in ``source`` for
+            # restart authority.  Validate that narrow projection here, then
+            # bind the marker to the route without discarding its principal.
+            key_source = route_source or source
+            if route_source is not None and route_source != source:
+                try:
+                    observed_group_projection = (
+                        source.platform == Platform.TELEGRAM
+                        and route_source.platform == Platform.TELEGRAM
+                        and source.chat_type == "group"
+                        and route_source.chat_type == "group"
+                        and route_source.user_id is None
+                        and isinstance(source.user_id, str)
+                        and bool(source.user_id)
+                        and canonical_resume_origin(
+                            replace(
+                                source,
+                                user_id=None,
+                                user_name=None,
+                                user_id_alt=None,
+                            )
+                        )
+                        == canonical_resume_origin(route_source)
+                    )
+                except (TypeError, ValueError):
+                    return None
+                if not observed_group_projection:
+                    return None
             try:
-                if self._generate_session_key(source) != session_key:
+                if self._generate_session_key(key_source) != session_key:
                     return None
             except Exception:
                 return None
@@ -3682,10 +3731,10 @@ class SessionStore:
         now = _now()
         max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
-        changed = False
 
         with self._lock:
             self._ensure_loaded_locked()
+            candidates = []
             for entry in self._entries.values():
                 if not entry.active_turn_token:
                     continue
@@ -3700,41 +3749,28 @@ class SessionStore:
                     # Mixed aware/naive timestamps are invalid for this local
                     # marker.  Clear rather than risking an unsafe old resume.
                     marker_is_stale = True
+                candidates.append(
+                    (
+                        entry.session_key,
+                        str(entry.active_turn_token),
+                        marker_is_stale or entry.suspended,
+                        entry.resume_pending,
+                        entry.resume_reason,
+                    )
+                )
 
-                if not marker_is_stale and not entry.suspended:
-                    interrupted_token = str(entry.active_turn_token or "")
-                    origin_payload = _active_origin_payload(entry)
-                    if entry.resume_pending:
-                        # A drain-timeout marker is more specific than the
-                        # generic crash reason; preserve it and its freshness.
-                        if entry.last_resume_marked_at is None:
-                            entry.last_resume_marked_at = now
-                        if not entry.resume_task_id:
-                            self._stamp_resume_identity(
-                                entry, task_id=interrupted_token
-                            )
-                        _bind_resume_origin_snapshot(entry, origin_payload)
-                    else:
-                        entry.resume_pending = True
-                        entry.resume_reason = "restart_interrupted"
-                        # Freshness starts when recovery is discovered, not
-                        # when a potentially hours-long turn began.
-                        entry.last_resume_marked_at = now
-                        self._stamp_resume_identity(
-                            entry, task_id=interrupted_token
-                        )
-                        _bind_resume_origin_snapshot(entry, origin_payload)
-                        promoted += 1
-
-                entry.active_turn_token = None
-                entry.active_turn_started_at = None
-                entry.active_turn_origin_snapshot = None
-                changed = True
-
-            if changed:
-                # Cold-start batch: one durable rewrite is clearer and cheaper
-                # than an upsert per interrupted routing entry.
-                self._save()
+        for session_key, token, discard, was_pending, existing_reason in candidates:
+            if discard:
+                self.clear_turn_active(session_key, token)
+                continue
+            reason = existing_reason if was_pending and existing_reason else "restart_interrupted"
+            receipt = self.mark_resume_pending_with_receipt(session_key, reason)
+            if receipt is None:
+                # Admission is the durable authority. Keep the active marker
+                # retryable when K cannot commit the matching PENDING row.
+                continue
+            if self.clear_turn_active(session_key, token) and not was_pending:
+                promoted += 1
 
         return promoted
 
@@ -3772,47 +3808,189 @@ class SessionStore:
 
         Returns True if the session existed and was marked.
         """
-        with self._lock:
-            self._ensure_loaded_locked()
-            if session_key in self._entries:
-                entry = self._entries[session_key]
-                # Never override an explicit ``suspended`` — that is a hard
-                # forced-wipe signal (from /stop or stuck-loop escalation).
-                if entry.suspended:
-                    return False
-                entry.resume_pending = True
-                entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
-                origin_payload = _active_origin_payload(entry)
-                self._stamp_resume_identity(
-                    entry,
-                    task_id=str(entry.active_turn_token or ""),
-                )
-                _bind_resume_origin_snapshot(entry, origin_payload)
-                self._save()
-                return True
-        return False
+        return self.mark_resume_pending_with_receipt(session_key, reason) is not None
 
     def mark_resume_pending_with_receipt(
         self,
         session_key: str,
         reason: str = "restart_timeout",
+        *,
+        _outcome: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Atomically mark and return the immutable continuation identity."""
+        def fail(outcome: str) -> None:
+            if _outcome is not None:
+                _outcome.clear()
+                _outcome["outcome"] = outcome
+
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or entry.suspended:
+                fail("failed_missing_active_origin")
                 return None
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.last_resume_marked_at = _now()
             origin_payload = _active_origin_payload(entry)
-            self._stamp_resume_identity(
-                entry,
-                task_id=str(entry.active_turn_token or ""),
+            if origin_payload is None:
+                fail("failed_missing_active_origin")
+                return None
+
+            active_task_id = str(entry.active_turn_token or "")
+            already_owned = False
+            rollover_identity: Optional[Dict[str, Any]] = None
+            if entry.resume_pending:
+                if active_task_id and active_task_id == entry.resume_task_id:
+                    already_owned = True
+                    expected_generation = int(entry.continuation_generation) - 1
+                    candidate = replace(entry)
+                else:
+                    snapshot = entry.resume_origin_snapshot or {}
+                    previous_payload = snapshot.get("source")
+                    if (
+                        not active_task_id
+                        or resume_origin_from_snapshot(entry) is None
+                        or previous_payload != origin_payload
+                    ):
+                        fail("failed_nonterminal_previous_generation")
+                        return None
+                    rollover_identity = {
+                        "previous_resume_task_id": str(entry.resume_task_id or ""),
+                        "previous_generation": int(
+                            entry.continuation_generation or 0
+                        ),
+                        "previous_claim_owner": str(
+                            entry.continuation_claim_owner or ""
+                        ),
+                        "previous_claim_token": str(
+                            entry.continuation_claim_token or ""
+                        ),
+                    }
+                    expected_generation = int(entry.continuation_generation)
+                    candidate = replace(entry)
+                    candidate.resume_task_id = active_task_id
+                    candidate.continuation_generation = expected_generation + 1
+                    candidate.continuation_claim_owner = f"gateway:{os.getpid()}"
+                    candidate.continuation_claim_token = uuid.uuid4().hex
+                    candidate.resume_reason = reason
+                    candidate.last_resume_marked_at = _now()
+            else:
+                if not active_task_id:
+                    fail("failed_missing_active_origin")
+                    return None
+                expected_generation = int(entry.continuation_generation or 0)
+                candidate = replace(entry)
+                candidate.resume_task_id = active_task_id
+                candidate.continuation_generation = expected_generation + 1
+                candidate.continuation_claim_owner = f"gateway:{os.getpid()}"
+                candidate.continuation_claim_token = uuid.uuid4().hex
+                candidate.resume_pending = True
+                candidate.resume_reason = reason
+                candidate.last_resume_marked_at = _now()
+            _bind_resume_origin_snapshot(candidate, origin_payload)
+            snapshot = candidate.resume_origin_snapshot or {}
+            source_payload = snapshot.get("source")
+            source_digest = snapshot.get("source_sha256")
+            if not isinstance(source_payload, dict) or not isinstance(source_digest, str):
+                fail("failed_missing_active_origin")
+                return None
+            source_json = json.dumps(
+                source_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
-            _bind_resume_origin_snapshot(entry, origin_payload)
+
+            db = self._db
+            admit = getattr(db, "admit_gateway_resume_obligation", None) if db else None
+            rollover = (
+                getattr(db, "rollover_claimed_gateway_resume_obligation", None)
+                if db
+                else None
+            )
+            if rollover_identity is not None:
+                if not callable(rollover):
+                    fail("failed_db")
+                    return None
+                committed = rollover(
+                    session_key=session_key,
+                    **rollover_identity,
+                    resume_task_id=candidate.resume_task_id,
+                    origin_json=source_json,
+                    origin_sha256=source_digest,
+                    reason=reason,
+                    marked_at=candidate.last_resume_marked_at.timestamp(),
+                )
+            elif not callable(admit):
+                fail("failed_db")
+                return None
+            else:
+                committed = admit(
+                    session_key=session_key,
+                    resume_task_id=candidate.resume_task_id,
+                    expected_generation=expected_generation,
+                    origin_json=source_json,
+                    origin_sha256=source_digest,
+                    reason=reason,
+                    marked_at=candidate.last_resume_marked_at.timestamp(),
+                )
+            committed_state = committed.get("state") if isinstance(committed, dict) else None
+            if committed is None:
+                get_obligation = getattr(db, "get_gateway_resume_obligation", None)
+                if callable(get_obligation):
+                    current_obligation = get_obligation(session_key)
+                    if isinstance(current_obligation, dict) and str(
+                        current_obligation.get("state") or ""
+                    ) in {"PENDING", "CLAIMED"}:
+                        committed_state = str(current_obligation["state"])
+            if isinstance(committed, dict) and committed_state == "PENDING":
+                try:
+                    committed_generation = int(committed["generation"])
+                except (KeyError, TypeError, ValueError):
+                    fail("failed_db")
+                    return None
+                if committed_generation < candidate.continuation_generation:
+                    fail("failed_nonterminal_previous_generation")
+                    return None
+                candidate.continuation_generation = committed_generation
+                # The immutable snapshot binds the generation as well as the
+                # route.  Re-seal it when the authoritative DB advanced from a
+                # terminal generation absent from the routing projection.
+                _bind_resume_origin_snapshot(candidate, origin_payload)
+            exact_existing_claim = bool(
+                committed_state == "CLAIMED"
+                and committed.get("claim_owner")
+                == candidate.continuation_claim_owner
+                and committed.get("claim_token")
+                == candidate.continuation_claim_token
+            )
+            if (
+                not isinstance(committed, dict)
+                or (committed_state != "PENDING" and not exact_existing_claim)
+                or committed.get("resume_task_id") != candidate.resume_task_id
+                or committed.get("generation") != candidate.continuation_generation
+                or committed.get("origin_json") != source_json
+                or committed.get("origin_sha256") != source_digest
+            ):
+                fail(
+                    "failed_nonterminal_previous_generation"
+                    if committed_state in {"PENDING", "CLAIMED"}
+                    else "failed_db"
+                )
+                return None
+
+            entry.resume_pending = candidate.resume_pending
+            entry.resume_reason = str(committed.get("reason") or "")
+            try:
+                entry.last_resume_marked_at = datetime.fromtimestamp(
+                    float(committed["marked_at"])
+                )
+            except (KeyError, TypeError, ValueError, OSError):
+                fail("failed_db")
+                return None
+            entry.resume_task_id = candidate.resume_task_id
+            entry.continuation_generation = candidate.continuation_generation
+            entry.continuation_claim_owner = candidate.continuation_claim_owner
+            entry.continuation_claim_token = candidate.continuation_claim_token
+            entry.resume_origin_snapshot = candidate.resume_origin_snapshot
             receipt = {
                 "resume_task_id": str(entry.resume_task_id or ""),
                 "continuation_generation": int(entry.continuation_generation or 0),
@@ -3820,7 +3998,35 @@ class SessionStore:
                 "continuation_claim_token": str(entry.continuation_claim_token or ""),
             }
             self._save()
+            fail("already_owned_exact" if already_owned else "marked_exact")
             return receipt
+
+    def mark_resume_pending_with_outcome(
+        self,
+        session_key: str,
+        reason: str = "restart_timeout",
+    ) -> Dict[str, Any]:
+        """Return a categorical pre-drain result without exposing claim secrets."""
+        outcome: Dict[str, str] = {}
+        try:
+            receipt = self.mark_resume_pending_with_receipt(
+                session_key,
+                reason,
+                _outcome=outcome,
+            )
+        except Exception:
+            logger.exception(
+                "Gateway resume premark failed for %s",
+                session_key,
+            )
+            return {"outcome": "failed_db", "receipt": None}
+        if receipt is not None and "outcome" not in outcome:
+            # Compatibility with tests/embedders that replace the receipt API.
+            outcome["outcome"] = "marked_exact"
+        return {
+            "outcome": outcome.get("outcome", "failed_db"),
+            "receipt": receipt,
+        }
 
     @staticmethod
     def _stamp_resume_identity(entry: SessionEntry, *, task_id: str = "") -> None:
@@ -3909,11 +4115,39 @@ class SessionStore:
                 )
             if current != expected:
                 return False
+            db = self._db
+            get_obligation = (
+                getattr(db, "get_gateway_resume_obligation", None) if db else None
+            )
+            if not callable(get_obligation):
+                return False
+            row = get_obligation(session_key)
+            if not isinstance(row, dict):
+                return False
+            if row.get("state") == "PENDING":
+                settle = getattr(db, "cancel_gateway_resume_obligation", None)
+                settled = callable(settle) and settle(
+                    session_key=session_key,
+                    resume_task_id=resume_task_id,
+                    expected_generation=continuation_generation,
+                    reason="completed_before_resume",
+                )
+            elif row.get("state") == "CLAIMED":
+                settle = getattr(db, "clear_gateway_resume_obligation", None)
+                settled = callable(settle) and settle(
+                    session_key=session_key,
+                    resume_task_id=resume_task_id,
+                    expected_generation=continuation_generation,
+                    claim_token=continuation_claim_token,
+                )
+            else:
+                settled = False
+            if not settled:
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
             entry.resume_task_id = ""
-            entry.continuation_generation = 0
             entry.continuation_claim_owner = ""
             entry.continuation_claim_token = ""
             entry.resume_origin_snapshot = None
@@ -3926,6 +4160,422 @@ class SessionStore:
                 entry.metadata.pop(key, None)
             self._save()
             return True
+
+    def abandon_resume_pending_exact(
+        self,
+        session_key: str,
+        *,
+        resume_task_id: str,
+        continuation_generation: int,
+        continuation_claim_owner: str,
+        continuation_claim_token: str,
+        reason: str,
+    ) -> bool:
+        """Cancel one exact claimed continuation and release its route key."""
+        expected = (
+            resume_task_id,
+            continuation_generation,
+            continuation_claim_owner,
+            continuation_claim_token,
+        )
+        if (
+            type(continuation_generation) is not int
+            or continuation_generation <= 0
+            or any(
+                not isinstance(value, str) or not value
+                for value in (
+                    resume_task_id,
+                    continuation_claim_owner,
+                    continuation_claim_token,
+                )
+            )
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_pending:
+                return False
+            current = (
+                entry.resume_task_id,
+                entry.continuation_generation,
+                entry.continuation_claim_owner,
+                entry.continuation_claim_token,
+            )
+            if current != expected:
+                return False
+            db = self._db
+            abandon = (
+                getattr(db, "abandon_gateway_resume_obligation", None)
+                if db
+                else None
+            )
+            if not callable(abandon) or not abandon(
+                session_key=session_key,
+                resume_task_id=resume_task_id,
+                expected_generation=continuation_generation,
+                claim_owner=continuation_claim_owner,
+                claim_token=continuation_claim_token,
+                reason=reason.strip(),
+            ):
+                return False
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
+            entry.resume_task_id = ""
+            entry.continuation_claim_owner = ""
+            entry.continuation_claim_token = ""
+            entry.resume_origin_snapshot = None
+            for key in (
+                "resume_task_id",
+                "continuation_generation",
+                "continuation_claim_owner",
+                "continuation_claim_token",
+            ):
+                entry.metadata.pop(key, None)
+            self._save()
+            return True
+
+    def reconcile_orphaned_resume_obligations(
+        self,
+        *,
+        max_age_seconds: float,
+    ) -> Dict[str, int]:
+        """Release nonterminal DB claims that no longer have a fresh marker.
+
+        The DB row is the durable authority, while ``gateway_routing`` mirrors
+        the continuation identity used to schedule startup recovery.  A row
+        that no longer has an exact, fresh mirror cannot be replayed, but it
+        must also not block the next independently authorized task generation.
+        """
+        db = self._db
+        list_rows = (
+            getattr(db, "list_gateway_resume_obligations", None)
+            if db
+            else None
+        )
+        if not callable(list_rows):
+            list_rows = (
+                getattr(db, "list_nonterminal_gateway_resume_obligations", None)
+                if db
+                else None
+            )
+        empty = {
+            "cancelled_pending": 0,
+            "abandoned_claimed": 0,
+            "cleared_terminal_projection": 0,
+            "kept": 0,
+        }
+        if not callable(list_rows):
+            return empty
+        rows = list_rows()
+        now = _now()
+        max_age = timedelta(seconds=max(0.0, float(max_age_seconds)))
+        counts = dict(empty)
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            entries = dict(self._entries)
+
+        for row in rows:
+            session_key = str(row.get("session_key") or "")
+            task_id = str(row.get("resume_task_id") or "")
+            generation = int(row.get("generation") or 0)
+            state = str(row.get("state") or "")
+            entry = entries.get(session_key)
+            if entry is None:
+                # A second live SessionStore may share this DB in tests and
+                # embedded gateways.  Accept a foreign projection only when a
+                # live in-process owner for that exact DB+scope exists and its
+                # full immutable envelope is fresh.  Merely finding matching
+                # JSON is not ownership: stale scopes left on disk have no
+                # scheduler and must be settled here instead of stranding a
+                # CLAIMED row forever.
+                foreign_owner = None
+                foreign_entry = None
+                list_projection_records = getattr(
+                    db, "list_gateway_routing_projection_records", None
+                )
+                if callable(list_projection_records):
+                    for projection_record in list_projection_records(session_key):
+                        try:
+                            candidate_entry = SessionEntry.from_dict(
+                                json.loads(projection_record["entry_json"])
+                            )
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                        identity_exact = bool(
+                            candidate_entry.resume_pending
+                            and candidate_entry.resume_task_id == task_id
+                            and candidate_entry.continuation_generation == generation
+                        )
+                        if state == "CLAIMED":
+                            identity_exact = bool(
+                                identity_exact
+                                and candidate_entry.continuation_claim_owner
+                                == str(row.get("claim_owner") or "")
+                                and candidate_entry.continuation_claim_token
+                                == str(row.get("claim_token") or "")
+                            )
+                        if not identity_exact:
+                            continue
+                        owner_key = (
+                            str(Path(db.db_path).resolve()),
+                            str(projection_record["scope"]),
+                        )
+                        with _SESSION_STORE_SCOPE_OWNERS_LOCK:
+                            candidate_owner = _SESSION_STORE_SCOPE_OWNERS.get(owner_key)
+                        if candidate_owner is not None and candidate_owner is not self:
+                            with candidate_owner._lock:
+                                candidate_owner._ensure_loaded_locked()
+                                owned_entry = candidate_owner._entries.get(session_key)
+                                owned_identity_exact = bool(
+                                    owned_entry is not None
+                                    and owned_entry.resume_pending
+                                    and owned_entry.resume_task_id == task_id
+                                    and owned_entry.continuation_generation == generation
+                                )
+                                if state == "CLAIMED":
+                                    owned_identity_exact = bool(
+                                        owned_identity_exact
+                                        and owned_entry.continuation_claim_owner
+                                        == str(row.get("claim_owner") or "")
+                                        and owned_entry.continuation_claim_token
+                                        == str(row.get("claim_token") or "")
+                                    )
+                                if owned_identity_exact:
+                                    foreign_owner = candidate_owner
+                                    foreign_entry = SessionEntry.from_dict(
+                                        owned_entry.to_dict()
+                                    )
+                                    break
+
+                foreign_exact_fresh = False
+                if foreign_entry is not None:
+                    snapshot = foreign_entry.resume_origin_snapshot or {}
+                    source_payload = snapshot.get("source")
+                    source_digest = snapshot.get("source_sha256")
+                    try:
+                        marked_at_exact = abs(
+                            foreign_entry.last_resume_marked_at.timestamp()
+                            - float(row.get("marked_at"))
+                        ) <= 0.001
+                        marked_at = datetime.fromtimestamp(float(row.get("marked_at")))
+                        marker_fresh = (
+                            max_age_seconds <= 0 or now - marked_at <= max_age
+                        )
+                    except (AttributeError, TypeError, ValueError, OSError):
+                        marked_at_exact = False
+                        marker_fresh = False
+                    foreign_exact_fresh = bool(
+                        isinstance(source_payload, dict)
+                        and isinstance(source_digest, str)
+                        and json.dumps(
+                            source_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ) == str(row.get("origin_json") or "")
+                        and source_digest == str(row.get("origin_sha256") or "")
+                        and str(foreign_entry.resume_reason or "")
+                        == str(row.get("reason") or "")
+                        and marked_at_exact
+                        and marker_fresh
+                    )
+                if foreign_exact_fresh:
+                    counts["kept"] += 1
+                    continue
+
+                settled = False
+                if state == "PENDING":
+                    cancel = getattr(db, "cancel_gateway_resume_obligation", None)
+                    settled = bool(
+                        callable(cancel)
+                        and cancel(
+                            session_key=session_key,
+                            resume_task_id=task_id,
+                            expected_generation=generation,
+                            reason="orphaned_claim",
+                        )
+                    )
+                    if settled:
+                        counts["cancelled_pending"] += 1
+                elif state == "CLAIMED":
+                    abandon = getattr(db, "abandon_gateway_resume_obligation", None)
+                    settled = bool(
+                        callable(abandon)
+                        and abandon(
+                            session_key=session_key,
+                            resume_task_id=task_id,
+                            expected_generation=generation,
+                            claim_owner=str(row.get("claim_owner") or ""),
+                            claim_token=str(row.get("claim_token") or ""),
+                            reason="orphaned_claim",
+                        )
+                    )
+                    if settled:
+                        counts["abandoned_claimed"] += 1
+                if settled and foreign_owner is not None:
+                    with foreign_owner._lock:
+                        foreign_owner._ensure_loaded_locked()
+                        current = foreign_owner._entries.get(session_key)
+                        if (
+                            current is not None
+                            and current.resume_pending
+                            and current.resume_task_id == task_id
+                            and current.continuation_generation == generation
+                        ):
+                            foreign_owner._clear_resume_projection_locked(current)
+                            foreign_owner._save_entry(session_key, lock_held=True)
+                continue
+            projection_identity_match = bool(
+                entry.resume_pending
+                and entry.resume_task_id == task_id
+                and entry.continuation_generation == generation
+            )
+            if state == "CLAIMED":
+                projection_identity_match = bool(
+                    projection_identity_match
+                    and entry.continuation_claim_owner
+                    == str(row.get("claim_owner") or "")
+                    and entry.continuation_claim_token
+                    == str(row.get("claim_token") or "")
+                )
+            if state in {"TERMINAL", "CANCELLED"}:
+                terminal_match = bool(projection_identity_match)
+                row_owner = str(row.get("claim_owner") or "")
+                row_token = str(row.get("claim_token") or "")
+                if terminal_match and (row_owner or row_token):
+                    terminal_match = bool(
+                        entry.continuation_claim_owner == row_owner
+                        and entry.continuation_claim_token == row_token
+                    )
+                if terminal_match:
+                    with self._lock:
+                        current = self._entries.get(session_key)
+                        if (
+                            current is entry
+                            and current.resume_pending
+                            and current.resume_task_id == task_id
+                            and current.continuation_generation == generation
+                        ):
+                            self._clear_resume_projection_locked(current)
+                            self._save_entry(session_key, lock_held=True)
+                            counts["cleared_terminal_projection"] += 1
+                continue
+
+            origin_exact = False
+            if projection_identity_match:
+                snapshot = entry.resume_origin_snapshot or {}
+                source_payload = snapshot.get("source")
+                source_digest = snapshot.get("source_sha256")
+                row_marked_at = row.get("marked_at")
+                try:
+                    projection_marked_at = entry.last_resume_marked_at.timestamp()
+                    marked_at_exact = abs(
+                        projection_marked_at - float(row_marked_at)
+                    ) <= 0.001
+                except (AttributeError, TypeError, ValueError):
+                    marked_at_exact = False
+                if isinstance(source_payload, dict) and isinstance(
+                    source_digest, str
+                ):
+                    origin_exact = bool(
+                        json.dumps(
+                            source_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        == str(row.get("origin_json") or "")
+                        and source_digest == str(row.get("origin_sha256") or "")
+                        and str(entry.resume_reason or "")
+                        == str(row.get("reason") or "")
+                        and marked_at_exact
+                    )
+            exact_marker = projection_identity_match and origin_exact
+            marker_fresh = False
+            if exact_marker:
+                try:
+                    authoritative_marked_at = datetime.fromtimestamp(
+                        float(row.get("marked_at"))
+                    )
+                    marker_fresh = (
+                        max_age_seconds <= 0
+                        or now - authoritative_marked_at <= max_age
+                    )
+                except (TypeError, ValueError, OSError):
+                    marker_fresh = False
+            if exact_marker and marker_fresh:
+                counts["kept"] += 1
+                continue
+
+            if projection_identity_match and not origin_exact:
+                reason = "quarantined_invalid_envelope"
+            else:
+                reason = "stale_claim" if exact_marker else "orphaned_claim"
+            settled = False
+            if state == "PENDING":
+                cancel = getattr(db, "cancel_gateway_resume_obligation", None)
+                settled = bool(
+                    callable(cancel)
+                    and cancel(
+                        session_key=session_key,
+                        resume_task_id=task_id,
+                        expected_generation=generation,
+                        reason=reason,
+                    )
+                )
+                if settled:
+                    counts["cancelled_pending"] += 1
+            elif state == "CLAIMED":
+                abandon = getattr(db, "abandon_gateway_resume_obligation", None)
+                settled = bool(
+                    callable(abandon)
+                    and abandon(
+                        session_key=session_key,
+                        resume_task_id=task_id,
+                        expected_generation=generation,
+                        claim_owner=str(row.get("claim_owner") or ""),
+                        claim_token=str(row.get("claim_token") or ""),
+                        reason=reason,
+                    )
+                )
+                if settled:
+                    counts["abandoned_claimed"] += 1
+            if not settled or not projection_identity_match:
+                continue
+            with self._lock:
+                current = self._entries.get(session_key)
+                if (
+                    current is entry
+                    and current.resume_pending
+                    and current.resume_task_id == task_id
+                    and current.continuation_generation == generation
+                ):
+                    self._clear_resume_projection_locked(current)
+                    self._save_entry(session_key, lock_held=True)
+        return counts
+
+    @staticmethod
+    def _clear_resume_projection_locked(entry: SessionEntry) -> None:
+        """Clear one routing projection while the SessionStore lock is held."""
+        entry.resume_pending = False
+        entry.resume_reason = None
+        entry.last_resume_marked_at = None
+        entry.resume_task_id = ""
+        entry.continuation_claim_owner = ""
+        entry.continuation_claim_token = ""
+        entry.resume_origin_snapshot = None
+        for key in (
+            "resume_task_id",
+            "continuation_generation",
+            "continuation_claim_owner",
+            "continuation_claim_token",
+        ):
+            entry.metadata.pop(key, None)
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.

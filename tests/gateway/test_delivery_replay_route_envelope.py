@@ -56,6 +56,7 @@ def _row(*, route_envelope, chat_id: str = "700000321") -> dict:
         "content": "private final",
         "needs_marker": False,
         "attempts": 1,
+        "runtime_claim_token": "claim-token-1",
         "route_envelope": route_envelope,
     }
 
@@ -85,7 +86,16 @@ async def test_business_replay_uses_exact_transport_and_full_route_metadata():
         profile_adapters={"transport-b": {Platform.TELEGRAM: exact}},
     )
 
-    with patch("gateway.delivery_ledger.mark_delivered") as mark_delivered:
+    with (
+        patch(
+            "gateway.delivery_ledger.begin_redelivery_attempt",
+            return_value=True,
+        ) as begin_attempt,
+        patch(
+            "gateway.delivery_ledger.settle_runtime_claim",
+            return_value=True,
+        ) as settle_claim,
+    ):
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=_business_route())]
         )
@@ -102,7 +112,10 @@ async def test_business_replay_uses_exact_transport_and_full_route_metadata():
     assert sent["metadata"]["telegram_business_external_contact"] is True
     assert sent["metadata"]["profile"] == "runtime-a"
     assert sent["metadata"]["transport_profile"] == "transport-b"
-    mark_delivered.assert_called_once_with("business-replay")
+    begin_attempt.assert_called_once_with("business-replay", "claim-token-1")
+    settle_claim.assert_called_once_with(
+        "business-replay", "claim-token-1", delivered=True
+    )
 
 
 @pytest.mark.asyncio
@@ -116,7 +129,16 @@ async def test_default_transport_replay_uses_only_the_default_adapter():
         external_safe_mode=False,
     )
 
-    with patch("gateway.delivery_ledger.mark_delivered") as mark_delivered:
+    with (
+        patch(
+            "gateway.delivery_ledger.begin_redelivery_attempt",
+            return_value=True,
+        ) as begin_attempt,
+        patch(
+            "gateway.delivery_ledger.settle_runtime_claim",
+            return_value=True,
+        ) as settle_claim,
+    ):
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=route)]
         )
@@ -126,7 +148,10 @@ async def test_default_transport_replay_uses_only_the_default_adapter():
     assert sent["metadata"]["profile"] == "default"
     assert sent["metadata"]["transport_profile"] == "default"
     assert "business_connection_id" not in sent["metadata"]
-    mark_delivered.assert_called_once_with("business-replay")
+    begin_attempt.assert_called_once_with("business-replay", "claim-token-1")
+    settle_claim.assert_called_once_with(
+        "business-replay", "claim-token-1", delivered=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -152,15 +177,17 @@ async def test_legacy_or_mismatched_route_is_quarantined_without_send(route_enve
     primary = _adapter(owner_profile=None)
     runner = _runner(primary=primary)
 
-    with patch("gateway.delivery_ledger.mark_abandoned") as mark_abandoned:
+    with patch(
+        "gateway.delivery_ledger.abandon_runtime_claim", return_value=True
+    ) as abandon_claim:
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=route_envelope)]
         )
 
     assert delivered == 0
     primary.send.assert_not_awaited()
-    mark_abandoned.assert_called_once_with(
-        "business-replay", "ambiguous_route_envelope"
+    abandon_claim.assert_called_once_with(
+        "business-replay", "claim-token-1", "ambiguous_route_envelope"
     )
 
 
@@ -177,7 +204,9 @@ async def test_missing_or_mismatched_transport_never_falls_back_to_primary(
         profile_adapters = {"transport-b": {Platform.TELEGRAM: wrong}}
     runner = _runner(primary=primary, profile_adapters=profile_adapters)
 
-    with patch("gateway.delivery_ledger.mark_failed") as mark_failed:
+    with patch(
+        "gateway.delivery_ledger.settle_runtime_claim", return_value=True
+    ) as settle_claim:
         delivered = await runner._redeliver_claimed_obligations(
             [_row(route_envelope=_business_route())]
         )
@@ -186,8 +215,11 @@ async def test_missing_or_mismatched_transport_never_falls_back_to_primary(
     primary.send.assert_not_awaited()
     if wrong is not None:
         wrong.send.assert_not_awaited()
-    mark_failed.assert_called_once_with(
-        "business-replay", "delivery_route_unavailable"
+    settle_claim.assert_called_once_with(
+        "business-replay",
+        "claim-token-1",
+        delivered=False,
+        error="delivery_route_unavailable",
     )
 
 

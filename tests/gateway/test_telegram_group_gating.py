@@ -1,11 +1,11 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
-from gateway.config import Platform, PlatformConfig, load_gateway_config
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
-from gateway.session import SessionSource
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
 
 def _make_adapter(
@@ -228,6 +228,168 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
         assert "Existing topic prompt" in event.channel_prompt
         assert "observed Telegram group context" in event.channel_prompt
         assert "current new message" in event.channel_prompt
+
+    asyncio.run(_run())
+
+
+def test_observed_group_turn_keeps_exact_sender_for_restart_authority():
+    """Shared model context must not erase the active turn's real principal."""
+
+    async def _run():
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        text = "@hermes_bot run the release canary"
+        message = _group_message(
+            text,
+            from_user_id=222,
+            from_user_name="Bob Example",
+            thread_id=7,
+            entities=[_mention_entity(text)],
+        )
+        event = adapter._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=1004,
+        )
+        event = adapter._apply_telegram_group_observe_attribution(event)
+        assert event.source.user_id is None
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        runner._is_user_authorized = lambda source: source.user_id == "222"
+        runner.session_store = MagicMock()
+        mark_active = AsyncMock(return_value="turn-token")
+        runner._async_session_store = SimpleNamespace(
+            _store=runner.session_store,
+            mark_turn_active=mark_active,
+        )
+
+        assert await runner._mark_durable_active_turn(
+            event,
+            "agent:main:telegram:group:-100:7",
+        )
+        authority_source = mark_active.await_args.args[1]
+        assert authority_source.chat_id == "-100"
+        assert authority_source.thread_id == "7"
+        assert authority_source.message_id == "42"
+        assert authority_source.user_id == "222"
+
+    asyncio.run(_run())
+
+
+def test_observed_group_turn_preflight_uses_shared_route_with_per_user_sessions():
+    """Production per-user mode must not reject an intentionally shared route."""
+
+    async def _run():
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        text = "@hermes_bot inspect this link"
+        message = _group_message(
+            text,
+            from_user_id=222,
+            from_user_name="Bob Example",
+            entities=[_mention_entity(text)],
+        )
+        event = adapter._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=1005,
+        )
+        event = adapter._apply_telegram_group_observe_attribution(event)
+        assert event.source.user_id is None
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        runner._is_user_authorized = lambda source: source.user_id == "222"
+        runner.session_store = MagicMock()
+        mark_active = AsyncMock(return_value="turn-token")
+        runner._async_session_store = SimpleNamespace(
+            _store=runner.session_store,
+            mark_turn_active=mark_active,
+        )
+
+        session_key = "agent:main:telegram:group:-100"
+        assert await runner._mark_durable_active_turn(
+            event,
+            session_key,
+            preflight=True,
+        )
+        mark_active.assert_not_awaited()
+
+        assert await runner._mark_durable_active_turn(event, session_key)
+        authority_source = mark_active.await_args.args[1]
+        assert authority_source.message_id == "42"
+        assert authority_source.user_id == "222"
+
+    asyncio.run(_run())
+
+
+def test_observed_group_turn_persists_authority_on_shared_route(tmp_path):
+    """A real store must persist the sender without changing the shared key."""
+
+    async def _run():
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        text = "@hermes_bot inspect the attached voice note"
+        event = adapter._build_message_event(
+            _group_message(
+                text,
+                from_user_id=222,
+                from_user_name="Bob Example",
+                entities=[_mention_entity(text)],
+            ),
+            MessageType.TEXT,
+            update_id=1006,
+        )
+        event = adapter._apply_telegram_group_observe_attribution(event)
+        authority_source = event._hermes_turn_authority_source
+        assert event.source.user_id is None
+        assert authority_source.user_id == "222"
+
+        config = GatewayConfig(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        entry = store.get_or_create_session(event.source)
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = config
+        runner._is_user_authorized = lambda source: source.user_id == "222"
+        runner.session_store = store
+        runner._async_session_store = AsyncSessionStore(store)
+
+        assert await runner._mark_durable_active_turn(event, entry.session_key)
+        persisted = store._entries[entry.session_key]
+        snapshot = persisted.active_turn_origin_snapshot
+        assert snapshot is not None
+        assert snapshot["session_key"] == entry.session_key
+        assert snapshot["source"]["user_id"] == "222"
 
     asyncio.run(_run())
 
@@ -484,6 +646,54 @@ def test_allowed_topics_drop_other_forum_topics_before_other_gates():
     assert adapter._should_process_message(
         _group_message("hi @hermes_bot", chat_id=-100, thread_id=11, entities=[_mention_entity("hi @hermes_bot")])
     ) is False
+
+
+def test_group_allowed_chats_is_an_authority_gate_for_dispatch():
+    adapter = _make_adapter(
+        require_mention=False,
+        allowed_chats=["-100", "-999"],
+        group_allowed_chats=["-100"],
+    )
+
+    assert adapter._should_process_message(_group_message(chat_id=-100)) is True
+    assert adapter._should_process_message(_group_message(chat_id=-999)) is False
+
+
+def test_dm_root_and_ignored_topic_filters_run_before_dm_return():
+    adapter = _make_adapter(require_mention=False, ignored_threads=[77])
+    adapter.config.extra["ignore_root_dm"] = True
+    adapter._dm_topic_chat_ids = {"111"}
+
+    root = _group_message(chat_id=111)
+    root.chat.type = "private"
+    root.chat.is_forum = False
+    root.is_topic_message = False
+    assert adapter._should_process_message(root) is False
+
+    topic = _group_message(chat_id=111, thread_id=77)
+    topic.chat.type = "private"
+    topic.chat.is_forum = False
+    assert adapter._should_process_message(topic) is False
+
+
+def test_foreign_bot_reply_policy_matches_dispatch_and_observe():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    adapter.config.extra["ignore_other_bot_replies_chats"] = ["-100"]
+    message = _group_message("follow-up", chat_id=-100)
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=555, is_bot=True),
+        message_id=10,
+        text="foreign bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is False
 
 
 def _forum_message(*, chat_id, thread_id, is_topic_message, is_forum, chat_type="supergroup"):

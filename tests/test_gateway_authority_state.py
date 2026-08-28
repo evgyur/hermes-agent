@@ -129,6 +129,105 @@ async def test_gateway_authority_seals_direct_reply_semantics_before_marker(tmp_
 
 
 @pytest.mark.asyncio
+async def test_gateway_authority_bounds_long_rich_reply_to_consumed_semantic_prefix(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "long-rich-reply-authority"
+    holder = "pid=1:long-rich-reply-authority"
+    db.create_session(session_id, source="telegram")
+    assert db.acquire_session_turn_lease(session_id, holder, wait_seconds=0.1)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="42",
+    )
+    rich_text = "🧭" * 3000
+    event = MessageEvent(
+        text="Use this",
+        source=source,
+        message_id="tg-rich-reply",
+        reply_to_message_id="tg-rich",
+        reply_to_text=rich_text,
+        reply_to_is_own_message=True,
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    result = await runner._persist_gateway_triggering_user_row(
+        event,
+        type("Entry", (), {"session_id": session_id})(),
+        {"db": db, "holder": holder, "ttl_seconds": 300.0},
+        platform_message_id="tg-rich-reply",
+        display_kind=None,
+    )
+
+    assert result.inserted is True
+    history = db.get_messages_as_conversation(session_id)
+    envelope = history[-1]["display_metadata"]["gateway_raw_semantic_v1"]
+    assert envelope["reply"]["quote"] == rich_text[:500]
+    assert len(envelope["reply"]["quote"].encode("utf-8")) == 2000
+
+    cold_event = MessageEvent(
+        text="Use this", source=source, message_id="tg-rich-reply"
+    )
+    assert runner._restore_startup_raw_semantic_envelope(
+        cold_event,
+        history,
+        source_message_id="tg-rich-reply",
+    )
+    assert cold_event.reply_to_text == rich_text[:500]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_authority_preserves_exact_whitespace_reply_prefix(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "whitespace-rich-reply-authority"
+    holder = "pid=1:whitespace-rich-reply-authority"
+    db.create_session(session_id, source="telegram")
+    assert db.acquire_session_turn_lease(session_id, holder, wait_seconds=0.1)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="42",
+    )
+    rich_text = (" \n" * 260) + "outside-the-live-prefix"
+    event = MessageEvent(
+        text="Use this",
+        source=source,
+        message_id="tg-whitespace-reply",
+        reply_to_message_id="tg-rich",
+        reply_to_text=rich_text,
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    result = await runner._persist_gateway_triggering_user_row(
+        event,
+        type("Entry", (), {"session_id": session_id})(),
+        {"db": db, "holder": holder, "ttl_seconds": 300.0},
+        platform_message_id="tg-whitespace-reply",
+        display_kind=None,
+    )
+
+    assert result.inserted is True
+    history = db.get_messages_as_conversation(session_id)
+    envelope = history[-1]["display_metadata"]["gateway_raw_semantic_v1"]
+    assert envelope["reply"]["quote"] == rich_text[:500]
+    cold_event = MessageEvent(
+        text="Use this", source=source, message_id="tg-whitespace-reply"
+    )
+    assert runner._restore_startup_raw_semantic_envelope(
+        cold_event,
+        history,
+        source_message_id="tg-whitespace-reply",
+    )
+    assert cold_event.reply_to_text == rich_text[:500]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_gateway_authority_seals_recoverable_media_refs_without_bytes(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "media-authority"

@@ -8,6 +8,7 @@ Four calling shapes:
 
 All run zero LLM calls.
 """
+import hashlib
 import inspect
 import json
 import time
@@ -149,7 +150,7 @@ class TestBrowseShape:
         profile_db = _DB()
         monkeypatch.setattr(
             "tools.session_search_tool._resolve_profile_db",
-            lambda _profile: profile_db,
+            lambda _profile, **_kwargs: profile_db,
         )
 
         result = json.loads(session_search(db=shared_db, profile="work"))
@@ -538,6 +539,181 @@ class TestCrossProfileRead:
             assert result["success"] is True, kwargs
             assert result["mode"] == "read"
             assert result["session_id"] == "s_other"
+
+
+class TestHermesdevMainHistoryRead:
+    @staticmethod
+    def _authorize(monkeypatch, main_home, *, active="hermesdev", allowed=None):
+        from hermes_cli import config as config_mod
+        from hermes_cli import profiles as profiles_mod
+
+        if allowed is None:
+            allowed = ["default"]
+        monkeypatch.setattr(
+            profiles_mod, "get_active_profile_name", lambda: active
+        )
+        monkeypatch.setattr(
+            profiles_mod,
+            "normalize_profile_name",
+            lambda n: str(n).strip().lower(),
+        )
+        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda _n: None)
+        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "default")
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda _n: main_home)
+        monkeypatch.setattr(
+            config_mod,
+            "load_config_readonly",
+            lambda: {"tools": {"session_search": {"read_profiles": allowed}}},
+        )
+
+    def test_allowed_query_is_bounded_provenanced_read_only_and_byte_stable(
+        self, db, tmp_path, monkeypatch
+    ):
+        main_home = tmp_path / "main"
+        main_home.mkdir()
+        main_path = main_home / "state.db"
+        main = SessionDB(main_path)
+        for index in range(14):
+            sid = f"main-{index}"
+            main.create_session(sid, source="telegram")
+            main.append_message(
+                sid,
+                role="user",
+                content=f"release-history-needle item {index}",
+            )
+        main.close()
+        before = (
+            main_path.stat().st_size,
+            hashlib.sha256(main_path.read_bytes()).hexdigest(),
+        )
+        self._authorize(monkeypatch, main_home)
+
+        result = json.loads(
+            session_search(
+                query="release-history-needle",
+                limit=999,
+                profile="default",
+                db=db,
+            )
+        )
+
+        after = (
+            main_path.stat().st_size,
+            hashlib.sha256(main_path.read_bytes()).hexdigest(),
+        )
+        assert result["success"] is True
+        assert 1 <= result["count"] <= 10
+        assert all(
+            entry["source_profile"] == "default" for entry in result["results"]
+        )
+        assert all(
+            entry["session_id"].startswith("main-") for entry in result["results"]
+        )
+        assert all(
+            entry["link"].startswith("@session:default/")
+            for entry in result["results"]
+        )
+        assert before == after
+
+    @pytest.mark.parametrize(
+        ("active", "allowed"),
+        [
+            ("worker", ["default"]),
+            ("hermesdev", []),
+            ("hermesdev", "default"),
+        ],
+    )
+    def test_non_allowlisted_reader_fails_before_main_db_open(
+        self, db, tmp_path, monkeypatch, active, allowed
+    ):
+        main_home = tmp_path / "main"
+        main_home.mkdir()
+        self._authorize(monkeypatch, main_home, active=active, allowed=allowed)
+        opens = []
+
+        def forbidden_open(*args, **kwargs):
+            opens.append((args, kwargs))
+            raise AssertionError("main DB must not be touched")
+
+        monkeypatch.setattr("hermes_state.SessionDB", forbidden_open)
+
+        result = json.loads(
+            session_search(query="needle", profile="default", db=db)
+        )
+
+        assert result["success"] is False
+        assert opens == []
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"session_id": "root-session"},
+            {"session_id": "root-session", "around_message_id": 42},
+        ],
+    )
+    def test_main_history_is_query_only_and_denies_before_open(
+        self, db, tmp_path, monkeypatch, kwargs
+    ):
+        main_home = tmp_path / "main"
+        main_home.mkdir()
+        self._authorize(monkeypatch, main_home)
+        opens = []
+
+        def forbidden_open(*args, **open_kwargs):
+            opens.append((args, open_kwargs))
+            raise AssertionError("non-query shape must not touch main DB")
+
+        monkeypatch.setattr("hermes_state.SessionDB", forbidden_open)
+
+        result = json.loads(session_search(profile="default", db=db, **kwargs))
+
+        assert result["success"] is False
+        assert opens == []
+
+    def test_failed_main_read_only_open_never_falls_back_or_scans_profiles(
+        self, db, tmp_path, monkeypatch
+    ):
+        main_home = tmp_path / "main"
+        main_home.mkdir()
+        self._authorize(monkeypatch, main_home)
+
+        def unavailable(*_args, **kwargs):
+            assert kwargs["read_only"] is True
+            raise OSError("main history unavailable")
+
+        monkeypatch.setattr("hermes_state.SessionDB", unavailable)
+        monkeypatch.setattr(
+            "tools.session_search_tool._locate_session_db",
+            lambda _sid: (_ for _ in ()).throw(
+                AssertionError("must not scan profiles")
+            ),
+        )
+
+        result = json.loads(
+            session_search(query="needle", profile="default", db=db)
+        )
+
+        assert result["success"] is False
+        assert "unavailable" in result["error"]
+
+    def test_schema_exposes_no_main_db_authority_or_mutation_parameters(self):
+        parameters = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        forbidden = {
+            "route",
+            "resume",
+            "claim",
+            "lease",
+            "obligation",
+            "continuation",
+            "callback",
+            "effect",
+            "write",
+            "mutate",
+            "deliver",
+        }
+
+        assert forbidden.isdisjoint(parameters)
 
 
 # =========================================================================
@@ -1143,4 +1319,3 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
-

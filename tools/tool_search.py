@@ -48,6 +48,8 @@ import logging
 import math
 import re
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -66,6 +68,25 @@ TOOL_DESCRIBE_NAME = "tool_describe"
 TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
+
+_ACTIVE_SCOPED_DEFERRED_TOOL: ContextVar[Optional[str]] = ContextVar(
+    "active_scoped_deferred_tool",
+    default=None,
+)
+
+
+@contextmanager
+def _bind_scoped_deferred_tool_authority(tool_name: str):
+    token = _ACTIVE_SCOPED_DEFERRED_TOOL.set(tool_name)
+    try:
+        yield
+    finally:
+        _ACTIVE_SCOPED_DEFERRED_TOOL.reset(token)
+
+
+def get_active_scoped_deferred_tool_authority() -> Optional[str]:
+    """Return the exact deferred tool admitted for the current dispatch."""
+    return _ACTIVE_SCOPED_DEFERRED_TOOL.get()
 
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
@@ -1317,4 +1338,5 @@ __all__ = [
     "resolve_underlying_call",
     "scoped_deferrable_names",
     "validate_deferred_call_args",
+    "get_active_scoped_deferred_tool_authority",
 ]

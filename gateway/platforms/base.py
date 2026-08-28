@@ -285,10 +285,21 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
-def _mark_notify_metadata(metadata: dict | None) -> dict:
-    """Clone metadata and mark a user-visible reply as notify-worthy."""
+def _mark_notify_metadata(
+    metadata: dict | None,
+    *,
+    gateway_command: str | None = None,
+) -> dict:
+    """Clone metadata and mark a user-visible reply as notify-worthy.
+
+    ``gateway_command`` is derived from the trusted inbound command parser.
+    It lets platform policy distinguish control-plane acknowledgements from
+    model-authored content without inspecting or trusting response text.
+    """
     notify_metadata = dict(metadata) if metadata else {}
     notify_metadata["notify"] = True
+    if gateway_command:
+        notify_metadata["gateway_command"] = str(gateway_command)
     return notify_metadata
 
 
@@ -729,7 +740,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Literal, Tuple, Union
 from enum import Enum
 
@@ -778,6 +789,65 @@ class StreamingTTSHandle:
     audible: bool = False
     # Set to True by abort_streaming_tts; late chunks are dropped.
     aborted: bool = False
+
+
+class StartupResumeDispatchHandoff:
+    """One-shot fence for an adapter accepting a synthetic resume event.
+
+    ``handle_message`` normally installs its session task synchronously before
+    returning.  Multiplex wrappers may defer that call, though, so the gateway
+    needs an exact way to revoke the event before abandoning its durable claim.
+    A late ``_start_session_processing`` call must then fail before its child
+    task is created.
+    """
+
+    __slots__ = (
+        "expected_session_key",
+        "_accepted_task",
+        "_blocking_task",
+        "_revoked",
+    )
+
+    def __init__(self, expected_session_key: str):
+        self.expected_session_key = str(expected_session_key)
+        self._accepted_task: Optional[asyncio.Task] = None
+        self._blocking_task: Optional[asyncio.Task] = None
+        self._revoked = False
+
+    def is_open_for(self, session_key: str) -> bool:
+        return bool(
+            not self._revoked
+            and self._accepted_task is None
+            and self._blocking_task is None
+            and str(session_key) == self.expected_session_key
+        )
+
+    def accept(self, session_key: str, task: asyncio.Task) -> bool:
+        if not self.is_open_for(session_key):
+            return False
+        self._accepted_task = task
+        return True
+
+    def defer_to_existing(self, session_key: str, task: asyncio.Task) -> bool:
+        """Fence startup resume behind an already-owned exact-route task."""
+        if not self.is_open_for(session_key):
+            return False
+        self._blocking_task = task
+        return True
+
+    def revoke(self) -> bool:
+        if self._accepted_task is not None:
+            return False
+        self._revoked = True
+        return True
+
+    @property
+    def accepted_task(self) -> Optional[asyncio.Task]:
+        return self._accepted_task
+
+    @property
+    def blocking_task(self) -> Optional[asyncio.Task]:
+        return self._blocking_task
 
 
 def streaming_tts_turn_key(session_key: str | None, turn_marker: Any = None, *, event: Any = None) -> str | None:
@@ -1519,10 +1589,24 @@ def _media_delivery_strict_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _runtime_home_path() -> Path:
+    """Return the gateway user's home, honoring its explicit runtime env.
+
+    ``os.path.expanduser`` follows ``USERPROFILE`` on Windows even when a
+    managed runtime (or a test harness) deliberately supplies ``HOME``.
+    Reading the explicit value first keeps the credential denylist aligned
+    with the actual process environment on every host OS.
+    """
+    raw_home = os.environ.get("HOME", "").strip()
+    if raw_home:
+        return Path(raw_home)
+    return Path(os.path.expanduser("~"))
+
+
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    home = _runtime_home_path()
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1594,7 +1678,7 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = _runtime_home_path().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -1637,7 +1721,7 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+def _parse_docker_volume_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """Parse configured Docker volume mounts into ``(host_path, container_path)``.
 
     Source of truth is ``TERMINAL_DOCKER_VOLUMES`` (JSON list of
@@ -1657,7 +1741,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     if not isinstance(parsed, list):
         return []
 
-    mounts: List[Tuple[Path, Path]] = []
+    mounts: List[Tuple[Path, PurePosixPath]] = []
     for entry in parsed:
         if not isinstance(entry, str):
             continue
@@ -1682,7 +1766,10 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
             continue
         try:
             host_path = Path(host_expanded).resolve(strict=False)
-            container_path = Path(container_raw)
+            # Container paths are POSIX paths even when the gateway host is
+            # Windows. ``Path('/workspace')`` is not absolute on Windows
+            # because it has no drive, which used to disable translation.
+            container_path = PurePosixPath(container_raw)
         except (OSError, RuntimeError, ValueError):
             continue
         if not container_path.is_absolute():
@@ -1806,7 +1893,7 @@ def _docker_persistent_home_host_roots(session_key: str = "") -> List[Path]:
     return roots
 
 
-def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+def _cache_dir_container_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """(host, container) pairs for the auto-mounted Hermes cache dirs.
 
     The agent legitimately sees generated artifacts at ``/root/.hermes/...``
@@ -1821,7 +1908,7 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         from tools.credential_files import get_cache_directory_mounts
 
         return [
-            (Path(m["host_path"]), Path(m["container_path"]))
+            (Path(m["host_path"]), PurePosixPath(str(m["container_path"])))
             for m in get_cache_directory_mounts()
         ]
     except Exception:
@@ -1848,7 +1935,9 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
     )
 
 
-def _translate_docker_container_media_path(candidate: Path, session_key: str = "") -> Optional[Path]:
+def _translate_docker_container_media_path(
+    candidate: PurePosixPath, session_key: str = ""
+) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1877,7 +1966,7 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     # bug-window per-session layout — the file is tried against each.
     if not any(c.as_posix() == "/workspace" for _, c in mounts):
         for ws_root in _default_docker_workspace_host_roots(session_key):
-            mounts.append((ws_root, Path("/workspace")))
+            mounts.append((ws_root, PurePosixPath("/workspace")))
     # Synthetic /root mounts for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1890,7 +1979,7 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
             for home_root in _docker_persistent_home_host_roots(session_key):
-                mounts.append((home_root, Path("/root")))
+                mounts.append((home_root, PurePosixPath("/root")))
 
     if not mounts:
         _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved")
@@ -1911,10 +2000,15 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     for host_root, container_root, _score in matched:
         try:
             relative = candidate.relative_to(container_root)
-            translated = (host_root / relative).resolve(strict=True)
+            resolved_host_root = host_root.resolve(strict=False)
+            translated = resolved_host_root.joinpath(*relative.parts).resolve(
+                strict=True
+            )
         except (OSError, RuntimeError, ValueError):
             continue
-        if translated != host_root and not _path_is_within(translated, host_root):
+        if translated != resolved_host_root and not _path_is_within(
+            translated, resolved_host_root
+        ):
             continue
         return translated
     _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox")
@@ -1956,16 +2050,24 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
         return None
-    if not expanded.is_absolute():
-        return None
-
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded, session_key=session_key)
+    container_candidate = (
+        PurePosixPath(candidate) if candidate.startswith("/") else None
+    )
+    translated = (
+        _translate_docker_container_media_path(
+            container_candidate, session_key=session_key
+        )
+        if container_candidate is not None
+        else None
+    )
     if translated is not None:
         resolved = translated
     else:
+        if not expanded.is_absolute():
+            return None
         try:
             resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
@@ -2674,8 +2776,11 @@ class MessageEvent:
         command_text = (self.text or "").lstrip()
         parts = command_text.split(maxsplit=1)
         args = parts[1] if len(parts) > 1 else ""
-        # iOS auto-corrects -- to — (em dash) and - to – (en dash)
-        args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
+        # iOS auto-corrects -- to — (em dash) and - to – (en dash).
+        # Adapter-generated skill commands may carry verbatim user content after
+        # a trusted transport envelope; preserve that content byte-for-byte.
+        if not self.metadata.get("preserve_command_args"):
+            args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
 
 
@@ -2956,13 +3061,47 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def seal_pending_message_event_identity(event: MessageEvent) -> bool:
+    """Seal one pending event to adapter-owned native message identity.
+
+    Pending events are consumed after the outer turn has already delivered its
+    final response.  Rejecting an unverifiable mismatch here prevents that
+    completed turn from being retroactively followed by a generic session
+    error.  Telegram may repair a copied/stale ``SessionSource`` only when the
+    event ID exactly matches the immutable native PTB message ID.
+    """
+    source = getattr(event, "source", None)
+    source_id = getattr(source, "message_id", None)
+    event_id = getattr(event, "message_id", None)
+    for value in (source_id, event_id):
+        if value is not None and (
+            type(value) is not str or not value or value != value.strip()
+        ):
+            return False
+    if source_id == event_id:
+        return True
+    if source_id is None and event_id is None:
+        return True
+    if not (
+        isinstance(source, SessionSource)
+        and source.platform == Platform.TELEGRAM
+        and type(event_id) is str
+        and event_id
+        and str(getattr(getattr(event, "raw_message", None), "message_id", ""))
+        == event_id
+    ):
+        return False
+    event.source = dataclasses.replace(source, message_id=event_id)
+    return True
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2974,6 +3113,12 @@ def merge_pending_message_event(
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
     """
+    if not seal_pending_message_event_identity(event):
+        logger.warning(
+            "Rejecting pending event for %s: unverifiable platform message identity",
+            session_key,
+        )
+        return False
     existing = pending_messages.get(session_key)
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
@@ -2987,7 +3132,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -3006,7 +3151,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -3015,9 +3160,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
     pending_messages[session_key] = event
+    return True
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -6237,7 +6383,9 @@ class BasePlatformAdapter(ABC):
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
-                state.event.message_id = str(latest_message_id)
+                latest_message_id = str(latest_message_id)
+                state.event.message_id = latest_message_id
+                state.event.source.message_id = latest_message_id
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
@@ -6375,18 +6523,35 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         *,
         interrupt_event: Optional[asyncio.Event] = None,
-    ) -> bool:
+    ) -> Optional[asyncio.Task]:
         """Spawn a background processing task under the given session guard.
 
-        Returns True on success.  If the runtime stubs ``create_task`` with a
+        Returns the exact owner task on success.  If the runtime stubs
+        ``create_task`` with a
         non-Task sentinel (some tests do this), the guard is rolled back and
-        False is returned so the caller isn't left holding a half-installed
+        ``None`` is returned so the caller isn't left holding a half-installed
         session lock.
         """
+        handoff = getattr(event, "_gateway_startup_dispatch_handoff", None)
+        if handoff is not None and (
+            not isinstance(handoff, StartupResumeDispatchHandoff)
+            or not handoff.is_open_for(session_key)
+        ):
+            return None
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        background = self._process_message_background(event, session_key)
+        try:
+            task = asyncio.create_task(background)
+        except BaseException:
+            # Fail closed without stranding the per-session guard.  The
+            # coroutine was never transferred to a task, so close it here.
+            close = getattr(background, "close", None)
+            if callable(close):
+                close()
+            self._release_session_guard(session_key, guard=guard)
+            raise
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -6395,11 +6560,20 @@ class BasePlatformAdapter(ABC):
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
-            return False
+            close = getattr(background, "close", None)
+            if callable(close):
+                close()
+            return None
+        if handoff is not None and not handoff.accept(session_key, task):
+            task.cancel()
+            self._background_tasks.discard(task)
+            self._session_tasks.pop(session_key, None)
+            self._release_session_guard(session_key, guard=guard)
+            return None
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-        return True
+        return task
 
     async def cancel_session_processing(
         self,
@@ -6520,7 +6694,10 @@ class BasePlatformAdapter(ABC):
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_mark_notify_metadata(
+                        thread_meta,
+                        gateway_command=cmd,
+                    ),
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -6535,6 +6712,7 @@ class BasePlatformAdapter(ABC):
                 release_guard=False,
                 discard_pending=False,
             )
+            await self._settle_durable_ingress_acceptance(event)
         except Exception:
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
@@ -6547,7 +6725,27 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def _settle_durable_ingress_acceptance(
+        self, event: MessageEvent
+    ) -> bool:
+        """Run a trusted one-shot durable-ingress callback after acceptance."""
+        callback = getattr(event, "_gateway_drain_processing_callback", None)
+        if not callable(callback):
+            return True
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                result = await result
+            return result is not False
+        except Exception:
+            logger.exception(
+                "[%s] Durable ingress acceptance callback failed", self.name
+            )
+            return False
+
+    async def handle_message(
+        self, event: MessageEvent
+    ) -> Optional[asyncio.Task]:
         """
         Process an incoming message.
         
@@ -6596,6 +6794,20 @@ class BasePlatformAdapter(ABC):
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+
+        # A Telegram update can be redelivered while startup restore is being
+        # assembled.  If that exact route already has a concrete owner task,
+        # do not feed the synthetic resume through the ordinary busy-message
+        # path and do not abandon its durable claim.  The startup wrapper will
+        # wait for this exact task, then re-dispatch against durable state.
+        handoff = getattr(event, "_gateway_startup_dispatch_handoff", None)
+        if session_key in self._active_sessions and isinstance(
+            handoff, StartupResumeDispatchHandoff
+        ):
+            owner_task = self._session_tasks.get(session_key)
+            if isinstance(owner_task, asyncio.Task) and not owner_task.done():
+                if handoff.defer_to_existing(session_key, owner_task):
+                    return owner_task
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
@@ -6648,7 +6860,10 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_mark_notify_metadata(
+                                _thread_meta,
+                                gateway_command=cmd,
+                            ),
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -6656,6 +6871,7 @@ class BasePlatformAdapter(ABC):
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    await self._settle_durable_ingress_acceptance(event)
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -6766,7 +6982,7 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        return self._start_session_processing(event, session_key)
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -6974,7 +7190,10 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _mark_notify_metadata(
+                    _thread_metadata,
+                    gateway_command=event.get_command(),
+                )
 
                 # Parent continuations require a text delivery obligation. This
                 # keeps restart recovery exact; media may accompany the text but
@@ -7472,6 +7691,8 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            if processing_ok:
+                await self._settle_durable_ingress_acceptance(event)
             if _is_parent_task_delivery:
                 if _parent_obligation_id is not None:
                     from gateway.delivery_ledger import (

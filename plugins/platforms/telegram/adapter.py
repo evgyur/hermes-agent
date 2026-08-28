@@ -16,6 +16,7 @@ import hashlib
 import os
 import html as _html
 import re
+import subprocess
 import threading
 import time
 import tempfile
@@ -911,6 +912,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._post_connect_task: Optional[asyncio.Task] = None
 
     def _mark_connected(self) -> None:
+        self._planned_ingress_quiesced = False
         self._drop_delayed_deliveries = False
         super()._mark_connected()
         # Drain anything held while we were down. PTB will not redeliver —
@@ -1259,6 +1261,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        # Multiplex adapters install a profile-bound resolver.  It is the
+        # authoritative callback gate because the bound message handler may
+        # belong to the shared/default runner.  A resolver exception is a
+        # denial, never permission to borrow process-wide env grants.
+        if getattr(self, "_authorization_check", None) is not None:
+            decision = self._is_sender_authorized(
+                normalized_user_id,
+                chat_type=chat_type,
+                chat_id=str(chat_id) if chat_id is not None else None,
+            )
+            return decision is True
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
@@ -1288,10 +1302,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
+                    "[Telegram] Callback authorization failed for user %s",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
 
         allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
@@ -2375,7 +2390,47 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(payload, dict):
             return None
         exact = payload.get(self._business_connection_store_key(chat_id))
-        return str(exact) if exact else None
+        if exact:
+            return str(exact)
+
+        # Older Hermes versions stored only ``chat_id -> connection_id``.
+        # Never trust that unscoped binding by itself: this state file can be
+        # shared across transport profiles and bot identities.  It is safe to
+        # promote only when the same connection has already been observed in a
+        # scoped entry for this exact profile + bot.  This preserves restart
+        # continuity for legacy peers without reviving cross-profile route
+        # borrowing.
+        legacy = payload.get(str(chat_id))
+        if not legacy:
+            return None
+        try:
+            current_scope = json.loads(
+                self._business_connection_store_key(chat_id).removeprefix(
+                    "scope:v1:"
+                )
+            )[:2]
+        except (TypeError, ValueError):
+            return None
+        trusted_connection_ids: set[str] = set()
+        for key, connection_id in payload.items():
+            if not isinstance(key, str) or not key.startswith("scope:v1:"):
+                continue
+            try:
+                stored_scope = json.loads(key.removeprefix("scope:v1:"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(stored_scope, list)
+                and len(stored_scope) == 3
+                and stored_scope[:2] == current_scope
+                and connection_id
+            ):
+                trusted_connection_ids.add(str(connection_id))
+        legacy_connection_id = str(legacy)
+        if legacy_connection_id not in trusted_connection_ids:
+            return None
+        self._remember_business_connection_id(chat_id, legacy_connection_id)
+        return legacy_connection_id
 
     def _remember_business_connection_id(self, chat_id: Any, connection_id: Any) -> None:
         """Persist only a Telegram-supplied peer→connection binding."""
@@ -2530,6 +2585,107 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _is_bounded_business_resume_directive(message: Any) -> bool:
+        """Recognize only exact, low-entropy continuation directives.
+
+        These phrases carry no safe recipient context on their own.  The
+        caller must additionally prove a recent persisted Hermes session for
+        the exact Telegram Business route before admitting the message.
+        """
+        text = str(
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or ""
+        ).casefold()
+        normalized = re.sub(r"\s+", " ", text).strip()
+        normalized = normalized.strip(" \t\r\n.,!?…:;—-")
+        return normalized in {
+            "go",
+            "go on",
+            "continue",
+            "давай",
+            "го",
+            "продолжай",
+            "продолжить",
+            "продолжаешь",
+        }
+
+    def _has_recent_business_session(self, message: Any) -> bool:
+        """Return whether this exact Business route recently belonged to Hermes.
+
+        A bare continuation must never open a new lane in an arbitrary private
+        conversation.  Requiring the exact persisted session key keeps the
+        convenience limited to routes where Hermes already handled work, and
+        survives gateway restarts without trusting warm adapter memory.
+        """
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None) if store else None
+        if not callable(lookup):
+            return False
+
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        chat_id = str(getattr(chat, "id", "") or "")
+        user_id = str(getattr(user, "id", "") or "")
+        if not chat_id or not user_id:
+            return False
+        connection_id = self._telegram_supplied_business_connection_id(message)
+        if not connection_id:
+            connection_id = self._known_business_connection_id(chat_id)
+        if not connection_id:
+            return False
+
+        thread_id = self._effective_message_thread_id(message)
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+        source.business_connection_id = str(connection_id)
+        source.external_safe_mode = True
+        try:
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=self._session_key_profile(source),
+            )
+            entry = lookup(session_key)
+        except Exception:
+            logger.debug(
+                "[%s] Failed to verify recent Business session for chat %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
+            return False
+        if entry is None:
+            return False
+
+        updated_at = getattr(entry, "updated_at", None)
+        try:
+            updated_ts = float(updated_at.timestamp())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        business_cfg = self._telegram_business_config()
+        try:
+            configured_window = float(
+                business_cfg.get("short_resume_window_seconds", 7 * 24 * 60 * 60)
+            )
+        except (TypeError, ValueError):
+            configured_window = 7 * 24 * 60 * 60
+        window_seconds = min(max(configured_window, 60.0), 7 * 24 * 60 * 60)
+        age_seconds = time.time() - updated_ts
+        return -300.0 <= age_seconds <= window_seconds
+
     def _reply_index_runtime_profile(
         self,
         message: Any,
@@ -2571,7 +2727,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if user_id not in self._business_owner_ids() or self._is_business_bot_echo(message):
             return False
-        return self._has_explicit_business_wake(message) or self._is_reply_to_own_outbound_text(message)
+        owner_voice_route = bool(
+            getattr(message, "voice", None)
+            and self._truthy_config_value(
+                self._telegram_business_config().get("auto_transcribe_voice", False)
+            )
+        )
+        short_resume_route = bool(
+            self._is_bounded_business_resume_directive(message)
+            and self._has_recent_business_session(message)
+        )
+        return (
+            self._has_explicit_business_wake(message)
+            or self._is_reply_to_own_outbound_text(message)
+            or owner_voice_route
+            or short_resume_route
+        )
 
     def _strip_business_wake_trigger(self, text: Optional[str]) -> Optional[str]:
         if not text:
@@ -2638,7 +2809,7 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]],
     ) -> bool:
-        """Persist optional reply text without redefining transport success."""
+        """Persist reply ownership; Business delivery requires a durable receipt."""
         business_connection_id = (metadata or {}).get("business_connection_id")
         try:
             from gateway import rich_sent_store
@@ -2813,9 +2984,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
-            self._record_sent_reply_text(
+            receipted = self._record_sent_reply_text(
                 str(chat_id), str(message_id), content, metadata
             )
+            if (metadata or {}).get("business_connection_id") and not receipted:
+                return SendResult(
+                    success=False,
+                    message_id=str(message_id),
+                    error="telegram_business_receipt_persist_failed",
+                    retryable=False,
+                    raw_response={"wire_delivered": True, "receipt_persisted": False},
+                )
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
@@ -4851,6 +5030,35 @@ class TelegramAdapter(BasePlatformAdapter):
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
+    def _drop_pending_updates_on_connect(self, *, is_reconnect: bool) -> bool:
+        """Drop only for an explicit operator reset on an unrelated cold start.
+
+        The restart notification markers are written by the old gateway and
+        consumed only after the new process connects.  Their presence proves
+        this cold start belongs to a planned lifecycle restart, so Telegram
+        updates received while the process was down must remain queued even
+        when the persistent config normally requests a stale-update reset.
+        """
+        if not is_reconnect:
+            try:
+                from hermes_constants import get_hermes_home
+
+                home = get_hermes_home()
+                if any(
+                    (home / marker).exists()
+                    for marker in (".restart_notify.json", ".restart_pending.json")
+                ):
+                    return False
+            except Exception:
+                logger.debug(
+                    "Could not inspect planned-restart Telegram markers",
+                    exc_info=True,
+                )
+        return bool(
+            not is_reconnect
+            and self.config.extra.get("drop_pending_updates") is True
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -5301,7 +5509,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # server-side getUpdates queue, so this flag is a no-op
                     # in practice. Mirror the polling path's reconnect
                     # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates_on_connect(
+                        is_reconnect=is_reconnect
+                    ),
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -5358,7 +5568,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates_on_connect(
+                        is_reconnect=is_reconnect
+                    ),
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
@@ -5581,6 +5793,74 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return False
 
+    async def quiesce_inbound(self) -> None:
+        """Stop planned-restart intake after already-entered events settle.
+
+        The bot client remains initialized for final outbound delivery.  New
+        updates stay in Telegram's server-side queue, while delayed batches
+        already accepted by this process flush through the gateway's durable
+        drain-inbox admission before ``disconnect()`` closes the client.
+        """
+        if getattr(self, "_planned_ingress_quiesced", False):
+            return
+        app = self._app
+        if app is None:
+            self._planned_ingress_quiesced = True
+            return
+        if app.updater and app.updater.running:
+            stopped = await self._await_disconnect_step(
+                app.updater.stop(),
+                _UPDATER_STOP_TIMEOUT,
+                "planned-restart updater quiesce",
+            )
+            if not stopped:
+                raise RuntimeError("Telegram updater did not quiesce")
+
+        # Application.stop waits for update-handler tasks already accepted by
+        # PTB. A handler can create a delayed text/photo/media batch while stop
+        # is waiting, so settle Application handlers before snapshotting those
+        # task registries. Bot API egress remains usable until shutdown.
+        if app.running:
+            stopped = await self._await_disconnect_step(
+                app.stop(),
+                _DISCONNECT_STEP_TIMEOUT,
+                "planned-restart application quiesce",
+            )
+            if not stopped:
+                raise RuntimeError("Telegram update handlers did not quiesce")
+
+        # Every PTB handler has now exited and polling is stopped, so no new
+        # delayed batches can be created. Existing batches own acknowledged
+        # updates and must dispatch into the gateway's durable admission
+        # barrier instead of being moved to the process-local reconnect hold.
+        batch_tasks: list[asyncio.Task] = []
+        seen: set[int] = set()
+        for task_map in (
+            getattr(self, "_pending_text_batch_tasks", {}),
+            getattr(self, "_pending_photo_batch_tasks", {}),
+            getattr(self, "_media_group_tasks", {}),
+        ):
+            for task in list(task_map.values()):
+                if task is None or task.done() or id(task) in seen:
+                    continue
+                seen.add(id(task))
+                batch_tasks.append(task)
+        if batch_tasks:
+            settled = await self._await_disconnect_step(
+                asyncio.gather(*batch_tasks, return_exceptions=True),
+                max(
+                    _DISCONNECT_STEP_TIMEOUT,
+                    float(getattr(self, "_text_batch_split_delay_seconds", 0.0))
+                    + 2.0,
+                ),
+                "planned-restart inbound batch flush",
+            )
+            if not settled:
+                raise RuntimeError("Telegram inbound batches did not quiesce")
+        self._polling_teardown_started = True
+        self._polling_progress_accepting = False
+        self._planned_ingress_quiesced = True
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         # Mark disconnected first so the drop guard short-circuits any flush
@@ -5795,6 +6075,7 @@ class TelegramAdapter(BasePlatformAdapter):
             and preview_guard.get("enabled", False)
             and str(chat_id) in {str(value) for value in preview_guard.get("chats", [])}
             and bool((metadata or {}).get("notify"))
+            and not str((metadata or {}).get("gateway_command") or "").strip()
         ):
             content = (
                 "⚠️ превью заблокировано: готовая публикация должна пройти "
@@ -6071,9 +6352,23 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_id = str(msg.message_id)
                 message_ids.append(message_id)
-                self._record_sent_reply_text(
+                receipted = self._record_sent_reply_text(
                     str(chat_id), message_id, _strip_mdv2(chunk), metadata
                 )
+                if (metadata or {}).get("business_connection_id") and not receipted:
+                    return SendResult(
+                        success=False,
+                        message_id=message_id,
+                        error="telegram_business_receipt_persist_failed",
+                        retryable=False,
+                        raw_response={
+                            "wire_delivered": True,
+                            "receipt_persisted": False,
+                            "message_ids": list(message_ids),
+                            "requested_thread_id": requested_thread_id,
+                            "thread_fallback": used_thread_fallback,
+                        },
+                    )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -8377,9 +8672,113 @@ class TelegramAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             size_text = "unknown size"
         return (
-            f"[Telegram {label} skipped: file size {size_text} exceeds the "
-            f"{limit_mb} MB limit. Ask the user to send a smaller file.]"
+            f"[Telegram {label} was not cached by the Bot API gateway: file size "
+            f"{size_text} exceeds its {limit_mb} MB limit. Check any configured "
+            "recovery route before asking the user to resend.]"
         )
+
+    @staticmethod
+    def _telegram_route_values(route: Dict[str, Any], key: str) -> set[str]:
+        raw = route.get(key)
+        if raw in (None, ""):
+            return set()
+        values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        return {str(value) for value in values if value not in (None, "")}
+
+    def _telegram_oversize_recovery_skill(self, event: MessageEvent) -> Optional[str]:
+        """Resolve an authenticated, profile-scoped oversized-media skill route."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        route_chat_id = str(getattr(source, "chat_id", "") or "")
+        route_thread_id = str(getattr(source, "thread_id", "") or "")
+        route_user_id = str(
+            event.metadata.get("telegram_transport_sender_user_id")
+            or getattr(source, "user_id", "")
+            or ""
+        )
+        route_profile = str(
+            event.metadata.get("telegram_route_profile")
+            or self._session_key_profile(source)
+            or "default"
+        )
+
+        for route in self.config.extra.get("auto_skill_routes", []) or []:
+            if not isinstance(route, dict):
+                continue
+            match = route.get("match") if isinstance(route.get("match"), dict) else {}
+            if not bool(match.get("oversize_media")):
+                continue
+            route_users = self._telegram_route_values(route, "users")
+            route_profiles = self._telegram_route_values(route, "profiles")
+            if not route_users or not route_profiles:
+                continue
+            predicates = (
+                ("chats", route_chat_id),
+                ("threads", route_thread_id),
+            )
+            if any(
+                (allowed := self._telegram_route_values(route, key)) and value not in allowed
+                for key, value in predicates
+            ):
+                continue
+            if route_user_id not in route_users or route_profile not in route_profiles:
+                continue
+            skill = str(route.get("skill") or "").strip().lstrip("/")
+            if skill:
+                return skill
+        return None
+
+    def _mark_telegram_media_too_large(
+        self,
+        event: MessageEvent,
+        source: Any,
+        label: str,
+    ) -> None:
+        """Attach a trusted recovery target and force a configured skill route."""
+        max_bytes = int(getattr(self, "_max_doc_bytes", 20 * 1024 * 1024) or 20 * 1024 * 1024)
+        file_size = getattr(source, "file_size", None)
+        note = self._telegram_media_too_large_note(label, file_size, max_bytes)
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        event_source = getattr(event, "source", None)
+        metadata["telegram_media_recovery"] = {
+            "chat_id": str(getattr(event_source, "chat_id", "") or ""),
+            "message_id": str(getattr(event, "message_id", "") or ""),
+            "thread_id": str(getattr(event_source, "thread_id", "") or ""),
+            "sender_user_id": str(
+                metadata.get("telegram_transport_sender_user_id")
+                or getattr(event_source, "user_id", "")
+                or ""
+            ),
+            "media_label": label,
+            "file_size": int(file_size or 0),
+            "bot_api_limit": max_bytes,
+        }
+
+        skill = self._telegram_oversize_recovery_skill(event)
+        original = (event.text or "").strip()
+        if skill and not event.is_command():
+            target = event.metadata["telegram_media_recovery"]
+            # The generated slash command is the sole activation path. Clear any
+            # topic/channel binding to avoid loading the same skill twice.
+            event.auto_skill = None
+            event.metadata["preserve_command_args"] = True
+            event.text = (
+                f"/{skill} Recover the exact oversized Telegram {label} through the "
+                "configured canonical recovery path. The trusted transport target is "
+                f"chat_id={target['chat_id']}, message_id={target['message_id']}, "
+                f"thread_id={target['thread_id'] or 'none'}, "
+                f"sender_user_id={target['sender_user_id']}, "
+                f"file_size={target['file_size']} bytes. Do not ask for a smaller "
+                "file until canonical recovery has been attempted."
+            )
+            if original:
+                event.text += f"\n\nOriginal user text:\n{original}"
+            return
+        event.text = self._append_observed_note(original, note)
 
     def _telegram_media_size_allowed(self, source: Any, label: str) -> tuple[bool, Optional[str]]:
         """Validate Telegram media size before downloading into memory."""
@@ -9487,6 +9886,14 @@ class TelegramAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
             raw = _scoped_gate_env("TELEGRAM_ALLOWED_CHATS")
+        if isinstance(raw, str) and raw.lstrip().startswith("["):
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if isinstance(decoded, list):
+                    raw = decoded
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -9514,6 +9921,26 @@ class TelegramAdapter(BasePlatformAdapter):
         if response_allowed:
             return group_allowed & response_allowed
         return group_allowed
+
+    def _should_ignore_foreign_bot_reply(self, message: Message) -> bool:
+        """Apply one foreign-bot reply rule to dispatch and observation."""
+        reply = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply, "from_user", None)
+        if not (
+            reply_user
+            and getattr(reply_user, "is_bot", False)
+            and str(getattr(reply_user, "id", ""))
+            != str(getattr(getattr(self, "_bot", None), "id", ""))
+        ):
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        ignored = {
+            str(value)
+            for value in self.config.extra.get(
+                "ignore_other_bot_replies_chats", []
+            )
+        }
+        return chat_id in ignored
 
     def _telegram_allowed_topics(self) -> set[str]:
         """Return the whitelist of Telegram forum topic IDs this bot handles.
@@ -9806,6 +10233,44 @@ class TelegramAdapter(BasePlatformAdapter):
         except UnicodeDecodeError:
             return ""
 
+    def _expand_link_entities(self, message: Message) -> str:
+        """Inline hidden Telegram ``text_link`` URLs into visible text."""
+        text = getattr(message, "text", None)
+        entities = getattr(message, "entities", None) or []
+        if not text:
+            text = getattr(message, "caption", None) or ""
+            entities = getattr(message, "caption_entities", None) or []
+        if not text or not entities:
+            return text
+
+        raw = text.encode("utf-16-le")
+        links: List[tuple[int, int, str]] = []
+        for entity in entities:
+            entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+            url = getattr(entity, "url", None)
+            if entity_type != "text_link" or not isinstance(url, str) or not url.strip():
+                continue
+            try:
+                offset = int(getattr(entity, "offset", -1))
+                length = int(getattr(entity, "length", 0))
+                start_bytes = offset * 2
+                end_bytes = (offset + length) * 2
+                if offset < 0 or length <= 0 or end_bytes > len(raw):
+                    continue
+                start = len(raw[:start_bytes].decode("utf-16-le"))
+                end = start + len(raw[start_bytes:end_bytes].decode("utf-16-le"))
+            except (TypeError, ValueError, UnicodeDecodeError):
+                continue
+            if end > start:
+                links.append((start, end, url.strip()))
+
+        expanded = text
+        for _start, end, url in sorted(links, reverse=True):
+            inline = f" ({url})"
+            if not expanded[end:].startswith(inline):
+                expanded = f"{expanded[:end]}{inline}{expanded[end:]}"
+        return expanded
+
     def _message_mentions_bot(self, message: Message) -> bool:
         if not self._bot:
             return False
@@ -9956,6 +10421,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if not self._is_group_chat(message):
             return False
+        if self._should_ignore_foreign_bot_reply(message):
+            return False
 
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
@@ -10049,12 +10516,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 event,
                 channel_prompt=channel_prompt,
             )
-        return dataclasses.replace(
+        attributed = dataclasses.replace(
             event,
             text=self._telegram_group_observe_attributed_text(event),
             source=shared_source,
             channel_prompt=channel_prompt,
         )
+        # The shared source deliberately removes the sender from model/session
+        # context, but restart authority must still bind to the exact human who
+        # authorized this turn.  Keep that source process-local: the gateway
+        # validates the route equivalence before sealing it and never persists
+        # this private carrier as user/model-authored metadata.
+        setattr(attributed, "_hermes_turn_authority_source", event.source)
+        return attributed
 
     def _media_message_type(self, msg: Message) -> MessageType:
         """Classify a Telegram media message into a MessageType."""
@@ -10169,7 +10643,15 @@ class TelegramAdapter(BasePlatformAdapter):
             elif cached.kind == "video":
                 event.message_type = MessageType.VIDEO
             elif cached.kind == "audio":
-                event.message_type = MessageType.AUDIO
+                # Preserve Telegram's voice-note semantics for replied-to
+                # media.  Generic audio attachments intentionally bypass STT,
+                # but a reply to ``message.voice`` must enter the same Groq/
+                # Whisper path as a directly received voice note.
+                event.message_type = (
+                    MessageType.VOICE
+                    if getattr(reply_msg, "voice", None)
+                    else MessageType.AUDIO
+                )
         event.text = self._append_observed_note(
             event.text,
             f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
@@ -10344,10 +10826,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
             user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+            user_name = str(
+                getattr(getattr(message, "from_user", None), "username", "") or ""
+            )
             try:
                 from gateway.telegram_egress_policy import assert_recipient_allowed
 
-                assert_recipient_allowed(chat_id)
+                assert_recipient_allowed(chat_id, username=user_name or None)
             except Exception:
                 # The same operator deny applies on ingress: a blocked peer can
                 # never create state that a later callback/replay might answer.
@@ -10374,6 +10859,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Customer-authored Business traffic is not admitted into the
                 # private agent/tool lane by this connector.
                 return False
+
+            thread_id = self._effective_message_thread_id(message)
+            if thread_id is not None:
+                try:
+                    if int(thread_id) in self._telegram_ignored_threads():
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            if (
+                thread_id is None
+                and self.config.extra.get("ignore_root_dm", False)
+                and not is_command
+                and chat_id in self._dm_topic_chat_ids
+            ):
+                return False
             return True
 
         thread_id = self._effective_message_thread_id(message)
@@ -10383,7 +10883,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if topic_id not in allowed_topics:
                 return False
 
-        # Check ignored_threads first — applies to both groups and DM topics
+        # Check ignored_threads first for groups (DM topics returned above).
         if thread_id is not None:
             try:
                 if int(thread_id) in self._telegram_ignored_threads():
@@ -10391,28 +10891,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
 
-        if not self._is_group_chat(message):
-            # Root DM (non-topic): ignore if ignore_root_dm is configured
-            if thread_id is None and self.config.extra.get("ignore_root_dm", False):
-                chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-                if not is_command and chat_id in self._dm_topic_chat_ids:
-                    return False
-            return True
-
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
-
-        _reply = getattr(message, "reply_to_message", None)
-        _reply_user = getattr(_reply, "from_user", None)
-        _reply_is_foreign_bot = bool(
-            _reply_user
-            and getattr(_reply_user, "is_bot", False)
-            and str(getattr(_reply_user, "id", "")) != str(getattr(self._bot, "id", ""))
-        )
-        _ignore_foreign_reply_chats = {
-            str(value)
-            for value in self.config.extra.get("ignore_other_bot_replies_chats", [])
-        }
-        if _reply_is_foreign_bot and chat_id_str in _ignore_foreign_reply_chats:
+        if self._should_ignore_foreign_bot_reply(message):
             return False
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
@@ -10428,6 +10908,9 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
+        authority_chats = self._telegram_group_allowed_chats()
+        if authority_chats and chat_id_str not in authority_chats:
+            return False
 
         if guest_mention:
             return True
@@ -10643,6 +11126,16 @@ class TelegramAdapter(BasePlatformAdapter):
             payload = json.loads(raw_payload.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("telegram-chip returned a non-object message payload")
+        if "success" in payload:
+            if payload.get("success") is not True:
+                raise RuntimeError(
+                    str(payload.get("error") or "telegram-chip message lookup failed")
+                )
+            payload = payload.get("data")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("telegram-chip returned invalid message data")
         return payload
 
     def _telegram_chip_media_download_sync(self, chat_id: str, message_id: int) -> str:
@@ -10668,17 +11161,71 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise RuntimeError("telegram-chip media redirects are not allowed")
 
         quoted_chat = urllib.parse.quote(str(chat_id), safe="")
-        url = f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"
-        request = urllib.request.Request(url, headers={"Accept": "audio/*,application/octet-stream"})
+        owned_dir = tempfile.mkdtemp(prefix="hermes-telegram-chip-media-")
+        # Telegram voice notes are Ogg/Opus. Keep a supported suffix on the
+        # sidecar-owned path so STT validation does not reject valid audio
+        # before ffmpeg can inspect the container.
+        owned_path = os.path.join(owned_dir, "media.ogg")
+        query = urllib.parse.urlencode({"output_path": owned_path})
+        url = (
+            f"{base_url}/chats/{quoted_chat}/messages/{int(message_id)}/media"
+            f"?{query}"
+        )
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
         max_bytes = 64 * 1024 * 1024
         opener = urllib.request.build_opener(_NoRedirect())
         temp_path = ""
+        keep_owned_path = False
         try:
+            if os.name != "nt":
+                subprocess.run(
+                    ["/usr/bin/setfacl", "-m", "u:chip:rwx", owned_dir],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=5.0,
+                )
             with opener.open(request, timeout=20.0) as response:
                 declared = response.headers.get("Content-Length")
+                content_type = str(response.headers.get_content_type() or "")
+                if content_type == "application/json":
+                    if declared and int(declared) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
+                        raise ValueError("telegram-chip JSON body exceeds the size limit")
+                    raw_payload = response.read(_TELEGRAM_CHIP_MAX_JSON_BYTES + 1)
+                    os.chmod(owned_dir, 0o700)
+                    if len(raw_payload) > _TELEGRAM_CHIP_MAX_JSON_BYTES:
+                        raise ValueError("telegram-chip JSON body exceeds the size limit")
+                    payload = json.loads(raw_payload.decode("utf-8"))
+                    if not isinstance(payload, dict) or payload.get("success") is not True:
+                        raise RuntimeError(
+                            str(
+                                payload.get("error")
+                                if isinstance(payload, dict)
+                                else "telegram-chip media lookup failed"
+                            )
+                        )
+                    media_result = payload.get("data")
+                    if isinstance(media_result, str):
+                        media_result = json.loads(media_result)
+                    if (
+                        not isinstance(media_result, dict)
+                        or media_result.get("success") is not True
+                    ):
+                        raise RuntimeError("telegram-chip media download failed")
+                    media_path = media_result.get("path")
+                    if not isinstance(media_path, str) or not os.path.isabs(media_path):
+                        raise ValueError("telegram-chip returned an invalid media path")
+                    if os.path.realpath(media_path) != os.path.realpath(owned_path):
+                        raise ValueError("telegram-chip returned an unowned media path")
+                    if os.path.islink(media_path) or not os.path.isfile(media_path):
+                        raise ValueError("telegram-chip returned an unsafe media path")
+                    media_size = os.path.getsize(media_path)
+                    if media_size <= 0 or media_size > max_bytes:
+                        raise ValueError("telegram-chip returned empty or oversized media")
+                    keep_owned_path = True
+                    return media_path
                 if declared and int(declared) > max_bytes:
                     raise ValueError("telegram-chip media exceeds the byte limit")
-                content_type = str(response.headers.get_content_type() or "")
                 if content_type and not (
                     content_type.startswith("audio/")
                     or content_type == "application/octet-stream"
@@ -10699,6 +11246,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 except OSError:
                     pass
             raise
+        finally:
+            if not keep_owned_path:
+                try:
+                    os.chmod(owned_dir, 0o700)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(owned_path)
+                except OSError:
+                    pass
+                try:
+                    os.rmdir(owned_dir)
+                except OSError:
+                    pass
 
     @staticmethod
     def _bounded_telegram_chip_context(text: object, limit: int = 16 * 1024) -> str:
@@ -10707,6 +11268,28 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(encoded) <= limit:
             return raw
         raise ValueError("telegram-chip context size limit exceeded")
+
+    @staticmethod
+    def _cleanup_telegram_chip_media_path(path: str) -> None:
+        """Remove one transient media file and only its proved owned directory."""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        parent = os.path.dirname(path)
+        try:
+            if (
+                os.path.basename(path) == "media"
+                and os.path.basename(parent).startswith("hermes-telegram-chip-media-")
+                and not os.path.islink(parent)
+                and (
+                    not hasattr(os, "getuid")
+                    or os.stat(parent).st_uid == os.getuid()
+                )
+            ):
+                os.rmdir(parent)
+        except OSError:
+            pass
 
     async def _resolve_telegram_chip_context(self, event: MessageEvent) -> bool:
         """Resolve private-link/reply context before the model sees the turn.
@@ -10869,10 +11452,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         except Exception:
             for path in recovered_paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                self._cleanup_telegram_chip_media_path(path)
             event.message_type = original_type
             event.media_urls = original_urls
             event.media_types = original_types
@@ -10940,10 +11520,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except OSError:
                     pass
             for path in transient_media:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                self._cleanup_telegram_chip_media_path(path)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
@@ -11272,7 +11849,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 _observe_type = self._media_message_type(_m)
                 _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
                 if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
+                    _event.text = self._clean_bot_trigger_text(
+                        self._expand_link_entities(_m)
+                    )
                 await self._cache_observed_media(_m, _event)
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
@@ -11287,7 +11866,9 @@ class TelegramAdapter(BasePlatformAdapter):
         
         # Add caption as text
         if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+            event.text = self._clean_bot_trigger_text(
+                self._expand_link_entities(msg)
+            )
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -11338,7 +11919,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.voice, "voice message")
                 if not allowed:
-                    event.text = self._append_observed_note(event.text, note or "")
+                    self._mark_telegram_media_too_large(event, msg.voice, "voice message")
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
                     await self.handle_message(event)
                     return
@@ -11355,7 +11936,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.audio, "audio file")
                 if not allowed:
-                    event.text = self._append_observed_note(event.text, note or "")
+                    self._mark_telegram_media_too_large(event, msg.audio, "audio file")
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
                     await self.handle_message(event)
                     return
@@ -11373,7 +11954,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.video, "video file")
                 if not allowed:
-                    event.text = self._append_observed_note(event.text, note or "")
+                    self._mark_telegram_media_too_large(event, msg.video, "video file")
                     logger.info("[Telegram] Skipped oversized user video (size=%s)", getattr(msg.video, "file_size", None))
                     await self.handle_message(event)
                     return
@@ -11418,11 +11999,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Check file size early so image documents cannot bypass the
                 # document size limit by taking the image path.
                 if not doc.file_size or doc.file_size > self._max_doc_bytes:
-                    limit_mb = self._max_doc_bytes // (1024 * 1024)
-                    event.text = (
-                        "The document is too large or its size could not be verified. "
-                        f"Maximum: {limit_mb} MB."
-                    )
+                    self._mark_telegram_media_too_large(event, doc, "document")
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
@@ -11855,7 +12432,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         chat = message.chat
         user = message.from_user
-        
+        route_chat_id = str(chat.id)
+
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
@@ -11878,7 +12456,7 @@ class TelegramAdapter(BasePlatformAdapter):
         topic_skill = None
 
         if chat_type == "dm" and thread_id_str:
-            topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
+            topic_info = self._get_dm_topic_info(route_chat_id, thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
                 topic_skill = topic_info.get("skill")
@@ -11887,7 +12465,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if hasattr(message, "forum_topic_created") and message.forum_topic_created:
                 created_name = message.forum_topic_created.name
                 if created_name:
-                    self._cache_dm_topic_from_message(str(chat.id), thread_id_str, created_name)
+                    self._cache_dm_topic_from_message(route_chat_id, thread_id_str, created_name)
                     if not chat_topic:
                         chat_topic = created_name
 
@@ -11910,7 +12488,7 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 group_topics_iter = []
             for chat_entry in group_topics_iter:
-                if str(chat_entry.get("chat_id", "")) == str(chat.id):
+                if str(chat_entry.get("chat_id", "")) == route_chat_id:
                     topics = chat_entry.get("topics", [])
                     if not isinstance(topics, list):
                         topics = []
@@ -11931,7 +12509,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message, chat_type=chat_type
         )
         source = self.build_source(
-            chat_id=str(chat.id),
+            chat_id=route_chat_id,
             chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
             chat_type=chat_type,
             user_id=(
@@ -12005,13 +12583,13 @@ class TelegramAdapter(BasePlatformAdapter):
                                     or "default"
                                 ),
                                 business_connection_id=reply_business_id,
-                                chat_id=str(chat.id),
+                                chat_id=route_chat_id,
                                 thread_id=thread_id_str,
                                 message_id=reply_to_id,
                             )
                         else:
                             reply_to_text = rich_sent_store.lookup(
-                                str(chat.id),
+                                route_chat_id,
                                 reply_to_id,
                             )
                     except Exception:
@@ -12019,20 +12597,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
-        _chat_id_str = str(chat.id)
+        _chat_id_str = route_chat_id
         _channel_prompt = resolve_channel_prompt(
             self.config.extra,
             thread_id_str or _chat_id_str,
             _chat_id_str if thread_id_str else None,
         )
 
-        _event_text = message.text or ""
+        _event_text = self._expand_link_entities(message)
         _auto_skill = topic_skill
         for _route in self.config.extra.get("auto_skill_routes", []) or []:
             if not isinstance(_route, dict):
                 continue
             _route_chats = {str(value) for value in (_route.get("chats") or [])}
-            if _route_chats and str(chat.id) not in _route_chats:
+            if _route_chats and route_chat_id not in _route_chats:
                 continue
             _match = _route.get("match") if isinstance(_route.get("match"), dict) else {}
             _url_match = bool(_match.get("urls")) and bool(
@@ -12061,6 +12639,12 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
             channel_prompt=_channel_prompt,
+            metadata={
+                "telegram_transport_sender_user_id": str(source.user_id or ""),
+                "telegram_route_profile": str(
+                    self._session_key_profile(source) or "default"
+                ),
+            },
             timestamp=message.date,
         )
 

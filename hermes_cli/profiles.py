@@ -1069,7 +1069,9 @@ def profiles_to_serve(
     - ``multiplex=True``: returns the default profile plus every valid named
       profile under ``profiles/``, each paired with its own HERMES_HOME. When
       ``profile_allowlist`` is provided, only selected named profiles are
-      included; the default profile is always served.
+      included; the default profile is always served. A named profile carrying
+      the explicit ``ARCHIVE_README.md`` contract remains discoverable for
+      read-only session search but is never runtime-served.
 
     Intentionally lightweight (a directory scan + name validation only): no
     per-profile config reads, gateway-running probes, or skill counts like
@@ -1108,6 +1110,12 @@ def profiles_to_serve(
             if not _PROFILE_ID_RE.match(name):
                 continue
             if allowed is not None and name not in allowed:
+                continue
+            if (entry / "ARCHIVE_README.md").is_file():
+                logger.info(
+                    "Excluding explicit archive profile from gateway runtime: %s",
+                    name,
+                )
                 continue
             serve.append((name, entry))
 

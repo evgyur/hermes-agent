@@ -310,6 +310,22 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+_STARTUP_RECOVERY_MARKER = (
+    "[Internal continuation marker: startup recovery turn.]"
+)
+_STARTUP_RECOVERY_NOTE_PREFIX = (
+    "[System note: The previous turn was interrupted by a gateway "
+)
+
+
+def _is_startup_recovery_user_turn(message: Any) -> bool:
+    """Recognize one-turn gateway recovery scaffolding after persistence."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    text = _content_text_for_contains(message.get("content")).strip()
+    return text == _STARTUP_RECOVERY_MARKER or text.startswith(
+        _STARTUP_RECOVERY_NOTE_PREFIX
+    )
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -5580,7 +5596,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
+        if (
+            message.get("observed") is True
+            or message.get("internal") is True
+            or str(message.get("display_kind") or "").casefold()
+            in {"internal_notification", "hidden"}
+        ):
+            return True
         if cls._has_compressed_summary_metadata(message):
+            return True
+        if _is_startup_recovery_user_turn(message):
             return True
         content = message.get("content")
         if cls._is_context_summary_content(content):

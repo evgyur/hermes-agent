@@ -97,6 +97,7 @@ async def test_queue_preserves_photo_media():
         text="/queue look at this",
         message_type=MessageType.PHOTO,
         source=_make_source(),
+        raw_message=SimpleNamespace(message_id="q-photo"),
         message_id="q-photo",
         media_urls=["/tmp/photo-a.jpg"],
         media_types=["image/jpeg"],
@@ -119,6 +120,7 @@ async def test_queue_preserves_reply_context():
     event = MessageEvent(
         text="/queue and this",
         source=_make_source(),
+        raw_message=SimpleNamespace(message_id="q-reply"),
         message_id="q-reply",
         reply_to_message_id="orig-7",
         reply_to_text="the original message",

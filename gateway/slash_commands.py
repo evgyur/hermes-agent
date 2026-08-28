@@ -574,8 +574,26 @@ class GatewaySlashCommandsMixin:
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
+        """Handle /status with the private operator-grade gateway snapshot.
+
+        Keep the current async SessionDB and dominant-route resolution, but do
+        not regress the presentation contract to the legacy session summary.
+        """
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _format_status_count,
+            _format_status_duration,
+            _gateway_status_auth_label,
+            _gateway_status_fallbacks,
+            _gateway_status_model_parts,
+            _gateway_status_runtime_label,
+            _load_gateway_runtime_config,
+            _read_system_uptime_seconds,
+            _resolve_gateway_model,
+            _status_git_revision,
+        )
+        from hermes_cli import __version__ as hermes_version
+        from hermes_cli.fallback_config import get_fallback_chain
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
@@ -610,7 +628,6 @@ class GatewaySlashCommandsMixin:
         # so session_entry.total_tokens is always 0.  SessionDB is the
         # single source of truth; reading it here keeps /status accurate
         # without duplicating token writes into two stores.
-        db_total_tokens = 0
         persisted_route: dict[str, Any] = {}
         if self._session_db:
             try:
@@ -621,15 +638,8 @@ class GatewaySlashCommandsMixin:
                 row = await self._session_db.get_session(session_entry.session_id)
                 if isinstance(row, dict):
                     session_row = row
-                    db_total_tokens = (
-                        _int_value(row.get("input_tokens"))
-                        + _int_value(row.get("output_tokens"))
-                        + _int_value(row.get("cache_read_tokens"))
-                        + _int_value(row.get("cache_write_tokens"))
-                        + _int_value(row.get("reasoning_tokens"))
-                    )
             except Exception:
-                db_total_tokens = 0
+                session_row = {}
             try:
                 route = await self._session_db.get_dominant_session_model_route(
                     session_entry.session_id
@@ -638,6 +648,27 @@ class GatewaySlashCommandsMixin:
                     persisted_route = route
             except Exception:
                 persisted_route = {}
+
+        input_tokens = _int_value(session_row.get("input_tokens"))
+        output_tokens = _int_value(session_row.get("output_tokens"))
+        cache_read = _int_value(session_row.get("cache_read_tokens"))
+        cache_write = _int_value(session_row.get("cache_write_tokens"))
+        reasoning_tokens = _int_value(session_row.get("reasoning_tokens"))
+        total_tokens = (
+            input_tokens
+            + output_tokens
+            + cache_read
+            + cache_write
+            + reasoning_tokens
+        )
+        api_calls = _int_value(session_row.get("api_call_count"))
+        cost_value = session_row.get("actual_cost_usd")
+        if cost_value is None:
+            cost_value = session_row.get("estimated_cost_usd")
+        try:
+            cost = float(cost_value or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
 
         # Resolve model/context for cockpit-style status. Prefer the live or
         # cached agent because it carries the actual runtime route and context
@@ -663,6 +694,7 @@ class GatewaySlashCommandsMixin:
         route_resolved = False
         context_used = 0
         context_total = 0
+        compression_count = 0
         if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
             live_model = _clean_str(getattr(status_agent, "model", ""))
             live_provider = _clean_str(getattr(status_agent, "provider", ""))
@@ -675,6 +707,9 @@ class GatewaySlashCommandsMixin:
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
                 context_total = _int_value(getattr(ctx, "context_length", 0))
+                compression_count = _int_value(
+                    getattr(ctx, "compression_count", 0)
+                )
 
         persisted_model = _clean_str(persisted_route.get("model"))
         persisted_provider = _clean_str(persisted_route.get("billing_provider"))
@@ -689,23 +724,50 @@ class GatewaySlashCommandsMixin:
             base_url = _clean_str(session_row.get("billing_base_url"))
         context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
-        user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
-            try:
-                user_config = _load_gateway_config()
-            except Exception:
-                user_config = {}
+        try:
+            user_config = _load_gateway_runtime_config()
+        except Exception:
+            user_config = {}
+        (
+            configured_model,
+            configured_provider,
+            configured_base_url,
+            configured_context,
+        ) = _gateway_status_model_parts(user_config)
         if not model_name:
-            model_name = _resolve_gateway_model(user_config)
+            model_name = _resolve_gateway_model(user_config) or configured_model
         if not provider_name:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            if isinstance(model_cfg, dict):
-                provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
+            provider_name = configured_provider
+        if (
+            not base_url
+            and model_name == configured_model
+            and provider_name == configured_provider
+        ):
+            base_url = configured_base_url
+        if not context_total and configured_context and configured_context > 0:
+            context_total = configured_context
+        if not context_total and model_name:
+            try:
+                from hermes_cli.model_switch import (
+                    resolve_display_context_length_async,
+                )
+
+                resolved_context = await resolve_display_context_length_async(
+                    model_name,
+                    provider_name,
+                    base_url=base_url,
+                    config_context_length=configured_context,
+                    configured_model=configured_model or None,
+                    configured_provider=configured_provider or None,
+                    configured_base_url=configured_base_url or None,
+                )
+                if resolved_context and resolved_context > 0:
+                    context_total = int(resolved_context)
+            except Exception:
+                logger.debug(
+                    "Could not resolve provider context window for /status",
+                    exc_info=True,
+                )
 
         model_line = ""
         if model_name:
@@ -726,27 +788,124 @@ class GatewaySlashCommandsMixin:
         elif context_used:
             context_line = t("gateway.status.context_used", used=f"{context_used:,}")
 
+        context_pct = 0
+        if context_total > 0:
+            context_pct = max(
+                0,
+                min(100, round((context_used / context_total) * 100)),
+            )
+
+        gateway_started = getattr(self, "_gateway_started_at", None)
+        gateway_uptime = (
+            _format_status_duration(time.time() - gateway_started)
+            if gateway_started
+            else "unknown"
+        )
+        system_uptime_seconds = _read_system_uptime_seconds()
+        system_uptime = (
+            _format_status_duration(system_uptime_seconds)
+            if system_uptime_seconds is not None
+            else "unknown"
+        )
+
+        cache_total = cache_read + input_tokens
+        cache_hit_pct = (
+            round((cache_read / cache_total) * 100)
+            if cache_total > 0 and cache_read
+            else 0
+        )
+        cache_line = (
+            f"🗄️ Cache: {cache_hit_pct}% hit · "
+            f"{_format_status_count(cache_read)} cached, "
+            f"{_format_status_count(cache_write)} new"
+            if cache_read or cache_write
+            else "🗄️ Cache: n/a"
+        )
+
+        fallback_chain = getattr(self, "_fallback_model", None) or get_fallback_chain(
+            user_config
+        )
+        try:
+            reason_cfg = (
+                self._resolve_session_reasoning_config(
+                    source=source,
+                    session_key=session_key,
+                )
+                or {}
+            )
+        except Exception:
+            reason_cfg = {}
+        think = str(
+            reason_cfg.get("effort")
+            or cfg_get(
+                user_config,
+                "agent",
+                "reasoning_effort",
+                default="",
+            )
+            or "medium"
+        )
+        fast_on = "on" if getattr(self, "_service_tier", None) else "off"
+        runtime_label = _gateway_status_runtime_label(provider_name, base_url)
+        auth_label = _gateway_status_auth_label(provider_name)
+        queue_mode = getattr(self, "_busy_input_mode", "interrupt") or "interrupt"
+
+        try:
+            updated_delta = max(
+                0,
+                int((datetime.now() - session_entry.updated_at).total_seconds()),
+            )
+        except Exception:
+            updated_delta = 0
+        if updated_delta < 5:
+            updated_text = "just now"
+        elif updated_delta < 60:
+            updated_text = f"{updated_delta}s ago"
+        else:
+            updated_text = f"{_format_status_duration(updated_delta)} ago"
+
+        session_label = (
+            self._redact_matrix_session_key(session_key)
+            if source.platform == Platform.MATRIX
+            else session_key
+        )
+        if len(session_label) > 96:
+            session_label = session_label[:93] + "..."
+        title_suffix = f" · {title}" if title else ""
+        model_display = model_name or "unknown"
+        if provider_name and not model_display.startswith(f"{provider_name}/"):
+            model_display = f"{provider_name}/{model_display}"
+
         lines = [
-            t("gateway.status.header"),
-            "",
-            t("gateway.status.session_id", session_id=session_entry.session_id),
+            f"🪽 **Hermes {hermes_version} ({_status_git_revision()})**",
+            f"⏱️ Uptime: gateway {gateway_uptime} · system {system_uptime}",
+            f"🧠 Model: {model_display} · 🔑 {auth_label}",
+            f"🔄 Fallbacks: {_gateway_status_fallbacks(fallback_chain)}",
+            f"🧮 Tokens: {_format_status_count(input_tokens)} in / "
+            f"{_format_status_count(output_tokens)} out · total "
+            f"{_format_status_count(total_tokens)} · 💵 Cost: ${cost:.4f}",
+            cache_line,
+            f"📚 Context: {_format_status_count(context_used)}/"
+            f"{_format_status_count(context_total)} ({context_pct}%) · "
+            f"🧹 Compactions: {compression_count}",
+            f"🧵 Session: `{session_label}` • updated {updated_text}{title_suffix}",
+            f"⚙️ Execution: direct · Runtime: {runtime_label} · "
+            f"Think: {think} · Fast: {fast_on}",
+            f"🪢 Queue: {queue_mode} (depth {queue_depth}) · "
+            f"Agent: {'running ⚡' if is_running else 'idle'} · Calls: {api_calls}",
+            f"🔌 Platforms: "
+            f"{', '.join(connected_platforms) if connected_platforms else 'none'}",
+            f"🆔 Session ID: `{session_entry.session_id}` · Created: "
+            f"{session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
         ]
-        if title:
-            lines.append(t("gateway.status.title", title=title))
-        lines.extend([
-            t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
-            t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
-        ])
         if model_line:
             lines.append(model_line)
         if context_line:
             lines.append(context_line)
-        lines.extend([
-            t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
-            t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
-        ])
-        if queue_depth:
-            lines.append(t("gateway.status.queued", count=queue_depth))
+        lines.append(
+            f"**Cumulative API tokens (re-sent each call):** {total_tokens:,}"
+        )
+
         if source.platform == Platform.MATRIX:
             adapter = self.adapters.get(Platform.MATRIX)
             scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
@@ -763,10 +922,6 @@ class GatewaySlashCommandsMixin:
                     session_key=self._redact_matrix_session_key(session_key),
                 ),
             ])
-        lines.extend([
-            "",
-            t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
-        ])
 
         return "\n".join(lines)
 
@@ -1438,6 +1593,12 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+
+        # /stop revokes the whole bounded task, including durable parent
+        # continuations that are not represented by a currently running agent.
+        # Without this, the barrier watcher can revive stopped work after a
+        # gateway restart even though /stop reported that nothing was active.
+        self._cancel_session_background_work(session_key, reason="user_stop")
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
@@ -4051,6 +4212,10 @@ class GatewaySlashCommandsMixin:
                 tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
+            elif value == "ultrafast":
+                tier = "ultrafast"
+                saved_value = "ultrafast"
+                label = "ULTRAFAST"
             elif value in {"normal", "off"}:
                 tier = None
                 saved_value = "normal"
@@ -4076,8 +4241,15 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.session_only", label=label)
 
         if not args or args == "status":
+            is_ultrafast = self._service_tier == "ultrafast"
             is_fast = self._service_tier == "priority"
-            status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
+            status = (
+                "ultrafast"
+                if is_ultrafast
+                else t("gateway.fast.status_fast")
+                if is_fast
+                else t("gateway.fast.status_normal")
+            )
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
                 return _apply_fast_selection(value, persist=persist_global)
@@ -4088,6 +4260,11 @@ class GatewaySlashCommandsMixin:
                 title=t("gateway.fast.picker_title", mode=status),
                 choices=[
                     {
+                        "value": "ultrafast",
+                        "label": "ultrafast — Ultrafast Processing on",
+                        "is_current": is_ultrafast,
+                    },
+                    {
                         "value": "fast",
                         "label": t("gateway.fast.choice_fast"),
                         "is_current": is_fast,
@@ -4095,7 +4272,7 @@ class GatewaySlashCommandsMixin:
                     {
                         "value": "normal",
                         "label": t("gateway.fast.choice_normal"),
-                        "is_current": not is_fast,
+                        "is_current": not is_fast and not is_ultrafast,
                     },
                 ],
                 on_choice_selected=_on_fast_choice,
@@ -4180,6 +4357,12 @@ class GatewaySlashCommandsMixin:
             or str(source.user_id) != str(source.chat_id)
         ):
             return "Tool progress can only be changed from the bot owner's plain Telegram DM."
+        if source.platform == Platform.TELEGRAM:
+            from gateway.slash_access import policy_for_source
+
+            policy = policy_for_source(self.config, source)
+            if not policy.enabled or not policy.is_admin(source.user_id):
+                return "Only the configured Telegram profile admin can change tool progress."
 
         # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose", "log"]

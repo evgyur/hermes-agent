@@ -1001,7 +1001,7 @@ def test_scoped_reply_text_never_falls_back_to_legacy_cross_profile_key(
 
 
 @pytest.mark.asyncio
-async def test_successful_business_send_survives_reply_index_commit_failure(
+async def test_business_send_fails_closed_when_reply_index_commit_fails(
     monkeypatch, tmp_path
 ):
     adapter = _make_adapter({"rich_messages": False})
@@ -1031,5 +1031,41 @@ async def test_successful_business_send_survives_reply_index_commit_failure(
     result = await adapter.send("12345", "must be receipted", metadata=metadata)
 
     adapter._bot.send_message.assert_awaited_once()
-    assert result.success is True
+    assert result.success is False
     assert result.message_id == "683"
+    assert result.error == "telegram_business_receipt_persist_failed"
+    assert result.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_rich_business_send_fails_closed_when_reply_index_commit_fails(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    from gateway import rich_sent_store
+
+    monkeypatch.setattr(rich_sent_store, "record_scoped", lambda **_kwargs: False)
+    metadata = {
+        "business_connection_id": "biz-1",
+        "external_safe_mode": True,
+        "telegram_business_external_contact": True,
+        "route_envelope": {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": "12345",
+            "thread_id": None,
+            "user_id": "42",
+            "business_connection_id": "biz-1",
+            "external_safe_mode": True,
+        },
+    }
+
+    result = await adapter.send("12345", RICH_CONTENT, metadata=metadata)
+
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert result.success is False
+    assert result.message_id == "123"
+    assert result.error == "telegram_business_receipt_persist_failed"
+    assert result.retryable is False

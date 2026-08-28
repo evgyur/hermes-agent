@@ -43,6 +43,9 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     runner._sessions = {}
     runner._draining = False
     runner._restart_requested = False
+    runner._admit_planned_restart_event = AsyncMock(
+        return_value="⏳ Gateway restarting — message safely queued."
+    )
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
@@ -63,6 +66,7 @@ def _event(*, profile: str | None) -> MessageEvent:
             chat_type="dm",
             user_id="user-1",
             profile=profile,
+            message_id="message-1",
         ),
         message_id="message-1",
     )
@@ -92,6 +96,9 @@ async def _load_profile_snapshot(
     (profile_home / "config.yaml").write_text(display, encoding="utf-8")
 
     assert await runner._start_one_profile_adapters("research", profile_home, {}) == 0
+    # These tests exercise profile-specific busy policy, not profile discovery.
+    # Route the stamped synthetic source to the snapshot created above.
+    runner._resolve_profile_home_for_source = lambda _source: Path(profile_home)
     adapter = _adapter()
     runner._profile_adapters["research"][Platform.TELEGRAM] = adapter
     runner._configure_profile_adapter(adapter, "research", Platform.TELEGRAM)
@@ -180,17 +187,16 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("default_mode", "secondary_mode", "queued"),
+    ("default_mode", "secondary_mode"),
     [
-        ("interrupt", "queue", True),
-        ("queue", "interrupt", False),
+        ("interrupt", "queue"),
+        ("queue", "interrupt"),
     ],
 )
-async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
+async def test_planned_restart_telegram_uses_durable_admission_for_every_busy_mode(
     tmp_path,
     default_mode,
     secondary_mode,
-    queued,
 ):
     runner = _runner(default_mode=default_mode)
     adapter = await _load_profile_snapshot(
@@ -204,7 +210,10 @@ async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     session_key = runner._session_key_for_source(event.source)
 
     assert await runner._handle_active_session_busy_message(event, session_key) is True
-    assert (session_key in adapter._pending_messages) is queued
+    assert adapter._pending_messages == {}
+    runner._admit_planned_restart_event.assert_awaited_once_with(
+        event, session_key
+    )
 
 
 @pytest.mark.asyncio
@@ -231,7 +240,8 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
 
     assert isinstance(response, str)
     assert "queued" in response
-    assert adapter._pending_messages[session_key] is event
+    assert adapter._pending_messages == {}
+    runner._admit_planned_restart_event.assert_awaited_once_with(event, session_key)
     agent.interrupt.assert_not_called()
 
 
@@ -269,6 +279,48 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     assert event.source.profile == "research"
     agent.steer.assert_called_once_with("follow up")
     agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_primary_adapter_busy_guard_enters_routed_profile_scope(
+    tmp_path,
+    monkeypatch,
+):
+    """A shared Telegram listener must persist busy input in the routed DB."""
+    runner = _runner(default_mode="interrupt")
+    profile_home = tmp_path / "hermesdev"
+    event = _event(profile="hermesdev")
+    entered = []
+    observed = []
+
+    class _Scope:
+        def __init__(self, home):
+            self.home = Path(home)
+
+        def __enter__(self):
+            entered.append(self.home)
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(
+        "gateway.run._profile_runtime_scope",
+        lambda home: _Scope(home),
+    )
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+
+    async def _record_busy(_event, session_key):
+        observed.append((_event.source.profile, session_key))
+        return True
+
+    runner._handle_active_session_busy_message = _record_busy
+    handler = runner._primary_busy_session_handler()
+
+    assert await handler(event, "agent:main:telegram:group:chat-1") is True
+    assert entered == [profile_home]
+    assert observed == [
+        ("hermesdev", "agent:hermesdev:telegram:dm:chat-1")
+    ]
 
 
 @pytest.mark.asyncio

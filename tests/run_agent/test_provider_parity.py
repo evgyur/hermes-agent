@@ -458,6 +458,16 @@ class TestBuildApiKwargsCodex:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
 
+    def test_includes_ultrafast_service_tier_via_request_overrides(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        agent.model = "gpt-5.6-sol"
+        agent.service_tier = "ultrafast"
+        agent.request_overrides = {"service_tier": "ultrafast"}
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["service_tier"] == "ultrafast"
+
 
 
     def test_tools_converted_to_responses_format(self, monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -102,12 +103,123 @@ def _business_update(message: SimpleNamespace) -> SimpleNamespace:
     )
 
 
+def _plain_owner_dm_message(*, text: str) -> SimpleNamespace:
+    message = _business_message(
+        chat_id=OWNER_ID,
+        text=text,
+    )
+    message.business_connection_id = None
+    message.message_id = 14124
+    return message
+
+
+def _plain_update(message: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        update_id=9000,
+        effective_message=message,
+        message=message,
+    )
+
+
 def test_unset_mock_reply_does_not_forge_business_connection() -> None:
     """Loose MagicMock attributes must not turn an ordinary DM into Business traffic."""
     message = MagicMock()
     message.business_connection_id = None
 
     assert TelegramAdapter._telegram_supplied_business_connection_id(message) is None
+
+
+def test_owner_business_voice_uses_the_bounded_auto_transcribe_route() -> None:
+    adapter = _adapter()
+    message = _business_message(
+        chat_id=SAFE_CUSTOMER_ID,
+        voice=SimpleNamespace(file_id="voice-owner", file_size=1024),
+    )
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_customer_business_voice_never_enters_the_owner_transcribe_route() -> None:
+    adapter = _adapter()
+    message = _business_message(
+        chat_id=SAFE_CUSTOMER_ID,
+        from_user_id=SAFE_CUSTOMER_ID,
+        voice=SimpleNamespace(file_id="voice-customer", file_size=1024),
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_dispatch_preserves_the_exact_safe_route(
+    monkeypatch, tmp_path
+) -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    cached = tmp_path / "owner-business.ogg"
+    file_obj = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"voice")))
+    voice = SimpleNamespace(
+        file_id="voice-owner",
+        file_size=1024,
+        get_file=AsyncMock(return_value=file_obj),
+    )
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, voice=voice)
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+        lambda *_a, **_k: str(cached),
+    )
+
+    await adapter._handle_media_message(_business_update(message), SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+    assert event.source.thread_id is None
+    assert event.media_urls == [str(cached)]
+    assert event.media_types == ["audio/ogg"]
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_bot_chat_mirror_never_downloads_or_dispatches() -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    voice = SimpleNamespace(
+        file_id="voice-mirror",
+        file_size=1024,
+        get_file=AsyncMock(),
+    )
+    mirror = _business_message(chat_id=str(BOT_ID), voice=voice)
+
+    await adapter._handle_media_message(_business_update(mirror), SimpleNamespace())
+
+    voice.get_file.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owner_business_voice_download_error_stays_on_the_same_safe_route() -> None:
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    voice = SimpleNamespace(
+        file_id="voice-error",
+        file_size=1024,
+        get_file=AsyncMock(side_effect=RuntimeError("cdn unavailable")),
+    )
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, voice=voice)
+    message.reply_text = AsyncMock()
+
+    await adapter._handle_media_message(_business_update(message), SimpleNamespace())
+
+    message.reply_text.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+    assert "could not be downloaded" in event.text
 
 
 @pytest.mark.asyncio
@@ -151,6 +263,49 @@ async def test_owner_text_requires_explicit_prefix_in_customer_chat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owner_business_bot_chat_mirror_is_dropped_after_plain_dm() -> None:
+    """One Telegram DM delivered through two envelopes must dispatch once."""
+    adapter = _adapter()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._cache_replied_media = AsyncMock()
+    plain = _plain_owner_dm_message(text="привет")
+    mirror = _business_message(
+        chat_id=str(BOT_ID),
+        text="привет",
+    )
+
+    await adapter._handle_text_message(_plain_update(plain), SimpleNamespace())
+    await adapter._handle_text_message(_business_update(mirror), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "привет"
+    assert event.source.chat_id == OWNER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id is None
+    assert event.source.external_safe_mode is False
+    assert ":telegram:dm:" in build_session_key(event.source)
+
+
+@pytest.mark.asyncio
+async def test_owner_new_command_business_mirror_does_not_reset_twice() -> None:
+    """Production incident: one /new must produce one reset dispatch."""
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    adapter._cache_replied_media = AsyncMock()
+    plain = _plain_owner_dm_message(text="/new")
+    mirror = _business_message(chat_id=str(BOT_ID), text="/new")
+
+    await adapter._handle_command(_plain_update(plain), SimpleNamespace())
+    await adapter._handle_command(_business_update(mirror), SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/new"
+    assert event.source.chat_id == OWNER_ID
+
+
+@pytest.mark.asyncio
 async def test_owner_explicit_business_wake_preserves_connection_and_safe_lane() -> None:
     adapter = _adapter()
     adapter._enqueue_text_event = MagicMock()
@@ -170,6 +325,47 @@ async def test_owner_explicit_business_wake_preserves_connection_and_safe_lane()
     assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
     assert event.source.external_safe_mode is True
     assert ":telegram:business:" in build_session_key(event.source)
+
+
+@pytest.mark.asyncio
+async def test_owner_short_resume_requires_recent_exact_business_session() -> None:
+    """A bare ``go on`` resumes Hermes, but never opens an arbitrary owner DM."""
+    adapter = _adapter()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._cache_replied_media = AsyncMock()
+    adapter._has_recent_business_session = MagicMock(return_value=False)
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, text="go on")
+
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_not_called()
+
+    adapter._has_recent_business_session.return_value = True
+    await adapter._handle_text_message(_business_update(message), SimpleNamespace())
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "go on"
+    assert event.source.chat_id == SAFE_CUSTOMER_ID
+    assert event.source.user_id == OWNER_ID
+    assert event.source.business_connection_id == BUSINESS_CONNECTION_ID
+    assert event.source.external_safe_mode is True
+
+
+def test_short_resume_session_proof_uses_exact_business_route() -> None:
+    adapter = _adapter()
+    lookup = MagicMock(
+        return_value=SimpleNamespace(updated_at=datetime.now(timezone.utc))
+    )
+    adapter._session_store = SimpleNamespace(lookup_by_session_key=lookup)
+    message = _business_message(chat_id=SAFE_CUSTOMER_ID, text="продолжай")
+
+    assert adapter._has_recent_business_session(message) is True
+    session_key = lookup.call_args.args[0]
+    assert session_key == (
+        f"agent:main:telegram:business:{BUSINESS_CONNECTION_ID}:"
+        f"{SAFE_CUSTOMER_ID}:{OWNER_ID}:external"
+    )
 
 
 @pytest.mark.asyncio
@@ -208,6 +404,62 @@ def test_cached_business_connections_are_isolated_by_transport_profile(
 
     assert adapter_a._known_business_connection_id(SAFE_CUSTOMER_ID) == "biz-a"
     assert adapter_b._known_business_connection_id(SAFE_CUSTOMER_ID) == "biz-b"
+
+
+def test_legacy_business_route_is_promoted_only_from_current_scoped_connection(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter()
+    store = adapter._business_connection_store_path()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    confirmed_peer = "700000777"
+    store.write_text(
+        json.dumps(
+            {
+                confirmed_peer: BUSINESS_CONNECTION_ID,
+                SAFE_CUSTOMER_ID: BUSINESS_CONNECTION_ID,
+                adapter._business_connection_store_key(confirmed_peer): (
+                    BUSINESS_CONNECTION_ID
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert adapter._known_business_connection_id(SAFE_CUSTOMER_ID) == (
+        BUSINESS_CONNECTION_ID
+    )
+    persisted = json.loads(store.read_text(encoding="utf-8"))
+    assert persisted[adapter._business_connection_store_key(SAFE_CUSTOMER_ID)] == (
+        BUSINESS_CONNECTION_ID
+    )
+
+
+def test_legacy_business_route_from_another_transport_profile_stays_closed(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter()
+    other = _adapter()
+    other._owner_profile = "other-transport"
+    store = adapter._business_connection_store_path()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(
+        json.dumps(
+            {
+                SAFE_CUSTOMER_ID: BUSINESS_CONNECTION_ID,
+                other._business_connection_store_key("700000777"): (
+                    BUSINESS_CONNECTION_ID
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert adapter._known_business_connection_id(SAFE_CUSTOMER_ID) is None
+    persisted = json.loads(store.read_text(encoding="utf-8"))
+    assert adapter._business_connection_store_key(SAFE_CUSTOMER_ID) not in persisted
 
 
 def test_business_source_round_trip_and_connection_isolation() -> None:

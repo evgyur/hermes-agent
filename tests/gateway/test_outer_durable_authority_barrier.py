@@ -248,6 +248,7 @@ async def test_retry_adopts_reused_authority_tail_before_short_approval_preproce
             "_row_id": 202,
             "role": "assistant",
             "content": "Latest candidate commitment: deploy candidate 31e after approval.",
+            "finish_reason": "stop",
             "_db_persisted": True,
         },
         {

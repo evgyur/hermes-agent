@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -47,6 +47,15 @@ def _make_runner():
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={"allow_admin_from": ["12345"]},
+            )
+        }
+    )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     return runner
 
@@ -124,6 +133,25 @@ class TestVerboseCommand:
         assert config_path.read_text(encoding="utf-8") == original
 
     @pytest.mark.asyncio
+    async def test_verbose_non_owner_dm_cannot_mutate_profile_setting(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        original = "display:\n  tool_progress_command: true\n  tool_progress: all\n"
+        config_path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        result = await runner._handle_verbose_command(
+            _make_event(user_id="99999", chat_id="99999")
+        )
+
+        assert "owner" in result.lower() or "admin" in result.lower()
+        assert config_path.read_text(encoding="utf-8") == original
+
+    @pytest.mark.asyncio
     async def test_quoted_false_keeps_command_disabled(self, tmp_path, monkeypatch):
         """Quoted false must not enable the /verbose gateway command."""
         hermes_home = tmp_path / "hermes"
@@ -141,4 +169,3 @@ class TestVerboseCommand:
 
         assert "not enabled" in result.lower()
         assert "tool_progress_command" in result
-

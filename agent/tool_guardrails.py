@@ -492,6 +492,19 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
+        # A landed write/patch changes the execution environment for commands
+        # that may consume the edited file.  The terminal arguments can remain
+        # byte-identical (for example, ``python repair.py``) while the command
+        # itself is no longer the same attempt.  Discard only terminal failure
+        # history; all other guardrail state and thresholds remain intact.
+        if file_mutation_result_landed(tool_name, result):
+            self._exact_failure_counts = {
+                observed_signature: count
+                for observed_signature, count in self._exact_failure_counts.items()
+                if observed_signature.tool_name != "terminal"
+            }
+            self._same_tool_failure_counts.pop("terminal", None)
+
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)

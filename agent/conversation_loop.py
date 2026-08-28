@@ -2187,6 +2187,15 @@ def run_conversation(
                 else:
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                drained_receipts = list(
+                    getattr(agent, "_drained_steer_receipts", []) or []
+                )
+                if drained_receipts:
+                    pending_receipts = list(
+                        getattr(agent, "_pending_steer_receipts", []) or []
+                    )
+                    agent._pending_steer_receipts = drained_receipts + pending_receipts
+                    agent._drained_steer_receipts = []
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
@@ -3280,6 +3289,12 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _steer_request_fenced = bool(
+                    (_pre_api_steer and _injected)
+                    or getattr(agent, "_drained_steer_receipts", None)
+                )
+                if _steer_request_fenced:
+                    agent._mark_drained_steer_request_fenced()
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -3297,6 +3312,13 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                except BaseException:
+                    if _steer_request_fenced:
+                        agent._mark_fenced_steer_provider_result(accepted=False)
+                    raise
+                else:
+                    if _steer_request_fenced:
+                        agent._mark_fenced_steer_provider_result(accepted=True)
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:

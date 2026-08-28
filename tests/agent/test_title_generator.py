@@ -1,5 +1,7 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
+import threading
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -244,6 +246,47 @@ class TestAutoTitleSession:
 
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
+
+    def test_background_title_keeps_the_active_profile_secret_scope(self):
+        """The daemon worker must not lose multiplex profile credentials."""
+        from agent.secret_scope import (
+            get_secret,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        called = threading.Event()
+        observed = {}
+
+        def worker(*_args, **_kwargs):
+            try:
+                observed["key"] = get_secret("FREEMODEL_API_KEY")
+            except Exception as exc:  # captured for the assertion below
+                observed["error"] = exc
+            finally:
+                called.set()
+
+        set_multiplex_active(True)
+        token = set_secret_scope({"FREEMODEL_API_KEY": "profile-key"})
+        try:
+            with patch(
+                "agent.title_generator.auto_title_session", side_effect=worker
+            ):
+                maybe_auto_title(
+                    db,
+                    "sess-profile-scope",
+                    "fix title generation",
+                    [{"role": "user", "content": "fix title generation"}],
+                )
+                assert called.wait(timeout=10), "auto-title worker never ran"
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert observed == {"key": "profile-key"}
 
     def test_skips_if_not_first_exchange(self):
         """Should not fire once the conversation is past its opening turn."""

@@ -58,7 +58,7 @@ def test_run_conversation_persists_tokens_for_telegram_sessions():
 
 
 
-def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
+def test_invoke_session_search_forwards_profile_when_opening_db_lazily(monkeypatch):
     sentinel_db = object()
     captured = {}
 
@@ -82,7 +82,7 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     agent = _make_agent(None, platform="acp")
     result = json.loads(agent._invoke_tool(
         "session_search",
-        {"query": "Hermes", "detail": "full"},
+        {"query": "Hermes", "detail": "full", "profile": "default"},
         "task-id",
     ))
 
@@ -90,10 +90,11 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert captured["db"] is sentinel_db
     assert captured["query"] == "Hermes"
     assert captured["detail"] == "full"
+    assert captured["profile"] == "default"
     assert agent._session_db is sentinel_db
 
 
-def test_sequential_session_search_forwards_detail(monkeypatch):
+def test_sequential_session_search_forwards_profile(monkeypatch):
     session_db = MagicMock()
     captured = {}
 
@@ -111,7 +112,9 @@ def test_sequential_session_search_forwards_detail(monkeypatch):
         id="search-1",
         function=SimpleNamespace(
             name="session_search",
-            arguments=json.dumps({"query": "Hermes", "detail": "full"}),
+            arguments=json.dumps(
+                {"query": "Hermes", "detail": "full", "profile": "default"}
+            ),
         ),
     )
     assistant_message = SimpleNamespace(tool_calls=[tool_call])
@@ -126,3 +129,4 @@ def test_sequential_session_search_forwards_detail(monkeypatch):
     assert captured["db"] is session_db
     assert captured["query"] == "Hermes"
     assert captured["detail"] == "full"
+    assert captured["profile"] == "default"
