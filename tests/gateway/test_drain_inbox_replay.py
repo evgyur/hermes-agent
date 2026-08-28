@@ -21,12 +21,17 @@ class _RecordingTelegramAdapter:
 
     def __init__(self):
         self.events = []
+        self.sent = []
 
     async def handle_message(self, event):
         async def _consume():
             self.events.append(event)
 
         return asyncio.create_task(_consume())
+
+    async def _send_with_retry(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(success=True, message_id="ack")
 
 
 class _BusyQueueTelegramAdapter(_RecordingTelegramAdapter):
@@ -69,6 +74,38 @@ def _runner(monkeypatch, tmp_path):
         gateway_run, "_profile_runtime_scope", lambda _home: nullcontext()
     )
     return runner, db, adapter
+
+
+@pytest.mark.asyncio
+async def test_busy_session_input_during_planned_drain_is_durable_before_ack(
+    monkeypatch, tmp_path
+):
+    """An active adapter session must not bypass the restart inbox."""
+
+    runner, db, adapter = _runner(monkeypatch, tmp_path)
+    event = _event("707", "arrived while the current turn was finishing")
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._draining = True
+    runner._restart_requested = True
+    runner._validated_turn_authority_source = lambda _event, _key: _event.source
+    runner._is_user_authorized = lambda _source: True
+    runner._adapter_for_source = lambda _source: adapter
+    runner._effective_busy_input_mode = lambda _source: "interrupt"
+    runner._handle_active_session_busy_message = (
+        gateway_run.GatewayRunner._handle_active_session_busy_message.__get__(runner)
+    )
+    try:
+        await runner._handle_active_session_busy_message(event, session_key)
+
+        rows = db.list_gateway_drain_inbox_ready()
+        assert [(row["message_id"], row["state"]) for row in rows] == [
+            ("707", "READY")
+        ]
+        assert [item["content"] for item in adapter.sent] == [
+            "⏳ Gateway restarting — message safely queued."
+        ]
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

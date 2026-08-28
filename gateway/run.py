@@ -11680,13 +11680,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
-            adapter = self._adapter_for_source(event.source)
-            if not adapter:
-                return True
-
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled(effective_mode):
+            if (
+                self._restart_requested
+                and event.source.platform == Platform.TELEGRAM
+            ):
+                # BasePlatformAdapter routes a follow-up for an already-active
+                # session here before GatewayRunner._handle_message sees it.
+                # Planned-restart durability must therefore live on both
+                # admission paths; otherwise the exact updates most likely to
+                # arrive during a long drain are only held in RAM (or rejected)
+                # and disappear when the process exits.
+                message = await self._admit_planned_restart_event(
+                    event, session_key
+                )
+            elif self._queue_during_drain_enabled(effective_mode):
                 admitted = self._queue_or_replace_pending_event(session_key, event)
                 if (
                     getattr(event, "_hermes_trusted_restart_event", None)
@@ -11698,6 +11707,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
+            adapter = self._adapter_for_source(event.source)
+            if not adapter:
+                # A committed drain-inbox row remains authoritative even when
+                # its best-effort acknowledgement transport vanished during
+                # multiplex teardown. Startup replay still owns the input.
+                return True
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
