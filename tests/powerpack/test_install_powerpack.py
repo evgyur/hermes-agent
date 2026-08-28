@@ -18,6 +18,7 @@ def test_locked_sync_preserves_the_configured_messaging_runtime():
     installer = INSTALLER.read_text(encoding="utf-8")
 
     assert '"$uv_bin" sync --project "$INSTALL_DIR" --extra all --extra messaging --locked' in installer
+    assert "UV_NO_CACHE=1" in installer
 
 
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

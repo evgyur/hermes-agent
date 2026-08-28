@@ -268,7 +268,7 @@ if [[ "$SYNC_DEPS" == true ]]; then
         uv_bin="$HERMES_HOME/uv/bin/uv"
     fi
     [[ -n "$uv_bin" ]] || die "uv is required for locked dependency sync"
-    UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" \
+    UV_NO_CACHE=1 UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" \
         "$uv_bin" sync --project "$INSTALL_DIR" --extra all --extra messaging --locked
     "$INSTALL_DIR/venv/bin/python" -c \
         "import hermes_cli; assert hermes_cli.__version__ == '$init_version'"
