@@ -21,7 +21,13 @@ def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+        env={
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            # Contract tests operate on temporary checkouts.  They must never
+            # observe, stop, or require --restart for a real host gateway.
+            "HERMES_GATEWAY_SERVICE": "hermes-powerpack-test.invalid.service",
+        },
     )
     if check and result.returncode != 0:
         raise AssertionError(
