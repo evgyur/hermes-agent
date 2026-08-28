@@ -19649,6 +19649,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The route selects agent/session state, not which bot admitted the
             # message. Keep those two trust domains separate.
             source._authorization_profile_home = default_home
+            authority_source = getattr(
+                event,
+                "_hermes_turn_authority_source",
+                None,
+            )
+            if isinstance(authority_source, SessionSource):
+                # Observed-group mode intentionally anonymizes the shared
+                # session route. Its process-local principal carrier was
+                # admitted by this same transport, so preserve the transport
+                # authorization scope on both halves of the sealed event.
+                authority_source._authorization_profile_home = default_home
             if (
                 not getattr(source, "profile", None)
                 and getattr(source, "profile_route_rejected", False) is not True
@@ -20796,20 +20807,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
+        authorization_source = source
+        if not is_internal and source.platform == Platform.TELEGRAM:
+            authorization_source = self._validated_turn_authority_source(
+                event,
+                self._session_key_for_source(source),
+            )
+            if authorization_source is None:
+                return None
+
         if is_internal:
             pass
-        elif source.user_id is None:
+        elif authorization_source.user_id is None:
             # Messages with no user identity (Telegram service messages,
             # channel forwards, anonymous admin posts, sender_chat) can't
             # be paired, but they can still be authorized via a
             # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized_for_source(source):
+            if not self._is_user_authorized_for_source(authorization_source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized_for_source(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+        elif not self._is_user_authorized_for_source(authorization_source):
+            logger.warning(
+                "Unauthorized user: %s (%s) on %s",
+                authorization_source.user_id,
+                authorization_source.user_name,
+                source.platform.value,
+            )
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -20830,10 +20855,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(
+                    platform_name, authorization_source.user_id
+                ):
                     return None
                 code = pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
+                    platform_name,
+                    authorization_source.user_id,
+                    authorization_source.user_name or "",
                 )
                 if code:
                     adapter = self._adapter_for_source(source)
@@ -20863,7 +20892,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(
+                        platform_name, authorization_source.user_id
+                    )
             return None
 
         # A planned restart is a lifecycle boundary, not a rejection boundary.
@@ -24250,7 +24281,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 )
                 == canonical_resume_origin(source)
-                and self._is_user_authorized(authority_source)
+                and self._is_user_authorized_for_source(authority_source)
             ):
                 logger.warning(
                     "Rejected mismatched active-turn authority carrier for %s",

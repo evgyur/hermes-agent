@@ -285,6 +285,7 @@ async def test_authorized_text_emits_content_free_ingress_stage_markers(caplog):
     adapter._cache_replied_media = AsyncMock()
     adapter._apply_telegram_group_observe_attribution = lambda event: event
     adapter._clean_bot_trigger_text = lambda text: text
+    adapter._should_process_message = lambda *_args, **_kwargs: True
     adapter._recover_transcribe_route_tme_link_via_telegram_chip = AsyncMock(
         return_value=False
     )

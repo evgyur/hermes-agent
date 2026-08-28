@@ -146,6 +146,60 @@ class TestBusySessionAck:
         assert handled is True
         agent.steer.assert_called_once_with("продолжаешь?")
 
+    @pytest.mark.asyncio
+    async def test_observed_group_cold_ingress_authorizes_validated_principal_carrier(self):
+        """Top-level ingress auth must not reject the anonymized shared route."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        runner._is_user_authorized = (
+            lambda source: source.user_id == "617744661"
+        )
+        adapter = _make_adapter()
+
+        authority_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="49708",
+            user_id="617744661",
+            message_id="49715",
+        )
+        shared_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="49708",
+            user_id=None,
+            message_id="49715",
+        )
+        event = MessageEvent(
+            text="HERMES_INGRESS_CANARY_0213",
+            message_type=MessageType.TEXT,
+            source=shared_source,
+            message_id="49715",
+        )
+        event._hermes_turn_authority_source = authority_source
+        session_key = build_session_key(shared_source)
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time() - 8
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        agent.redirect.assert_called_once_with("HERMES_INGRESS_CANARY_0213")
+
 
     @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
