@@ -8136,6 +8136,46 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+def _named_custom_provider_cache_identity(
+    provider: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve secret-safe cache inputs for one named custom provider.
+
+    ``_get_cached_client`` is called before ``resolve_provider_client`` expands
+    a named provider into its configured endpoint and credential.  Keying the
+    cache only on the symbolic provider name therefore reused a client built
+    with an older key after a reviewed config/key rotation.  Resolve the same
+    static connection fields for cache discrimination; ``_client_cache_key``
+    digests the credential and never retains it in its repr.
+    """
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(provider)
+    except Exception:
+        return None, None, None
+    if not isinstance(entry, dict):
+        return None, None, None
+
+    base_url = str(entry.get("base_url") or "").strip() or None
+    api_key = str(entry.get("api_key") or "").strip() or None
+    if api_key is None:
+        key_env = str(
+            entry.get("key_env") or entry.get("api_key_env") or ""
+        ).strip()
+        if key_env:
+            api_key = _scoped_key_env(key_env) or None
+    if api_key is None:
+        # Do not execute key_cmd solely to build a cache key.  Its command
+        # identity still invalidates the client when the reviewed source
+        # changes; callable/token refresh remains owned by the resolver.
+        key_cmd = str(entry.get("key_cmd") or "").strip()
+        if key_cmd:
+            api_key = f"key-cmd:{key_cmd}"
+    api_mode = str(entry.get("api_mode") or "").strip() or None
+    return base_url, api_key, api_mode
+
+
 def _get_cached_client(
     provider: str,
     model: str = None,
@@ -8175,12 +8215,24 @@ def _get_cached_client(
         except RuntimeError:
             pass
     runtime = _normalize_main_runtime(main_runtime)
+    cache_base_url = base_url
+    cache_api_key = api_key
+    cache_api_mode = api_mode
+    if not base_url and not api_key:
+        named_base_url, named_api_key, named_api_mode = (
+            _named_custom_provider_cache_identity(provider)
+        )
+        if named_base_url:
+            cache_base_url = named_base_url
+            cache_api_key = named_api_key
+            cache_api_mode = api_mode or named_api_mode
+
     cache_key = _client_cache_key(
         provider,
         async_mode=async_mode,
-        base_url=base_url,
-        api_key=api_key,
-        api_mode=api_mode,
+        base_url=cache_base_url,
+        api_key=cache_api_key,
+        api_mode=cache_api_mode,
         main_runtime=main_runtime,
         is_vision=is_vision,
         task=task,
