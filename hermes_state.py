@@ -11454,16 +11454,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             target = row
             if int(row["active"] or 0) != 1:
                 if platform_message_id is None:
-                    raise RuntimeError(
-                        "inactive gateway authority without platform identity is ambiguous"
-                    )
-                candidates = conn.execute(
-                    "SELECT id, role, content, active, platform_message_id, "
-                    "display_kind, display_metadata FROM messages WHERE session_id = ? "
-                    "AND role = 'user' AND active = 1 "
-                    "AND platform_message_id = ? ORDER BY id",
-                    (session_id, platform_message_id),
-                ).fetchall()
+                    # Internal gateway events intentionally have no platform
+                    # message id.  Compaction may replace their prepared row
+                    # while attachment/hook preprocessing is still running.
+                    # Recover only the one active copy whose full raw content
+                    # and sealed semantic provenance are byte-identical; a
+                    # duplicate remains ambiguous and fails closed below.
+                    candidates = conn.execute(
+                        "SELECT id, role, content, active, platform_message_id, "
+                        "display_kind, display_metadata FROM messages "
+                        "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                        "AND platform_message_id IS NULL AND content = ? "
+                        "AND display_kind IS ? AND display_metadata IS ? ORDER BY id",
+                        (
+                            session_id,
+                            row["content"],
+                            row["display_kind"],
+                            row["display_metadata"],
+                        ),
+                    ).fetchall()
+                else:
+                    candidates = conn.execute(
+                        "SELECT id, role, content, active, platform_message_id, "
+                        "display_kind, display_metadata FROM messages "
+                        "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                        "AND platform_message_id = ? ORDER BY id",
+                        (session_id, platform_message_id),
+                    ).fetchall()
                 if len(candidates) != 1:
                     raise RuntimeError(
                         "compacted durable gateway authority is ambiguous"

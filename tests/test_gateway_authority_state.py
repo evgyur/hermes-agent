@@ -82,6 +82,109 @@ def test_gateway_authority_user_row_reuses_only_exact_unfinished_tail(tmp_path):
         db.close()
 
 
+def test_internal_gateway_authority_survives_compaction_without_platform_id(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "internal-authority-session"
+        holder = "pid=1:internal-gateway-authority"
+        raw_semantics = {
+            "gateway_raw_semantic_v1": {
+                "version": 1,
+                "message_type": "text",
+                "reply": None,
+                "media": [],
+            }
+        }
+        db.create_session(session_id, source="telegram")
+        assert db.acquire_session_turn_lease(
+            session_id,
+            holder,
+            wait_seconds=0.1,
+        )
+        inserted = db.append_or_reuse_gateway_user_authority(
+            session_id,
+            content="internal watch notification",
+            platform_message_id=None,
+            display_kind="internal_notification",
+            display_metadata=raw_semantics,
+            turn_lease_holder=holder,
+        )
+
+        db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "older history summary"}],
+            watermark=inserted.row_id - 1,
+            turn_lease_holder=holder,
+        )
+        enriched_row_id = db.enrich_gateway_user_authority(
+            session_id,
+            inserted.row_id,
+            content="internal watch notification after preprocessing",
+            platform_message_id=None,
+            turn_lease_holder=holder,
+        )
+
+        assert enriched_row_id != inserted.row_id
+        durable = db.get_messages_as_conversation(session_id)
+        assert durable[-1]["content"] == (
+            "internal watch notification after preprocessing"
+        )
+        assert durable[-1]["display_kind"] == "internal_notification"
+        assert durable[-1]["display_metadata"] == raw_semantics
+    finally:
+        db.close()
+
+
+def test_internal_gateway_authority_still_fails_closed_when_copy_is_ambiguous(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "ambiguous-internal-authority"
+        holder = "pid=1:ambiguous-internal-authority"
+        metadata = {"gateway_raw_semantic_v1": {"version": 1}}
+        db.create_session(session_id, source="telegram")
+        assert db.acquire_session_turn_lease(session_id, holder, wait_seconds=0.1)
+        inserted = db.append_or_reuse_gateway_user_authority(
+            session_id,
+            content="same internal notification",
+            platform_message_id=None,
+            display_kind="internal_notification",
+            display_metadata=metadata,
+            turn_lease_holder=holder,
+        )
+        db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "older history summary"}],
+            watermark=inserted.row_id - 1,
+            turn_lease_holder=holder,
+        )
+        db.append_or_reuse_gateway_user_authority(
+            session_id,
+            content="same internal notification",
+            platform_message_id=None,
+            display_kind="internal_notification",
+            display_metadata=metadata,
+            turn_lease_holder=holder,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="compacted durable gateway authority is ambiguous",
+        ):
+            db.enrich_gateway_user_authority(
+                session_id,
+                inserted.row_id,
+                content="processed internal notification",
+                platform_message_id=None,
+                turn_lease_holder=holder,
+            )
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_gateway_authority_seals_direct_reply_semantics_before_marker(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
