@@ -1191,6 +1191,81 @@ def _retry_compression_on_fallback_chain(
     return result_msgs, result_prompt
 
 
+def _retry_compression_with_deterministic_fallback(
+    *,
+    worker: Callable[[CompressionCommitFence], Tuple[list, str]],
+    messages: list,
+    system_prompt_fallback: Any,
+    idle_timeout_seconds: float,
+    total_ceiling_seconds: float,
+    on_commit_overrun: Optional[Callable[[float, float], None]] = None,
+    telemetry_agent: Any = None,
+    new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+) -> Optional[Tuple[list, str]]:
+    """Finish compression locally after every bounded summary route stalls.
+
+    ``abort_on_summary_failure=True`` remains a strict opt-out.  The local
+    path reuses ContextCompressor's bounded deterministic handoff, protected
+    recent tail, and ordinary commit fence; it never invents another model
+    route and never runs after an explicit stop.
+    """
+    compressor = getattr(telemetry_agent, "context_compressor", None)
+    if compressor is None or bool(
+        getattr(compressor, "abort_on_summary_failure", True)
+    ):
+        return None
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
+        return None
+
+    retry_fence = None
+    if new_fence is not None:
+        try:
+            retry_fence = new_fence()
+        except Exception:
+            logger.warning(
+                "deterministic compression fallback fence factory failed; "
+                "using an unpublished fence",
+                exc_info=True,
+            )
+    if not isinstance(retry_fence, CompressionCommitFence):
+        retry_fence = CompressionCommitFence()
+
+    logger.warning(
+        "All configured context-summary routes stalled — completing "
+        "compression with the bounded deterministic handoff"
+    )
+    try:
+        from agent.context_compressor import force_deterministic_summary_fallback
+
+        with force_deterministic_summary_fallback():
+            result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=messages,
+                system_prompt_fallback=system_prompt_fallback,
+                idle_timeout_seconds=idle_timeout_seconds,
+                total_ceiling_seconds=total_ceiling_seconds,
+                on_commit_overrun=on_commit_overrun,
+                fence=retry_fence,
+                telemetry_agent=telemetry_agent,
+                stall_fallback=False,
+            )
+    except Exception:
+        logger.warning(
+            "deterministic compression fallback failed; continuing without "
+            "compression",
+            exc_info=True,
+        )
+        return None
+    if result_msgs is messages:
+        logger.warning(
+            "deterministic compression fallback produced no compression; "
+            "continuing without compression"
+        )
+        return None
+    return result_msgs, result_prompt
+
+
 def run_compress_context_with_progress_timeout(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
@@ -1455,6 +1530,18 @@ def run_compress_context_with_progress_timeout(
         # own summary call a no-op.
         if stall_fallback:
             recovered = _retry_compression_on_fallback_chain(
+                worker=worker,
+                messages=messages,
+                system_prompt_fallback=system_prompt_fallback,
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
+                on_commit_overrun=on_commit_overrun,
+                telemetry_agent=telemetry_agent,
+                new_fence=new_fence,
+            )
+            if recovered is not None:
+                return recovered
+            recovered = _retry_compression_with_deterministic_fallback(
                 worker=worker,
                 messages=messages,
                 system_prompt_fallback=system_prompt_fallback,

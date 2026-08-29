@@ -26,6 +26,8 @@ from unittest.mock import patch
 
 from agent.context_compressor import (
     ContextCompressor,
+    deterministic_summary_fallback_forced,
+    force_deterministic_summary_fallback,
     pin_summary_route,
     take_pinned_summary_route,
 )
@@ -228,6 +230,91 @@ def test_fallback_that_also_stalls_degrades_after_one_attempt():
     assert msgs is original, "no messages may be dropped when both routes stall"
     assert prompt == "degraded-prompt"
     assert len(timeouts) == 1, "the degrade must be reported exactly once"
+
+
+class _TwoStallsThenDeterministicWorker:
+    """Both model routes stall; the third pass must be local and bounded."""
+
+    def __init__(self, compressed):
+        self.compressed = compressed
+        self.attempts = []
+        self.release = threading.Event()
+
+    def __call__(self, fence: CompressionCommitFence):
+        deterministic = deterministic_summary_fallback_forced()
+        self.attempts.append(deterministic)
+        if not deterministic:
+            self.release.wait(timeout=10)
+            return ([{"role": "assistant", "content": "late"}], "late-prompt")
+        if not fence.begin_commit():
+            return ([{"role": "assistant", "content": "cancelled"}], "cancelled")
+        try:
+            return self.compressed, "deterministic-prompt"
+        finally:
+            fence.finish_commit()
+
+
+def test_two_stalled_routes_finish_with_deterministic_fallback_when_enabled():
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "bounded local handoff"}]
+    worker = _TwoStallsThenDeterministicWorker(compressed)
+    timeouts = []
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(abort_on_summary_failure=False),
+        _hard_interrupt_requested=threading.Event(),
+    )
+    entry = dict(CHAIN_ENTRY, timeout=0.05)
+
+    try:
+        with _patch_chain([entry]):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="degraded-prompt",
+                idle_timeout_seconds=0.05,
+                total_ceiling_seconds=0.10,
+                on_timeout=lambda *args: timeouts.append(args),
+                telemetry_agent=agent,
+            )
+    finally:
+        worker.release.set()
+
+    assert worker.attempts == [False, False, True]
+    assert msgs == compressed
+    assert prompt == "deterministic-prompt"
+    assert not timeouts, "a successful local fallback must not arm cooldown"
+
+
+def test_forced_deterministic_pass_skips_llm_and_shrinks_context():
+    with patch("agent.context_compressor.get_model_context_length", return_value=8_000):
+        compressor = ContextCompressor(
+            model="main-model",
+            quiet_mode=True,
+            config_context_length=8_000,
+            threshold_percent=0.50,
+            protect_first_n=1,
+            protect_last_n=4,
+            abort_on_summary_failure=False,
+        )
+    messages = [{"role": "system", "content": "system"}]
+    for i in range(18):
+        role = "user" if i % 2 == 0 else "assistant"
+        messages.append({"role": role, "content": f"turn-{i} " + "x" * 1_500})
+
+    no_llm = AssertionError("deterministic fallback must not call an LLM")
+    with patch("agent.context_compressor.call_llm", side_effect=no_llm), patch(
+        "agent.auxiliary_client.call_llm", side_effect=no_llm
+    ):
+        with force_deterministic_summary_fallback():
+            compressed = compressor.compress(
+                messages,
+                current_tokens=7_000,
+                force=False,
+            )
+
+    assert len(compressed) < len(messages)
+    assert compressor._last_summary_fallback_used is True
+    assert compressor._last_compression_made_progress is True
 
 
 # ---------------------------------------------------------------------------

@@ -86,6 +86,9 @@ def _safe_int(value: Any) -> int | None:
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
+_DETERMINISTIC_SUMMARY_FALLBACK: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_deterministic_summary_fallback", default=False
+)
 
 # Echo of the route the summary call consumed, for SIBLING aux calls of the
 # same attempt (lean digests). Context-local like the pin itself, so it can
@@ -120,6 +123,27 @@ def pin_summary_route(route: Optional[Dict[str, Any]]):
         yield
     finally:
         _SUMMARY_ROUTE_PIN.reset(token)
+
+
+@contextlib.contextmanager
+def force_deterministic_summary_fallback():
+    """Skip the summary LLM for one compression attempt.
+
+    The host uses this only after every bounded summary route stalled.  A
+    ContextVar is required because the timed-out workers remain detached and
+    share the compressor instance; an instance attribute could leak the local
+    fallback into one of those workers or an unrelated session.
+    """
+    token = _DETERMINISTIC_SUMMARY_FALLBACK.set(True)
+    try:
+        yield
+    finally:
+        _DETERMINISTIC_SUMMARY_FALLBACK.reset(token)
+
+
+def deterministic_summary_fallback_forced() -> bool:
+    """Return whether this worker must use the bounded local handoff path."""
+    return bool(_DETERMINISTIC_SUMMARY_FALLBACK.get())
 
 
 def take_pinned_summary_route() -> Optional[Dict[str, Any]]:
@@ -4770,7 +4794,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary += _redact_compaction_text(
                 _build_anchor_index(turns_to_summarize)
             )
-        if _LEAN_DIGESTS_HEADING not in summary:
+        if (
+            _LEAN_DIGESTS_HEADING not in summary
+            and not deterministic_summary_fallback_forced()
+        ):
             summary += _redact_compaction_text(
                 self._build_chunk_digests(turns_to_summarize)
             )
@@ -7844,7 +7871,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        deterministic_stall_fallback = deterministic_summary_fallback_forced()
+        if (
+            not deterministic_stall_fallback
+            and not force
+            and self._ineffective_compression_count >= 1
+        ):
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -7871,7 +7903,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        if feasibility_skip:
+        if deterministic_stall_fallback:
+            # Every configured summary route already exhausted its bounded
+            # host timeout.  Do not call another model: Phase 4 builds the
+            # existing bounded local handoff and preserves the protected tail.
+            summary = None
+        elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
@@ -7911,11 +7948,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         # rotating into a child session with a placeholder summary degrades the
         # conversation for zero benefit. Preserve it unchanged until access or
         # provider health is restored (#29559, #25585, #94448).
-        if not summary and not feasibility_skip and (
-            self.abort_on_summary_failure
-            or self._last_summary_auth_failure
-            or self._last_summary_network_failure
-            or self._last_summary_empty_content_failure
+        if (
+            not summary
+            and not feasibility_skip
+            and not deterministic_stall_fallback
+            and (
+                self.abort_on_summary_failure
+                or self._last_summary_auth_failure
+                or self._last_summary_network_failure
+                or self._last_summary_empty_content_failure
+            )
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -8003,7 +8045,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # content-free "N messages were removed" marker.
         if not summary:
             if not self.quiet_mode:
-                if feasibility_skip:
+                if deterministic_stall_fallback:
+                    logger.warning(
+                        "All summary routes stalled — inserting deterministic "
+                        "fallback context summary"
+                    )
+                elif feasibility_skip:
                     logger.info("Feasibility skip — inserting deterministic fallback context summary")
                 else:
                     logger.warning("Summary generation failed — inserting deterministic fallback context summary")
@@ -8011,18 +8058,28 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
-            if feasibility_skip:
+            if deterministic_stall_fallback:
+                telemetry["failure_class"] = (
+                    telemetry.get("failure_class")
+                    or "deterministic_stall_fallback"
+                )
+            elif feasibility_skip:
                 # Deliberate optimization, not a summary failure — keep the
                 # telemetry class distinct so dashboards don't count skips
                 # as aux-model breakage.
                 telemetry["failure_class"] = telemetry.get("failure_class") or "feasibility_skip"
             else:
                 telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
+            fallback_reason = self._last_summary_error
+            if feasibility_skip:
+                fallback_reason = None
+            elif deterministic_stall_fallback:
+                fallback_reason = "all configured summary routes stalled"
             summary = self._build_static_fallback_summary(
                 turns_to_summarize,
                 # A stale error from an earlier real failure must not be
                 # embedded into a deliberate feasibility skip's fallback.
-                reason=None if feasibility_skip else self._last_summary_error,
+                reason=fallback_reason,
             )
 
         tail_messages: List[Dict[str, Any]] = []
