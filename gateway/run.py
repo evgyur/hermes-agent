@@ -4525,6 +4525,18 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
+        interrupt_message = str(
+            agent_result.get("interrupt_message") or ""
+        ).strip()
+        if interrupt_message.casefold() in {
+            _INTERRUPT_REASON_GATEWAY_SHUTDOWN.casefold(),
+            _INTERRUPT_REASON_GATEWAY_RESTART.casefold(),
+        }:
+            # Planned lifecycle interruption has its own pre-shutdown notice
+            # and durable startup-resume path.  Treating it as a stale /stop
+            # tells the user to resend an already-authorized task and can race
+            # the exact synthetic continuation after boot.
+            return response
         # An interrupted run that did work (api_calls > 0) is the drain of a
         # run the user deliberately stopped or steered — its silence is
         # intentional, and any queued/interrupting message is delivered by
@@ -13660,7 +13672,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 handoff = StartupResumeDispatchHandoff(session_key)
                 setattr(event, "_gateway_startup_dispatch_handoff", handoff)
                 try:
-                    await adapter.handle_message(event)
+                    if getattr(self.config, "multiplex_profiles", False):
+                        profile_home = self._resolve_profile_home_for_source(
+                            event.source
+                        )
+                        with _profile_runtime_scope(profile_home):
+                            await adapter.handle_message(event)
+                    else:
+                        await adapter.handle_message(event)
                 finally:
                     # No adapter may publish a child after returning without
                     # having accepted this exact handoff.  Revocation happens

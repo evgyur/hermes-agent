@@ -31,6 +31,7 @@ import logging
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -3551,6 +3552,65 @@ def test_startup_handoff_is_one_shot_and_route_exact():
     assert handoff.accepted_task is task
     assert handoff.revoke() is False
     assert handoff.accept("expected-route", MagicMock(spec=asyncio.Task)) is False
+
+
+@pytest.mark.asyncio
+async def test_startup_resume_dispatch_keeps_multiplex_profile_scope(monkeypatch, tmp_path):
+    """The adapter child must inherit the transcript owner's profile home."""
+    from hermes_constants import get_hermes_home
+
+    runner, adapter = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    profile_home = tmp_path / "profiles" / "hermesdev"
+    source = replace(
+        make_restart_source(
+            chat_id="-1003971448755",
+            message_id="49965",
+        ),
+        chat_type="group",
+        profile="hermesdev",
+        thread_id="45764",
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=(
+                "agent:hermesdev:telegram:group:-1003971448755:45764"
+            ),
+            session_id="sess-profile-resume",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-profile-resume",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+    runner._session_state(entry.session_key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = runner._build_startup_resume_event(entry, source)
+    event.metadata["startup_resume_after_priority_reply"] = True
+    observed_homes = []
+
+    async def _child():
+        observed_homes.append(Path(get_hermes_home()))
+
+    async def _handle_message(_event):
+        task = asyncio.create_task(_child())
+        handoff = _event._gateway_startup_dispatch_handoff
+        assert handoff.accept(entry.session_key, task)
+
+    adapter.handle_message = _handle_message
+    runner.async_session_store.abandon_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    await runner._run_startup_resume_event(adapter, event, entry.session_key)
+
+    assert observed_homes == [profile_home]
 
 
 @pytest.mark.asyncio

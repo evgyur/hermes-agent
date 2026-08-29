@@ -58,15 +58,21 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.11` is based on upstream
+Powerpack `0.21.12` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.11` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
+Release `0.21.12` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
 Keys Groq STT transport, and no-repeat Jyotish rectification intake to one
 verified server-doctor commit. The installer records these pins in its receipt
 while preserving profile files; the pinned component owner remains responsible
 for installing or updating those private assets and profile-scoped credentials.
+
+Planned gateway restart recovery now dispatches each synthetic continuation
+inside the exact multiplex profile that owns its transcript. A `hermesdev` task
+therefore resumes from the profile database instead of being quarantined after
+an accidental root-database read. A turn interrupted before its first model
+call by gateway shutdown is also no longer mislabeled as a stale `/stop`.
 
 It also keeps the final Telegram delivery and its parent-task barrier in the
 same multiplex profile until platform acknowledgement. A completed `hermesdev`
