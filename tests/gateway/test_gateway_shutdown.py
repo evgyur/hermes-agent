@@ -169,6 +169,26 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_external_restart_intent_preserves_recovery_without_self_restart():
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._external_drain_active = True
+    runner._external_drain_restart_intent = True
+    runner._restart_requested = False
+    runner._restart_via_service = False
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    assert runner._restart_requested is True
+    assert runner._restart_via_service is False
+    assert runner._restart_detached is False
+    assert runner._exit_code is None
+
+
+@pytest.mark.asyncio
 async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     runner, adapter = make_restart_runner()
     source = make_restart_source(thread_id="42")
@@ -343,5 +363,4 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
 

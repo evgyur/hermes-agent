@@ -7763,6 +7763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_restart_intent: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -7966,6 +7967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_restart_intent = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -10090,10 +10092,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("scale-to-zero: self-suspend failed", exc_info=True)
 
     def _status_action_label(self) -> str:
-        return "restart" if self._restart_requested else "shutdown"
+        return "restart" if self._planned_restart_ingress_active() else "shutdown"
 
     def _status_action_gerund(self) -> str:
-        return "restarting" if self._restart_requested else "shutting down"
+        return "restarting" if self._planned_restart_ingress_active() else "shutting down"
+
+    def _planned_restart_ingress_active(self) -> bool:
+        return bool(
+            self._restart_requested
+            or getattr(self, "_external_drain_restart_intent", False)
+        )
 
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
@@ -10102,7 +10110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to be lost during restart — queue them for the newly-spawned gateway
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         mode = busy_input_mode or self._busy_input_mode
-        return self._restart_requested and mode in {"queue", "steer"}
+        return self._planned_restart_ingress_active() and mode in {"queue", "steer"}
 
     @staticmethod
     def _drain_inbox_json(value: Any) -> str:
@@ -10366,7 +10374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _quiesce_planned_restart_ingress(self) -> None:
         """Stop Telegram polling, then close the already-entered commit barrier."""
-        if not self._restart_requested:
+        if not self._planned_restart_ingress_active():
             return
         adapters = []
         for adapter in self._iter_gateway_adapters():
@@ -10689,7 +10697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
-                restart_requested=self._restart_requested,
+                restart_requested=self._planned_restart_ingress_active(),
                 active_agents=self._active_work_count(),
             )
         except Exception:
@@ -10727,16 +10735,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # with its lifecycle action, then (on cancel/abort) the marker is removed
     # and the gateway re-accepts turns.
     # ------------------------------------------------------------------
-    def _enter_external_drain(self) -> None:
+    def _enter_external_drain(self, *, planned_restart: bool = False) -> None:
         """Begin external drain: stop accepting new turns, flip state.
 
         Idempotent — re-entering while already draining is a no-op beyond a
         best-effort status re-write. In-flight turns are NOT interrupted (the
         whole point is to let them finish); only NEW turns are refused.
         """
+        planned_restart = bool(planned_restart)
         if self._external_drain_active:
+            changed = self._external_drain_restart_intent != planned_restart
+            self._external_drain_restart_intent = planned_restart
+            if changed:
+                self._update_runtime_status("draining")
             return
         self._external_drain_active = True
+        self._external_drain_restart_intent = planned_restart
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.",
@@ -10755,8 +10769,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         never resurrect a stopping gateway to ``running``).
         """
         if not self._external_drain_active:
+            self._external_drain_restart_intent = False
             return
         self._external_drain_active = False
+        self._external_drain_restart_intent = False
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -10785,12 +10801,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import (
+            drain_planned_restart_requested,
+            drain_requested,
+        )
 
         while self._running:
             try:
                 if drain_requested():
-                    self._enter_external_drain()
+                    self._enter_external_drain(
+                        planned_restart=drain_planned_restart_requested()
+                    )
                 else:
                     self._exit_external_drain()
                 # API and cron work live outside messaging's
@@ -11844,11 +11865,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
 
         # --- Draining case (gateway restarting/stopping) ---
-        if self._draining:
+        if self._draining or getattr(
+            self, "_external_drain_restart_intent", False
+        ):
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if (
-                self._restart_requested
+                self._planned_restart_ingress_active()
                 and event.source.platform == Platform.TELEGRAM
             ):
                 # BasePlatformAdapter routes a follow-up for an already-active
@@ -18243,6 +18266,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        # A lifecycle updater can drain first and stop the service second.
+        # Carry that explicit restart intent into shutdown so active-turn
+        # recovery and Telegram quiescing use the planned-restart contract.
+        # The updater remains the only successor owner: this does not request
+        # a detached or service-managed self-restart.
+        if not restart and getattr(self, "_external_drain_restart_intent", False):
+            restart = True
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart
@@ -20920,8 +20950,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Authorization and exact profile/route binding above have completed;
         # commit a real Telegram input before telling the user it is safe.
         if (
-            self._draining
-            and self._restart_requested
+            self._planned_restart_ingress_active()
             and not is_internal
             and source.platform == Platform.TELEGRAM
             and not getattr(event, "_hermes_startup_restore_replay", False)

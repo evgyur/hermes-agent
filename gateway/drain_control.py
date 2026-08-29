@@ -165,6 +165,7 @@ def write_drain_request(
     *,
     principal: str = "drain-control",
     suppress_notification: bool = False,
+    planned_restart: bool = False,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
@@ -188,6 +189,11 @@ def write_drain_request(
     ping. The gateway stays agnostic about *why* the drain is quiet; the policy
     of which drain causes set the flag lives entirely in the caller (NAS). The
     field defaults False so legacy/operator drains behave exactly as before.
+
+    ``planned_restart`` is explicit lifecycle intent. When true, authorized
+    Telegram input received during this external drain is durably admitted to
+    the restart inbox rather than rejected. It defaults False: a reversible
+    maintenance drain must never promise replay when no restart is guaranteed.
     """
     payload = {
         "action": "drain",
@@ -195,6 +201,7 @@ def write_drain_request(
         "principal": principal,
         "epoch": current_instantiation_epoch(),
         "suppress_notification": bool(suppress_notification),
+        "planned_restart": bool(planned_restart),
     }
     atomic_json_write(drain_request_path(home), payload)
     return payload
@@ -320,6 +327,14 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
     if _marker_is_stale(body):
         return False
     return True
+
+
+def drain_planned_restart_requested(*, home: Optional[Path] = None) -> bool:
+    """True only for an active marker carrying explicit restart intent."""
+    body = read_drain_request(home=home)
+    if body is None or _marker_is_stale(body):
+        return False
+    return body.get("planned_restart") is True
 
 
 def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:

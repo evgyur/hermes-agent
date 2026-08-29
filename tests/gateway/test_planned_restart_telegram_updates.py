@@ -97,6 +97,45 @@ async def test_authorized_telegram_input_is_committed_during_planned_drain(
 
 
 @pytest.mark.asyncio
+async def test_authorized_telegram_input_is_committed_during_external_planned_restart(
+    monkeypatch, tmp_path
+):
+    """Server-doctor maintenance must queue, not reject, a new Telegram turn."""
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    db = SessionDB(tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    runner._external_drain_active = True
+    runner._external_drain_restart_intent = True
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="12345",
+        user_id="42",
+        message_id="701",
+        profile="main",
+        transport_profile="default",
+    )
+    event = MessageEvent(
+        text="queue this maintenance correction",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(message_id=701),
+        message_id="701",
+    )
+    try:
+        response = await runner._handle_message(event)
+        assert response == "⏳ Gateway restarting — message safely queued."
+        rows = await runner._session_db.list_gateway_drain_inbox_ready()
+        assert [(row["message_id"], row["session_key"]) for row in rows] == [
+            ("701", "agent:main:telegram:group:-1001:12345")
+        ]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_planned_quiesce_waits_for_handler_created_batch():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test"))
     order = []
@@ -150,3 +189,23 @@ async def test_runner_planned_quiesce_uses_live_gateway_adapters(
 
     telegram.quiesce_inbound.assert_awaited_once()
     api.quiesce_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_external_planned_restart_quiesces_live_gateway_adapters(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    telegram = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        quiesce_inbound=AsyncMock(),
+    )
+    runner.adapters = {Platform.TELEGRAM: telegram}
+    runner._profile_adapters = {}
+    runner._restart_requested = False
+    runner._external_drain_restart_intent = True
+    runner._drain_ingress_admission_tasks = set()
+
+    await runner._quiesce_planned_restart_ingress()
+
+    telegram.quiesce_inbound.assert_awaited_once()
