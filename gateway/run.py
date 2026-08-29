@@ -199,6 +199,9 @@ _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 # from "compaction silently switched off". 1h is well past the point where a
 # retry is cheap and still recovers within a session.
 _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
+_HYGIENE_PROTECTED_TAIL_RETRY_ERROR = (
+    "hygiene protected active turn remained oversized"
+)
 
 
 def _hygiene_cooldown_for_failure(
@@ -349,6 +352,42 @@ def _record_hygiene_cooldown(
         recorder(session_id, _time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
+def _clear_completed_turn_hygiene_retry_cooldown(
+    gateway,
+    session_id: str,
+) -> bool:
+    """Release only the cooldown created for a protected active turn.
+
+    Hygiene runs before the current turn starts.  A successful compaction may
+    still leave that active turn above the safety threshold because cutting a
+    tool trace in half would corrupt conversation structure.  The short
+    cooldown prevents the agent's own preflight from immediately repeating the
+    same ineffective attempt inside this turn.  Once the turn completes, its
+    boundary becomes safe to compact, so the next user message must be allowed
+    to retry immediately.
+
+    Compare the persisted reason before clearing so a real provider/timeout
+    failure recorded later in the same turn is never clobbered.
+    """
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    getter = getattr(session_db, "get_compression_failure_cooldown", None)
+    clearer = getattr(session_db, "clear_compression_failure_cooldown", None)
+    if not callable(getter) or not callable(clearer):
+        return False
+    try:
+        state = getter(session_id)
+        if not state or state.get("error") != _HYGIENE_PROTECTED_TAIL_RETRY_ERROR:
+            return False
+        clearer(session_id)
+        return True
+    except Exception as exc:
+        logger.debug(
+            "completed-turn hygiene retry cooldown clear failed: %s", exc
+        )
+        return False
 
 
 def _status_template_to_regex(template: str) -> str:
@@ -24641,6 +24680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _hygiene_turn_retry_cooldown_session_id: Optional[str] = None
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
@@ -25800,6 +25840,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_aborted = _comp is not None and getattr(
                                         _comp, "_last_compress_aborted", False
                                     )
+                                    _hyg_recovered = (
+                                        not _hyg_aborted
+                                        and hygiene_compaction_recovered(
+                                            aborted=_hyg_aborted,
+                                            rotated=_hyg_rotated,
+                                            in_place=_hyg_in_place,
+                                            msg_count=_msg_count,
+                                            new_count=_new_count,
+                                            approx_tokens=_approx_tokens,
+                                            new_tokens=_new_tokens,
+                                        )
+                                    )
                                     if _new_tokens >= _warn_token_threshold:
                                         logger.warning(
                                             "Session hygiene: still ~%s tokens after "
@@ -25818,7 +25870,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     session_key,
                                                     _hyg_failure_cooldown_seconds,
                                                 ),
+                                                (
+                                                    _HYGIENE_PROTECTED_TAIL_RETRY_ERROR
+                                                    if _hyg_recovered
+                                                    else None
+                                                ),
                                             )
+                                            if _hyg_recovered:
+                                                _hygiene_turn_retry_cooldown_session_id = (
+                                                    session_entry.session_id
+                                                )
 
                                     # If summary generation failed, the
                                     # compressor aborts entirely and returns
@@ -25838,15 +25899,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # counts, so a numbers-only check would
                                         # read a no-op as success and clear the
                                         # streak on every wedged run (#79624).
-                                        if hygiene_compaction_recovered(
-                                            aborted=_hyg_aborted,
-                                            rotated=_hyg_rotated,
-                                            in_place=_hyg_in_place,
-                                            msg_count=_msg_count,
-                                            new_count=_new_count,
-                                            approx_tokens=_approx_tokens,
-                                            new_tokens=_new_tokens,
-                                        ):
+                                        if _hyg_recovered:
                                             await asyncio.to_thread(
                                                 _reset_hygiene_failure_streak,
                                                 self,
@@ -26303,6 +26356,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 _trusted_parent_task_continuation=_parent_continuation_start,
             )
+            if _hygiene_turn_retry_cooldown_session_id:
+                await asyncio.to_thread(
+                    _clear_completed_turn_hygiene_retry_cooldown,
+                    self,
+                    _hygiene_turn_retry_cooldown_session_id,
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A reconciliation-only turn is the one bounded exception to the

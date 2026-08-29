@@ -1304,3 +1304,68 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_retries_after_completed_turn_releases_protected_tail(
+    monkeypatch, tmp_path
+):
+    """A successful partial compaction must not block the next turn.
+
+    Gateway hygiene can only compact complete turns.  If one active turn owns
+    most of the context, the first pass legitimately leaves the transcript
+    above the safety threshold.  The old code persisted that condition as a
+    normal 300-second failure cooldown, so the next user message -- the event
+    that finally makes the large turn compactable -- was rejected by the
+    cooldown instead of retrying immediately.
+    """
+    from hermes_state import SessionDB
+
+    session_id = "sess-protected-tail"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+
+        class PartialInPlaceCompressAgent:
+            instances = 0
+
+            def __init__(self, **kwargs):
+                type(self).instances += 1
+                self.session_id = kwargs.get("session_id", session_id)
+                self._session_db = kwargs.get("session_db")
+                self._last_compaction_in_place = False
+                self.context_compressor = SimpleNamespace(
+                    bind_session_state=MagicMock(),
+                    bind_turn_lease=MagicMock(),
+                    _last_compress_aborted=False,
+                    _last_aux_model_failure_model=None,
+                )
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+
+            def _compress_context(self, messages, *_args, **_kwargs):
+                # One completed prefix row was compacted, but the protected
+                # active turn remains far above the tiny test context window.
+                self._last_compaction_in_place = True
+                return (messages[1:], None)
+
+        runner1, _adapter1, event1 = _make_cooldown_runner(
+            monkeypatch, tmp_path, PartialInPlaceCompressAgent, db, session_id
+        )
+        assert await runner1._handle_message(event1) == "ok"
+        assert PartialInPlaceCompressAgent.instances == 1
+        assert db.get_compression_failure_cooldown(session_id) is None, (
+            "a completed turn left the protected-tail retry cooldown active; "
+            "the next user boundary will be blocked"
+        )
+
+        runner2, _adapter2, event2 = _make_cooldown_runner(
+            monkeypatch, tmp_path, PartialInPlaceCompressAgent, db, session_id
+        )
+        assert await runner2._handle_message(event2) == "ok"
+        assert PartialInPlaceCompressAgent.instances == 2, (
+            "the newly completed turn became compressible, but hygiene did "
+            "not retry on the next user boundary"
+        )
+    finally:
+        db.close()
