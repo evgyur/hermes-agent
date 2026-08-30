@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.6"
+    assert manifest["version"] == "2.3.7"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
@@ -178,6 +178,17 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
             "cron_self_delivery": [],
         },
     )
+    monkeypatch.setattr(
+        doctor,
+        "_process_pythonpath_report",
+        lambda *_args, **_kwargs: {
+            "status": "PASS",
+            "present": False,
+            "entry_count": 0,
+            "outside_candidate_count": 0,
+            "values_exposed": False,
+        },
+    )
 
     report = doctor.run_doctor(
         root=PACKAGE_ROOT,
@@ -200,6 +211,7 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
     assert checks["host_sqlite_runtime"]["status"] == "PASS"
     assert checks["host_deleted_state_handles"]["status"] == "PASS"
     assert checks["host_operational_config"]["status"] == "PASS"
+    assert checks["host_pythonpath_identity"]["status"] == "PASS"
 
 
 def test_service_failure_policy_requires_upstream_restart_contract():
@@ -221,6 +233,45 @@ def test_service_failure_policy_requires_upstream_restart_contract():
     assert passing["status"] == "PASS"
     assert missing_fatal_stop["status"] == "FAIL"
     assert missing_fatal_stop["fatal_config_stops"] is False
+
+
+def test_pythonpath_identity_rejects_stale_checkout_without_exposing_path(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    report = doctor._pythonpath_identity_report(
+        b"PYTHONPATH=/srv/hermes-old\0OTHER=value\0",
+        repository=candidate,
+        process_cwd=candidate,
+    )
+
+    assert report == {
+        "status": "FAIL",
+        "present": True,
+        "entry_count": 1,
+        "outside_candidate_count": 1,
+        "values_exposed": False,
+    }
+    assert "/srv/hermes-old" not in json.dumps(report)
+
+
+def test_pythonpath_identity_accepts_empty_or_candidate_scoped_value(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    empty = doctor._pythonpath_identity_report(
+        b"PYTHONPATH=\0",
+        repository=candidate,
+        process_cwd=candidate,
+    )
+    scoped = doctor._pythonpath_identity_report(
+        f"PYTHONPATH={candidate}\0".encode(),
+        repository=candidate,
+        process_cwd=candidate,
+    )
+
+    assert empty["status"] == "PASS"
+    assert scoped["status"] == "PASS"
+    assert scoped["outside_candidate_count"] == 0
 
 
 def test_gen2_credentials_require_perplexity_only_when_selected(monkeypatch):

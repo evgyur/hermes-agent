@@ -288,6 +288,72 @@ def _systemd_host_report(service: str) -> dict[str, Any]:
     }
 
 
+def _pythonpath_identity_report(
+    raw_environment: bytes,
+    *,
+    repository: Path,
+    process_cwd: Path,
+) -> dict[str, Any]:
+    """Validate PYTHONPATH scope without returning any environment value."""
+
+    value: bytes | None = None
+    for row in raw_environment.split(b"\0"):
+        if row.startswith(b"PYTHONPATH="):
+            value = row.split(b"=", 1)[1]
+            break
+    if value is None or value == b"":
+        return {
+            "status": "PASS",
+            "present": value is not None,
+            "entry_count": 0,
+            "outside_candidate_count": 0,
+            "values_exposed": False,
+        }
+
+    repository = repository.resolve()
+    process_cwd = process_cwd.resolve()
+    entries = [item for item in os.fsdecode(value).split(os.pathsep) if item]
+    outside = 0
+    for item in entries:
+        path = Path(item)
+        if not path.is_absolute():
+            path = process_cwd / path
+        resolved = path.resolve()
+        if resolved != repository and repository not in resolved.parents:
+            outside += 1
+    return {
+        "status": "PASS" if outside == 0 else "FAIL",
+        "present": True,
+        "entry_count": len(entries),
+        "outside_candidate_count": outside,
+        "values_exposed": False,
+    }
+
+
+def _process_pythonpath_report(
+    pid: int,
+    *,
+    repository: Path,
+    process_cwd: Path,
+) -> dict[str, Any]:
+    try:
+        raw_environment = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {
+            "status": "FAIL",
+            "present": False,
+            "entry_count": 0,
+            "outside_candidate_count": 0,
+            "values_exposed": False,
+            "readable": False,
+        }
+    return _pythonpath_identity_report(
+        raw_environment,
+        repository=repository,
+        process_cwd=process_cwd,
+    )
+
+
 def _exit_status_contains(raw: str, expected: int) -> bool:
     tokens = {part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()}
     return str(expected) in tokens
@@ -584,6 +650,11 @@ def run_doctor(
             process_cwd=process_cwd if isinstance(process_cwd, str) else None,
             process_exe=process_exe if isinstance(process_exe, str) else None,
         )
+        pythonpath_identity = _process_pythonpath_report(
+            int(process.get("pid") or 0),
+            repository=repository,
+            process_cwd=Path(process_cwd) if isinstance(process_cwd, str) else repository,
+        )
         process_identity_ok = process_identity["status"] == "PASS"
         host_report = {
             "repository": git_report,
@@ -602,6 +673,7 @@ def run_doctor(
             "venv": {"path": str(venv), "owner_uid": venv_owner, "expected_uid": expected_uid},
             "process_identity_ok": process_identity_ok,
             "process_identity": process_identity,
+            "pythonpath_identity": pythonpath_identity,
         }
         _check(checks, "host_repository_clean", git_report["clean"], required=mode == "gen2_only", evidence=git_report)
         _check(
@@ -624,6 +696,13 @@ def run_doctor(
         _check(checks, "host_deleted_state_handles", state_handles["status"] == "PASS", required=mode == "gen2_only", evidence=state_handles)
         _check(checks, "host_operational_config", operational_config["status"] == "PASS", required=mode == "gen2_only", evidence=operational_config)
         _check(checks, "host_process_loaded_identity", process_identity_ok, evidence={"cwd": process_cwd, "exe": process_exe})
+        _check(
+            checks,
+            "host_pythonpath_identity",
+            pythonpath_identity["status"] == "PASS",
+            required=mode == "gen2_only",
+            evidence=pythonpath_identity,
+        )
         _check(checks, "host_venv_ownership", venv_owner == expected_uid, evidence=host_report["venv"])
         _check(
             checks,
