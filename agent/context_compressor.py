@@ -3436,6 +3436,9 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        # Durable obligation armed only when the original prune candidate was
+        # fenced by a released turn lease; consumed after that boundary.
+        self._proactive_prune_retry_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
