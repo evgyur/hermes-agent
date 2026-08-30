@@ -1,12 +1,12 @@
 ---
 name: live-meeting-operations
-description: "Use for every Zoom or Google Meet call/webinar lifecycle: plan, create, join, host, speak, facilitate, record, retrieve, transcribe, summarize, assign owners, and hand off to Kanban. This is the single canonical meeting root for all Human20 agents and bots; related meeting skills are subordinate adapters, never parallel lifecycles."
-version: 4.0.2
+description: "Use for every live meeting/webinar lifecycle, including Telegram-linked third-party rooms: resolve, plan, create, join, host, speak, facilitate, record, retrieve, transcribe, summarize, package, assign owners, and hand off to Kanban. This is the single canonical meeting root for all Human20 agents and bots; related meeting skills are subordinate adapters, never parallel lifecycles."
+version: 4.1.3
 author: Human20Team
 license: Proprietary
 metadata:
   hermes:
-    tags: [human20, meetings, webinars, zoom, google-meet, realtime-voice, transcription, facilitation, kanban]
+    tags: [human20, meetings, webinars, zoom, google-meet, telegram, capture, realtime-voice, transcription, facilitation, kanban]
     related_skills: [calendar-and-task-operations, computer-use, chip-browser-relay, teams-meeting-pipeline, team20-ops]
     canonical_repo: human20team/human20-meeting-operations
     canonical_branch: main
@@ -17,7 +17,7 @@ metadata:
 
 # Live Meeting Operations
 
-Use when any Human20 agent or bot must plan, create, join, host, facilitate, record, retrieve, transcribe, summarize, publish follow-up from, or create Team20 actions for a Zoom/Google Meet call or webinar. This skill owns the full lifecycle between source context, Calendar/provider APIs, browser attendance, Realtime voice, recordings, protocol, and Kanban.
+Use when any Human20 agent or bot must resolve, plan, create, join, host, facilitate, record, retrieve, transcribe, summarize, package, publish follow-up from, or create Team20 actions for a live call or webinar. This includes Zoom, Google Meet, and third-party webinar rooms reached through Telegram messages, hidden text URLs, or inline URL buttons. This skill owns the full lifecycle between source context, Calendar/provider APIs, browser attendance, detached capture, Realtime voice, recordings, protocol, and Kanban.
 
 ## Canonical Human20 governance
 
@@ -28,9 +28,9 @@ This repository contains the **single canonical Human20 skill** for meeting beha
 3. Changes land here first with `VERSION`, `CHANGELOG.md`, contract validation, realistic trigger tests, and secret/privacy scan. Downstream bots update only after the canonical commit exists.
 4. Every bot reports the canonical commit in its release/health receipt. A skill file present without matching receipt is drift, not a healthy install.
 5. Compatibility aliases (`live-meeting-capture-operations`, narrow Zoom transcript workflows, provider-specific meeting skills) must delegate here. They may not fork policy, start competing recorders, or declare completion independently.
-6. This root governs Zoom calls, Zoom webinars, Google Meet calls, Google Meet livestream/webinar-style sessions, pre-call preparation, live voice participation, recording retrieval, transcript/summary, decisions/owners/deadlines, and requested Team20 handoff.
+6. This root governs Zoom calls, Zoom webinars, Google Meet calls, Google Meet livestream/webinar-style sessions, Telegram-linked third-party webinars, pre-call preparation, live voice participation, recording retrieval, transcript/summary, canonical private packaging, decisions/owners/deadlines, and requested Team20 handoff.
 
-Read [`references/canonical-governance-and-rollout.md`](references/canonical-governance-and-rollout.md) before changing or distributing the skill. For webinars, load [`references/webinar-lifecycle.md`](references/webinar-lifecycle.md).
+Read [`references/canonical-governance-and-rollout.md`](references/canonical-governance-and-rollout.md) before changing or distributing the skill. For provider webinars, load [`references/webinar-lifecycle.md`](references/webinar-lifecycle.md). For Telegram-sourced rooms, detached capture, deferred finalization, or canonical meeting packages, load [`references/telegram-webinar-capture-and-packaging.md`](references/telegram-webinar-capture-and-packaging.md).
 
 ## Core invariant
 
@@ -122,6 +122,12 @@ This is the single canonical Zoom root. It owns the whole lifecycle:
 #### Zoom cloud artifact recovery gate
 
 Do not route a post-call request to a browser password form before checking configured Zoom Server-to-Server OAuth. Do not stop after downloading a file when the user asked for synthesis or Kanban actions. The legacy reference name [`references/zoom-cloud-artifact-recovery.md`](references/zoom-cloud-artifact-recovery.md) is a compatibility pointer; the canonical workflow is [`references/zoom-cloud-artifacts.md`](references/zoom-cloud-artifacts.md).
+
+#### Telegram-sourced webinar capture and package
+
+For a Telegram post, forwarded bot message, hidden text URL, or inline URL button, use `scripts/telegram_source_resolver.py` before joining. Bind the selected source to `scripts/webinar_pipeline.py` receipts, detached capture verification, two-phase integrity/ASR/package finalization, and `scripts/webinar_finalizer_gate.py` retries. A busy synthesis lease is `FINALIZATION_DEFERRED`; only the integrity phase may classify a recording as missing. The completion artifact is a canonical private packaging directory with semantic dates, exact hashes, transcript, per-speaker transcripts, requested summaries/decisions/ideas, and source links.
+
+Detailed contract: [`references/telegram-webinar-capture-and-packaging.md`](references/telegram-webinar-capture-and-packaging.md).
 
 ## Workflow
 

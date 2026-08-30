@@ -2,9 +2,9 @@
   "schema": 1,
   "name": "live-meeting-operations",
   "source_repo": "human20team/human20-meeting-operations",
-  "source_commit": "23c3b8cdcfce3421ab51944dff5f8c7a9187a9ed",
-  "source_tree": "09bfb9813d6c0de0d89960a6ba49f463470ac3d0",
-  "version": "4.0.2",
+  "source_commit": "c6d2e921ae0e7d3087e104e54b45d4b943063d10",
+  "source_tree": "5f8dea76c25526da7ada0ea5ba564a492e2e8aac",
+  "version": "4.1.3",
   "entries": [
     {
       "path": ".gitignore",
@@ -12,15 +12,15 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "37b6dbcdd665dc82a4ee4290822257628a64d37c10666967539820d8a663f0ed"
+      "sha256": "2ae587f16112de4f6c4c4b2b48704dd241b3f9e413fe8bd51a2cd6356c363bd3"
     },
     {
       "path": "SKILL.md",
-      "sha256": "5940fa3c203f6499c45348127eb82af1ba97b81a10e6f4553d370467aecccfd0"
+      "sha256": "40503da8bd1b06b10a52d4761517c91076ced28111756d05bca982341541bbee"
     },
     {
       "path": "VERSION",
-      "sha256": "c6d3fb057b198f1d0563d4218d4e36b48df752251aabffe78ea60aac5a72c7a2"
+      "sha256": "d91a33c9b99340e3e1f7ba48f043a10f6e9719c885ffecaa4fd8108957ecaf72"
     },
     {
       "path": "references/agenda-realtime-facilitator.md",
@@ -55,8 +55,12 @@
       "sha256": "c94a8a86319babba8e3cb92c46d6f2e436d5acd876d94c0f6c791610b5c75a22"
     },
     {
+      "path": "references/telegram-webinar-capture-and-packaging.md",
+      "sha256": "e48773bcdba80c144559ab8601113e2a39758680259c155df6ab7636867e5142"
+    },
+    {
       "path": "references/webinar-lifecycle.md",
-      "sha256": "46ae6ce58a314492b461f9645b227519c474b453026329c3e12f8c09ff924f2b"
+      "sha256": "be283bf55783006a318237bf9cfeb7e30884a08d1a70c551a219729f05dee9e0"
     },
     {
       "path": "references/zoom-browser-live-operator.md",
@@ -107,6 +111,10 @@
       "sha256": "8dde369670dc7d49d76b5601ad9a78af3fadab46233160a43e9d832d81511f5b"
     },
     {
+      "path": "scripts/telegram_source_resolver.py",
+      "sha256": "025042c67698c3e974918b1a5ba04f5b14bc77abc9c2df64f94461a9c6aeeba7"
+    },
+    {
       "path": "scripts/test_contract_negative.py",
       "sha256": "0f462c7f1071f437b59a1fbef8302d2060c537a5d4f0deb359267ba27b204e7a"
     },
@@ -116,7 +124,15 @@
     },
     {
       "path": "scripts/validate_contract.py",
-      "sha256": "bc3cc44815073ad64a042cf1df64ab7175afeffdafe6c40610f78f699d119ad5"
+      "sha256": "baed7a263cb2ff1cde537013478dc6b65f29870d986b962a69d2e3a3141ba9f2"
+    },
+    {
+      "path": "scripts/webinar_finalizer_gate.py",
+      "sha256": "de7a9277ec6a12a88c7f9b437bbaaa1dfb0df9f4425a55ade88743dc2d747d61"
+    },
+    {
+      "path": "scripts/webinar_pipeline.py",
+      "sha256": "247f4de27ece453c391de41cfe0fbb5cd9d457ed2495c32dd2873e8339f06c05"
     },
     {
       "path": "scripts/zoom_cloud_artifacts.py",
@@ -145,6 +161,18 @@
     {
       "path": "templates/sigurd-gpt-voice@.service",
       "sha256": "005d43bdcc0d751512bdab237970ce7d0c68fecefafc5cd5bea1eb2252c632eb"
+    },
+    {
+      "path": "tests/test_telegram_source_resolver.py",
+      "sha256": "56ea58ead353717ea42e9780d521a85b48c392c0dc2154517746a9e8b6c40072"
+    },
+    {
+      "path": "tests/test_webinar_finalizer_gate.py",
+      "sha256": "7df9dcd4885aa9c8e54a2a22e66a16a9f865b8ba001f09daa574553fd8b80336"
+    },
+    {
+      "path": "tests/test_webinar_pipeline.py",
+      "sha256": "1cf6e77fc71135259142435997f262196468512401ff19181a6e97008584bafe"
     },
     {
       "path": "tests/test_zoom_cloud_artifacts.py",
