@@ -15173,9 +15173,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 incoming_reply_id = getattr(event, "reply_to_message_id", None)
             if (
                 type(durable_reply_id) is not str
-                or incoming_reply_id != durable_reply_id
+                or incoming_reply_id not in (None, durable_reply_id)
             ):
                 return False
+
+        durable_content = row.get("content")
+        if type(durable_content) is not str:
+            return False
+        # Queued events can already contain the deterministic reply prefix by
+        # the time a post-start reconnect copy reaches turn admission.
+        if durable_content == event.text:
+            return True
 
         expected_content = event.text
         reply = durable_reply
@@ -15188,9 +15196,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             expected_content = (
                 f'[{label}: "{reply.get("quote")}"]\n\n{expected_content}'
             )
-        durable_content = row.get("content")
-        if type(durable_content) is not str:
-            return False
         if durable_content == expected_content:
             return True
         media = durable_envelope.get("media")

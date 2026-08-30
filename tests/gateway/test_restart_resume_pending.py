@@ -3332,12 +3332,18 @@ async def test_completed_telegram_redelivery_after_startup_drops_when_reply_quot
             "has_downstream": True,
         }
     )
+    enriched_text = (
+        f'[Replying to: "{durable_quote}"]\n\n'
+        "through telegram=chip everything is possible"
+    )
     redelivery = MessageEvent(
-        text="through telegram=chip everything is possible",
+        # The post-start queue can already carry the durable prompt prefix
+        # while Telegram omits the old replied-to Message entirely.
+        text=enriched_text,
         message_type=MessageType.TEXT,
         source=source,
         message_id="24113",
-        reply_to_message_id="24112",
+        reply_to_message_id=None,
         reply_to_text=None,
         reply_to_is_own_message=False,
     )
@@ -3351,6 +3357,12 @@ async def test_completed_telegram_redelivery_after_startup_drops_when_reply_quot
     altered = replace(redelivery, text="different edited content")
     assert await runner._is_completed_durable_telegram_redelivery(
         altered,
+        entry,
+        "24113",
+    ) is False
+    wrong_reply = replace(redelivery, reply_to_message_id="99999")
+    assert await runner._is_completed_durable_telegram_redelivery(
+        wrong_reply,
         entry,
         "24113",
     ) is False

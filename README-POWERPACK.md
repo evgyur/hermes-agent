@@ -58,11 +58,11 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.27` is based on upstream
+Powerpack `0.21.28` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.27` enters the durable restart path immediately instead of
+Release `0.21.28` enters the durable restart path immediately instead of
 waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
 turns are checkpointed before interruption; cron work retains its bounded
 30-second drain. The installer now arms and verifies the lossless Telegram
@@ -94,6 +94,11 @@ their exact route, immutable message ID, body, media envelope, and reply target
 before a new turn is admitted. A reply quote that Telegram omits while
 rehydrating an old update no longer creates a second owner; changed content,
 media, or reply targets still fail closed.
+
+The same dedupe also accepts the already-rendered durable reply prefix when a
+post-start queue replays it without Telegram's original reply object. This is
+still bounded to a completed row with the exact route and platform message ID;
+an explicit different reply target remains rejected.
 
 Telegram redelivery during startup now matches the durable raw reply/media
 envelope before the later prompt-only reply prefix is applied. The original
