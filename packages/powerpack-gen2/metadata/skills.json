@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "skills": [
+    {
+      "name": "powerpack-evidence",
+      "path": "skills/powerpack-evidence/SKILL.md",
+      "variant": "common"
+    }
+  ]
+}

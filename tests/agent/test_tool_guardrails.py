@@ -229,6 +229,24 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.should_halt is True
 
 
+def test_skill_view_is_idempotent_and_blocks_repeated_no_progress():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"name": "team20-ops"}
+    result = "same skill contents"
+
+    assert controller.after_call("skill_view", args, result, failed=False).action == "allow"
+    warning = controller.after_call("skill_view", args, result, failed=False)
+    assert warning.code == "idempotent_no_progress_warning"
+    blocked = controller.before_call("skill_view", args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
+
 
 
 

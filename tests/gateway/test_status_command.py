@@ -560,7 +560,10 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
     result = await runner._handle_profile_command(event)
 
     assert "**Profile:** `milo`" in result
-    display_home = "~/" + str(profile_home.relative_to(Path.home()))
+    try:
+        display_home = "~/" + profile_home.relative_to(Path.home()).as_posix()
+    except ValueError:
+        display_home = str(profile_home)
     assert f"**Home:** `{display_home}`" in result
 
 

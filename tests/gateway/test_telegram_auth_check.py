@@ -145,6 +145,47 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+@pytest.mark.asyncio
+async def test_team_membership_allow_is_not_rejected_by_legacy_allowlist(
+    monkeypatch,
+):
+    """A live team decision must not be rechecked as an unstamped sender."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    adapter = _make_adapter()
+    adapter._team_membership_policy = object()
+    adapter._team_membership_allows_message = AsyncMock(return_value=True)
+    adapter.handle_message = AsyncMock(return_value=None)
+    build_called = False
+    original_build = adapter._build_message_event
+
+    def track_build(*args, **kwargs):
+        nonlocal build_called
+        build_called = True
+        return original_build(*args, **kwargs)
+
+    adapter._build_message_event = track_build
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(
+            from_user_id=244,
+            chat_id=-100,
+            chat_type="supergroup",
+        ),
+        effective_message=None,
+    )
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+    assert build_called is True
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.await_args.args[0]
+    assert dispatched.source.telegram_team_membership_required is True
+    assert dispatched.source.telegram_team_membership_authorized is True
+    assert dispatched.source.telegram_team_membership_reason == (
+        "verified_from_same_telegram_message"
+    )
+
+
 def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     """Allowlist + unauthorized_dm_behavior:pair must not early-drop unknown DMs.
 

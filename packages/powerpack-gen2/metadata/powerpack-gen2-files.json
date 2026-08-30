@@ -1,0 +1,99 @@
+{
+  "aggregate_sha256": "84d05d8dc03831299640d88e88df8cdea7d5dce79a6791711728871a7833b9a5",
+  "file_count": 17,
+  "files": [
+    {
+      "bytes": 1963,
+      "path": "README.md",
+      "sha256": "9fb4d4ae13d539d03bca094e5cd495545c31556d602f565c7eea04fcbb6befa5"
+    },
+    {
+      "bytes": 332,
+      "path": "__init__.py",
+      "sha256": "2f5a5f4591b88864c8ab7941aecf0d0724c92a26e051e6ee9a83687314f9deb3"
+    },
+    {
+      "bytes": 4286,
+      "path": "metadata/powerpack-gen2.json",
+      "sha256": "e556c77a43d9d2dc62d2a20c5ff07f38bd9c0233adcd19c47418640dad2b5750"
+    },
+    {
+      "bytes": 171,
+      "path": "metadata/skills.json",
+      "sha256": "3522c45d5e1524b32d41d7c3465bd7fd0d40d8c131953004996185d322487cf8"
+    },
+    {
+      "bytes": 823,
+      "path": "overlays/employee/skills/telegram-chip/SKILL.md",
+      "sha256": "34e890d9605d7f174861cc3236b5f56d15fd3fed254eca1cb92caefe9bb103bc"
+    },
+    {
+      "bytes": 753,
+      "path": "plugin.yaml",
+      "sha256": "7b35d1dccf099189b11b15385cadfa0f81c427bf3f99bb59f7f5d44934c7aa1b"
+    },
+    {
+      "bytes": 6557,
+      "path": "powerpack_gen2/__init__.py",
+      "sha256": "6cbcaa6798dab4f0b54b3fb0db5f8cfb0463106305abe2dbe0f8afbd6be039fb"
+    },
+    {
+      "bytes": 6032,
+      "path": "powerpack_gen2/cli.py",
+      "sha256": "464a3320cf390f4ba49800774e149da310ab48e90f9ef6a0385804ef5f740af2"
+    },
+    {
+      "bytes": 16823,
+      "path": "powerpack_gen2/doctor.py",
+      "sha256": "bf346ad87e8b4c4ed71ca23709fb979828cd5f7a3da93dab90dc32059256e719"
+    },
+    {
+      "bytes": 6797,
+      "path": "powerpack_gen2/installer.py",
+      "sha256": "d72eb394f8097f7e4cd67acbff11515e55257a3770863b450e545b9fe766f7a2"
+    },
+    {
+      "bytes": 8955,
+      "path": "powerpack_gen2/tools.py",
+      "sha256": "5bed2325f10a75046b372fc762caeb4708cb670f58cacfb86b79e389c17be70d"
+    },
+    {
+      "bytes": 71,
+      "path": "powerpack_gen2/vendors/__init__.py",
+      "sha256": "038c4515fb8964623ac5e65c783dd1387e60b8fa9f1adf36d2c96d55968c88a6"
+    },
+    {
+      "bytes": 38562,
+      "path": "powerpack_gen2/vendors/human20_keys/__init__.py",
+      "sha256": "f91bf0ddc5478363ec0f4bc915f0097735c81a2d0f89358abc756a2466f12a32"
+    },
+    {
+      "bytes": 6036,
+      "path": "powerpack_gen2/vendors/human20_keys/transcription.py",
+      "sha256": "059fc82ea61541b86a187722542d2a949a882778f6586bd82f78e5a8b323bb6d"
+    },
+    {
+      "bytes": 591,
+      "path": "powerpack_gen2/vendors/perplexity/__init__.py",
+      "sha256": "eaddd05636587668e8fb2030a92e4037fb1e84008838f52e9c61ee71b5510153"
+    },
+    {
+      "bytes": 10321,
+      "path": "powerpack_gen2/vendors/perplexity/provider.py",
+      "sha256": "5c607787638db611e985b3a6e2c6e1f21f649d64d56cdc1e13cd107be37c55c2"
+    },
+    {
+      "bytes": 794,
+      "path": "skills/powerpack-evidence/SKILL.md",
+      "sha256": "bf72ca448756783d0fa3ef833ae44634ec40f3df44a63575655f80aa1d45256e"
+    }
+  ],
+  "inventory_excludes": [
+    "metadata/powerpack-gen2-files.json",
+    "**/__pycache__/**",
+    "**/*.pyc"
+  ],
+  "package": "human20-powerpack-gen2",
+  "schema_version": 2,
+  "version": "2.3.2"
+}

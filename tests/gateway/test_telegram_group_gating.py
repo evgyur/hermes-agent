@@ -696,6 +696,29 @@ def test_foreign_bot_reply_policy_matches_dispatch_and_observe():
     assert adapter._should_observe_unmentioned_group_message(message) is False
 
 
+def test_explicit_self_mention_overrides_foreign_bot_reply_filter():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+    )
+    adapter.config.extra["ignore_other_bot_replies_chats"] = ["-100"]
+    text = "help @hermes_bot"
+    message = _group_message(
+        text,
+        chat_id=-100,
+        entities=[_mention_entity(text)],
+    )
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=555, is_bot=True),
+        message_id=10,
+        text="foreign bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is True
+
+
 def _forum_message(*, chat_id, thread_id, is_topic_message, is_forum, chat_type="supergroup"):
     """Build a message with independently-controlled topic/forum flags.
 
