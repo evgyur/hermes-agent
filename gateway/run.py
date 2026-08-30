@@ -14108,14 +14108,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             session_key = self._session_key_for_source(source)
-            if (
-                getattr(event, "_hermes_exact_startup_resume_redelivery", False)
-                and session_key
-                in getattr(self, "_startup_resume_scheduled_session_keys", set())
+            if getattr(
+                event, "_hermes_exact_startup_resume_redelivery", False
             ):
-                # The synthetic startup turn owns this exact immutable
-                # Telegram update.  Replaying the transport copy would create
-                # a second owner after the durable continuation has run.
+                # One exact durable user row already owns this immutable
+                # Telegram update. A synthetic continuation may still be
+                # scheduled, terminal, or unavailable; replaying the transport
+                # copy in any of those states would create a second turn.
                 drained += 1
                 continue
             priority_keys = getattr(
@@ -21277,32 +21276,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
             session_key = self._session_key_for_source(source)
-            exact_resume_redelivery = False
+            exact_durable_redelivery = False
             if getattr(source, "platform", None) == Platform.TELEGRAM:
                 try:
                     entry = self.session_store._entries.get(session_key)
-                    sealed_source = (
-                        resume_origin_from_snapshot(entry)
-                        if entry is not None
-                        else None
-                    )
                     authority_source = self._validated_turn_authority_source(
                         event,
                         session_key,
                     )
                     route_is_exact = bool(
-                        sealed_source is not None
+                        entry is not None
                         and authority_source is not None
-                        and canonical_resume_origin(sealed_source)
-                        == canonical_resume_origin(authority_source)
+                        and self._session_key_for_source(authority_source)
+                        == session_key
                     )
                     if route_is_exact:
-                        source_message_id = str(sealed_source.message_id or "")
+                        source_message_id = str(
+                            self._turn_platform_message_id(event) or ""
+                        )
                         rows = await self._startup_resume_raw_semantic_rows(
                             entry.session_id,
                             source_message_id,
                         )
-                        exact_resume_redelivery = bool(
+                        exact_durable_redelivery = bool(
                             len(rows or []) == 1
                             and self._startup_redelivery_matches_durable_row(
                                 event,
@@ -21310,14 +21306,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         )
                 except Exception:
-                    exact_resume_redelivery = False
+                    exact_durable_redelivery = False
             priority_keys = getattr(
                 self, "_startup_restore_priority_session_keys", None
             )
             if priority_keys is None:
                 priority_keys = set()
                 self._startup_restore_priority_session_keys = priority_keys
-            if exact_resume_redelivery:
+            if exact_durable_redelivery:
                 setattr(event, "_hermes_exact_startup_resume_redelivery", True)
             else:
                 priority_keys.add(session_key)

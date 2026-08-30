@@ -58,11 +58,11 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.25` is based on upstream
+Powerpack `0.21.26` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.25` enters the durable restart path immediately instead of
+Release `0.21.26` enters the durable restart path immediately instead of
 waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
 turns are checkpointed before interruption; cron work retains its bounded
 30-second drain. The installer now arms and verifies the lossless Telegram
@@ -92,8 +92,9 @@ revoked owners still fail closed before a continuation claim is acquired.
 Telegram redelivery during startup now matches the durable raw reply/media
 envelope before the later prompt-only reply prefix is applied. The original
 update therefore cannot masquerade as a new human turn or collide with its own
-platform message id. Legacy continuation rows with no exact Telegram message
-id are claimed and terminally quarantined instead of retrying every restart.
+platform message id, even when its continuation is already terminal. Legacy
+continuation rows with no exact Telegram message id are claimed and terminally
+quarantined instead of retrying every restart.
 
 Planned gateway restart recovery now dispatches each synthetic continuation
 inside the exact multiplex profile that owns its transcript. A `hermesdev` task

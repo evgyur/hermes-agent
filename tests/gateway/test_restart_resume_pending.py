@@ -3215,6 +3215,78 @@ async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human(
     assert runner._startup_restore_queue == []
 
 
+@pytest.mark.asyncio
+async def test_terminal_telegram_redelivery_is_dropped_from_startup_queue():
+    """A terminal continuation does not make its Telegram update new again."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_priority_session_keys = set()
+    runner._startup_resume_scheduled_session_keys = set()
+
+    source = make_restart_source(
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        message_id="24101",
+    )
+    entry = SessionEntry(
+        session_key=runner._session_key_for_source(source),
+        session_id="20260830_014701_39da5150",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=False,
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = MagicMock()
+    reply_quote = "The beta still has the old version."
+    runner._session_db.get_messages = MagicMock(
+        return_value=[
+            {
+                "role": "user",
+                "content": f'[Replying to: "{reply_quote}"]\n\nFix it',
+                "platform_message_id": "24101",
+                "display_metadata": {
+                    "gateway_raw_semantic_v1": {
+                        "version": 1,
+                        "message_type": "text",
+                        "reply": {
+                            "message_id": "24100",
+                            "is_own": False,
+                            "quote": reply_quote,
+                        },
+                        "media": [],
+                    }
+                },
+            }
+        ]
+    )
+
+    shared_source = replace(source, user_id=None, user_name=None, user_id_alt=None)
+    redelivery = MessageEvent(
+        text="Fix it",
+        message_type=MessageType.TEXT,
+        source=shared_source,
+        message_id="24101",
+        reply_to_message_id="24100",
+        reply_to_text=reply_quote,
+        reply_to_is_own_message=False,
+    )
+    redelivery._hermes_turn_authority_source = source
+
+    assert await runner._handle_message(redelivery) is None
+    assert entry.session_key not in runner._startup_restore_priority_session_keys
+    assert runner._startup_restore_queue == [redelivery]
+
+    adapter.handle_message = AsyncMock()
+    assert await runner._drain_startup_restore_queue() == 1
+    adapter.handle_message.assert_not_awaited()
+    assert runner._startup_restore_queue == []
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------
