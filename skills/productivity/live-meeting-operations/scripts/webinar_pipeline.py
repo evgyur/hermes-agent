@@ -295,6 +295,9 @@ def _build_package(args: argparse.Namespace, state: dict[str, Any], recording_re
         (source_receipt, stage / "source-receipt.json"),
         (Path(args.transcript), stage / "transcript.md"),
     ]
+    capture_receipt = Path((state.get("capture") or {}).get("receipt_path") or "")
+    if capture_receipt.is_file():
+        sources.append((capture_receipt, stage / "capture-receipt.json"))
     optional = [
         (args.summary, "summary.md"),
         (args.decisions, "decisions-and-actions.md"),

@@ -2,9 +2,9 @@
   "schema": 1,
   "name": "live-meeting-operations",
   "source_repo": "human20team/human20-meeting-operations",
-  "source_commit": "9e23d90ea42b3993c58f3cfb6b8e1fa5f0514fc6",
-  "source_tree": "53748796d00f08884d24eb23619f1f8f63759bbd",
-  "version": "4.1.0",
+  "source_commit": "41e2ee2b16dc69bedf04a9e3b225e1e56cf32f13",
+  "source_tree": "d0fa2939164a012891cf9e82d2ee729cbdb740dc",
+  "version": "4.1.1",
   "entries": [
     {
       "path": ".gitignore",
@@ -12,15 +12,15 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "5fac870e416ea46f9d39a74ec6da0ce9b37139f8fdd711e681caeb4eff34ed8b"
+      "sha256": "4aa0a24bdaff493b40551cf69fb3ee752cc896acf6f64a2ec38bab3c750ea186"
     },
     {
       "path": "SKILL.md",
-      "sha256": "719877c185e1228e5947da694f2f1b8171bf791b546dfc0ade8da56120dd3d9c"
+      "sha256": "2c9d3748d178d8a67d47dbd10f948567f53096505b698f150053ee9fcdf8d1cd"
     },
     {
       "path": "VERSION",
-      "sha256": "3b10b6ad566eadbcacadb33c591f1ec629593d6adf47442e56e0f61996829ef7"
+      "sha256": "9737915fce5e934ea348658fccb82a4c532157d2161bb032a240c2837b8f66cb"
     },
     {
       "path": "references/agenda-realtime-facilitator.md",
@@ -132,7 +132,7 @@
     },
     {
       "path": "scripts/webinar_pipeline.py",
-      "sha256": "919e0bb9446d32b3de05d0200c89e4bdc6ccbd5175106add889432f3b6cdda07"
+      "sha256": "27b51c2a877ef97da6841d586dd3f9558dd4985bb3fb893257b25b47d8669e2d"
     },
     {
       "path": "scripts/zoom_cloud_artifacts.py",
@@ -172,7 +172,7 @@
     },
     {
       "path": "tests/test_webinar_pipeline.py",
-      "sha256": "7268d43559fb6b3c4e36b65099a7e96c42ba9ec2688ef23dbfaeb3e6efa455d1"
+      "sha256": "9bee98f5a8de685230dea5886d205d3be6c0edf0f87cabc89df27427757fead3"
     },
     {
       "path": "tests/test_zoom_cloud_artifacts.py",

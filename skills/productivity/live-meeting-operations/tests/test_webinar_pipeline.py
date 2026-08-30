@@ -166,6 +166,9 @@ class WebinarPipelineTests(unittest.TestCase):
             self.assertEqual(payload["source"]["final_domain"], "start.bizon365.ru")
             self.assertTrue(payload["media_ready"])
             self.assertTrue(payload["file_growth_verified"])
+            with mock.patch.object(pipeline, "verify_recording", return_value=self._verified_metadata()):
+                self.assertEqual(pipeline.finalize(final_args), 0)
+            self.assertTrue((Path(final_args.package_dir) / "capture-receipt.json").is_file())
 
     def test_missing_recording_is_only_reported_by_integrity_phase(self):
         with tempfile.TemporaryDirectory() as tmp:

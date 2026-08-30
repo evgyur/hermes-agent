@@ -2,6 +2,10 @@
 
 All notable changes to the canonical Human20 meeting skill are recorded here.
 
+## 4.1.1 — 2026-08-30
+
+- Included the preflight/live capture receipt in the canonical private package whenever the state machine has one.
+
 ## 4.1.0 — 2026-08-30
 
 - Added a receipt-backed Telegram source resolver for plain URLs, UTF-16-safe `MessageEntityTextUrl` values, inline URL buttons, and validated redirect chains.
