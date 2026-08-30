@@ -1,7 +1,7 @@
 ---
 name: live-meeting-operations
 description: "Use for every live meeting/webinar lifecycle, including Telegram-linked third-party rooms: resolve, plan, create, join, host, speak, facilitate, record, retrieve, transcribe, summarize, package, assign owners, and hand off to Kanban. This is the single canonical meeting root for all Human20 agents and bots; related meeting skills are subordinate adapters, never parallel lifecycles."
-version: 4.1.2
+version: 4.1.3
 author: Human20Team
 license: Proprietary
 metadata:

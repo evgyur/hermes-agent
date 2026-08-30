@@ -2,6 +2,10 @@
 
 All notable changes to the canonical Human20 meeting skill are recorded here.
 
+## 4.1.3 — 2026-08-30
+
+- Reused an existing recording-integrity receipt on automatic resume only when path, size, nanosecond mtime, device, and inode still match, avoiding repeated full hashing/decoding after a deferred finalization.
+
 ## 4.1.2 — 2026-08-30
 
 - Kept the canonical package path absent while finalization is deferred; only the recording receipt and durable state exist until package completion.

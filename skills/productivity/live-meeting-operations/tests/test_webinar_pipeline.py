@@ -117,6 +117,23 @@ class WebinarPipelineTests(unittest.TestCase):
                 if path.is_file():
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_resume_reuses_integrity_receipt_when_file_identity_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, args = self._fixture(root)
+            lock_handle = open(args.finalization_lock, "w", encoding="utf-8")
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(pipeline, "verify_recording", return_value=self._verified_metadata()) as verify:
+                    self.assertEqual(pipeline.finalize(args), 75)
+                    verify.assert_called_once()
+            finally:
+                lock_handle.close()
+            with mock.patch.object(pipeline, "verify_recording", side_effect=AssertionError("must reuse receipt")):
+                self.assertEqual(pipeline.finalize(args), 0)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(state["recording"]["integrity_reused"])
+
     def test_atomic_rebuild_drops_stale_optional_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

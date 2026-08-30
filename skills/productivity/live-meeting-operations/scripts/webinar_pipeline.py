@@ -234,6 +234,7 @@ def capture_receipt(args: argparse.Namespace) -> int:
 
 def _recording_receipt(state: Mapping[str, Any], media: Path, metadata: Mapping[str, Any]) -> dict[str, Any]:
     event = dict(state.get("event") or {})
+    stat_result = media.stat()
     return {
         "schema": SCHEMA,
         "kind": "recording_integrity_receipt",
@@ -246,8 +247,42 @@ def _recording_receipt(state: Mapping[str, Any], media: Path, metadata: Mapping[
             "capture_started_at": event.get("capture_started_at"),
             "official_replay_published_at": event.get("official_replay_published_at"),
         },
-        "media": {"path": str(media), **dict(metadata)},
+        "media": {
+            "path": str(media),
+            **dict(metadata),
+            "file_identity": {
+                "bytes": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
+                "device": stat_result.st_dev,
+                "inode": stat_result.st_ino,
+            },
+        },
     }
+
+
+def _verified_receipt_matches(receipt_path: Path, media: Path) -> bool:
+    """Reuse integrity proof only while the exact file identity is unchanged."""
+    if not receipt_path.is_file():
+        return False
+    try:
+        receipt = _load_json(receipt_path)
+        recorded = receipt.get("media") or {}
+        identity = recorded.get("file_identity") or {}
+        stat_result = media.stat()
+        samples = recorded.get("decode_samples") or []
+        return (
+            receipt.get("kind") == "recording_integrity_receipt"
+            and recorded.get("path") == str(media)
+            and bool(recorded.get("sha256"))
+            and bool(samples)
+            and all(isinstance(sample, Mapping) and sample.get("decodable") is True for sample in samples)
+            and identity.get("bytes") == stat_result.st_size
+            and identity.get("mtime_ns") == stat_result.st_mtime_ns
+            and identity.get("device") == stat_result.st_dev
+            and identity.get("inode") == stat_result.st_ino
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _copy_private(source: Path, destination: Path) -> None:
@@ -361,7 +396,13 @@ def finalize(args: argparse.Namespace) -> int:
 
     # Phase 1 intentionally precedes the synthesis lease.
     try:
-        metadata = verify_recording(media, ffprobe=args.ffprobe, ffmpeg=args.ffmpeg)
+        if _verified_receipt_matches(recording_receipt, media):
+            metadata = (_load_json(recording_receipt).get("media") or {})
+            integrity_reused = True
+        else:
+            metadata = verify_recording(media, ffprobe=args.ffprobe, ffmpeg=args.ffmpeg)
+            _atomic_json(recording_receipt, _recording_receipt(state, media, metadata))
+            integrity_reused = False
     except FileNotFoundError:
         state.setdefault("phases", {})["recording_integrity"] = "MISSING"
         _save_state(state_path, state, "RECORDING_MISSING", blocker=f"media not found: {media}")
@@ -373,7 +414,6 @@ def finalize(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "RECORDING_INVALID", "error": str(exc)}))
         return 6
 
-    _atomic_json(recording_receipt, _recording_receipt(state, media, metadata))
     state.setdefault("recording", {}).update(
         {
             "receipt_path": str(recording_receipt),
@@ -381,6 +421,7 @@ def finalize(args: argparse.Namespace) -> int:
             "media_sha256": metadata["sha256"],
             "bytes": metadata["bytes"],
             "duration_seconds": metadata["duration_seconds"],
+            "integrity_reused": integrity_reused,
         }
     )
     state.setdefault("phases", {})["recording_integrity"] = "VERIFIED"
