@@ -49,7 +49,11 @@ def test_locked_sync_preserves_the_configured_messaging_runtime():
     assert '"$HOME/.local/bin/uv"' in installer
 
 
-def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(
+    *args: str,
+    check: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash, "Git Bash/bash is required for the installer contract test"
     installer = str(INSTALLER).replace("\\", "/")
@@ -64,6 +68,7 @@ def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
             # Contract tests operate on temporary checkouts.  They must never
             # observe, stop, or require --restart for a real host gateway.
             "HERMES_GATEWAY_SERVICE": "hermes-powerpack-test.invalid.service",
+            **(extra_env or {}),
         },
     )
     if check and result.returncode != 0:
@@ -202,6 +207,82 @@ def test_upgrade_switches_code_and_preserves_data(tmp_path: Path):
     ).splitlines()
     assert base in backup_refs
     assert before == {name: _digest(home / name) for name in before}
+
+
+def test_restart_announces_lossless_planned_drain_before_stopping_service(
+    tmp_path: Path,
+):
+    """An updater stop must activate the durable restart inbox first."""
+
+    source, install, home, _base, candidate = _fixture(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "systemctl.trace"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+norm() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1"
+  else
+    printf '%s\\n' "$1"
+  fi
+}
+home="$(norm "$POWERPACK_TEST_HOME")"
+trace="$(norm "$POWERPACK_TEST_TRACE")"
+if [[ "${1:-}" == "--user" ]]; then shift; fi
+case "${1:-}" in
+  is-active)
+    exit 0
+    ;;
+  show)
+    grep -q '"planned_restart"[[:space:]]*:[[:space:]]*true' \
+      "$home/.drain_request.json"
+    printf '{"gateway_state":"draining","restart_requested":true,"pid":4242}\\n' \
+      > "$home/gateway_state.json"
+    printf '4242\\n'
+    ;;
+  stop)
+    grep -q '"planned_restart"[[:space:]]*:[[:space:]]*true' \
+      "$home/.drain_request.json"
+    printf 'stop\\n' >> "$trace"
+    ;;
+  start)
+    test ! -e "$home/.drain_request.json"
+    printf 'start\\n' >> "$trace"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+
+    result = _run(
+        "--restart",
+        "--no-sync",
+        "--source-dir",
+        str(source),
+        "--repo-url",
+        str(source),
+        "--dir",
+        str(install),
+        "--hermes-home",
+        str(home),
+        extra_env={
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "POWERPACK_TEST_HOME": str(home),
+            "POWERPACK_TEST_TRACE": str(trace),
+        },
+    )
+
+    assert "result=PASS" in result.stdout
+    assert _git(install, "rev-parse", "HEAD") == candidate
+    assert trace.read_text(encoding="utf-8").splitlines() == ["stop", "start"]
+    assert not (home / ".drain_request.json").exists()
 
 
 def test_install_receipt_records_release_component_pins(tmp_path: Path):

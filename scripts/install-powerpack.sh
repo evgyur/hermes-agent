@@ -207,6 +207,108 @@ service_do() {
     fi
 }
 
+service_main_pid() {
+    service_do show --property=MainPID --value
+}
+
+drain_marker_created=false
+write_planned_restart_drain() {
+    local control_python=""
+    control_python="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+    [[ -n "$control_python" ]] || die "Python is required to arm lossless restart ingress"
+    POWERPACK_DRAIN_HOME="$HERMES_HOME" "$control_python" - <<'PY'
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(os.environ["POWERPACK_DRAIN_HOME"])
+path = home / ".drain_request.json"
+if path.exists():
+    raise SystemExit(f"active drain marker already exists: {path}")
+
+boot_id = ""
+try:
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+except OSError:
+    pass
+pid1_start = ""
+try:
+    tail = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()
+    pid1_start = tail[19]
+except (OSError, IndexError):
+    pass
+epoch = f"{boot_id}:{pid1_start}" if boot_id or pid1_start else ""
+payload = {
+    "action": "drain",
+    "requested_at": datetime.now(timezone.utc).isoformat(),
+    "principal": "powerpack-installer",
+    "epoch": epoch,
+    "suppress_notification": False,
+    "planned_restart": True,
+}
+home.mkdir(parents=True, exist_ok=True)
+fd, tmp_name = tempfile.mkstemp(prefix=".drain_request.", dir=home)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o600)
+    os.replace(tmp_name, path)
+finally:
+    try:
+        os.unlink(tmp_name)
+    except FileNotFoundError:
+        pass
+PY
+    drain_marker_created=true
+}
+
+wait_for_planned_restart_drain() {
+    local expected_pid="$1"
+    local control_python=""
+    control_python="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+    local status_path="$HERMES_HOME/gateway_state.json"
+    local _
+    for _ in {1..50}; do
+        if POWERPACK_GATEWAY_STATUS="$status_path" \
+           POWERPACK_GATEWAY_PID="$expected_pid" \
+           "$control_python" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+try:
+    state = json.loads(Path(os.environ["POWERPACK_GATEWAY_STATUS"]).read_text())
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+expected_pid = int(os.environ["POWERPACK_GATEWAY_PID"])
+ok = (
+    state.get("gateway_state") == "draining"
+    and state.get("restart_requested") is True
+    and int(state.get("pid") or 0) == expected_pid
+)
+raise SystemExit(0 if ok else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+clear_planned_restart_drain() {
+    [[ "$drain_marker_created" == true ]] || return 0
+    rm -f -- "$HERMES_HOME/.drain_request.json"
+    [[ ! -e "$HERMES_HOME/.drain_request.json" ]] \
+        || die "could not clear planned restart drain marker"
+    drain_marker_created=false
+}
+
 old_origin=""
 backup_ref=""
 mutated=false
@@ -226,6 +328,7 @@ rollback() {
             git_at "$INSTALL_DIR" remote set-url origin "$old_origin" >/dev/null 2>&1 || true
         fi
     fi
+    clear_planned_restart_drain || true
     if [[ "$service_stopped" == true ]]; then
         service_do start >/dev/null 2>&1 || true
     fi
@@ -235,6 +338,12 @@ rollback() {
 trap rollback EXIT
 
 if [[ -n "$service_scope" ]]; then
+    write_planned_restart_drain
+    live_service_pid="$(service_main_pid)"
+    [[ "$live_service_pid" =~ ^[1-9][0-9]*$ ]] \
+        || die "cannot resolve live $SERVICE_NAME PID before planned restart"
+    wait_for_planned_restart_drain "$live_service_pid" \
+        || die "$SERVICE_NAME did not acknowledge lossless planned-restart ingress"
     service_do stop
     service_stopped=true
 fi
@@ -297,6 +406,7 @@ if [[ "$SYNC_DEPS" == true ]]; then
 fi
 
 if [[ "$service_stopped" == true ]]; then
+    clear_planned_restart_drain
     service_do start
     service_stopped=false
     service_do is-active --quiet
