@@ -125,6 +125,28 @@ def test_dry_run_is_read_only_and_reports_exact_candidate(tmp_path: Path):
     assert before == {name: _digest(home / name) for name in before}
 
 
+def test_dry_run_accepts_source_git_worktree(tmp_path: Path):
+    source, install, home, _base, candidate = _fixture(tmp_path)
+    source_worktree = tmp_path / "source-worktree"
+    _git(source, "worktree", "add", "--detach", str(source_worktree), candidate)
+
+    result = _run(
+        "--dry-run",
+        "--source-dir",
+        str(source_worktree),
+        "--repo-url",
+        str(source),
+        "--dir",
+        str(install),
+        "--hermes-home",
+        str(home),
+    )
+
+    assert f"candidate_sha={candidate}" in result.stdout
+    assert "action=upgrade" in result.stdout
+    assert "data_action=preserve" in result.stdout
+
+
 def test_upgrade_switches_code_and_preserves_data(tmp_path: Path):
     source, install, home, base, candidate = _fixture(tmp_path)
     before = {

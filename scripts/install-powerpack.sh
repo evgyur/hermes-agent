@@ -69,12 +69,17 @@ git_at() {
     git -c "safe.directory=$repo" -C "$repo" "$@"
 }
 
+is_git_checkout() {
+    local repo="$1"
+    [[ "$(git_at "$repo" rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]]
+}
+
 SOURCE_DIR="$(normalize_path "$SOURCE_DIR")"
 HERMES_HOME="$(normalize_path "$HERMES_HOME")"
 if [[ -z "$INSTALL_DIR" ]]; then
-    if [[ -d /opt/hermes-agent/.git ]]; then
+    if is_git_checkout /opt/hermes-agent; then
         INSTALL_DIR=/opt/hermes-agent
-    elif [[ -d "$HERMES_HOME/hermes-agent/.git" ]]; then
+    elif is_git_checkout "$HERMES_HOME/hermes-agent"; then
         INSTALL_DIR="$HERMES_HOME/hermes-agent"
     else
         INSTALL_DIR="$HERMES_HOME/hermes-agent"
@@ -82,7 +87,7 @@ if [[ -z "$INSTALL_DIR" ]]; then
 fi
 INSTALL_DIR="$(normalize_path "$INSTALL_DIR")"
 
-[[ -d "$SOURCE_DIR/.git" ]] || die "source is not a git checkout: $SOURCE_DIR"
+is_git_checkout "$SOURCE_DIR" || die "source is not a git checkout: $SOURCE_DIR"
 candidate_sha="$(git_at "$SOURCE_DIR" rev-parse 'HEAD^{commit}')"
 [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve candidate SHA"
 
@@ -100,7 +105,8 @@ action=fresh_install
 current_sha=""
 current_branch=""
 if [[ -e "$INSTALL_DIR" ]]; then
-    [[ -d "$INSTALL_DIR/.git" ]] || die "install directory is not a git checkout: $INSTALL_DIR"
+    is_git_checkout "$INSTALL_DIR" \
+        || die "install directory is not a git checkout: $INSTALL_DIR"
     action=upgrade
     dirty_status="$(git_at "$INSTALL_DIR" status --porcelain=v1 --untracked-files=all)"
     [[ -z "$dirty_status" ]] \
