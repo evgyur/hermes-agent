@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "6594efcf7b20f7f4a0ef783630ef6e183c56ceb6e48bcf3ddd29ad3a1b095b1e",
+  "aggregate_sha256": "96b58e77e425d89e40d754091b3eeae9afd2f966f65ea6e75cdd06d2b6cd5027",
   "file_count": 17,
   "files": [
     {
@@ -15,7 +15,7 @@
     {
       "bytes": 4286,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "d855be450ba04f2ab3a726001a00e93040d694cdc48b3c0ab368654bfa76d4db"
+      "sha256": "266a98c3d66a74985663a49bea57bbb4a7dc73c96dc4a020017b32f20905dac2"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 753,
       "path": "plugin.yaml",
-      "sha256": "31914fd3114ea8e37660cb1e047bb0edc9c7e581f2fee5b81898487f7372f6e4"
+      "sha256": "6b8b526c61c703a41c842030888726822190da65d13ada1843375dd98fb2dcf9"
     },
     {
       "bytes": 6557,
@@ -43,14 +43,14 @@
       "sha256": "9958e0476e73fa99848afa3718240d5b135ccf94003f261c6b1d3f20e8ccd26e"
     },
     {
-      "bytes": 25550,
+      "bytes": 25942,
       "path": "powerpack_gen2/doctor.py",
-      "sha256": "8e0400690d7fcfa73b0f7dcc4d387c7e31cc38458d36ba36e0ad6c618079e1de"
+      "sha256": "c0ff0ae472242860b11b5c5e486407592416b516ce1504c81b83e6e5e94f6aac"
     },
     {
-      "bytes": 6797,
+      "bytes": 7131,
       "path": "powerpack_gen2/installer.py",
-      "sha256": "d72eb394f8097f7e4cd67acbff11515e55257a3770863b450e545b9fe766f7a2"
+      "sha256": "22ac0bee827399c9daf81ed2cf7e557b54bed0bd6f8a4202e664dac72d0afb0a"
     },
     {
       "bytes": 8955,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.3.3"
+  "version": "2.3.4"
 }

@@ -487,14 +487,15 @@ def _operational_config_report(hermes_home: Path) -> dict[str, Any]:
     }
 
 
-def _credential_report(mode: str) -> dict[str, Any]:
+def _credential_report(mode: str, *, require_perplexity: bool = True) -> dict[str, Any]:
     names = ("H20_KEYS_BASE_URL", "H20_KEYS_STT_API_KEY", "H20_KEYS_API_KEY", "PERPLEXITY_API_KEY", "PPLX_API_KEY")
     present = {name: bool(os.environ.get(name)) for name in names}
     h20 = present["H20_KEYS_BASE_URL"] and (present["H20_KEYS_STT_API_KEY"] or present["H20_KEYS_API_KEY"])
     perplexity = present["PERPLEXITY_API_KEY"] or present["PPLX_API_KEY"]
     return {
-        "status": "PASS" if mode != "gen2_only" or (h20 and perplexity) else "FAIL",
+        "status": "PASS" if mode != "gen2_only" or (h20 and (perplexity or not require_perplexity)) else "FAIL",
         "present": present,
+        "perplexity_required": require_perplexity,
         "values_exposed": False,
     }
 
@@ -555,10 +556,16 @@ def run_doctor(
         except ImportError as exc:  # pragma: no cover - Windows has no host certification
             raise RuntimeError("host certification requires a POSIX runtime") from exc
         repository = (repo_root or root.parents[1]).resolve()
+        configured_home = (hermes_home or Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")).resolve()
         git_report = _git_host_report(repository, upstream_sha)
         systemd_report = _systemd_host_report(service)
         service_policy = _service_failure_policy_report(systemd_report.get("properties", {}))
-        credentials = _credential_report(mode)
+        root_config = _load_mapping(configured_home / "config.yaml")
+        web_config = root_config.get("web") if isinstance(root_config.get("web"), dict) else {}
+        credentials = _credential_report(
+            mode,
+            require_perplexity=web_config.get("search_backend") == "human20-perplexity",
+        )
         plugin_manifest = root / "plugin.yaml"
         expected_uid = pwd.getpwnam(expected_user).pw_uid
         venv = Path(os.environ.get("VIRTUAL_ENV") or repository / "venv")
@@ -570,7 +577,6 @@ def run_doctor(
         process_exe = process.get("exe")
         sqlite_runtime = _sqlite_runtime_report(process_exe if isinstance(process_exe, str) else None)
         state_handles = _state_handle_report(int(process.get("pid") or 0))
-        configured_home = (hermes_home or Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")).resolve()
         operational_config = _operational_config_report(configured_home)
         process_identity = _process_identity_report(
             repository=repository,

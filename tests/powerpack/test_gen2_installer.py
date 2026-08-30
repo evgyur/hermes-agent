@@ -16,7 +16,8 @@ if str(PACKAGE_ROOT) not in sys.path:
 from powerpack_gen2 import doctor, installer  # noqa: E402
 
 
-def test_installer_atomically_materializes_and_activates_boxed_plugin(tmp_path):
+def test_installer_atomically_materializes_and_activates_boxed_plugin(monkeypatch, tmp_path):
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -56,6 +57,29 @@ def test_installer_atomically_materializes_and_activates_boxed_plugin(tmp_path):
     assert config["image_gen"]["provider"] == "human20-keys-openai-codex"
     persisted = json.loads((home / "powerpack" / "receipts" / "human20-powerpack-gen2-install.json").read_text())
     assert persisted["package_sha256"] == receipt["package_sha256"]
+
+
+def test_installer_preserves_default_web_provider_without_perplexity_credentials(monkeypatch, tmp_path):
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    monkeypatch.delenv("PPLX_API_KEY", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {"enabled": []},
+                "web": {"search_backend": "human20-perplexity", "extract_backend": "parallel"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    installer.install(PACKAGE_ROOT, home, variant="employee", mode="gen2_only")
+    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+
+    assert "search_backend" not in config["web"]
+    assert config["web"]["extract_backend"] == "parallel"
 
 
 def test_installer_rejects_tampered_source_without_mutating_profile(tmp_path):

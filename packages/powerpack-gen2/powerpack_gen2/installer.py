@@ -33,7 +33,13 @@ def _load_config(path: Path) -> dict[str, Any]:
     return value
 
 
-def _activate_config(config: dict[str, Any], variant: str, mode: str) -> None:
+def _activate_config(
+    config: dict[str, Any],
+    variant: str,
+    mode: str,
+    *,
+    perplexity_available: bool,
+) -> None:
     plugins = config.setdefault("plugins", {})
     if not isinstance(plugins, dict):
         raise RuntimeError("plugins config must be a mapping")
@@ -64,7 +70,10 @@ def _activate_config(config: dict[str, Any], variant: str, mode: str) -> None:
     image_gen = config.setdefault("image_gen", {})
     if not all(isinstance(section, dict) for section in (web, stt, image_gen)):
         raise RuntimeError("web, stt, and image_gen config sections must be mappings")
-    web["search_backend"] = "human20-perplexity"
+    if perplexity_available:
+        web["search_backend"] = "human20-perplexity"
+    elif web.get("search_backend") == "human20-perplexity":
+        web.pop("search_backend", None)
     stt["enabled"] = True
     stt["provider"] = "human20-keys-groq"
     stt.setdefault("human20-keys-groq", {})["model"] = "whisper-large-v3"
@@ -105,7 +114,8 @@ def install(source_root: Path, hermes_home: Path, *, variant: str, mode: str) ->
     config_path = hermes_home / "config.yaml"
     original_config = config_path.read_bytes() if config_path.exists() else None
     config = _load_config(config_path)
-    _activate_config(config, variant, mode)
+    perplexity_available = bool(os.environ.get("PERPLEXITY_API_KEY") or os.environ.get("PPLX_API_KEY"))
+    _activate_config(config, variant, mode, perplexity_available=perplexity_available)
 
     stage = Path(tempfile.mkdtemp(prefix=f".{PLUGIN_NAME}.stage-", dir=plugins_root))
     backup = plugins_root / f".{PLUGIN_NAME}.backup-{os.getpid()}"

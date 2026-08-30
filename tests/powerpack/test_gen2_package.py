@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.3"
+    assert manifest["version"] == "2.3.4"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
@@ -153,7 +153,7 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
     monkeypatch.setattr(
         doctor,
         "_credential_report",
-        lambda _mode: {"status": "PASS", "present": {}, "values_exposed": False},
+        lambda _mode, **_kwargs: {"status": "PASS", "present": {}, "values_exposed": False},
     )
     monkeypatch.setattr(
         doctor,
@@ -221,6 +221,19 @@ def test_service_failure_policy_requires_upstream_restart_contract():
     assert passing["status"] == "PASS"
     assert missing_fatal_stop["status"] == "FAIL"
     assert missing_fatal_stop["fatal_config_stops"] is False
+
+
+def test_gen2_credentials_require_perplexity_only_when_selected(monkeypatch):
+    monkeypatch.setenv("H20_KEYS_BASE_URL", "https://keys.example.invalid/v1")
+    monkeypatch.setenv("H20_KEYS_API_KEY", "test-key")
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    monkeypatch.delenv("PPLX_API_KEY", raising=False)
+
+    fallback = doctor._credential_report("gen2_only", require_perplexity=False)
+    selected = doctor._credential_report("gen2_only", require_perplexity=True)
+
+    assert fallback["status"] == "PASS"
+    assert selected["status"] == "FAIL"
 
 
 def test_sqlite_runtime_floor_rejects_wal_reset_vulnerable_version():
