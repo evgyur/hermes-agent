@@ -8206,6 +8206,7 @@ class AIAgent:
         focus_topic: str = None,
         force: bool = False,
         bypass_ineffective_guard: bool = False,
+        bypass_degraded_summary_guard: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8216,9 +8217,10 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
 
-        ``bypass_ineffective_guard=True`` is narrower: critical gateway
-        hygiene may retry after the anti-thrash breaker trips, but it still
-        honors provider failure cooldowns and remains an automatic attempt.
+        ``bypass_degraded_summary_guard=True`` is the 85%-95% gateway rail:
+        it may retry a fallback-streak/degraded-summary breaker only. Both
+        automatic rails continue to honor provider cooldowns and never acquire
+        manual ``force`` semantics.
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
@@ -8276,6 +8278,7 @@ class AIAgent:
                     focus_topic=focus_topic,
                     force=force,
                     bypass_ineffective_guard=bypass_ineffective_guard,
+                    bypass_degraded_summary_guard=bypass_degraded_summary_guard,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -9324,6 +9327,42 @@ class AIAgent:
                         self._active_session_turn_lease_holder = None
                         self._active_session_turn_lease_ttl_seconds = None
                         _bind_context_compressor_turn_lease(None)
+                    # A proactive prune can finish computing after its turn
+                    # lease was released and be fenced by SessionDB. The
+                    # compressor persisted that exact obligation in model_config;
+                    # execute one deterministic retry immediately on the safe
+                    # side of this turn boundary. No force/manual semantics are
+                    # involved, and a new turn will serialize on the outer
+                    # gateway/process-local turn slot while this finally unwinds.
+                    _compressor = getattr(self, "context_compressor", None)
+                    _retry_tokens = int(
+                        getattr(_compressor, "_proactive_prune_retry_tokens", 0)
+                        or 0
+                    )
+                    if _retry_tokens > 0 and _turn_db is not None and session_id:
+                        try:
+                            _retry_session_id = (
+                                getattr(self, "session_id", None) or session_id
+                            )
+                            _retry_messages = _turn_db.get_messages_as_conversation(
+                                _retry_session_id,
+                                repair_alternation=True,
+                                include_row_ids=True,
+                            )
+                            _pruned, _pruned_count = (
+                                _compressor.prune_tool_results_only(
+                                    _retry_messages,
+                                    current_tokens=_retry_tokens,
+                                )
+                            )
+                            if _pruned_count > 0:
+                                self._session_messages = _pruned
+                        except Exception:
+                            logger.warning(
+                                "Post-turn proactive prune retry failed: %s",
+                                getattr(self, "session_id", None) or session_id,
+                                exc_info=True,
+                            )
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

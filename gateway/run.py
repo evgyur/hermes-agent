@@ -25541,6 +25541,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             bypass_ineffective_guard=(
                                                 _approx_tokens >= _warn_token_threshold
                                             ),
+                                            # Two deterministic summaries are a
+                                            # degraded-summary breaker, not proof
+                                            # that the transcript is structurally
+                                            # incompressible. Give the next 85%-95%
+                                            # gateway boundary one fenced recovery;
+                                            # the >=95% ineffective rail above stays
+                                            # unchanged and provider cooldowns are
+                                            # still checked by both automatic gates.
+                                            bypass_degraded_summary_guard=(
+                                                _compress_token_threshold
+                                                <= _approx_tokens
+                                                < _warn_token_threshold
+                                            ),
                                             commit_fence=_hyg_commit_fence,
                                         ),
                                     )

@@ -129,6 +129,44 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     )
 
 
+def test_post_turn_executes_durable_proactive_prune_retry(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    calls = []
+
+    class Compressor:
+        _proactive_prune_retry_tokens = 9000
+
+        def bind_turn_lease(self, holder, **_kwargs):
+            calls.append(("bind", holder))
+
+        def prune_tool_results_only(self, messages, *, current_tokens):
+            calls.append(("prune", current_tokens, list(messages)))
+            self._proactive_prune_retry_tokens = 0
+            return ([{"role": "user", "content": "pruned"}], 1)
+
+    agent.context_compressor = Compressor()
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda _agent, _message, _system, history, *_args, **_kwargs: {
+            "final_response": "ok",
+            "messages": history,
+            "failed": False,
+        },
+    )
+
+    AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "before"}],
+    )
+
+    assert [event[0] for event in db.events] == ["acquire", "release", "reload"]
+    assert calls[-2] == ("bind", None)
+    assert calls[-1][0:2] == ("prune", 9000)
+    assert agent._session_messages == [{"role": "user", "content": "pruned"}]
+
+
 def test_gateway_preacquired_lease_is_verified_but_not_reowned(monkeypatch):
     """Gateway retains acquire/release ownership across the agent handoff."""
     db = _DB()

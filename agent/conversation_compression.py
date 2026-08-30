@@ -2824,6 +2824,7 @@ def compress_context(
     focus_topic: Optional[str] = None,
     force: bool = False,
     bypass_ineffective_guard: bool = False,
+    bypass_degraded_summary_guard: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2847,6 +2848,11 @@ def compress_context(
             anti-thrash/ineffective breaker. Active provider-failure cooldowns
             remain authoritative. Used by critical gateway hygiene when the
             transcript has reached the model-window safety boundary.
+        bypass_degraded_summary_guard: If True, bypass the same shared breaker
+            only when it was tripped solely by repeated deterministic summary
+            fallbacks. Gateway hygiene uses this for one boundary recovery in
+            the 85%-95% runway; ineffective-compaction strikes and provider
+            cooldowns remain authoritative.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -2973,6 +2979,8 @@ def compress_context(
         if not callable(blocked) or not blocked(agent.context_compressor):
             return False
         if bypass_ineffective_guard:
+            # Critical recovery is explicit and opt-in; it never inherits the
+            # manual force path or bypasses provider cooldowns.
             reason_fn = getattr(
                 type(agent.context_compressor),
                 "_compression_block_reason",
@@ -2983,9 +2991,38 @@ def compress_context(
                 if callable(reason_fn)
                 else None
             )
-            if reason == "ineffective":
+            if reason == "ineffective" or reason == "ineffective+degraded_summary":
                 logger.warning(
-                    "critical compression recovery bypassing ineffective "
+                    "gateway compression recovery bypassing ineffective breaker "
+                    "for session=%s",
+                    agent.session_id or "none",
+                )
+                return False
+        if bypass_degraded_summary_guard:
+            reason_fn = getattr(
+                type(agent.context_compressor),
+                "_compression_block_reason",
+                None,
+            )
+            reason = (
+                reason_fn(agent.context_compressor)
+                if callable(reason_fn)
+                else None
+            )
+            if (
+                reason == "degraded_summary"
+                and int(
+                    getattr(
+                        agent.context_compressor,
+                        "_fallback_compression_streak",
+                        0,
+                    )
+                    or 0
+                )
+                >= 2
+            ):
+                logger.warning(
+                    "gateway compression recovery bypassing degraded-summary "
                     "breaker for session=%s",
                     agent.session_id or "none",
                 )
@@ -3996,7 +4033,7 @@ def compress_context(
         # completed since the previous boundary, retaining the old snapshot
         # would resurrect finished work even though there is nothing fresh to
         # append. System rows are canonical standalone snapshots; legacy user
-        # snapshots were suffix-merged and must preserve preceding human text.
+        # snapshots may be standalone or suffix-merged with human text.
         compressed = [
             row
             for row in compressed
@@ -4008,19 +4045,24 @@ def compress_context(
                 )
             )
         ]
-        _tail = (
-            compressed[-1]
-            if compressed and isinstance(compressed[-1], dict)
-            else None
-        )
-        if _tail is not None and _tail.get("role") == "user":
-            _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
-            if _stripped != _tail.get("content"):
-                if _message_text({"role": "user", "content": _stripped}).strip():
-                    _tail["content"] = _stripped
-                    _tail.pop("_todo_snapshot_synthetic", None)
-                else:
-                    compressed.pop()
+        # Legacy releases could persist the synthetic snapshot as role=user,
+        # either standalone or suffix-merged into a human turn. Normalize every
+        # surviving row, not only the tail: drop standalone scaffolding, while
+        # preserving and unflagging any human prefix before the snapshot.
+        _without_legacy_todos = []
+        for _row in compressed:
+            if not isinstance(_row, dict) or _row.get("role") != "user":
+                _without_legacy_todos.append(_row)
+                continue
+            _stripped = _strip_stale_todo_snapshot(_row.get("content"))
+            if _stripped == _row.get("content"):
+                _without_legacy_todos.append(_row)
+                continue
+            if _message_text({"role": "user", "content": _stripped}).strip():
+                _row["content"] = _stripped
+                _row.pop("_todo_snapshot_synthetic", None)
+                _without_legacy_todos.append(_row)
+        compressed = _without_legacy_todos
 
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
@@ -4039,7 +4081,13 @@ def compress_context(
             # can otherwise render or reason about it as though the operator
             # authored the snapshot. Keeping it as a system turn also avoids
             # converting internal plan state into a steer after compaction.
-            compressed.append({"role": "system", "content": todo_snapshot})
+            compressed.append(
+                {
+                    "role": "system",
+                    "content": todo_snapshot,
+                    "_todo_snapshot_synthetic": True,
+                }
+            )
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
             messages, compressed
         )

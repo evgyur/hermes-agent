@@ -786,6 +786,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             # the model window (regression: 398,608-token Telegram context).
             assert _kwargs.get("force") is not True
             assert _kwargs.get("bypass_ineffective_guard") is True
+            assert _kwargs.get("bypass_degraded_summary_guard") is False
             self._last_compaction_in_place = True
             # Persisted compaction happened, but the remaining payload is still
             # above the 95% safety boundary; gateway must apply its bounded
@@ -1367,5 +1368,62 @@ async def test_hygiene_retries_after_completed_turn_releases_protected_tail(
             "the newly completed turn became compressible, but hygiene did "
             "not retry on the next user boundary"
         )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_two_stalled_routes_then_fallback_streak_recovers_at_85_percent(
+    monkeypatch, tmp_path
+):
+    """Two deterministic fallbacks get one fenced boundary recovery, no /new."""
+    from hermes_state import SessionDB
+
+    session_id = "sess-two-stalls-two-fallbacks"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        db.set_compression_fallback_streak(session_id, 2)
+
+        class RecoveryAgent:
+            calls = []
+
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id", session_id)
+                self._session_db = kwargs.get("session_db")
+                self._last_compaction_in_place = False
+                streak = db.get_compression_fallback_streak(session_id)
+                assert streak == 2  # two successful deterministic fallbacks
+                self.context_compressor = SimpleNamespace(
+                    bind_session_state=MagicMock(),
+                    bind_turn_lease=MagicMock(),
+                    _fallback_compression_streak=streak,
+                    _ineffective_compression_count=0,
+                    _last_compress_aborted=False,
+                    _last_aux_model_failure_model=None,
+                )
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+
+            def _compress_context(self, messages, *_args, **kwargs):
+                type(self).calls.append(kwargs)
+                self._last_compaction_in_place = True
+                return (messages[:2], None)
+
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, RecoveryAgent, db, session_id
+        )
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            lambda *_args, **_kwargs: 720,
+        )
+        assert await runner._handle_message(event) == "ok"
+        assert len(RecoveryAgent.calls) == 1
+        call = RecoveryAgent.calls[0]
+        assert call.get("force", False) is False
+        assert call["bypass_degraded_summary_guard"] is True
+        assert call["bypass_ineffective_guard"] is False
+        assert "commit_fence" in call
+        assert runner._run_agent.await_count == 1
     finally:
         db.close()

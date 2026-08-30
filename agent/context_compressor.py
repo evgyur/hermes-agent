@@ -313,6 +313,7 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
+PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY = "_proactive_prune_retry_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -556,7 +557,10 @@ def _salvage_reduce_todo_snapshot(out: List[Dict[str, Any]]) -> None:
         msg = out[i]
         if not isinstance(msg, dict):
             continue
-        if msg.get("_todo_snapshot_synthetic") and msg.get("role") == "user":
+        if msg.get("_todo_snapshot_synthetic") and msg.get("role") in {
+            "user",
+            "system",
+        }:
             content = msg.get("content")
             notice_idx = (
                 content.find(_PRUNED_SKILL_RELOAD_NOTICE_HEADER)
@@ -2275,6 +2279,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
         self._turn_lease_holder = None
         self._turn_lease_ttl_seconds = 300.0
 
@@ -2582,6 +2587,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -2599,10 +2605,12 @@ class ContextCompressor(ContextEngine):
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_proactive_prune_rearm_tokens()
+        self._load_proactive_prune_retry_tokens()
 
     def bind_turn_lease(
         self,
@@ -2714,6 +2722,49 @@ class ContextCompressor(ContextEngine):
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
+
+    def _load_proactive_prune_retry_tokens(self) -> None:
+        """Restore a lease-raced prune obligation for post-turn execution."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(session_id, PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY, 0)
+            self._proactive_prune_retry_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("proactive prune retry lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "proactive prune retry lookup failed (non-sqlite): %s", exc
+            )
+
+    def _persist_proactive_prune_retry_tokens(self, tokens: int) -> bool:
+        """Persist one retry obligation without rewriting transcript rows."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return False
+        value = max(0, int(tokens or 0))
+        try:
+            patcher(
+                session_id,
+                {
+                    PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY: (
+                        value if value > 0 else None
+                    )
+                },
+            )
+        except Exception as exc:
+            logger.warning("proactive prune retry persist failed: %s", exc)
+            return False
+        self._proactive_prune_retry_tokens = value
+        return True
 
     def _clear_durable_proactive_prune_rearm(self) -> None:
         """Remove the persisted runway key without touching the transcript.
@@ -3736,8 +3787,9 @@ class ContextCompressor(ContextEngine):
         * ``"cooldown:<seconds>"`` — the summary LLM is recovering from a
           recent 429/transient failure; compression is deferred to avoid the
           freeze loop described in #11529.
-        * ``"ineffective"`` — anti-thrashing has backed off because the last
-          two compressions each saved <10%.
+        * ``"ineffective"`` / ``"degraded_summary"`` — anti-thrashing has
+          backed off after low-savings attempts or repeated deterministic
+          fallback summaries.
 
         When ``reason`` is non-``None`` the session is over its compression
         threshold yet cannot shrink — callers should surface a warning so the
@@ -3768,8 +3820,11 @@ class ContextCompressor(ContextEngine):
           eligible inside the protection window (#93022); retries are
           deferred transiently and compaction resumes when the backoff
           lapses or the transcript outgrows the window.
-        * ``"ineffective"`` — anti-thrashing has backed off (the last two
-          compressions each saved <10%, or the fallback streak tripped).
+        * ``"ineffective"`` — anti-thrashing has backed off after two
+          low-savings verdicts.
+        * ``"degraded_summary"`` — two completed deterministic fallback
+          summaries tripped the bounded degraded-summary breaker.
+        * ``"ineffective+degraded_summary"`` — both breakers are active.
         * ``None`` — no block active.
         """
         _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
@@ -3782,9 +3837,13 @@ class ContextCompressor(ContextEngine):
             return f"structural_backoff:{_structural_remaining:.0f}"
         if (
             self._ineffective_compression_count >= 2
-            or self._fallback_compression_streak >= 2
+            and self._fallback_compression_streak >= 2
         ):
+            return "ineffective+degraded_summary"
+        if self._ineffective_compression_count >= 2:
             return "ineffective"
+        if self._fallback_compression_streak >= 2:
+            return "degraded_summary"
         return None
 
     def _refresh_durable_guards(self) -> None:
@@ -4336,6 +4395,14 @@ class ContextCompressor(ContextEngine):
                     **turn_lease_kwargs,
                 )
             except Exception as exc:
+                if type(exc).__name__ == "SessionTurnLeaseLostError":
+                    # The prune crossed the active-turn boundary after making
+                    # its deterministic candidate. Persist one obligation in
+                    # the session row; run_agent executes it only after the
+                    # holder-qualified lease release, never with force semantics.
+                    retry_tokens = max(int(current_tokens or 0), before)
+                    self._proactive_prune_retry_tokens = retry_tokens
+                    self._persist_proactive_prune_retry_tokens(retry_tokens)
                 logger.warning(
                     "Proactive tool-result prune DB commit failed; keeping the "
                     "original transcript: %s",
@@ -4346,6 +4413,8 @@ class ContextCompressor(ContextEngine):
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         self._proactive_prune_rearm_tokens = next_rearm_tokens
+        if self._proactive_prune_retry_tokens:
+            self._persist_proactive_prune_retry_tokens(0)
         return pruned_msgs, pruned_count
 
     # ------------------------------------------------------------------
