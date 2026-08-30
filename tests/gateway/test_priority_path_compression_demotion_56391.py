@@ -43,11 +43,17 @@ def _make_source() -> SessionSource:
         chat_id="c1",
         user_name="tester",
         chat_type="dm",
+        message_id="m1",
     )
 
 
 def _make_event(text: str) -> MessageEvent:
-    return MessageEvent(text=text, source=_make_source(), message_id="m1")
+    return MessageEvent(
+        text=text,
+        source=_make_source(),
+        raw_message=SimpleNamespace(message_id="m1"),
+        message_id="m1",
+    )
 
 
 def _make_runner(*, compression_in_flight: bool):
@@ -145,5 +151,4 @@ async def test_priority_path_does_not_interrupt_when_compression_in_flight():
     agent_mock.interrupt.assert_not_called()
     queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
     assert queued is not None and queued.text == "still there?"
-
 

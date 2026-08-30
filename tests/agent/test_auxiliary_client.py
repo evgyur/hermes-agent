@@ -1812,7 +1812,10 @@ class TestStaleFallbackCandidateSkip:
         assert result.choices[0].message.content == "independent-fallback"
         broken_glm.chat.completions.create.assert_called_once()
         next_fb.assert_called_once_with(
-            "human20-keys", "compression", reason="failed fallback candidate"
+            "human20-keys",
+            "compression",
+            reason="failed fallback candidate",
+            failed_model="mmfast",
         )
         independent_fb.chat.completions.create.assert_called_once()
 
