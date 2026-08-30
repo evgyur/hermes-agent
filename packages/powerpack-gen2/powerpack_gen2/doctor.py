@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,6 +20,9 @@ SECRET_PATTERNS = (
 )
 VALID_MODES = frozenset({"disabled", "compatibility", "gen2_only"})
 VALID_VARIANTS = frozenset({"rentals", "employee"})
+MINIMUM_SQLITE_VERSION = (3, 53, 1)
+MANAGED_STT_PROVIDER = "human20-keys-groq"
+MANAGED_STT_MODEL = "whisper-large-v3"
 BUILTIN_COLLISION_NAMES = frozenset(
     {
         "power",
@@ -247,6 +251,14 @@ def _systemd_host_report(service: str) -> dict[str, Any]:
             "FragmentPath",
             "-p",
             "DropInPaths",
+            "-p",
+            "Restart",
+            "-p",
+            "RestartPreventExitStatus",
+            "-p",
+            "RestartForceExitStatus",
+            "-p",
+            "TimeoutStopUSec",
         ]
     )
     values: dict[str, str] = {}
@@ -273,6 +285,176 @@ def _systemd_host_report(service: str) -> dict[str, Any]:
         "properties": values,
         "process": process,
         "contracts": contracts,
+    }
+
+
+def _exit_status_contains(raw: str, expected: int) -> bool:
+    tokens = {part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()}
+    return str(expected) in tokens
+
+
+def _service_failure_policy_report(properties: dict[str, str]) -> dict[str, Any]:
+    restart = properties.get("Restart", "")
+    restarts = restart in {"always", "on-failure"}
+    fatal_config_stops = _exit_status_contains(properties.get("RestartPreventExitStatus", ""), 78)
+    forced_restart = _exit_status_contains(properties.get("RestartForceExitStatus", ""), 75)
+    return {
+        "status": "PASS" if restarts and fatal_config_stops and forced_restart else "FAIL",
+        "restart": restart,
+        "restarts": restarts,
+        "fatal_config_stops": fatal_config_stops,
+        "forced_restart": forced_restart,
+    }
+
+
+def _parse_version(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in value.strip().split("."):
+        match = re.match(r"\d+", part)
+        if not match:
+            break
+        parts.append(int(match.group(0)))
+    return tuple(parts)
+
+
+def _sqlite_version_report(version: str) -> dict[str, Any]:
+    minimum = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
+    parsed = _parse_version(version)
+    return {
+        "status": "PASS" if parsed >= MINIMUM_SQLITE_VERSION else "FAIL",
+        "version": version,
+        "minimum": minimum,
+    }
+
+
+def _sqlite_runtime_report(executable: str | None = None) -> dict[str, Any]:
+    if executable:
+        proc = _run(
+            [
+                executable,
+                "-c",
+                "import json,sqlite3; print(json.dumps({'version': sqlite3.sqlite_version}))",
+            ]
+        )
+        if proc.returncode != 0:
+            return {
+                "status": "FAIL",
+                "version": None,
+                "minimum": ".".join(str(part) for part in MINIMUM_SQLITE_VERSION),
+                "probe_failed": True,
+            }
+        try:
+            version = str(json.loads(proc.stdout)["version"])
+        except (KeyError, TypeError, ValueError):
+            return {
+                "status": "FAIL",
+                "version": None,
+                "minimum": ".".join(str(part) for part in MINIMUM_SQLITE_VERSION),
+                "probe_failed": True,
+            }
+        return _sqlite_version_report(version)
+    return _sqlite_version_report(sqlite3.sqlite_version)
+
+
+def _classify_deleted_state_handles(targets: Iterable[str]) -> dict[str, Any]:
+    kinds: set[str] = set()
+    for target in targets:
+        normalized = target.lower()
+        if "(deleted)" not in normalized:
+            continue
+        if "state.db-wal" in normalized:
+            kinds.add("wal")
+        if "state.db-shm" in normalized:
+            kinds.add("shm")
+    return {
+        "status": "PASS" if not kinds else "FAIL",
+        "deleted_count": len(kinds),
+        "kinds": sorted(kinds),
+    }
+
+
+def _state_handle_report(pid: int) -> dict[str, Any]:
+    targets: list[str] = []
+    fd_root = Path(f"/proc/{pid}/fd")
+    if pid <= 0 or not fd_root.is_dir():
+        return {"status": "FAIL", "deleted_count": 0, "kinds": [], "probe_failed": True}
+    try:
+        for descriptor in fd_root.iterdir():
+            try:
+                targets.append(os.readlink(descriptor))
+            except OSError:
+                continue
+    except OSError:
+        return {"status": "FAIL", "deleted_count": 0, "kinds": [], "probe_failed": True}
+    return _classify_deleted_state_handles(targets)
+
+
+def _load_mapping(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _stt_is_managed(config: dict[str, Any]) -> bool:
+    stt = config.get("stt")
+    if not isinstance(stt, dict) or stt.get("enabled") is not True:
+        return False
+    provider = stt.get("provider")
+    provider_config = stt.get(MANAGED_STT_PROVIDER)
+    return (
+        provider == MANAGED_STT_PROVIDER
+        and isinstance(provider_config, dict)
+        and provider_config.get("model") == MANAGED_STT_MODEL
+    )
+
+
+def _cron_self_delivery(profile_id: str, profile_home: Path) -> list[str]:
+    findings: list[str] = []
+    cron_root = profile_home / "cron"
+    if not cron_root.is_dir():
+        return findings
+    for path in sorted(cron_root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+        if not isinstance(jobs, list):
+            continue
+        for index, job in enumerate(jobs):
+            if not isinstance(job, dict) or job.get("enabled") is False:
+                continue
+            if job.get("deliver") != "bot-chat":
+                continue
+            job_id = str(job.get("id") or f"{path.stem}:{index}")
+            findings.append(f"{profile_id}:{job_id}")
+    return findings
+
+
+def _operational_config_report(hermes_home: Path) -> dict[str, Any]:
+    homes: list[tuple[str, Path]] = [("root", hermes_home)]
+    profiles = hermes_home / "profiles"
+    if profiles.is_dir():
+        homes.extend((path.name, path) for path in sorted(profiles.iterdir()) if path.is_dir())
+
+    stt_drift: list[str] = []
+    cron_self_delivery: list[str] = []
+    for profile_id, profile_home in homes:
+        config_path = profile_home / "config.yaml"
+        config = _load_mapping(config_path)
+        if config_path.is_file() and (profile_id == "root" or "stt" in config) and not _stt_is_managed(config):
+            stt_drift.append(profile_id)
+        cron_self_delivery.extend(_cron_self_delivery(profile_id, profile_home))
+    return {
+        "status": "PASS" if not stt_drift and not cron_self_delivery else "FAIL",
+        "stt_drift": stt_drift,
+        "cron_self_delivery": cron_self_delivery,
     }
 
 
@@ -304,6 +486,7 @@ def run_doctor(
     service: str = "human20team-hermes-gateway.service",
     expected_user: str = "human20team",
     active_plugin_root: Path | None = None,
+    hermes_home: Path | None = None,
 ) -> dict[str, Any]:
     root = root.resolve()
     manifest = load_manifest(root)
@@ -345,6 +528,7 @@ def run_doctor(
         repository = (repo_root or root.parents[1]).resolve()
         git_report = _git_host_report(repository, upstream_sha)
         systemd_report = _systemd_host_report(service)
+        service_policy = _service_failure_policy_report(systemd_report.get("properties", {}))
         credentials = _credential_report(mode)
         plugin_manifest = root / "plugin.yaml"
         expected_uid = pwd.getpwnam(expected_user).pw_uid
@@ -355,6 +539,10 @@ def run_doctor(
         process = systemd_report.get("process", {})
         process_cwd = process.get("cwd")
         process_exe = process.get("exe")
+        sqlite_runtime = _sqlite_runtime_report(process_exe if isinstance(process_exe, str) else None)
+        state_handles = _state_handle_report(int(process.get("pid") or 0))
+        configured_home = (hermes_home or Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")).resolve()
+        operational_config = _operational_config_report(configured_home)
         process_identity_ok = (
             process_cwd == str(repository)
             and isinstance(process_exe, str)
@@ -364,6 +552,10 @@ def run_doctor(
             "repository": git_report,
             "systemd": systemd_report,
             "credentials": credentials,
+            "service_failure_policy": service_policy,
+            "sqlite_runtime": sqlite_runtime,
+            "deleted_state_handles": state_handles,
+            "operational_config": operational_config,
             "active_plugin_manifest": {
                 "path": str(active_root / "plugin.yaml"),
                 "sha256": _sha256(active_root / "plugin.yaml") if (active_root / "plugin.yaml").is_file() else None,
@@ -389,6 +581,10 @@ def run_doctor(
             evidence=git_report,
         )
         _check(checks, "host_service_process", systemd_report["status"] == "PASS", evidence=systemd_report)
+        _check(checks, "host_service_failure_policy", service_policy["status"] == "PASS", required=mode == "gen2_only", evidence=service_policy)
+        _check(checks, "host_sqlite_runtime", sqlite_runtime["status"] == "PASS", required=mode == "gen2_only", evidence=sqlite_runtime)
+        _check(checks, "host_deleted_state_handles", state_handles["status"] == "PASS", required=mode == "gen2_only", evidence=state_handles)
+        _check(checks, "host_operational_config", operational_config["status"] == "PASS", required=mode == "gen2_only", evidence=operational_config)
         _check(checks, "host_process_loaded_identity", process_identity_ok, evidence={"cwd": process_cwd, "exe": process_exe})
         _check(checks, "host_venv_ownership", venv_owner == expected_uid, evidence=host_report["venv"])
         _check(

@@ -49,6 +49,7 @@ def setup_parser(parser, root: Path, variant: str, mode: str) -> None:
     doctor.add_argument("--repo-root")
     doctor.add_argument("--expected-user", default="human20team")
     doctor.add_argument("--active-plugin-root")
+    doctor.add_argument("--hermes-home")
     doctor.add_argument("--upstream-sha", default=os.environ.get("HERMES_UPSTREAM_SHA", PIN))
     doctor.set_defaults(power_root=str(root), power_variant=variant, power_mode=mode)
 
@@ -116,6 +117,7 @@ def handle_cli(args, root: Path, variant: str, mode: str, *, ctx=None) -> int:
             service=str(getattr(args, "service", "human20team-hermes-gateway.service")),
             expected_user=str(getattr(args, "expected_user", "human20team")),
             active_plugin_root=Path(str(getattr(args, "active_plugin_root", "") or root)) if host else None,
+            hermes_home=Path(str(getattr(args, "hermes_home", "") or os.environ.get("HERMES_HOME") or Path.home() / ".hermes")) if host else None,
         )
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0 if report["ok"] else 1

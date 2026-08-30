@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.2"
+    assert manifest["version"] == "2.3.3"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
@@ -140,7 +140,11 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
         "_systemd_host_report",
         lambda _service: {
             "status": "PASS",
-            "properties": {},
+            "properties": {
+                "Restart": "always",
+                "RestartPreventExitStatus": "78",
+                "RestartForceExitStatus": "75",
+            },
             "process": {"cwd": str(repo), "exe": str(venv / "bin/python")},
             "contracts": [],
         },
@@ -149,6 +153,29 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
         doctor,
         "_credential_report",
         lambda _mode: {"status": "PASS", "present": {}, "values_exposed": False},
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_sqlite_runtime_report",
+        lambda *_args, **_kwargs: {
+            "status": "PASS",
+            "version": "3.53.1",
+            "minimum": "3.53.1",
+        },
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_state_handle_report",
+        lambda *_args, **_kwargs: {"status": "PASS", "deleted_count": 0, "kinds": []},
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_operational_config_report",
+        lambda *_args, **_kwargs: {
+            "status": "PASS",
+            "stt_drift": [],
+            "cron_self_delivery": [],
+        },
     )
 
     report = doctor.run_doctor(
@@ -168,6 +195,132 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
     assert checks["host_supported_upstream_ancestor"]["status"] == "PASS"
     assert checks["host_core_matches_upstream"]["status"] == "FAIL"
     assert checks["host_core_matches_upstream"]["required"] is False
+    assert checks["host_service_failure_policy"]["status"] == "PASS"
+    assert checks["host_sqlite_runtime"]["status"] == "PASS"
+    assert checks["host_deleted_state_handles"]["status"] == "PASS"
+    assert checks["host_operational_config"]["status"] == "PASS"
+
+
+def test_service_failure_policy_requires_upstream_restart_contract():
+    passing = doctor._service_failure_policy_report(
+        {
+            "Restart": "always",
+            "RestartPreventExitStatus": "78",
+            "RestartForceExitStatus": "75",
+        }
+    )
+    missing_fatal_stop = doctor._service_failure_policy_report(
+        {
+            "Restart": "on-failure",
+            "RestartPreventExitStatus": "",
+            "RestartForceExitStatus": "75",
+        }
+    )
+
+    assert passing["status"] == "PASS"
+    assert missing_fatal_stop["status"] == "FAIL"
+    assert missing_fatal_stop["fatal_config_stops"] is False
+
+
+def test_sqlite_runtime_floor_rejects_wal_reset_vulnerable_version():
+    assert doctor._sqlite_version_report("3.53.1")["status"] == "PASS"
+    report = doctor._sqlite_version_report("3.50.4")
+    assert report["status"] == "FAIL"
+    assert report["minimum"] == "3.53.1"
+
+
+def test_deleted_state_handle_classifier_is_bounded_and_redacted():
+    report = doctor._classify_deleted_state_handles(
+        [
+            "/private/profile/state.db-wal (deleted)",
+            "/private/profile/state.db-shm (deleted)",
+            "/tmp/unrelated (deleted)",
+        ]
+    )
+
+    assert report == {
+        "status": "FAIL",
+        "deleted_count": 2,
+        "kinds": ["shm", "wal"],
+    }
+
+
+def test_operational_config_rejects_stt_drift_and_self_cron(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "stt": {
+                    "enabled": True,
+                    "provider": "human20-keys-groq",
+                    "human20-keys-groq": {"model": "whisper-large-v3"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile = tmp_path / "profiles" / "dev"
+    (profile / "cron").mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        yaml.safe_dump({"stt": {"enabled": True, "provider": "groq"}}),
+        encoding="utf-8",
+    )
+    (profile / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"id": "self-job", "enabled": True, "deliver": "bot-chat"},
+                    {"id": "other-job", "enabled": True, "deliver": "bot-chat:research"},
+                    {"id": "disabled", "enabled": False, "deliver": "bot-chat"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = doctor._operational_config_report(tmp_path)
+
+    assert report["status"] == "FAIL"
+    assert report["stt_drift"] == ["dev"]
+    assert report["cron_self_delivery"] == ["dev:self-job"]
+
+
+def test_operational_config_accepts_managed_stt_and_cross_profile_cron(tmp_path):
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "stt": {
+                    "enabled": True,
+                    "provider": "human20-keys-groq",
+                    "human20-keys-groq": {"model": "whisper-large-v3"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"id": "cross-profile", "enabled": True, "deliver": "bot-chat:research"},
+                    {"id": "telegram", "enabled": True, "deliver": "telegram"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    inherited = tmp_path / "profiles" / "inherited"
+    inherited.mkdir(parents=True)
+    (inherited / "config.yaml").write_text(
+        yaml.safe_dump({"model": {"default": "openai-codex/gpt-5.6-luna"}}),
+        encoding="utf-8",
+    )
+
+    report = doctor._operational_config_report(tmp_path)
+
+    assert report["status"] == "PASS"
+    assert report["stt_drift"] == []
+    assert report["cron_self_delivery"] == []
 
 
 def test_default_doctor_pin_matches_certified_fresh_upstream():

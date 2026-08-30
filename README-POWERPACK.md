@@ -58,11 +58,11 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.29` is based on upstream
+Powerpack `0.21.30` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.29` enters the durable restart path immediately instead of
+Release `0.21.30` enters the durable restart path immediately instead of
 waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
 turns are checkpointed before interruption; cron work retains its bounded
 30-second drain. The installer now arms and verifies the lossless Telegram
@@ -83,6 +83,11 @@ forever. Completed or payment-exhausted routes remain skipped on later calls.
 Legacy restart hints that lack an immutable task/generation identity can no
 longer block checkpointing a newer authority-bound Telegram turn. Exact
 pending or claimed continuations remain fail-closed and cannot be overwritten.
+
+Host certification now fails before rollout when the gateway uses the known
+unsafe SQLite runtime floor, holds deleted `state.db-wal` or `state.db-shm`
+handles, lacks the upstream fatal-config/restart exit contract, drifts from the
+managed H20 STT route, or has an enabled cron delivering back to its own bot.
 
 Telegram team-profile continuations now re-check current authority-group
 membership through the live adapter after restart. The short-lived membership
