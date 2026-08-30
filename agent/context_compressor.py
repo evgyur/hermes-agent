@@ -118,11 +118,13 @@ def pin_summary_route(route: Optional[Dict[str, Any]]):
     no-op passthrough so callers can wire it unconditionally. Re-entrant-safe:
     restores the previous pin on exit.
     """
-    token = _SUMMARY_ROUTE_PIN.set(route if isinstance(route, dict) else None)
+    pin_token = _SUMMARY_ROUTE_PIN.set(route if isinstance(route, dict) else None)
+    consumed_token = _SUMMARY_ROUTE_CONSUMED.set(None)
     try:
         yield
     finally:
-        _SUMMARY_ROUTE_PIN.reset(token)
+        _SUMMARY_ROUTE_CONSUMED.reset(consumed_token)
+        _SUMMARY_ROUTE_PIN.reset(pin_token)
 
 
 @contextlib.contextmanager
