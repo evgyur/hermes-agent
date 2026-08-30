@@ -13815,6 +13815,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
+    async def _authorize_startup_resume_owner(
+        self,
+        adapter: BasePlatformAdapter,
+        source: SessionSource,
+    ) -> bool:
+        """Re-authorize a durable continuation without persisting trust stamps.
+
+        Telegram team-membership stamps are deliberately excluded from the
+        durable origin.  Recreate them through the live adapter before the
+        gateway's synchronous authorization check; persisted/model-authored
+        route data alone can never mint this authority.
+        """
+        if (
+            source.platform == Platform.TELEGRAM
+            and getattr(adapter, "_team_membership_policy", None) is not None
+        ):
+            authorize_team_source = getattr(
+                adapter,
+                "_authorize_team_source",
+                None,
+            )
+            if not callable(authorize_team_source):
+                return False
+            if not await authorize_team_source(source):
+                return False
+        return bool(self._is_user_authorized(source))
+
     async def _run_startup_resume_event(
         self,
         adapter: BasePlatformAdapter,
@@ -13836,6 +13863,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _settlement_attempted = False
         task = None
         try:
+            if not await self._authorize_startup_resume_owner(
+                adapter,
+                event.source,
+            ):
+                logger.warning(
+                    "Skipping auto-resume for %s: session owner is no "
+                    "longer authorized under the current allowlist",
+                    session_key,
+                )
+                return
             if not _claim_owned:
                 try:
                     with self.session_store._lock:  # noqa: SLF001
@@ -14152,7 +14189,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if sealed_adapter is None:
             return False
         try:
-            if not self._is_user_authorized(sealed_source):
+            if not await self._authorize_startup_resume_owner(
+                sealed_adapter,
+                sealed_source,
+            ):
                 return False
         except Exception:
             return False
@@ -15779,7 +15819,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # receive a full agent response on gateway restart just
             # because it has a resume-pending marker (issue #23778).
             try:
-                if not self._is_user_authorized(source):
+                requires_live_team_authorization = bool(
+                    source.platform == Platform.TELEGRAM
+                    and getattr(adapter, "_team_membership_policy", None)
+                    is not None
+                )
+                if (
+                    not requires_live_team_authorization
+                    and not self._is_user_authorized(source)
+                ):
                     logger.warning(
                         "Skipping auto-resume for %s: session owner is no "
                         "longer authorized under the current allowlist",

@@ -2683,6 +2683,70 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_rechecks_live_telegram_team_membership():
+    """A durable Telegram origin must be re-authorized after restart.
+
+    Team-membership stamps are intentionally wire-invisible and are therefore
+    absent from the persisted resume origin.  Startup recovery must ask the
+    live adapter to recreate that stamp before applying the synchronous
+    gateway allowlist check; otherwise every valid team session is rejected.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5413",
+        message_id="24101",
+    )
+    source.user_id = "617744661"
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:group:-1003770669948:5413",
+            session_id="sid-team-resume",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="shutdown_timeout",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-team-resume",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._is_user_authorized = lambda candidate: bool(
+        candidate.telegram_team_membership_required
+        and candidate.telegram_team_membership_authorized
+    )
+    runner._claim_startup_resume_obligation = AsyncMock(return_value=False)
+    adapter._team_membership_policy = object()
+
+    async def _authorize(candidate):
+        candidate.telegram_team_membership_required = True
+        candidate.telegram_team_membership_authorized = True
+        candidate.telegram_team_membership_reason = "current_member"
+        return True
+
+    adapter._authorize_team_source = AsyncMock(side_effect=_authorize)
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    tasks = list(runner._background_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert scheduled == 1
+    adapter._authorize_team_source.assert_awaited_once()
+    authorized_source = adapter._authorize_team_source.await_args.args[0]
+    assert authorized_source.chat_id == source.chat_id
+    assert authorized_source.thread_id == source.thread_id
+    assert authorized_source.user_id == source.user_id
+    assert authorized_source.telegram_team_membership_required is True
+    assert authorized_source.telegram_team_membership_authorized is True
+    runner._claim_startup_resume_obligation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_reschedule_is_platform_scoped():
     """The platform filter limits the pass to that platform's sessions, so
     reconnecting one platform never resumes another's pending session."""
