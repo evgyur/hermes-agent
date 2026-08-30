@@ -58,11 +58,14 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.20` is based on upstream
+Powerpack `0.21.21` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.20` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
+Release `0.21.21` enters the durable restart path immediately instead of
+waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
+turns are checkpointed before interruption; cron work retains its bounded
+30-second drain. It also pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
 Keys Groq STT transport, and no-repeat Jyotish rectification intake to one
 verified server-doctor commit. The installer records these pins in its receipt
 while preserving profile files; the pinned component owner remains responsible

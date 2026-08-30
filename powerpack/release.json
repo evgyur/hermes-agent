@@ -1,6 +1,6 @@
 {
   "format": "hermes-powerpack-release-v1",
-  "version": "0.21.20",
+  "version": "0.21.21",
   "upstream_base": "4209d371aa1bb8840ce8447555bdd863a1a96c38",
   "accepted_predecessors": [
     "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
