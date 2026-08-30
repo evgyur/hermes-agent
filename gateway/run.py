@@ -11999,7 +11999,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if (
+            command = event.get_command()
+            canonical_command = command
+            if command:
+                try:
+                    from hermes_cli.commands import resolve_command
+
+                    command_def = resolve_command(command)
+                    if command_def is not None:
+                        canonical_command = command_def.name
+                except Exception:
+                    canonical_command = command
+            if canonical_command == "stop":
+                # /stop is control-plane authority, not post-restart work.
+                # Queueing it lets the task it is meant to cancel survive the
+                # restart and replay before the stop command. Execute it while
+                # the current owner is still live; ordinary inputs remain in
+                # the durable drain inbox below.
+                denied = self._check_slash_access(event.source, "stop")
+                message = (
+                    denied
+                    if denied is not None
+                    else await self._busy_stop_command(
+                        event, session_key, event.source
+                    )
+                )
+            elif (
                 self._planned_restart_ingress_active()
                 and event.source.platform == Platform.TELEGRAM
             ):

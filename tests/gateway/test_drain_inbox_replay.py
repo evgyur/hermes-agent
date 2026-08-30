@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -104,6 +105,39 @@ async def test_busy_session_input_during_planned_drain_is_durable_before_ack(
         assert [item["content"] for item in adapter.sent] == [
             "⏳ Gateway restarting — message safely queued."
         ]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_during_planned_drain_executes_immediately_not_inbox(
+    monkeypatch, tmp_path
+):
+    """Control-plane /stop must bypass the durable post-restart work queue."""
+
+    runner, db, adapter = _runner(monkeypatch, tmp_path)
+    event = _event("708", "/stop")
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._draining = True
+    runner._restart_requested = True
+    runner._validated_turn_authority_source = lambda _event, _key: _event.source
+    runner._is_user_authorized = lambda _source: True
+    runner._check_slash_access = lambda _source, _command: None
+    runner._adapter_for_source = lambda _source: adapter
+    runner._busy_stop_command = AsyncMock(return_value="⚡ Stopped.")
+    runner._handle_active_session_busy_message = (
+        gateway_run.GatewayRunner._handle_active_session_busy_message.__get__(runner)
+    )
+    try:
+        assert await runner._handle_active_session_busy_message(
+            event, session_key
+        ) is True
+
+        runner._busy_stop_command.assert_awaited_once_with(
+            event, session_key, event.source
+        )
+        assert db.list_gateway_drain_inbox_ready() == []
+        assert [item["content"] for item in adapter.sent] == ["⚡ Stopped."]
     finally:
         db.close()
 
