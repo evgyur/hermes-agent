@@ -29,6 +29,17 @@ def test_project_version_matches_locked_root_package():
     assert root_packages[0]["version"] == project["project"]["version"]
 
 
+def test_release_version_matches_project_and_cli():
+    from hermes_cli import __version__ as cli_version
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    release = json.loads(
+        (ROOT / "powerpack" / "release.json").read_text(encoding="utf-8")
+    )
+
+    assert cli_version == project["project"]["version"] == release["version"]
+
+
 def test_locked_sync_preserves_the_configured_messaging_runtime():
     installer = INSTALLER.read_text(encoding="utf-8")
 
