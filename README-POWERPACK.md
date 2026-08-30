@@ -58,15 +58,22 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.12` is based on upstream
+Powerpack `0.21.17` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.12` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
+Release `0.21.17` pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
 Keys Groq STT transport, and no-repeat Jyotish rectification intake to one
 verified server-doctor commit. The installer records these pins in its receipt
 while preserving profile files; the pinned component owner remains responsible
 for installing or updating those private assets and profile-scoped credentials.
+
+Compression now inherits the configured inactivity budget instead of cutting
+off healthy long summaries after ten seconds. Shutdown drains deferred
+compression cleanup before closing auxiliary clients or `state.db`, and the
+provider fallback chain advances through configured routes, the independent
+main-agent credential, and generic discovery without retrying one failed route
+forever. Completed or payment-exhausted routes remain skipped on later calls.
 
 Planned gateway restart recovery now dispatches each synthetic continuation
 inside the exact multiplex profile that owns its transcript. A `hermesdev` task
