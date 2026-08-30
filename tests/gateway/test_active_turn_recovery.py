@@ -400,7 +400,7 @@ def test_suspended_active_turn_is_cleared_without_resume(tmp_path):
     assert recovered.active_turn_started_at is None
 
 
-def test_forged_json_only_resume_fails_closed(tmp_path):
+def test_unsealed_json_resume_hint_is_replaced_by_exact_active_turn(tmp_path):
     store = _make_db_store(tmp_path)
     source = _make_source()
     entry = store.get_or_create_session(source)
@@ -423,10 +423,15 @@ def test_forged_json_only_resume_fails_closed(tmp_path):
     recovered = _entry_for(store, source)
     assert recovered.resume_pending is True
     assert recovered.resume_reason == "shutdown_timeout"
-    assert recovered.last_resume_marked_at == original_mark
-    assert recovered.active_turn_token is not None
-    assert recovered.active_turn_started_at is not None
-    assert store._db.get_gateway_resume_obligation(entry.session_key) is None
+    assert recovered.last_resume_marked_at > original_mark
+    assert recovered.active_turn_token is None
+    assert recovered.active_turn_started_at is None
+    assert resume_origin_from_snapshot(recovered) == source
+    obligation = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert obligation is not None
+    assert obligation["state"] == "PENDING"
+    assert obligation["resume_task_id"] == recovered.resume_task_id
+    assert obligation["generation"] == recovered.continuation_generation
 
 
 def test_ancient_active_marker_is_cleared_without_auto_resume(tmp_path):

@@ -2747,6 +2747,49 @@ async def test_startup_auto_resume_rechecks_live_telegram_team_membership():
 
 
 @pytest.mark.asyncio
+async def test_startup_scheduler_sends_missing_message_id_to_terminal_quarantine():
+    """A legacy pending row must reach the leased fail-closed settlement path.
+
+    Leaving it in PENDING at the scheduler boundary makes the same impossible
+    continuation wake up and warn on every subsequent gateway restart.
+    """
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5585",
+        message_id=None,
+    )
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key="agent:main:telegram:group:-1003770669948:5585",
+            session_id="sid-legacy-pending",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="shutdown_timeout",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-legacy-pending",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner._session_db = _ResumeObligationDB(entry)
+    runner._run_startup_resume_event = AsyncMock(return_value=None)
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    runner._run_startup_resume_event.assert_awaited_once()
+    event = runner._run_startup_resume_event.await_args.args[1]
+    assert event.message_id is None
+    assert event.startup_resume is True
+
+
+@pytest.mark.asyncio
 async def test_reconnect_reschedule_is_platform_scoped():
     """The platform filter limits the pass to that platform's sessions, so
     reconnecting one platform never resumes another's pending session."""
@@ -3093,7 +3136,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 @pytest.mark.asyncio
 async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human():
-    """The interrupted A update must not suppress its own synthetic resume."""
+    """A reply-context prefix must not disguise the interrupted redelivery."""
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
@@ -3123,11 +3166,27 @@ async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human(
     )
     runner.session_store._entries = {entry.session_key: entry}
     runner._session_db = _ResumeObligationDB(entry)
+    reply_quote = "The candidate is not complete yet."
     runner._session_db.get_messages = lambda *_args, **_kwargs: [
         {
             "role": "user",
-            "content": "[Owner|owner]\nA5-CANARY-1787777773",
+            "content": (
+                f'[Replying to: "{reply_quote}"]\n\n'
+                "[Owner|owner]\nA5-CANARY-1787777773"
+            ),
             "platform_message_id": "48397",
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": {
+                        "message_id": "48396",
+                        "is_own": False,
+                        "quote": reply_quote,
+                    },
+                    "media": [],
+                }
+            },
         }
     ]
     runner._run_startup_resume_event = AsyncMock(return_value=None)
@@ -3138,6 +3197,9 @@ async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human(
         message_type=MessageType.TEXT,
         source=shared_source,
         message_id="48397",
+        reply_to_message_id="48396",
+        reply_to_text=reply_quote,
+        reply_to_is_own_message=False,
     )
     redelivery._hermes_turn_authority_source = source
     assert await runner._handle_message(redelivery) is None

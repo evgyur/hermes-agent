@@ -15124,6 +15124,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exact_rows.append(row)
         return exact_rows
 
+    @classmethod
+    def _startup_redelivery_matches_durable_row(
+        cls,
+        event: "MessageEvent",
+        row: Dict[str, Any],
+    ) -> bool:
+        """Match one raw Telegram redelivery before prompt enrichment.
+
+        Durable user content may already contain the reply-context prefix that
+        is added later in the ordinary ingress pipeline.  Compare the sealed
+        raw reply/media envelope first, then render only that deterministic
+        prefix around the still-raw event text.  A reused message id with a
+        different quote, media envelope, or body remains fail-closed.
+        """
+        if not isinstance(row, dict) or type(event.text) is not str:
+            return False
+        metadata = row.get("display_metadata")
+        if not isinstance(metadata, dict):
+            return False
+        durable_envelope = metadata.get(_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY)
+        if not isinstance(durable_envelope, dict):
+            return False
+        try:
+            incoming_envelope = cls._gateway_raw_semantic_envelope(event)
+        except (TypeError, ValueError):
+            return False
+        if durable_envelope != incoming_envelope:
+            return False
+
+        expected_content = event.text
+        reply = durable_envelope.get("reply")
+        if isinstance(reply, dict):
+            label = (
+                "Replying to your previous message"
+                if reply.get("is_own") is True
+                else "Replying to"
+            )
+            expected_content = (
+                f'[{label}: "{reply.get("quote")}"]\n\n{expected_content}'
+            )
+        durable_content = row.get("content")
+        if type(durable_content) is not str:
+            return False
+        if durable_content == expected_content:
+            return True
+        media = durable_envelope.get("media")
+        return bool(
+            isinstance(media, list)
+            and media
+            and expected_content
+            and durable_content.endswith(f"\n\n{expected_content}")
+        )
+
     @staticmethod
     def _canonical_startup_tool_call(call: dict) -> Optional[tuple[str, str, str]]:
         """Return ``(call id, name, canonical args)`` or fail closed."""
@@ -15560,6 +15613,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return (getattr(self, "adapters", None) or {}).get(source.platform)
 
+    @staticmethod
+    def _startup_resume_entry_route_matches_snapshot(
+        entry_source: Optional[SessionSource],
+        snapshot_source: SessionSource,
+    ) -> bool:
+        """Keep mutable session metadata inside the sealed recovery route.
+
+        ``SessionEntry.origin`` is allowed to retain stale participant and
+        message presentation data for a shared topic.  It is not allowed to
+        switch the immutable delivery/trust lane underneath the digested
+        active-turn snapshot.  Message and participant identity are therefore
+        deliberately excluded while chat/topic, runtime owner, Telegram
+        transport, Business connection, and safe-mode remain exact.
+        """
+        if not isinstance(entry_source, SessionSource):
+            return False
+        try:
+            entry = canonical_resume_origin(entry_source)
+            sealed = canonical_resume_origin(snapshot_source)
+        except (TypeError, ValueError):
+            return False
+
+        fields = (
+            "platform",
+            "chat_id",
+            "chat_type",
+            "thread_id",
+            "scope_id",
+            "parent_chat_id",
+            "transport_owner",
+            "business_connection_id",
+            "external_safe_mode",
+            "auto_thread_created",
+            "prospective_thread_id",
+        )
+        if any(entry.get(field) != sealed.get(field) for field in fields):
+            return False
+        return (entry.get("profile") or "default") == (
+            sealed.get("profile") or "default"
+        )
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -15608,6 +15702,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning(
                     "Quarantining startup auto-resume for %s: missing, "
                     "corrupt, stale, or origin-mismatched durable snapshot",
+                    entry.session_key,
+                )
+                continue
+            if not self._startup_resume_entry_route_matches_snapshot(
+                getattr(entry, "origin", None), source
+            ):
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: mutable "
+                    "session route disagrees with sealed recovery route",
                     entry.session_key,
                 )
                 continue
@@ -15762,6 +15865,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or current.resume_reason not in self._AUTO_RESUME_REASONS
                     or canonical_resume_origin(current_source)
                     != canonical_resume_origin(source)
+                    or not self._startup_resume_entry_route_matches_snapshot(
+                        getattr(current, "origin", None), current_source
+                    )
                 ):
                     continue
             except Exception:
@@ -15790,27 +15896,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 continue
 
-            # A normal boot can reject legacy Telegram snapshots before it
-            # allocates any work.  A platform-scoped reconnect may enumerate
-            # such a legacy entry for backward-compatible retry bookkeeping,
-            # but the leased handler below still requires the exact message id
-            # and matching durable user row before model/tool execution.  Keep
-            # this check after the second adapter lookup so a newly admitted
-            # human turn always wins the race even over an invalid candidate.
-            if (
-                source.platform == Platform.TELEGRAM
-                and not (
-                    isinstance(source.message_id, str)
-                    and source.message_id.strip()
-                )
-                and platform is None
-            ):
-                logger.warning(
-                    "Quarantining startup auto-resume for %s: the sealed "
-                    "Telegram turn has no exact triggering message id",
-                    entry.session_key,
-                )
-                continue
+            # Legacy Telegram snapshots without an exact message id still go
+            # through the leased handler.  Its identity validation abandons
+            # the claimed obligation as ``quarantined_invalid_envelope``
+            # before transcript analysis or model/tool work.  Dropping them at
+            # this scheduler boundary would leave PENDING rows to wake up on
+            # every future restart.
 
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
@@ -21213,8 +21304,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         exact_resume_redelivery = bool(
                             len(rows or []) == 1
-                            and type(event.text) is str
-                            and rows[0].get("content") == event.text
+                            and self._startup_redelivery_matches_durable_row(
+                                event,
+                                rows[0],
+                            )
                         )
                 except Exception:
                     exact_resume_redelivery = False
