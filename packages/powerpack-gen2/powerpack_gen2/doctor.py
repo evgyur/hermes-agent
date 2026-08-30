@@ -389,6 +389,35 @@ def _state_handle_report(pid: int) -> dict[str, Any]:
     return _classify_deleted_state_handles(targets)
 
 
+def _venv_interpreter_paths(venv: Path) -> set[str]:
+    bin_root = venv / "bin"
+    if not bin_root.is_dir():
+        return set()
+    paths: set[str] = set()
+    for candidate in bin_root.glob("python*"):
+        if candidate.is_file():
+            paths.add(str(candidate.resolve()))
+    return paths
+
+
+def _process_identity_report(
+    *,
+    repository: Path,
+    venv: Path,
+    process_cwd: str | None,
+    process_exe: str | None,
+) -> dict[str, Any]:
+    interpreters = _venv_interpreter_paths(venv)
+    cwd_matches = process_cwd == str(repository)
+    executable_matches = isinstance(process_exe, str) and process_exe in interpreters
+    return {
+        "status": "PASS" if cwd_matches and executable_matches else "FAIL",
+        "cwd_matches": cwd_matches,
+        "executable_matches": executable_matches,
+        "interpreter_count": len(interpreters),
+    }
+
+
 def _load_mapping(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -543,11 +572,13 @@ def run_doctor(
         state_handles = _state_handle_report(int(process.get("pid") or 0))
         configured_home = (hermes_home or Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")).resolve()
         operational_config = _operational_config_report(configured_home)
-        process_identity_ok = (
-            process_cwd == str(repository)
-            and isinstance(process_exe, str)
-            and process_exe.startswith(str(venv.resolve()) + os.sep)
+        process_identity = _process_identity_report(
+            repository=repository,
+            venv=venv,
+            process_cwd=process_cwd if isinstance(process_cwd, str) else None,
+            process_exe=process_exe if isinstance(process_exe, str) else None,
         )
+        process_identity_ok = process_identity["status"] == "PASS"
         host_report = {
             "repository": git_report,
             "systemd": systemd_report,
@@ -564,6 +595,7 @@ def run_doctor(
             "candidate_plugin_manifest": {"path": str(plugin_manifest), "sha256": _sha256(plugin_manifest)},
             "venv": {"path": str(venv), "owner_uid": venv_owner, "expected_uid": expected_uid},
             "process_identity_ok": process_identity_ok,
+            "process_identity": process_identity,
         }
         _check(checks, "host_repository_clean", git_report["clean"], required=mode == "gen2_only", evidence=git_report)
         _check(

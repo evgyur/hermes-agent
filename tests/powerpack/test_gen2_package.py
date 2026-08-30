@@ -120,7 +120,8 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
 
     repo = tmp_path / "repo"
     venv = repo / "venv"
-    venv.mkdir(parents=True)
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("managed runtime", encoding="utf-8")
     monkeypatch.setenv("VIRTUAL_ENV", str(venv))
     monkeypatch.setattr(
         doctor,
@@ -243,6 +244,28 @@ def test_deleted_state_handle_classifier_is_bounded_and_redacted():
         "deleted_count": 2,
         "kinds": ["shm", "wal"],
     }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv symlink contract")
+def test_process_identity_accepts_exact_managed_python_symlink(tmp_path):
+    repository = tmp_path / "repo"
+    venv_bin = repository / "venv" / "bin"
+    runtime = tmp_path / "managed" / "python3.12"
+    venv_bin.mkdir(parents=True)
+    runtime.parent.mkdir()
+    runtime.write_text("runtime", encoding="utf-8")
+    (venv_bin / "python").symlink_to(runtime)
+
+    report = doctor._process_identity_report(
+        repository=repository,
+        venv=repository / "venv",
+        process_cwd=str(repository),
+        process_exe=str(runtime),
+    )
+
+    assert report["status"] == "PASS"
+    assert report["cwd_matches"] is True
+    assert report["executable_matches"] is True
 
 
 def test_operational_config_rejects_stt_drift_and_self_cron(tmp_path):

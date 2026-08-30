@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "5466418032a3dc3faa583949813aac68aa76c9d8b795c98617cb79b3f60dd7da",
+  "aggregate_sha256": "6594efcf7b20f7f4a0ef783630ef6e183c56ceb6e48bcf3ddd29ad3a1b095b1e",
   "file_count": 17,
   "files": [
     {
@@ -43,9 +43,9 @@
       "sha256": "9958e0476e73fa99848afa3718240d5b135ccf94003f261c6b1d3f20e8ccd26e"
     },
     {
-      "bytes": 24478,
+      "bytes": 25550,
       "path": "powerpack_gen2/doctor.py",
-      "sha256": "0de201e464949b77ce475014ab51b8084040c8239abfa4bf15027acf08ebacdd"
+      "sha256": "8e0400690d7fcfa73b0f7dcc4d387c7e31cc38458d36ba36e0ad6c618079e1de"
     },
     {
       "bytes": 6797,
