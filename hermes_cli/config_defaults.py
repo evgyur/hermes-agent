@@ -106,16 +106,14 @@ DEFAULT_CONFIG = {
         # past ~50s has no effect unless TimeoutStopSec is raised too.
         # 0 = opt out (cron drains on restart_drain_timeout, legacy).
         "cron_drain_timeout": 30,
-        # In-band restart wait for active turns to finish before stop()
-        # (seconds). /restart and SIGUSR1 refuse new work, then wait up to
-        # this cap for in-flight agents/cron/api runs to complete naturally
-        # so the requesting turn is not amputated by restart_drain_timeout.
-        # 0 = legacy behaviour (enter stop()/drain immediately). Default
-        # 30 min is a safety valve for wedged agents, not a target latency —
-        # an interactive `hermes gateway restart` must never block for hours
-        # on a turn that wedged (#79133). Long unattended turns can raise
-        # this in config.yaml.
-        "restart_after_turn_timeout": 1800,
+        # Optional in-band wait for active turns to finish before stop()
+        # (seconds). The default is 0: /restart and SIGUSR1 immediately enter
+        # the resumable stop path, which persists exact continuation authority
+        # before interrupting active chat/API work. This keeps a planned
+        # restart bounded by the 30s cron drain instead of an autonomous turn
+        # that may run for hours. Deployments that deliberately prefer
+        # finish-before-restart can opt in with a positive value.
+        "restart_after_turn_timeout": 0,
         # Upper bound (seconds) a submitted prompt waits for the deferred
         # agent build (MCP discovery, model metadata, skills scan) before
         # failing with a visible error (#63078). The gateway's wait is
