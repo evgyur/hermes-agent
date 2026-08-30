@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.env
+*.m4a
+*.mp3
+*.mp4
+*.wav
+*.vtt
+*.srt
+*.sqlite
+cookies.txt
+auth.json

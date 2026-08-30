@@ -152,3 +152,47 @@ def test_string_api_keys_are_not_retained_in_cache_key_repr():
     assert second_secret not in rendered
 
 
+def test_named_custom_provider_key_rotation_rebuilds_cached_client():
+    """A reviewed named-provider key change must not reuse the stale client."""
+    provider_entry = {
+        "name": "human20-compression",
+        "base_url": "http://human20-keys.test/v1",
+        "api_key": "old-compression-key",
+        "api_mode": "chat_completions",
+    }
+    first_client = SimpleNamespace(name="first")
+    second_client = SimpleNamespace(name="second")
+
+    with (
+        patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            side_effect=lambda _provider: dict(provider_entry),
+        ),
+        patch.object(
+            aux,
+            "resolve_provider_client",
+            side_effect=[
+                (first_client, "h20-compressor"),
+                (second_client, "h20-compressor"),
+            ],
+        ) as resolver,
+    ):
+        first, _ = aux._get_cached_client(
+            "human20-compression",
+            model="h20-compressor",
+            task="compression",
+        )
+        provider_entry["api_key"] = "new-compression-key"
+        second, _ = aux._get_cached_client(
+            "human20-compression",
+            model="h20-compressor",
+            task="compression",
+        )
+
+    assert first is first_client
+    assert second is second_client
+    assert resolver.call_count == 2
+    rendered = repr(tuple(aux._client_cache))
+    assert "old-compression-key" not in rendered
+    assert "new-compression-key" not in rendered
+

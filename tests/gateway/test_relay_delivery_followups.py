@@ -467,9 +467,10 @@ def test_live_completion_event_carries_scope_id(tmp_path, monkeypatch):
         completion_queue = _Q()
 
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_persist_completion_with_retry", lambda _evt, _result: True)
     monkeypatch.setattr(
         "tools.process_registry.process_registry", _PR(), raising=False
     )
-    ad._push_completion_event(record, {"summary": "ok"}, "completed")
+    assert ad._push_completion_event(record, {"summary": "ok"}, "completed") is True
     assert captured.get("scope_id") == "G777"
     assert captured.get("user_id") == "U9"

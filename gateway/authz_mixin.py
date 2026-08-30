@@ -407,6 +407,20 @@ class GatewayAuthorizationMixin:
 
         adapter_profile = self._adapter_profile_for_source(source)
 
+        # A configured Telegram authority-group policy is the complete
+        # authorization source for this adapter/profile.  Its local,
+        # wire-invisible stamp must win over static allowlists, pairing and
+        # allow-all switches; missing or negative stamps fail closed.
+        if source.platform == Platform.TELEGRAM:
+            adapter = self._adapter_for_source(source)
+            if getattr(adapter, "_team_membership_policy", None) is not None:
+                return (
+                    source.telegram_team_membership_required is True
+                    and source.telegram_team_membership_authorized is True
+                    and bool(source.user_id)
+                    and getattr(source, "is_bot", False) is not True
+                )
+
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
         # gateway's WS with a per-instance secret and resolves owner-only author

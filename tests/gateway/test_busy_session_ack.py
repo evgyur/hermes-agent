@@ -39,17 +39,19 @@ from gateway.platforms.base import (
 
 def _make_event(text="hello", chat_id="123", platform_val="telegram"):
     """Build a minimal MessageEvent."""
+    message_id = "msg1"
     source = SessionSource(
         platform=MagicMock(value=platform_val),
         chat_id=chat_id,
         chat_type="private",
         user_id="user1",
+        message_id=message_id,
     )
     evt = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
-        message_id="msg1",
+        message_id=message_id,
     )
     return evt
 
@@ -100,6 +102,106 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_observed_group_busy_message_uses_validated_principal_carrier(self):
+        """An anonymized shared route must not discard its exact owner follow-up."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._is_user_authorized = lambda source: source.user_id == "617744661"
+        adapter = _make_adapter()
+
+        authority_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="9623",
+            user_id="617744661",
+            message_id="48702",
+        )
+        shared_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="9623",
+            user_id=None,
+            message_id="48702",
+        )
+        event = MessageEvent(
+            text="продолжаешь?",
+            message_type=MessageType.TEXT,
+            source=shared_source,
+            message_id="48702",
+        )
+        event._hermes_turn_authority_source = authority_source
+        session_key = build_session_key(shared_source)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[session_key] = agent
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        handled = await runner._handle_active_session_busy_message(
+            event,
+            session_key,
+        )
+
+        assert handled is True
+        agent.steer.assert_called_once_with("продолжаешь?")
+
+    @pytest.mark.asyncio
+    async def test_observed_group_cold_ingress_authorizes_validated_principal_carrier(self):
+        """Top-level ingress auth must not reject the anonymized shared route."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        runner._is_user_authorized = (
+            lambda source: source.user_id == "617744661"
+        )
+        adapter = _make_adapter()
+
+        authority_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="49708",
+            user_id="617744661",
+            message_id="49715",
+        )
+        shared_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="49708",
+            user_id=None,
+            message_id="49715",
+        )
+        event = MessageEvent(
+            text="HERMES_INGRESS_CANARY_0213",
+            message_type=MessageType.TEXT,
+            source=shared_source,
+            message_id="49715",
+        )
+        event._hermes_turn_authority_source = authority_source
+        session_key = build_session_key(shared_source)
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time() - 8
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        agent.redirect.assert_called_once_with("HERMES_INGRESS_CANARY_0213")
+
+
+    @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
         """Rapid Telegram text follow-ups in queue mode must not merge."""
         from gateway.run import GatewayRunner
@@ -131,7 +233,13 @@ class TestBusySessionAck:
             MessageEvent(
                 text=text,
                 message_type=MessageType.TEXT,
-                source=source,
+                source=SessionSource(
+                    platform=source.platform,
+                    chat_id=source.chat_id,
+                    chat_type=source.chat_type,
+                    user_id=source.user_id,
+                    message_id=f"m-{idx}",
+                ),
                 message_id=f"m-{idx}",
             )
             for idx, text in enumerate(("first", "second", "third"), start=1)
@@ -147,6 +255,53 @@ class TestBusySessionAck:
             "third",
         ]
         agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_running_turn_fast_path_redirects_and_sends_ack(self, monkeypatch):
+        """A post-start Telegram correction must use the canonical busy ack path."""
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        adapter = _make_adapter()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003971448755",
+            chat_type="group",
+            thread_id="30162",
+            user_id="617744661",
+        )
+        event = MessageEvent(
+            text="use shaw to fix blocker",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="48805",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "current_tool": None,
+            "seconds_since_activity": 0.0,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 8
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        agent.redirect.assert_called_once_with("use shaw to fix blocker")
+        adapter._send_with_retry.assert_awaited_once()
+        assert "Redirected current run" in adapter._send_with_retry.call_args.kwargs["content"]
 
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
@@ -236,7 +391,7 @@ class TestBusySessionAck:
         runner._busy_input_mode = "steer"
         runner._should_echo_stt_transcripts = MagicMock(return_value=False)
         runner._enrich_message_with_transcription = AsyncMock(
-            return_value=('"yönü teknik mimariye çevir"', ["yönü teknik mimariye çevir"])
+            return_value=("yönü teknik mimariye çevir", ["yönü teknik mimariye çevir"])
         )
         adapter = _make_adapter()
 
@@ -256,7 +411,7 @@ class TestBusySessionAck:
         runner._enrich_message_with_transcription.assert_awaited_once_with(
             "", ["/tmp/follow-up.ogg"]
         )
-        agent.steer.assert_called_once_with('"yönü teknik mimariye çevir"')
+        agent.steer.assert_called_once_with("yönü teknik mimariye çevir")
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]
@@ -335,12 +490,13 @@ class TestBusySessionAck:
         shared_platform = Platform.TELEGRAM
 
         def _evt(text):
+            message_id = f"m-{text[:5]}"
             src = SessionSource(
                 platform=shared_platform, chat_id="123",
-                chat_type="dm", user_id="user1",
+                chat_type="dm", user_id="user1", message_id=message_id,
             )
             return MessageEvent(text=text, message_type=MessageType.TEXT,
-                                source=src, message_id=f"m-{text[:5]}")
+                                source=src, message_id=message_id)
 
         first = _evt("first message")
         second = _evt("second message")
@@ -469,5 +625,3 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
-

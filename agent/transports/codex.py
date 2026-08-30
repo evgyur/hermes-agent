@@ -930,6 +930,7 @@ class ResponsesApiTransport(ProviderTransport):
         allow_stream: bool = False,
         is_github_responses: bool = False,
         sanitize_harmony_tokens: bool = False,
+        reject_provider_executed_tools: bool = False,
     ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
@@ -945,6 +946,22 @@ class ResponsesApiTransport(ProviderTransport):
             is_github_responses=is_github_responses,
             sanitize_harmony_tokens=sanitize_harmony_tokens,
         )
+        if reject_provider_executed_tools:
+            from agent.codex_responses_adapter import _RESPONSES_BUILTIN_TOOL_TYPES
+
+            unsupported = sorted(
+                {
+                    str(tool.get("type"))
+                    for tool in normalized.get("tools") or []
+                    if isinstance(tool, dict)
+                    and tool.get("type") in _RESPONSES_BUILTIN_TOOL_TYPES
+                }
+            )
+            if unsupported:
+                raise RuntimeError(
+                    "start_ack_mode=required cannot be used with "
+                    "provider-executed Responses tools: " + ", ".join(unsupported)
+                )
         if "prompt_cache_key" in normalized:
             bounded = _bounded_prompt_cache_key(normalized["prompt_cache_key"])
             if bounded:

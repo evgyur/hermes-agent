@@ -158,7 +158,7 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_failed_async_injection_is_retried_and_only_success_is_acked(
+def test_failed_legacy_async_injection_retries_without_fake_durable_ack(
     monkeypatch, isolated_registry,
 ):
     isolated = queue.Queue()
@@ -184,7 +184,10 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
-    assert acknowledgements == ["deleg_duplicate"]
+    # This fixture intentionally has no durable delegation row.  Successful
+    # retry is protected by the runner-local seam; claiming a durable receipt
+    # for a row that never existed would be false evidence.
+    assert acknowledgements == []
 
 
 def _persist_pending_completion(event):

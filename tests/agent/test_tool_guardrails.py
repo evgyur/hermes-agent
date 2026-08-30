@@ -105,6 +105,66 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.action == "block"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+    assert blocked.should_halt is False
+    assert controller.halt_decision is None
+
+
+def test_landed_file_mutation_invalidates_terminal_failure_history():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    terminal_args = {"command": "python repair.py"}
+
+    for _ in range(2):
+        controller.after_call(
+            "terminal",
+            terminal_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+
+    controller.after_call(
+        "patch",
+        {"path": "repair.py", "patch": "updated"},
+        json.dumps({"success": True}),
+        failed=False,
+    )
+
+    assert controller.before_call("terminal", terminal_args).action == "allow"
+
+
+def test_failed_file_mutation_preserves_terminal_failure_history():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    terminal_args = {"command": "python repair.py"}
+
+    for _ in range(2):
+        controller.after_call(
+            "terminal",
+            terminal_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+
+    controller.after_call(
+        "patch",
+        {"path": "repair.py", "patch": "updated"},
+        json.dumps({"error": "patch did not apply"}),
+        failed=True,
+    )
+
+    blocked = controller.before_call("terminal", terminal_args)
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_exact_failure_block"
 
 
 
@@ -169,6 +229,23 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.should_halt is True
 
 
+def test_skill_view_is_idempotent_and_blocks_repeated_no_progress():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"name": "team20-ops"}
+    result = "same skill contents"
+
+    assert controller.after_call("skill_view", args, result, failed=False).action == "allow"
+    warning = controller.after_call("skill_view", args, result, failed=False)
+    assert warning.code == "idempotent_no_progress_warning"
+    blocked = controller.before_call("skill_view", args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
 
 
 

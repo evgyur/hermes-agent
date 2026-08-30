@@ -1,0 +1,29 @@
+[Unit]
+Description=Sigurd GPT Realtime voice bridge for Google Meet %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=MEETING_PROVIDER=google
+Environment=MEETING_REMOTE=chip@157.180.97.244
+Environment=MEETING_KEY=%i
+Environment=OPENAI_REALTIME_MODEL=gpt-realtime-2.1
+Environment=OPENAI_REALTIME_VOICE=cedar
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStartPre=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=8 chip@157.180.97.244 pactl set-sink-volume agent_mic 100%%
+ExecStartPre=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=8 chip@157.180.97.244 pactl set-source-volume agent_mic_source 100%%
+ExecStartPre=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=8 chip@157.180.97.244 python3 /home/chip/.local/lib/sigurd-meeting/meeting_state.py google unmute %i
+ExecStartPre=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=8 chip@157.180.97.244 python3 /home/chip/.local/lib/sigurd-meeting/meeting_state.py google ensure-recording %i
+ExecStart=/opt/hermes-agent/venv/bin/python /home/hermes/.local/lib/sigurd-meeting/zoom_gpt_voice.py
+ExecStopPost=-/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=8 chip@157.180.97.244 python3 /home/chip/.local/lib/sigurd-meeting/meeting_state.py google mute %i
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=8
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

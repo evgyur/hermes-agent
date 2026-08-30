@@ -46,8 +46,28 @@ class TestMarkerContract:
         assert dc.drain_requested() is True
         assert payload["action"] == "drain"
         assert payload["principal"] == "nas"
+        assert payload["planned_restart"] is False
+        assert dc.drain_planned_restart_requested() is False
         body = dc.read_drain_request()
         assert body is not None and body["principal"] == "nas"
+
+    def test_planned_restart_intent_round_trips(self, home):
+        payload = dc.write_drain_request(
+            principal="server-doctor",
+            planned_restart=True,
+        )
+
+        assert payload["planned_restart"] is True
+        assert dc.drain_requested() is True
+        assert dc.drain_planned_restart_requested() is True
+
+    def test_stale_planned_restart_intent_is_ignored(self, home, monkeypatch):
+        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-OLD")
+        dc.write_drain_request(planned_restart=True)
+        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-NEW")
+
+        assert dc.drain_requested() is False
+        assert dc.drain_planned_restart_requested() is False
 
 
 class TestSuppressNotification:
@@ -244,6 +264,7 @@ class TestMarkerMaxAge:
 def _drain_runner():
     runner, adapter = make_restart_runner()
     runner._external_drain_active = False
+    runner._external_drain_restart_intent = False
     # Bind the real methods under test.
     runner._enter_external_drain = GatewayRunner._enter_external_drain.__get__(
         runner, GatewayRunner
@@ -263,6 +284,16 @@ class TestDrainStateMachine:
         runner._update_runtime_status.reset_mock()
         runner._enter_external_drain()  # second call — no-op
         runner._update_runtime_status.assert_not_called()
+
+    def test_enter_upgrades_existing_drain_to_restart_intent(self):
+        runner, _ = _drain_runner()
+        runner._enter_external_drain()
+        runner._update_runtime_status.reset_mock()
+
+        runner._enter_external_drain(planned_restart=True)
+
+        assert runner._external_drain_restart_intent is True
+        runner._update_runtime_status.assert_called_once_with("draining")
 
 
     def test_exit_during_shutdown_does_not_revert_to_running(self):
@@ -284,6 +315,27 @@ class TestDrainStateMachine:
 class TestDrainWatcher:
 
     @pytest.mark.asyncio
+    async def test_watcher_reconciles_active_work_without_drain_marker(self, home):
+        runner, _ = _drain_runner()
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        runner._persist_active_agents = MagicMock()
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await asyncio.sleep(0.04)
+        runner._running = False
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert runner._external_drain_active is False
+        assert runner._persist_active_agents.call_count >= 2
+
+    @pytest.mark.asyncio
     async def test_watcher_enters_then_exits_with_marker(self, home):
         runner, _ = _drain_runner()
         runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
@@ -299,6 +351,30 @@ class TestDrainWatcher:
         assert runner._external_drain_active is False
         runner._running = False
         await asyncio.sleep(0.04)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_watcher_tracks_planned_restart_intent(self, home):
+        runner, _ = _drain_runner()
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        dc.write_drain_request(planned_restart=True)
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await asyncio.sleep(0.04)
+        assert runner._external_drain_active is True
+        assert runner._external_drain_restart_intent is True
+
+        dc.clear_drain_request()
+        await asyncio.sleep(0.04)
+        assert runner._external_drain_active is False
+        assert runner._external_drain_restart_intent is False
+        runner._running = False
         task.cancel()
         try:
             await task
@@ -325,4 +401,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-

@@ -1,0 +1,44 @@
+{
+  "format": "hermes-powerpack-release-v1",
+  "version": "0.21.19",
+  "upstream_base": "c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc",
+  "accepted_predecessors": [
+    "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
+    "63a56fb8ab29352ddd40d67aeaf37d3e355ee096",
+    "28f9cb18222e68c4a528df1d6ffe41e5a6b6446e",
+    "239b2658added37c861f44a058d7c196e3540cd0",
+    "be226053d5354fe0e2b5409f539ee4a5280d84a2",
+    "2b745185a0cb18039089faa040a5a3bc6471eeff",
+    "2867a4c9303fa62f10cd65a1c8bfa6277e1270e6",
+    "4a86d34f58eb7ba498341735b1551ce4ebc9c648",
+    "8b57d51b6e36cab711cd0fca37b13d30cf791696",
+    "289c02eebebb06f0d6f01403511f1ab5b8b16334",
+    "89a48845855884a90d20c36d2bd54d7d22c5b40b"
+  ],
+  "component_pins": {
+    "hermesdev_exact_topic_checkpoint": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
+      "asset_path": "assets/hermesdev-topic-context",
+      "deployment": "preserve_profile_use_pinned_component"
+    },
+    "h20_keys_groq_stt_transport": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
+      "asset_path": "assets/h20-keys",
+      "deployment": "preserve_profile_use_pinned_component"
+    },
+    "jyotish_rectification_continuity": {
+      "repository": "https://github.com/evgyur/server-doctor.git",
+      "commit": "bc6700b955355de5045e99ea534850ee0b89aa9d",
+      "asset_path": "assets/jyotish-rectification-intake",
+      "deployment": "preserve_profile_use_pinned_component"
+    }
+  },
+  "data_policy": {
+    "config": "preserve",
+    "profiles": "preserve",
+    "state_db": "preserve",
+    "telegram_chip": "preserve"
+  }
+}

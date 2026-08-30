@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "id": "human20-powerpack-gen2",
+  "version": "2.3.2",
+  "plugin_kind": "standalone",
+  "source_repository": "human20team/hermes-agent-powerpack",
+  "source_base_sha": "90bb41551f98edf847ca2c86f9b1a86c7422cb8d",
+  "donor_provenance": {
+    "repository": "human20team/human20-rentals-autopilot-powerpack",
+    "commit": "dbe696ec217576a0adef5fcb4e40370de253937a",
+    "subtree_commit": "a38390578f2e14fadaa009a104475ec3990dc2df",
+    "path": "packages/powerpack-gen2"
+  },
+  "coexistence_modes": ["disabled", "compatibility", "gen2_only"],
+  "surface_names": [
+    "powerpack-gen2",
+    "mem0g",
+    "continuum_host",
+    "chipmanager_telegram",
+    "human20-perplexity",
+    "human20-keys-openai-codex",
+    "human20-keys-groq"
+  ],
+  "curated_skill_tap": {
+    "repository": "human20team/human20-rentals-autopilot-powerpack",
+    "manifest": "metadata/skills_manifest.json",
+    "install_policy": "install reviewed skills individually; do not bypass Hermes plugin security scan"
+  },
+  "supported_upstream_shas": [
+    "0159b51f2b1cdaa8fcf65d181fc0527692724fae",
+    "175054c14b54404663d8614a178280cffe6062eb",
+    "ec44116d596d798d6cb230825f1a635bc6dd38e9",
+    "dc50f020905d5bdca5d5f683a5898f85b9c07dbd",
+    "ddbd928ee4e881f0c7b3536a00355647c6559fe2",
+    "057dcdf236f8a6a26721c10fcc6ccb72726e272a",
+    "d5632392c73f9418b2a4a90f4b351c8c21d152ff",
+    "4209d371aa1bb8840ce8447555bdd863a1a96c38"
+  ],
+  "variants": {
+    "rentals": {
+      "telegram_account_access": false,
+      "components": ["skills", "mem0g", "continuum-host", "human20-keys-groq-stt", "policy-receipts"]
+    },
+    "employee": {
+      "inherits": "rentals",
+      "telegram_account_access": "chipmanager-only",
+      "components": ["telegram-chip"]
+    }
+  },
+  "state_quota_bytes": 0,
+  "settings_quota_bytes": 4096,
+  "secrets": {
+    "storage": "Hermes .env or host secret files only",
+    "forbidden": ["repository", "prompt", "logs", "plugin state"]
+  },
+  "managed_runtimes": [
+    {
+      "id": "rembg",
+      "owner": "powerpack-visual-stack",
+      "interpreter": "$HERMES_HOME/venvs/rembg/bin/python",
+      "executable": "$HERMES_HOME/venvs/rembg/bin/rembg",
+      "version_args": ["--version"],
+      "expected_version": "2.0.81",
+      "model_cache_roots": ["$HOME/.u2net"],
+      "required": false,
+      "removal_contract": "remove the dedicated venv and model cache only after no installed skill references rembg"
+    },
+    {
+      "id": "chipmanager-api",
+      "owner": "employee-overlay",
+      "interpreter": "host service",
+      "executable": "/usr/bin/curl",
+      "version_args": ["--version"],
+      "expected_endpoint": "http://127.0.0.1:18083",
+      "required": false,
+      "removal_contract": "disable employee variant before removing the isolated host service"
+    }
+  ],
+  "shims": [
+    {
+      "id": "continuum-stateless-host-bridge",
+      "necessity": "Continuum is a host-owned daemon and upstream exposes no product-specific client.",
+      "rejected_simpler_alternative": "The donor same-card bridge imports private GatewayRunner fields and owns delivery lifecycle state.",
+      "removal_condition": "Remove when Continuum ships a supported MCP server or upstream public origin/edit capability covers the contract."
+    },
+    {
+      "id": "managed-runtime-doctor",
+      "necessity": "The rembg incident proved that main-venv and ambient-PATH checks can contradict the actual managed runtime.",
+      "rejected_simpler_alternative": "Checking only `which rembg` or the main Hermes venv produces false absence claims.",
+      "removal_condition": "Remove when upstream doctor supports component-declared interpreters, executables, versions, and cache roots."
+    },
+    {
+      "id": "receipt-contradiction-policy",
+      "necessity": "Operators need evidence-grounded correction when a later premise conflicts with completed tool receipts.",
+      "rejected_simpler_alternative": "A permanent core prompt edit increases fork drift for a tenant policy.",
+      "removal_condition": "Remove when upstream exposes an equivalent receipt-reconciliation policy configurable per profile."
+    }
+  ],
+  "forbidden_imports": [
+    "GatewayRunner private attributes",
+    "raw state.db writer connections",
+    "built-in slash command overrides"
+  ]
+}

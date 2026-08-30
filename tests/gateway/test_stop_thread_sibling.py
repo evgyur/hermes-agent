@@ -137,3 +137,65 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     result = await runner._handle_stop_command(event)
 
     assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_no_active_agent_cancels_durable_parent_continuations(
+    monkeypatch, tmp_path
+):
+    """A stopped route must never be revived by the barrier watcher."""
+    from tools import parent_task_barrier as barrier
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    barrier.initialize_storage()
+
+    key = _per_user_key("userA")
+    barrier_id = barrier.admit_required_child(
+        origin_session=key,
+        parent_session_id="parent-session",
+        root_turn_id="root-turn",
+        task_id="child-task",
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner.session_store = _FakeStore(key)
+    runner._is_user_authorized = lambda source: True
+    runner.adapters = {}
+
+    event = MessageEvent(
+        text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
+    )
+    result = await runner._handle_stop_command(event)
+
+    snapshot = barrier.barrier_snapshot(barrier_id)
+    assert snapshot is not None
+    assert snapshot["barrier"]["state"] == "cancelled"
+    assert barrier.claim_next_ready_continuation(owner="gateway-after-restart") is None
+    assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_cancels_durable_work_before_interrupt():
+    runner = object.__new__(GatewayRunner)
+    cancelled = []
+    interrupted = []
+    runner._cancel_session_background_work = (
+        lambda session_key, *, reason: cancelled.append((session_key, reason))
+    )
+
+    async def _interrupt(session_key, source, *, interrupt_reason, invalidation_reason):
+        interrupted.append((session_key, interrupt_reason, invalidation_reason))
+
+    runner._interrupt_and_clear_session = _interrupt
+    source = _thread_source("userA")
+    key = _per_user_key("userA")
+
+    await runner._busy_stop_command(
+        MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source),
+        key,
+        source,
+    )
+
+    assert cancelled == [(key, "user_stop")]
+    assert interrupted == [(key, _INTERRUPT_REASON_STOP, "stop_command")]

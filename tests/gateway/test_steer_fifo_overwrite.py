@@ -21,6 +21,7 @@ from tests.gateway.test_steer_command import (
 )
 from gateway.session import build_session_key
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 
 def _prequeue(runner, adapter, sk):
@@ -31,16 +32,22 @@ def _prequeue(runner, adapter, sk):
     if not hasattr(runner, "_queued_events"):
         runner._queued_events = {}
 
+    q1_source = _make_source()
+    q1_source.message_id = "m1"
     q1 = MessageEvent(
         text="Q1",
-        source=_make_source(),
+        source=q1_source,
+        raw_message=SimpleNamespace(message_id="m1"),
         message_id="m1",
         channel_context="ctx1",
         message_type=MessageType.TEXT,
     )
+    q2_source = _make_source()
+    q2_source.message_id = "m2"
     q2 = MessageEvent(
         text="Q2",
-        source=_make_source(),
+        source=q2_source,
+        raw_message=SimpleNamespace(message_id="m2"),
         message_id="m2",
         channel_context="ctx2",
         message_type=MessageType.TEXT,

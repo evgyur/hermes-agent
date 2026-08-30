@@ -673,3 +673,31 @@ class TestGatewayOuterFinalisationNoNameError:
         # This is trivially true with a holder, but was NOT true when
         # the consumer was a run_sync local.
         _ = holder[0]
+
+
+def test_fragmented_secret_is_redacted_before_streaming_provider():
+    class RecordingStreamer(FakeStreamer):
+        def __init__(self):
+            super().__init__(chunks_per_clause=1)
+            self.texts = []
+
+        def stream(self, text):
+            self.texts.append(text)
+            yield from super().stream(text)
+
+    async def run(loop):
+        adapter = FakeVoiceAdapter()
+        streamer = RecordingStreamer()
+        consumer = _make_consumer(adapter, "secret-chat", loop, streamer)
+        token = "sk-proj-audiotest1234567890abcdefghijklmnopqrstu"
+        text = f"Credential {token} was found."
+        split = text.index("sk-proj-") + 10
+        consumer.start()
+        consumer.on_delta(text[:split])
+        consumer.on_delta(text[split:])
+        consumer.finish()
+        assert await consumer.wait_complete(timeout=5.0) is True
+        assert streamer.texts
+        assert all(token not in item for item in streamer.texts)
+
+    _run_test(run)

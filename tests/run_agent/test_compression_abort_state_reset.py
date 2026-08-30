@@ -75,6 +75,29 @@ class _NoProgressCompressor(_InPlaceSuccessCompressor):
         return [dict(m) for m in messages]
 
 
+class _ReasonedBreakerCompressor(_InPlaceSuccessCompressor):
+    """Blocked compressor exposing the durable guard's exact reason."""
+
+    def __init__(self, reason, *, fallback_streak=0, ineffective_count=0):
+        self.reason = reason
+        self.compress_calls = 0
+        self._fallback_compression_streak = fallback_streak
+        self._ineffective_compression_count = ineffective_count
+
+    def _automatic_compression_blocked(self):
+        return True
+
+    def _compression_block_reason(self):
+        return self.reason
+
+    def _refresh_durable_guards(self):
+        return None
+
+    def compress(self, messages, **kwargs):
+        self.compress_calls += 1
+        return super().compress(messages, **kwargs)
+
+
 class TestAbortPathsResetPerAttemptState:
     def _in_place_success(self, agent, messages):
         from agent.conversation_compression import (
@@ -132,4 +155,130 @@ class TestAbortPathsResetPerAttemptState:
             assert new_history is history
             db.close()
 
+    def test_critical_recovery_bypasses_only_ineffective_breaker(self):
+        """Critical hygiene can escape an indefinite anti-thrash latch."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
 
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db.create_session("abort-state-session", source="telegram")
+            agent = _make_agent(db)
+            agent.compression_in_place = True
+            compressor = _ReasonedBreakerCompressor("ineffective")
+            agent.context_compressor = compressor
+            messages = [
+                {"role": "user", "content": "old question " * 100},
+                {"role": "assistant", "content": "old answer " * 100},
+            ]
+
+            compacted, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=100_000,
+                bypass_ineffective_guard=True,
+            )
+
+            assert compacted is not messages
+            assert compressor.compress_calls == 1
+            assert agent._last_compaction_in_place is True
+            db.close()
+
+    def test_critical_recovery_still_honors_provider_cooldown(self):
+        """Critical hygiene must not turn a transient outage into retries."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db.create_session("abort-state-session", source="telegram")
+            agent = _make_agent(db)
+            agent.compression_in_place = True
+            compressor = _ReasonedBreakerCompressor("cooldown:60")
+            agent.context_compressor = compressor
+            messages = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+            ]
+
+            returned, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=100_000,
+                bypass_ineffective_guard=True,
+            )
+
+            assert returned is messages
+            assert compressor.compress_calls == 0
+            assert agent._last_compression_attempt_in_place is None
+            db.close()
+
+    def test_boundary_recovery_bypasses_degraded_summary_only(self):
+        """85%-95% hygiene may recover from two deterministic summaries."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db.create_session("abort-state-session", source="telegram")
+            agent = _make_agent(db)
+            agent.compression_in_place = True
+            compressor = _ReasonedBreakerCompressor(
+                "degraded_summary", fallback_streak=2, ineffective_count=0
+            )
+            agent.context_compressor = compressor
+            messages = [
+                {"role": "user", "content": "old question " * 100},
+                {"role": "assistant", "content": "old answer " * 100},
+            ]
+
+            compacted, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=90_000,
+                bypass_degraded_summary_guard=True,
+            )
+
+            assert compacted is not messages
+            assert compressor.compress_calls == 1
+            db.close()
+
+    def test_boundary_recovery_does_not_bypass_ineffective_strikes(self):
+        """The lower rail is not a generic ineffective-breaker bypass."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db.create_session("abort-state-session", source="telegram")
+            agent = _make_agent(db)
+            compressor = _ReasonedBreakerCompressor(
+                "ineffective+degraded_summary",
+                fallback_streak=2,
+                ineffective_count=2,
+            )
+            agent.context_compressor = compressor
+            messages = [{"role": "user", "content": "keep"}]
+
+            returned, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=90_000,
+                bypass_degraded_summary_guard=True,
+            )
+
+            assert returned is messages
+            assert compressor.compress_calls == 0
+            db.close()
+
+    def test_no_progress_attempt_retains_previous_baseline(self):
+        """A semantic no-op attempt must not reuse the stale in-place flag."""
+        from agent.conversation_compression import (
+            compress_context,
+            conversation_history_after_compression,
+        )
+        from hermes_state import SessionDB

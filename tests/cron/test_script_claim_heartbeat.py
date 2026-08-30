@@ -316,6 +316,69 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         }
 
 
+def test_recurring_script_invocation_uses_runtime_timezone_when_job_omits_it(monkeypatch):
+    """Legacy recurring jobs still receive a complete pre-run context."""
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 8, 23, 23, 24, 30, tzinfo=timezone(timedelta(hours=3), "MSK"))
+    captured = {}
+
+    def _capture(_script_path: str, **kwargs):
+        captured.update(kwargs["invocation_context"])
+        return True, ""
+
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "_run_job_script", _capture)
+
+    job = {
+        "id": "legacy-recurring-script",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "next_run_at": "2026-08-23T23:24:29+03:00",
+    }
+    assert scheduler._run_job_script_with_claim_heartbeat(job, "watchdog.py") == (True, "")
+    assert captured == {
+        "job_id": "legacy-recurring-script",
+        "scheduled_at": "2026-08-23T23:24:29+03:00",
+        "timezone": "MSK",
+        "invocation_kind": "scheduled",
+    }
+
+
+def test_recurring_script_invocation_uses_claimed_occurrence_after_advance(monkeypatch):
+    """Recurring claim metadata survives next_run_at advancing to tomorrow."""
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 8, 28, 8, 32, tzinfo=timezone(timedelta(hours=3), "MSK"))
+    captured = {}
+
+    def _capture(_script_path: str, **kwargs):
+        captured.update(kwargs["invocation_context"])
+        return True, ""
+
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: now)
+    monkeypatch.setattr(scheduler, "_run_job_script", _capture)
+
+    job = {
+        "id": "daily-scout",
+        "schedule": {"kind": "cron", "expr": "30 8 * * *"},
+        "timezone": "Europe/Moscow",
+        "next_run_at": "2026-08-29T08:30:00+03:00",
+        "fire_claim": {
+            "at": now.isoformat(),
+            "by": "owner",
+            "scheduled_at": "2026-08-28T08:30:00+03:00",
+            "invocation_kind": "scheduled",
+        },
+    }
+    assert scheduler._run_job_script_with_claim_heartbeat(job, "scout.py") == (True, "")
+    assert captured == {
+        "job_id": "daily-scout",
+        "scheduled_at": "2026-08-28T08:30:00+03:00",
+        "timezone": "Europe/Moscow",
+        "invocation_kind": "scheduled",
+    }
+
+
 def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch):
     """The shared execute/save/deliver body keeps its durable fire claim alive."""
     import cron.jobs as jobs
@@ -369,7 +432,14 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
         lost_seen.set()
         return False
 
-    def _run_job(job, *, defer_agent_teardown=None, extra_prompt=None, cancel_event=None):
+    def _run_job(
+        job,
+        *,
+        defer_agent_teardown=None,
+        extra_prompt=None,
+        cancel_event=None,
+        transport_config=None,
+    ):
         assert lost_seen.wait(timeout=2)
         return True, "stale output", "stale response", None
 
@@ -537,6 +607,45 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
 
     assert scheduler.run_one_job(job) is True
     assert calls >= 3
+
+
+def test_single_late_heartbeat_error_can_recover(monkeypatch):
+    """A delayed transient store error is not proof that claim ownership was lost."""
+    import cron.scheduler as scheduler
+
+    calls = 0
+    recovered = threading.Event()
+
+    def heartbeat(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("transient store error")
+        if calls == 3:
+            recovered.set()
+        return True
+
+    def run_body(_job, **kwargs):
+        assert recovered.wait(timeout=0.5)
+        assert not kwargs["fire_claim_lost"].is_set()
+        return True
+
+    job = {
+        "id": "heartbeat-recovers",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
+    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(
+        scheduler.time,
+        "monotonic",
+        MagicMock(side_effect=[0.0, 1.0, 1.0]),
+    )
+
+    assert scheduler.run_one_job(job) is True
+    assert calls == 3
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

@@ -43,11 +43,13 @@ def _make_event(text: str = "hello", chat_id: str = "123") -> MessageEvent:
         chat_id=chat_id,
         chat_type="private",
         user_id="user1",
+        message_id="msg1",
     )
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
+        raw_message=SimpleNamespace(message_id="msg1"),
         message_id="msg1",
     )
 
@@ -153,5 +155,4 @@ class TestBusyHandlerDemotesInterruptForCompression:
         assert "queued" in content.lower()
         assert "/stop" in content
         assert "Interrupting" not in content
-
 

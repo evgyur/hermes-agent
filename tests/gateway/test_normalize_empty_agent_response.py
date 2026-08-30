@@ -126,3 +126,31 @@ class TestGenericFailureRegression:
 
         assert "context window" in response
         assert "/compact" in response
+
+
+class TestInterruptedBeforeFirstCall:
+    def test_gateway_shutdown_is_not_misattributed_to_stale_stop(self):
+        agent_result = {
+            "final_response": "",
+            "interrupted": True,
+            "interrupt_message": "Gateway shutting down",
+            "api_calls": 0,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert response == ""
+        assert "/stop" not in response
+
+    def test_explicit_stop_keeps_resend_notice(self):
+        agent_result = {
+            "final_response": "",
+            "interrupted": True,
+            "interrupt_message": "Stop requested",
+            "api_calls": 0,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "send it again" in response.lower()
+        assert "/stop" in response

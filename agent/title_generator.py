@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import threading
+from contextvars import copy_context
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -747,9 +748,15 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    # ``threading.Thread`` starts with a fresh Context.  In a multiplexed
+    # gateway that drops the active profile's secret/HERMES_HOME scopes and
+    # makes the auxiliary model call fail closed as an unscoped credential
+    # read.  Capture the current turn context while it is still authoritative
+    # and enter that exact snapshot in the daemon worker.
+    context = copy_context()
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message),
+        target=context.run,
+        args=(auto_title_session, session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

@@ -1,0 +1,26 @@
+name: human20-powerpack-gen2
+version: 2.3.2
+description: "Human20 skills, governed host bridges, and operator diagnostics."
+author: Human20
+kind: standalone
+license: Proprietary
+homepage: https://github.com/human20team/human20-rentals-autopilot-powerpack
+tags: [human20, skills, memory, operations]
+provides_tools:
+  - mem0g
+  - continuum_host
+  - chipmanager_telegram
+provides_hooks:
+  - pre_llm_call
+provides_web_providers:
+  - human20-perplexity
+config_schema:
+  mode:
+    type: str
+    default: disabled
+    choices: [disabled, compatibility, gen2_only]
+    description: "Coexistence ownership mode. Only gen2_only registers effectful surfaces."
+  variant:
+    type: str
+    default: rentals
+    description: "Install contour: rentals or employee."

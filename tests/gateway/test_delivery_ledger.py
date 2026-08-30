@@ -31,14 +31,39 @@ def _fresh_db(tmp_path, monkeypatch):
 
 
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
+    platform = kw.get("platform", "slack")
+    chat_id = kw.get("chat_id", "C1")
+    thread_id = kw.get("thread_id", "171.001")
+    route_envelope = kw.get("route_envelope")
+    if platform == "telegram" and route_envelope is None:
+        route_envelope = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "default",
+            "transport_profile": "default",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": chat_id,
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
     dl.record_obligation(
         obligation_id=oid,
         session_key=session_key,
-        platform=kw.get("platform", "slack"),
-        chat_id=kw.get("chat_id", "C1"),
-        thread_id=kw.get("thread_id", "171.001"),
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        resume_task_id=kw.get("resume_task_id", "resume-task-1"),
+        continuation_generation=kw.get("continuation_generation", 1),
+        continuation_claim_owner=kw.get(
+            "continuation_claim_owner", "gateway:test"
+        ),
+        continuation_claim_token=kw.get(
+            "continuation_claim_token", "claim-test-1"
+        ),
+        route_envelope=route_envelope,
     )
 
 
@@ -155,14 +180,14 @@ class TestSweep:
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is False
-        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["attempts"] == 0
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
 
 class TestRuntimeFailedSweep:
-    """A live gateway may reclaim only its own transient reconnect failures."""
+    """Reconnect recovery respects exact live ownership and dead generations."""
 
     def test_claims_current_process_send_path_degraded_row(self):
         _record(platform="telegram")
@@ -172,7 +197,9 @@ class TestRuntimeFailedSweep:
 
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is True
-        assert claimed[0]["attempts"] == 1
+        # Claiming is not a wire attempt.  The budget is consumed immediately
+        # before adapter.send() by begin_redelivery_attempt().
+        assert claimed[0]["attempts"] == 0
         assert _row("ob-1")["state"] == "attempting"
 
     def test_permanent_failure_is_not_claimed(self):
@@ -211,6 +238,7 @@ class TestRuntimeFailedSweep:
                 (12345, 101, dl.MAX_ATTEMPTS, "ob-1"),
             )
         monkeypatch.setattr(dl, "_owner_stamp", lambda: (54321, 202))
+        monkeypatch.setattr(dl, "_owner_alive", lambda *_args: True)
 
         assert dl.sweep_failed_for_runtime("telegram") == []
         assert _row("ob-1")["state"] == "failed"
@@ -243,7 +271,7 @@ class TestRuntimeFailedSweep:
         assert dl.sweep_failed_for_runtime("telegram") == []
         assert _row("ob-1")["state"] == "failed"
 
-    def test_same_pid_with_different_start_stamp_is_not_claimed(self, monkeypatch):
+    def test_same_pid_with_different_start_stamp_is_reclaimed(self, monkeypatch):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
         with dl._connect() as conn:
@@ -254,8 +282,11 @@ class TestRuntimeFailedSweep:
             )
         monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 202))
 
-        assert dl.sweep_failed_for_runtime("telegram") == []
-        assert _row("ob-1")["state"] == "failed"
+        claimed = dl.sweep_failed_for_runtime("telegram")
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        assert claimed[0]["attempts"] == 0
+        assert _row("ob-1")["state"] == "attempting"
 
     def test_profile_scope_never_claims_another_bot_identity(self):
         _record(platform="telegram")
@@ -314,7 +345,7 @@ class TestRuntimeFailedSweep:
         row = _row("ob-1")
         assert row is not None
         assert row["state"] == "delivered"
-        assert row["attempts"] == 1
+        assert row["attempts"] == 0
 
     def test_current_owner_stale_row_is_abandoned(self):
         _record(platform="telegram")
@@ -363,6 +394,7 @@ class TestGatewayRedeliverySweep:
         runner._active_profile_name = lambda: "default"
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending_exact = AsyncMock()
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
@@ -390,8 +422,12 @@ class TestGatewayRedeliverySweep:
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
 
     @pytest.mark.asyncio
@@ -459,8 +495,12 @@ class TestGatewayRedeliverySweep:
         n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
 
         assert n == 1
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
         )
         assert adapter.send.await_count == 1
         assert adapter.send.call_args.kwargs["content"].startswith(
@@ -509,32 +549,37 @@ class TestGatewayRedeliverySweep:
         assert _row("ob-1")["last_error"] == "send_path_degraded"
 
     @pytest.mark.asyncio
-    async def test_runtime_clear_failure_does_not_send_or_lose_retry(self):
+    async def test_runtime_clear_failure_keeps_process_fence_after_ack(self):
         from gateway.config import Platform
 
         _record(platform="slack")
         dl.mark_failed("ob-1", "send_path_degraded")
         adapter = self._adapter()
         runner = self._runner(adapter)
-        runner._async_session_store.clear_resume_pending.side_effect = RuntimeError(
-            "session store unavailable"
+        runner._async_session_store.clear_resume_pending_exact.side_effect = (
+            RuntimeError("session store unavailable")
         )
 
         n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
 
-        assert n == 0
-        adapter.send.assert_not_awaited()
-        assert _row("ob-1")["state"] == "failed"
-        assert _row("ob-1")["attempts"] == 0
-        assert _row("ob-1")["last_error"] == "send_path_degraded"
+        assert n == 1
+        adapter.send.assert_awaited_once()
+        assert _row("ob-1")["state"] == "delivered"
+        assert _row("ob-1")["attempts"] == 1
+        assert runner._startup_delivery_pending_continuations == {
+            (
+                "agent:main:slack:channel:C1",
+                "resume-task-1",
+                1,
+                "gateway:test",
+                "claim-test-1",
+            )
+        }
 
-    @pytest.mark.parametrize(
-        ("send_success", "ledger_method"),
-        [(True, "mark_delivered"), (False, "mark_failed")],
-    )
+    @pytest.mark.parametrize("send_success", [True, False])
     @pytest.mark.asyncio
     async def test_slow_state_update_does_not_block_event_loop(
-        self, send_success, ledger_method
+        self, send_success
     ):
         import asyncio
 
@@ -543,7 +588,7 @@ class TestGatewayRedeliverySweep:
         runner = self._runner(self._adapter(success=send_success))
         slow_update, event_loop_witness, blocked_event_loop = _blocking_probe()
 
-        with patch.object(dl, ledger_method, side_effect=slow_update):
+        with patch.object(dl, "settle_runtime_claim", side_effect=slow_update):
             await asyncio.gather(
                 runner._redeliver_pending_obligations(), event_loop_witness()
             )
@@ -551,14 +596,10 @@ class TestGatewayRedeliverySweep:
         assert blocked_event_loop == []
 
     @pytest.mark.asyncio
-    async def test_clear_resume_pending_before_send_so_a_hang_cannot_also_resume(
+    async def test_hung_send_keeps_durable_resume_and_process_delivery_fence(
         self,
     ):
-        """A hung redelivery send must still clear resume_pending.
-
-        Otherwise a timed-out startup-restore gate would schedule resume and
-        replay a turn whose answer is already in the ledger (#91969).
-        """
+        """A hung send must remain crash-recoverable without model replay."""
         import asyncio
 
         _record()
@@ -575,18 +616,86 @@ class TestGatewayRedeliverySweep:
         task = asyncio.create_task(runner._redeliver_pending_obligations())
 
         deadline = asyncio.get_running_loop().time() + 2
-        while runner._async_session_store.clear_resume_pending.await_count == 0:
+        while not getattr(
+            runner, "_startup_delivery_pending_continuations", set()
+        ):
             if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError("resume_pending was not cleared before send")
+                raise AssertionError("delivery fence was not installed before send")
             await asyncio.sleep(0)
 
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
-        )
+        runner._async_session_store.clear_resume_pending_exact.assert_not_awaited()
+        assert runner._startup_delivery_pending_continuations == {
+            (
+                "agent:main:slack:channel:C1",
+                "resume-task-1",
+                1,
+                "gateway:test",
+                "claim-test-1",
+            )
+        }
         assert not task.done()
 
         hang.set()
         assert await task == 1
+        runner._async_session_store.clear_resume_pending_exact.assert_awaited_once_with(
+            "agent:main:slack:channel:C1",
+            resume_task_id="resume-task-1",
+            continuation_generation=1,
+            continuation_claim_owner="gateway:test",
+            continuation_claim_token="claim-test-1",
+        )
+        assert runner._startup_delivery_pending_continuations == set()
+
+    @pytest.mark.asyncio
+    async def test_failed_boot_send_does_not_clear_durable_resume(self):
+        _record()
+        _orphan("ob-1")
+        runner = self._runner(self._adapter(success=False))
+
+        assert await runner._redeliver_pending_obligations() == 0
+
+        runner._async_session_store.clear_resume_pending_exact.assert_not_awaited()
+        assert runner._startup_delivery_pending_continuations == {
+            (
+                "agent:main:slack:channel:C1",
+                "resume-task-1",
+                1,
+                "gateway:test",
+                "claim-test-1",
+            )
+        }
+        assert _row("ob-1")["state"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_terminal_route_quarantine_releases_exact_delivery_fence(self):
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+
+        _record(
+            session_key="agent:main:telegram:dm:WRONG",
+            platform="telegram",
+            chat_id="777000123",
+            thread_id=None,
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter._owner_profile = "default"
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._profile_adapters = {}
+        runner.config = MagicMock(
+            multiplex_profiles=False,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        runner._async_session_store = MagicMock()
+        runner._async_session_store.clear_resume_pending_exact = AsyncMock()
+
+        assert await runner._redeliver_pending_obligations() == 0
+
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "abandoned"
+        assert runner._startup_delivery_pending_continuations == set()
 
 
 class TestAttemptsOnlySpentOnRealSends:
@@ -629,7 +738,26 @@ class TestAttemptsOnlySpentOnRealSends:
         _orphan("ob-1")
         claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
         assert len(claimed) == 1
-        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["attempts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_crashes_before_boot_send_never_spend_attempt_budget(self):
+        """Repeated boot claims without a wire attempt must not poison output."""
+        _record()
+        for _ in range(dl.MAX_ATTEMPTS + 2):
+            _orphan("ob-1")
+            claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
+            assert len(claimed) == 1
+            assert claimed[0]["attempts"] == 0
+            assert _row("ob-1")["attempts"] == 0
+
+        _orphan("ob-1")
+        runner = TestGatewayRedeliverySweep._runner(
+            TestGatewayRedeliverySweep._adapter()
+        )
+        assert await runner._redeliver_pending_obligations() == 1
+        assert _row("ob-1")["state"] == "delivered"
+        assert _row("ob-1")["attempts"] == 1
 
 
 class TestUnconnectedPlatformKeepsItsBudget:
@@ -720,3 +848,385 @@ class TestOwnerAlivePidProbe:
 
         monkeypatch.setattr(status, "_pid_exists", boom)
         assert dl._owner_alive(12345, 999) is False
+
+
+def test_runtime_reconnect_claim_is_exact_and_generation_carrying():
+    _record(
+        "runtime-claim",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="already generated",
+        resume_task_id="resume-3",
+        continuation_generation=3,
+        continuation_claim_owner="gateway:owner",
+        continuation_claim_token="continuation-token",
+    )
+    dl.mark_failed("runtime-claim", "send_path_degraded")
+    rows = dl.sweep_failed_for_runtime("telegram")
+    assert len(rows) == 1
+    assert rows[0]["continuation_generation"] == 3
+    assert rows[0]["continuation_claim_token"] == "continuation-token"
+    assert rows[0]["route_envelope"]["transport_profile"] == "default"
+    assert rows[0]["attempts"] == 0
+    assert dl.sweep_failed_for_runtime("telegram") == []
+    assert dl.begin_redelivery_attempt(
+        "runtime-claim", rows[0]["runtime_claim_token"]
+    )
+    assert dl.settle_runtime_claim(
+        "runtime-claim", rows[0]["runtime_claim_token"], delivered=True
+    )
+    assert _row("runtime-claim")["state"] == "delivered"
+    assert _row("runtime-claim")["attempts"] == 1
+
+
+def test_stale_runtime_token_cannot_begin_or_settle_replaced_claim():
+    _record()
+    _orphan("ob-1")
+    row = dl.sweep_recoverable()[0]
+    old_token = row["runtime_claim_token"]
+    with dl._connect() as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET runtime_claim_token=? "
+            "WHERE obligation_id=?",
+            ("replacement-token", "ob-1"),
+        )
+
+    assert not dl.begin_redelivery_attempt("ob-1", old_token)
+    assert not dl.settle_runtime_claim(
+        "ob-1", old_token, delivered=True
+    )
+    assert _row("ob-1")["state"] == "attempting"
+    assert _row("ob-1")["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_crashes_before_send_never_spend_attempt_budget():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    _record(
+        "reconnect-crash",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        thread_id=None,
+    )
+    dl.mark_failed("reconnect-crash", "send_path_degraded")
+    for _ in range(dl.MAX_ATTEMPTS + 2):
+        rows = dl.sweep_failed_for_runtime("telegram")
+        assert len(rows) == 1
+        assert rows[0]["attempts"] == 0
+        assert _row("reconnect-crash")["attempts"] == 0
+        _orphan("reconnect-crash")
+
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock(return_value=MagicMock(success=True, error=""))
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM
+    ) == 1
+    assert _row("reconnect-crash")["state"] == "delivered"
+    assert _row("reconnect-crash")["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_sends_stored_final_without_model_replay():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    _record(
+        "runtime-send",
+        session_key="agent:main:telegram:dm:C1",
+        platform="telegram",
+        thread_id=None,
+        content="stored final",
+    )
+    dl.mark_failed("runtime-send", "send_path_degraded")
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m1", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = None
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+    runner.session_store = None
+    runner._startup_delivery_pending_continuations = {
+        (
+            "agent:main:telegram:dm:C1",
+            "resume-task-1",
+            1,
+            "gateway:test",
+            "claim-test-1",
+        )
+    }
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM
+    ) == 1
+    assert adapter.send.await_args.kwargs["content"].endswith("stored final")
+    runner._async_session_store.clear_resume_pending_exact.assert_awaited_once()
+    assert runner._startup_delivery_pending_continuations == set()
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_preserves_exact_business_route_envelope():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "hermesdev",
+        "transport_profile": "hermesdev",
+        "chat_id": "700000321",
+        "thread_id": "1858",
+        "user_id": "711111111",
+        "business_connection_id": "biz-42",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-business",
+        session_key="agent:hermesdev:telegram:business:biz-42:700000321:711111111:external",
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=route["thread_id"],
+        adapter_profile="hermesdev",
+        route_envelope=route,
+        content="stored business final",
+    )
+    dl.mark_failed("runtime-business", "send_path_degraded")
+    adapter = MagicMock()
+    adapter._owner_profile = "hermesdev"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m2", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "hermesdev": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = None
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+    runner.session_store = None
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter, runtime_profile="hermesdev"
+    ) == 1
+    kwargs = adapter.send.await_args.kwargs
+    assert kwargs["chat_id"] == route["chat_id"]
+    assert kwargs["metadata"]["business_connection_id"] == "biz-42"
+    assert kwargs["metadata"]["profile"] == "hermesdev"
+    assert kwargs["metadata"]["transport_profile"] == "hermesdev"
+    assert kwargs["metadata"]["external_safe_mode"] is True
+    assert kwargs["metadata"]["route_envelope"] == route
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnect_allows_distinct_runtime_and_transport_profiles():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": None,
+        "user_id": "700000111",
+        "business_connection_id": "biz-distinct",
+        "external_safe_mode": True,
+    }
+    _record(
+        "runtime-distinct-transport",
+        session_key=(
+            "agent:runtime-a:telegram:business:biz-distinct:"
+            "777000123:700000111:external"
+        ),
+        platform="telegram",
+        chat_id=route["chat_id"],
+        thread_id=None,
+        adapter_profile="transport-b",
+        route_envelope=route,
+        content="exact distinct route",
+    )
+    dl.mark_failed("runtime-distinct-transport", "send_path_degraded")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, message_id="m3", error="")
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = None
+    runner._async_session_store.clear_resume_pending_exact = AsyncMock(
+        return_value=True
+    )
+    runner.session_store = None
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 1
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["profile"] == "runtime-a"
+    assert metadata["transport_profile"] == "transport-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["chat", "thread", "user", "business"])
+async def test_gateway_reconnect_quarantines_tampered_exact_session_route(tamper):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = {
+        "version": 1,
+        "platform": "telegram",
+        "runtime_profile": "runtime-a",
+        "transport_profile": "transport-b",
+        "chat_id": "777000123",
+        "thread_id": "1858",
+        "user_id": "700000111",
+        "business_connection_id": "biz-exact",
+        "external_safe_mode": True,
+    }
+    session_key = (
+        "agent:runtime-a:telegram:business:biz-exact:"
+        "777000123:700000111:external"
+    )
+    row_chat = route["chat_id"]
+    row_thread = route["thread_id"]
+    if tamper == "chat":
+        row_chat = "777000999"
+    elif tamper == "thread":
+        row_thread = "9999"
+    elif tamper == "user":
+        session_key = session_key.replace("700000111", "700000999")
+    elif tamper == "business":
+        session_key = session_key.replace("biz-exact", "biz-other")
+
+    oid = f"runtime-tampered-{tamper}"
+    _record(
+        oid,
+        session_key=session_key,
+        platform="telegram",
+        chat_id=row_chat,
+        thread_id=row_thread,
+        adapter_profile="transport-b",
+        route_envelope=route,
+        content="must not send",
+    )
+    dl.mark_failed(oid, "send_path_degraded")
+    adapter = MagicMock()
+    adapter._owner_profile = "transport-b"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "transport-b": {Platform.TELEGRAM: adapter}
+    }
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM,
+        adapter=adapter,
+        runtime_profile="runtime-a",
+    ) == 0
+    adapter.send.assert_not_awaited()
+    assert _row(oid)["state"] == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing-envelope", "cross-profile"])
+async def test_gateway_reconnect_quarantines_ambiguous_telegram_route(case):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    route = None
+    session_key = "agent:main:telegram:dm:C1"
+    if case == "cross-profile":
+        route = {
+            "version": 1,
+            "platform": "telegram",
+            "runtime_profile": "hermesdev",
+            "transport_profile": "hermesdev",
+            "chat_id": "C1",
+            "thread_id": None,
+            "user_id": "U1",
+            "business_connection_id": None,
+            "external_safe_mode": False,
+        }
+        session_key = "agent:hermesdev:telegram:dm:C1"
+    dl.record_obligation(
+        obligation_id=f"runtime-{case}",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="C1",
+        thread_id=None,
+        content="must not send",
+        adapter_profile="default",
+        route_envelope=route,
+    )
+    dl.mark_failed(f"runtime-{case}", "send_path_degraded")
+    adapter = MagicMock()
+    adapter._owner_profile = "default"
+    adapter.send = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._async_session_store = MagicMock()
+
+    assert await runner._redeliver_failed_obligations_for_platform(
+        Platform.TELEGRAM, adapter=adapter
+    ) == 0
+    adapter.send.assert_not_awaited()
+    # The transport-filtered sweep cannot prove ownership of an invalid or
+    # cross-transport row, so it leaves it untouched for operator repair.
+    assert _row(f"runtime-{case}")["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_settlement_continues_db_only_after_inline_lock_budget(monkeypatch):
+    import asyncio
+    import sqlite3
+
+    _record("settle-after-locks")
+    real_mark = dl.mark_delivered
+    calls = 0
+
+    def locked_then_open(obligation_id):
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark(obligation_id)
+
+    monkeypatch.setattr(dl, "mark_delivered", locked_then_open)
+    assert await dl.settle_with_retry(dl.mark_delivered, "settle-after-locks") is False
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while calls < 5 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert calls >= 5
+    assert _row("settle-after-locks")["state"] == "delivered"

@@ -876,6 +876,15 @@ def init_agent(
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
+    # Gateway-owned, per-turn fallback acknowledgment. The core invokes it
+    # only before the first tool batch when no model commentary was delivered.
+    agent.start_ack_callback = None
+    agent.start_ack_required = False
+    agent._pending_start_ack_visible_text = None
+    agent._latest_interim_visible_text = None
+    agent._tool_start_ack_emitted = False
+    agent._start_ack_delivered_text = None
+    agent._start_ack_receipt = None
     agent.status_callback = status_callback
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback

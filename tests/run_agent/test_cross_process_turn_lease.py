@@ -7,6 +7,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from agent import relay_runtime
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -125,6 +127,108 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         and "loading the latest transcript" in text
         for kind, text in status_events
     )
+
+
+def test_post_turn_executes_durable_proactive_prune_retry(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    calls = []
+
+    class Compressor:
+        _proactive_prune_retry_tokens = 9000
+
+        def bind_turn_lease(self, holder, **_kwargs):
+            calls.append(("bind", holder))
+
+        def prune_tool_results_only(self, messages, *, current_tokens):
+            calls.append(("prune", current_tokens, list(messages)))
+            self._proactive_prune_retry_tokens = 0
+            return ([{"role": "user", "content": "pruned"}], 1)
+
+    agent.context_compressor = Compressor()
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda _agent, _message, _system, history, *_args, **_kwargs: {
+            "final_response": "ok",
+            "messages": history,
+            "failed": False,
+        },
+    )
+
+    AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "before"}],
+    )
+
+    assert [event[0] for event in db.events] == ["acquire", "release", "reload"]
+    assert calls[-2] == ("bind", None)
+    assert calls[-1][0:2] == ("prune", 9000)
+    assert agent._session_messages == [{"role": "user", "content": "pruned"}]
+
+
+def test_gateway_preacquired_lease_is_verified_but_not_reowned(monkeypatch):
+    """Gateway retains acquire/release ownership across the agent handoff."""
+    db = _DB()
+    agent = _agent_with_db(db)
+    holder = "pid=7:gateway-turn=exact"
+    agent._gateway_preacquired_session_turn_lease_external = True
+    agent._gateway_preacquired_session_turn_lease_holder = holder
+    agent._gateway_preacquired_session_turn_lease_session_id = agent.session_id
+    agent._gateway_preacquired_session_turn_lease_ttl_seconds = 300.0
+
+    def refresh(session_id, received_holder, **_kwargs):
+        db.events.append(("refresh", session_id, received_holder))
+        return True
+
+    db.refresh_session_turn_lease = refresh
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        assert _agent._active_session_turn_lease_holder == holder
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    history = [{"role": "user", "content": "gateway snapshot"}]
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=history,
+        precommitted_authority=True,
+        precommitted_user_row_id=11,
+    )
+
+    assert result["final_response"] == "ok"
+    assert db.events == [("refresh", "stale-parent", holder)]
+    assert getattr(agent, "_active_session_turn_lease_holder", None) is None
+
+
+def test_gateway_preacquired_lease_loss_stops_before_turn(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    agent._gateway_preacquired_session_turn_lease_external = True
+    agent._gateway_preacquired_session_turn_lease_holder = "lost-holder"
+    agent._gateway_preacquired_session_turn_lease_session_id = agent.session_id
+    agent._gateway_preacquired_session_turn_lease_ttl_seconds = 300.0
+    db.refresh_session_turn_lease = lambda *_args, **_kwargs: False
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("turn started after gateway lease loss")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="pre-acquired session turn lease was lost"):
+        AIAgent.run_conversation(
+            agent,
+            "new message",
+            conversation_history=[{"role": "user", "content": "snapshot"}],
+            precommitted_authority=True,
+            precommitted_user_row_id=11,
+        )
+
+    assert db.events == []
+    assert getattr(agent, "_active_session_turn_lease_holder", None) is None
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):

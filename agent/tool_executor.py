@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import logging
 import os
@@ -33,6 +34,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_result_classification import tool_may_have_side_effect
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -54,6 +56,17 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _scoped_deferred_tool_authority(tool_name: Optional[str]):
+    if tool_name is None:
+        yield
+        return
+    from tools.tool_search import _bind_scoped_deferred_tool_authority
+
+    with _bind_scoped_deferred_tool_authority(tool_name):
+        yield
 
 
 def _pairing_tool_call_id(tool_call: Any) -> str:
@@ -190,6 +203,33 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
         },
         ensure_ascii=False,
     )
+
+
+def _seal_raw_replay_identity(
+    function_name: Any,
+    function_args: Any,
+) -> tuple[str, str] | None:
+    """Canonical immutable identity of the model-emitted tool call.
+
+    Dispatch layers may unwrap Tool Search or rewrite a call through Relay and
+    middleware.  Startup replay authority must remain bound to the name and
+    arguments stored in the assistant transcript *before* any such rewrite.
+    """
+
+    if type(function_name) is not str or not function_name:
+        return None
+    if not isinstance(function_args, dict):
+        return None
+    try:
+        canonical_args = json.dumps(
+            function_args,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    return function_name, canonical_args
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -592,8 +632,125 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    replay_identity: tuple[str, str] | None = None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Apply immutable recovery fences, then dispatch through middleware once."""
+    # Startup recovery owns a frozen capability derived from the exact durable
+    # task slice.  Match the ORIGINAL call before Relay, plugin hooks, request
+    # middleware, or any other rewrite can turn it into a different effect.
+    if getattr(agent, "startup_resume", False) is True:
+        fence = getattr(agent, "startup_resume_effect_fence", None)
+        if isinstance(fence, dict):
+            # ``replay_identity`` is sealed at the parser boundary, before Tool
+            # Search/Relay/other rewrites.  Direct callers that do not supply it
+            # retain the old canonical current-call behavior.
+            sealed_identity = replay_identity
+            if not (
+                isinstance(sealed_identity, tuple)
+                and len(sealed_identity) == 2
+                and all(type(part) is str for part in sealed_identity)
+            ):
+                sealed_identity = _seal_raw_replay_identity(
+                    function_name, function_args
+                )
+            reason = fence.get(sealed_identity) if sealed_identity is not None else None
+            if isinstance(reason, str) and reason:
+                if begin_execution is not None:
+                    # Advance the concurrent start-order gate without invoking
+                    # the real execution callback.
+                    begin_execution()
+                trace = middleware_trace if middleware_trace is not None else []
+                trace.append(
+                    {
+                        "middleware": "startup_resume_effect_fence",
+                        "action": "blocked",
+                        "reason": reason,
+                    }
+                )
+                replay_message = (
+                    "This pre-restart effect has an UNKNOWN outcome; replay "
+                    "was blocked. Use a read-only tool to inspect its "
+                    "postconditions."
+                    if reason == "unknown_pre_restart_effect"
+                    else "This effect already completed before restart; "
+                    "replay was blocked."
+                )
+                result = json.dumps(
+                    {
+                        "blocked": True,
+                        "status": "replay_fenced",
+                        "reason": reason,
+                        "message": replay_message,
+                    },
+                    ensure_ascii=False,
+                )
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    status="blocked",
+                    error_type="startup_resume_replay_fence",
+                    error_message=reason,
+                    middleware_trace=list(trace),
+                )
+                return _ManagedToolResult(
+                    result=result,
+                    args=function_args,
+                    middleware_trace=trace,
+                    blocked=True,
+                    dispatched=False,
+                )
+
+        if (
+            getattr(agent, "startup_resume_reconciliation_only", False) is True
+            and tool_may_have_side_effect(function_name)
+        ):
+            if begin_execution is not None:
+                begin_execution()
+            trace = middleware_trace if middleware_trace is not None else []
+            reason = "startup_reconciliation_effect_block"
+            trace.append(
+                {
+                    "middleware": "startup_resume_reconciliation_only",
+                    "action": "blocked",
+                    "reason": reason,
+                }
+            )
+            result = json.dumps(
+                {
+                    "blocked": True,
+                    "status": "reconciliation_effect_blocked",
+                    "reason": reason,
+                    "message": (
+                        "This startup turn may only inspect state with "
+                        "no-effect tools; new external effects are blocked."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type="startup_resume_reconciliation_only",
+                error_message=reason,
+                middleware_trace=list(trace),
+            )
+            return _ManagedToolResult(
+                result=result,
+                args=function_args,
+                middleware_trace=trace,
+                blocked=True,
+                dispatched=False,
+            )
+
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -827,6 +984,7 @@ def _run_sequential_tool_execution_middleware(
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
+    replay_identity: tuple[str, str] | None = None,
 ) -> _ManagedToolResult:
     """Run one sequential call with the concurrent executor's deadline.
 
@@ -845,6 +1003,7 @@ def _run_sequential_tool_execution_middleware(
         "scope_block": scope_block,
         "display_index": display_index,
         "middleware_trace": middleware_trace,
+        "replay_identity": replay_identity,
     }
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
@@ -1149,11 +1308,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # (tool call, resolved name, parsed args, middleware trace, parse error,
     # tool-search scope block)
     parsed_calls = []
+    raw_replay_identities: list[tuple[str, str] | None] = []
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
+        )
+        raw_replay_identities.append(
+            _seal_raw_replay_identity(function_name, function_args)
+            if malformed_args_result is None
+            else None
         )
 
         if malformed_args_result is not None:
@@ -1312,9 +1477,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         function_args,
         middleware_trace,
         scope_block,
+        replay_identity,
         start_order,
     ):
         """Worker function executed in a thread."""
+        try:
+            from tools.tool_search import TOOL_CALL_NAME
+
+            deferred_authority = (
+                function_name
+                if tool_call.function.name == TOOL_CALL_NAME
+                and function_name != TOOL_CALL_NAME
+                else None
+            )
+        except Exception:
+            deferred_authority = None
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -1373,17 +1550,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    return agent._invoke_tool(
-                        function_name,
-                        next_args,
-                        effective_task_id,
-                        tool_call_id,
-                        messages=messages,
-                        pre_tool_block_checked=True,
-                        skip_tool_request_middleware=True,
-                        skip_tool_execution_middleware=True,
-                        tool_request_middleware_trace=list(middleware_trace),
-                    )
+                    with _scoped_deferred_tool_authority(deferred_authority):
+                        return agent._invoke_tool(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id,
+                            messages=messages,
+                            pre_tool_block_checked=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                        )
 
                 managed = _run_agent_tool_execution_middleware(
                     agent,
@@ -1397,6 +1575,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    replay_identity=replay_identity,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1535,6 +1714,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             args,
                             parsed_calls[i][3],
                             scope_block,
+                            raw_replay_identities[i],
                             submit_index,
                         )
                     except RuntimeError as submit_error:
@@ -1961,7 +2141,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
+    _current_raw_replay_identity: tuple[str, str] | None = None
+
     def _run_agent_tool_execution_middleware(agent, **kwargs):
+        kwargs.setdefault("replay_identity", _current_raw_replay_identity)
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -2007,6 +2190,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
+        _current_raw_replay_identity = None
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -2038,10 +2222,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return
             continue
 
+        _current_raw_replay_identity = _seal_raw_replay_identity(
+            function_name, function_args
+        )
+
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
         _ts_scope_block: Optional[str] = None
+        _ts_authority: Optional[str] = None
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
@@ -2067,6 +2256,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         else:
                             function_name = _underlying
                             function_args = _underlying_args
+                            _ts_authority = _underlying
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -2143,6 +2333,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
                     detail=next_args.get("detail", "adaptive"),
+                    profile=next_args.get("profile"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
@@ -2513,8 +2704,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 def _execute(next_args: dict) -> Any:
                     from model_tools import suppress_post_tool_call_hook
 
-                    with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                    with _scoped_deferred_tool_authority(_ts_authority):
+                        with suppress_post_tool_call_hook():
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2595,8 +2787,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 def _execute(next_args: dict) -> Any:
                     from model_tools import suppress_post_tool_call_hook
 
-                    with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                    with _scoped_deferred_tool_authority(_ts_authority):
+                        with suppress_post_tool_call_hook():
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,

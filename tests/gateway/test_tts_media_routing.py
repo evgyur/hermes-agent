@@ -240,7 +240,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(f"file://{media_file.as_posix()}", "")],
+        images=[(media_file.resolve().as_uri(), "")],
         metadata={"thread_id": "topic-1"},
     )
 
@@ -290,7 +290,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(f"file://{media_file.as_posix()}", "")],
+        images=[(media_file.resolve().as_uri(), "")],
         metadata=routing_metadata,
     )
 
@@ -476,11 +476,12 @@ class _QueuedMediaCaptureAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=f"img-{len(self.images)}")
 
     async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
-        for image_url, _alt in images:
-            path = image_url
-            if path.startswith("file://"):
-                path = path[len("file://"):]
-            self.images.append({"chat_id": chat_id, "image_path": path, "metadata": metadata})
+        await super().send_multiple_images(
+            chat_id,
+            images,
+            metadata=metadata,
+            human_delay=human_delay,
+        )
 
     async def get_chat_info(self, chat_id):
         return {"id": chat_id, "type": "dm"}
@@ -493,7 +494,9 @@ class _QueuedMediaAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **_kwargs
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             return {

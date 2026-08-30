@@ -1346,16 +1346,37 @@ def _resolve_plugin_key(name: str) -> Optional[str]:
     ``disable`` write the same key that ``PluginManager`` matches against —
     nested category plugins (e.g. ``observability/langfuse``) included.
     """
+    resolved = _resolve_plugin_entry(name)
+    return resolved[5] if resolved is not None else None
+
+
+def _resolve_plugin_entry(name: str) -> Optional[tuple]:
+    """Resolve one CLI identifier using loader-compatible precedence.
+
+    Canonical keys remain an explicit escape hatch.  A manifest-name
+    collision, however, is a replacement boundary: discovery order is
+    bundled -> user -> project -> entry point, so the last matching manifest
+    is the effective public plugin.  This distinction matters for external
+    platform transports whose flat user key intentionally differs from the
+    bundled ``platforms/<name>`` key.
+    """
     entries = _discover_all_plugins()
-    # 1. Exact match on canonical key or manifest name — always unambiguous.
+
+    # 1. An explicit canonical key always names that exact plugin.
     for entry in entries:
         # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return entry[5]
-    # 2. Fall back to a bare leaf-name match (e.g. "langfuse" ->
+        if name == entry[5]:
+            return entry
+
+    # 2. A public manifest name follows source precedence (later wins).
+    name_matches = [entry for entry in entries if name == entry[0]]
+    if name_matches:
+        return name_matches[-1]
+
+    # 3. Fall back to a bare leaf-name match (e.g. "langfuse" ->
     #    "observability/langfuse"), but only when it resolves to exactly one
     #    plugin so we never silently pick the wrong same-named nested plugin.
-    leaf_matches = [entry[5] for entry in entries if name == entry[5].split("/")[-1]]
+    leaf_matches = [entry for entry in entries if name == entry[5].split("/")[-1]]
     if len(leaf_matches) == 1:
         return leaf_matches[0]
     return None
@@ -1368,18 +1389,10 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     plugin's source (``"bundled"``, ``"user"``, ``"project"``, ...) so the
     enable path can tell whether a built-in-override consent prompt is needed.
     """
-    entries = _discover_all_plugins()
-    for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return (entry[5], entry[3])
-    leaf_matches = [
-        (entry[5], entry[3]) for entry in entries
-        if name == entry[5].split("/")[-1]
-    ]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+    entry = _resolve_plugin_entry(name)
+    if entry is None:
+        return None
+    return (entry[5], entry[3])
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:

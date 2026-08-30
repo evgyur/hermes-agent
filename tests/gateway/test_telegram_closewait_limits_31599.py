@@ -51,11 +51,15 @@ class _RecordingHTTPXRequest:
         _RecordingHTTPXRequest.instances.append(self)
 
 
-def _make_adapter() -> TelegramAdapter:
-    return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+def _make_adapter(extra=None) -> TelegramAdapter:
+    return TelegramAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra=extra or {})
+    )
 
 
-def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
+def _drive_connect(
+    monkeypatch, *, proxy_url, fallback_ips=None, config_extra=None, return_builder=False
+):
     """Run connect() far enough to build the HTTPXRequests, then abort.
 
     Returns the list of recorded _RecordingHTTPXRequest instances.
@@ -73,7 +77,7 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
     # Replace the real HTTPXRequest with our recorder.
     monkeypatch.setattr(tg_adapter, "HTTPXRequest", _RecordingHTTPXRequest)
 
-    adapter = _make_adapter()
+    adapter = _make_adapter(config_extra)
     # Skip the cross-process token lock.
     monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
     # Ensure the adapter reports no statically-configured fallback IPs.
@@ -110,7 +114,10 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
         # continues to real init, the recorded instances are still valid.
         pass
 
-    return list(_RecordingHTTPXRequest.instances)
+    instances = list(_RecordingHTTPXRequest.instances)
+    if return_builder:
+        return instances, chainable
+    return instances
 
 
 def _assert_keepalive_tight(instances):
@@ -166,3 +173,22 @@ def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
 
     for instance in instances:
         asyncio.run(instance.kwargs["httpx_kwargs"]["transport"].aclose())
+
+
+def test_local_bot_api_options_are_forwarded_to_the_upstream_builder(monkeypatch):
+    base_url = "http://127.0.0.1:8081/bot"
+    base_file_url = "http://127.0.0.1:8081/file/bot"
+    _instances, builder = _drive_connect(
+        monkeypatch,
+        proxy_url=None,
+        config_extra={
+            "base_url": base_url,
+            "base_file_url": base_file_url,
+            "local_mode": True,
+        },
+        return_builder=True,
+    )
+
+    builder.base_url.assert_called_once_with(base_url)
+    builder.base_file_url.assert_called_once_with(base_file_url)
+    builder.local_mode.assert_called_once_with(True)

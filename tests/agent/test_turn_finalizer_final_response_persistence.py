@@ -1,7 +1,19 @@
-from types import SimpleNamespace
+import sys
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
+
+
+@pytest.fixture(autouse=True)
+def _initialized_parent_barrier_storage(monkeypatch, tmp_path):
+    from tools import parent_task_barrier
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent_task_barrier.initialize_storage()
 
 
 class FakeAgent:
@@ -273,20 +285,154 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     assert agent._db_flush_scan_prefix is None
 
 
+def test_required_background_child_withholds_initial_parent_answer(monkeypatch):
+    """A required child makes the root turn provisional before persistence."""
+
+    barrier = ModuleType("tools.parent_task_barrier")
+    setattr(
+        barrier,
+        "finalization_policy",
+        lambda **_kwargs: {
+            "action": "withhold",
+            "barrier_id": "barrier-1",
+            "defer_goal_evaluation": True,
+        },
+    )
+    setattr(barrier, "mark_initial_persisted", lambda _barrier_id: True)
+    monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached lifecycle hook")
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("provisional transcript reached context hook")
+        ),
+    )
+
+    agent = FakeAgent()
+    setattr(agent, "_db_flush_scan_prefix", [])
+    setattr(
+        agent,
+        "_save_trajectory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached trajectory storage")
+        ),
+    )
+    setattr(
+        agent,
+        "_sync_external_memory_for_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provisional answer reached external memory")
+        ),
+    )
+    messages = [
+        {"role": "user", "content": "delegate and finish"},
+        {
+            "role": "assistant",
+            "content": "PRE_TOOL_PROVISIONAL_SECRET",
+            "reasoning": "PRIVATE_REASONING",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "delegate_task", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "dispatched"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Initial parent answer must stay hidden.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="root-turn",
+        user_message="delegate and finish",
+        original_user_message="delegate and finish",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["suppress_delivery"] is True
+    assert result["defer_goal_evaluation"] is True
+    assert result["parent_task_barrier_id"] == "barrier-1"
+    assert result["delivery_control"] == {
+        "disposition": "DEFER",
+        "barrier_id": "barrier-1",
+        "defer_goal_evaluation": True,
+        "outcome_id": "",
+    }
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == ""
+    assert "Initial parent answer must stay hidden" not in str(
+        agent.persisted_messages
+    )
+    assert "PRE_TOOL_PROVISIONAL_SECRET" not in str(agent.persisted_messages)
+    assert "PRIVATE_REASONING" not in str(agent.persisted_messages)
+    assert all(
+        message.get("content") == ""
+        for message in agent.persisted_messages
+        if message.get("role") == "assistant"
+    )
+    assert agent.persisted_messages[-1]["_parent_task_candidate"] is True
+    assert agent.persisted_messages[-1]["_parent_task_barrier_id"] == "barrier-1"
+
+
+def test_parent_barrier_lookup_failure_suppresses_delivery(monkeypatch):
+    barrier = ModuleType("tools.parent_task_barrier")
+
+    def _broken_policy(**_kwargs):
+        raise RuntimeError("state db unavailable")
+
+    setattr(barrier, "finalization_policy", _broken_policy)
+    monkeypatch.setitem(sys.modules, "tools.parent_task_barrier", barrier)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = FakeAgent()
+    setattr(agent, "_db_flush_scan_prefix", [])
+    result = finalize_turn(
+        agent,
+        final_response="must not leak",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "delegate"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="root-turn",
+        user_message="delegate",
+        original_user_message="delegate",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["suppress_delivery"] is True
+    assert result["defer_goal_evaluation"] is True
+    assert result["delivery_control"]["disposition"] == "DEFER"
+    assert "state db unavailable" in result["error"]
+    assert agent.persisted_messages is not None
+    assert all(
+        "must not leak" not in repr(message) for message in agent.persisted_messages
+    )
+
+
 def test_empty_final_response_recovers_stream_buffer_into_blank_assistant_row(
     monkeypatch, tmp_path
 ):
-    """#95514: empty terminal completion must not persist content='' over a live stream.
-
-    After a tool result the incremental flush can leave a blank assistant tail.
-    If finalize_turn then receives final_response='' while the stream buffer
-    still holds the delivered text, that blank row is the durable transcript —
-    Desktop reload shows nothing even though the user already saw the answer.
-    """
+    """#95514: empty terminal completion must not persist content='' over a live stream."""
     from hermes_state import SessionDB
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("sess-test", source="cli")
     agent = FakeAgent()
@@ -367,13 +513,7 @@ def test_failed_turn_does_not_recover_stream_buffer_as_final_response(monkeypatc
 
 
 def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypatch):
-    """Labeled empty-terminal excerpt is delivery-only, not durable content.
-
-    ``empty_response_exhausted`` sets final_response to a labeled reasoning
-    excerpt while the transcript tail is a blank/sentinel assistant without
-    tool_calls. Filling that tail would persist the excerpt and break replay
-    (test_empty_terminal_reasoning_surface).
-    """
+    """Labeled empty-terminal excerpt is delivery-only, not durable content."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = FakeAgent()
     excerpt = (
@@ -408,4 +548,3 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
         and "only internal reasoning" in (m.get("content") or "")
         for m in result["messages"]
     )
-

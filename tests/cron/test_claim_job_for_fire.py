@@ -32,7 +32,10 @@ def test_claim_succeeds_once_then_blocks(temp_home):
 
     assert claim_job_for_fire(jid) is True
     assert claim_job_for_fire(jid) is False
-    assert get_job(jid)["next_run_at"] != before
+    claimed = get_job(jid)
+    assert claimed["next_run_at"] != before
+    assert claimed["fire_claim"]["scheduled_at"] == before
+    assert claimed["fire_claim"]["invocation_kind"] == "scheduled"
 
 
 def test_claim_oneshot_cannot_be_double_claimed(temp_home):

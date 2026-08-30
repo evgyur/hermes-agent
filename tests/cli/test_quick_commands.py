@@ -1,9 +1,17 @@
 """Tests for user-defined quick commands that bypass the agent loop."""
 import os
+import shlex
 import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 from rich.text import Text
 import pytest
+
+
+def _portable_command(*args):
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)
 
 
 # ── CLI tests ──────────────────────────────────────────────────────────────
@@ -102,6 +110,66 @@ class TestGatewayQuickCommands:
         event = self._make_event("limits")
         result = await runner._handle_message(event)
         assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_preserves_args_and_exact_origin(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "where": {
+                    "type": "exec",
+                    "command": _portable_command(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os; print('|'.join(os.environ.get(key, '') for key in "
+                            "('HERMES_COMMAND_NAME','HERMES_COMMAND_ARGS',"
+                            "'HERMES_ORIGIN_PLATFORM','HERMES_ORIGIN_CHAT_ID',"
+                            "'HERMES_ORIGIN_THREAD_ID')), end='')"
+                        ),
+                    ),
+                    "append_args": False,
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("where", "wallet HYPE")
+        event.source.chat_id = "-1003958174857"
+        event.source.thread_id = "3822"
+        result = await runner._handle_message(event)
+
+        assert result == "where|wallet HYPE|telegram|-1003958174857|3822"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_appends_user_args(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "chart": {
+                    "type": "exec",
+                    "command": _portable_command(
+                        sys.executable,
+                        "-c",
+                        "import sys; print(sys.argv[1], end='')",
+                    ),
+                    "append_args": True,
+                }
+            }
+        }
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        result = await runner._handle_message(self._make_event("chart", "2h"))
+
+        assert result == "2h"
 
     @pytest.mark.asyncio
     async def test_exec_command_does_not_leak_credentials(self):

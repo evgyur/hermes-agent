@@ -42,12 +42,15 @@ or delay an actual send. Callers wrap every call in try/except.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -64,6 +67,20 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_UNDELIVERED_ROWS = 2000
+_MAX_UNDELIVERED_BYTES = 128 * 1024 * 1024
+
+
+class DeliveryLedgerCapacityError(RuntimeError):
+    """The durable outbox is full; an unreceipted send must not proceed."""
+
+
+@dataclass(frozen=True)
+class ObligationRecordResult:
+    """Transactional admission/duplicate disposition for one exact effect."""
+
+    disposition: str
+    claim_token: str = ""
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -128,17 +145,26 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         )"""
     )
     columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+        str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
     }
-    if "adapter_profile" not in columns:
-        try:
-            conn.execute(
-                "ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT"
-            )
-        except sqlite3.OperationalError as exc:
-            # Concurrent first-use connections can both observe the old schema.
-            if "duplicate column" not in str(exc).lower():
-                raise
+    for name, sql_type in (
+        ("adapter_profile", "TEXT"),
+        ("resume_task_id", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("continuation_claim_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("continuation_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("runtime_claim_token", "TEXT NOT NULL DEFAULT ''"),
+        ("route_envelope_json", "TEXT"),
+    ):
+        if name not in columns:
+            try:
+                conn.execute(
+                    f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
+                )
+            except sqlite3.OperationalError as exc:
+                # Concurrent first-use connections can both observe the old schema.
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
 
 @contextmanager
@@ -239,23 +265,102 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
     adapter_profile: Optional[str] = None,
-) -> None:
+    resume_task_id: str = "",
+    continuation_generation: int = 0,
+    continuation_claim_owner: str = "",
+    continuation_claim_token: str = "",
+    route_envelope: Optional[Dict[str, Any]] = None,
+) -> ObligationRecordResult:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
     pid, started = _owner_stamp()
+    envelope_json = None
+    if route_envelope is not None:
+        if str(platform) == "telegram":
+            from gateway.telegram_egress_policy import canonical_route_envelope
+
+            route_envelope = canonical_route_envelope(route_envelope)
+        envelope_json = json.dumps(
+            route_envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     with _DB_LOCK, _transaction() as conn:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """SELECT session_key, platform, chat_id, thread_id, content, state
+               FROM delivery_obligations WHERE obligation_id=?""",
+            (obligation_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+            )
+            if tuple(existing[:5]) != expected:
+                raise ValueError(
+                    "delivery obligation id collision with different payload"
+                )
+            state = str(existing[5] or "")
+            if state in {"pending", "failed"}:
+                claim_token = uuid.uuid4().hex
+                changed = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='attempting', attempts=attempts+1,
+                           owner_pid=?, owner_started_at=?, runtime_claim_token=?,
+                           updated_at=?, last_error=NULL
+                       WHERE obligation_id=? AND state=?""",
+                    (pid, started, claim_token, now, obligation_id, state),
+                )
+                if changed.rowcount == 1:
+                    return ObligationRecordResult("retry_claimed", claim_token)
+                return ObligationRecordResult("attempting")
+            return ObligationRecordResult(state or "attempting")
+        pending_count, pending_bytes = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(
+                     LENGTH(CAST(content AS BLOB))
+                     + LENGTH(CAST(session_key AS BLOB))
+                     + LENGTH(CAST(chat_id AS BLOB))
+                   ), 0)
+               FROM delivery_obligations
+               WHERE state NOT IN ('delivered','abandoned')"""
+        ).fetchone()
+        planned_bytes = len(content.encode("utf-8")) + len(
+            session_key.encode("utf-8")
+        ) + len(str(chat_id).encode("utf-8"))
+        if (
+            int(pending_count or 0) >= _MAX_UNDELIVERED_ROWS
+            or int(pending_bytes or 0) + planned_bytes
+            > _MAX_UNDELIVERED_BYTES
+        ):
+            raise DeliveryLedgerCapacityError(
+                "delivery outbox capacity is full; final was not sent"
+            )
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, resume_task_id,
+                continuation_generation, continuation_claim_owner,
+                continuation_claim_token, runtime_claim_token,
+                route_envelope_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started, stored_profile),
+             pid, started, stored_profile, str(resume_task_id or ""),
+             int(continuation_generation or 0),
+             str(continuation_claim_owner or ""),
+             str(continuation_claim_token or ""), envelope_json),
         )
     _prune()
+    return ObligationRecordResult("created")
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -296,6 +401,10 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     return bool(cursor.rowcount)
 
 
+def mark_abandoned(obligation_id: str, error: str = "") -> None:
+    _update_state(obligation_id, "abandoned", error=error)
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -304,6 +413,39 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
                WHERE obligation_id=?""",
             (state, time.time(), error[:500] if error else None, obligation_id),
         )
+
+
+def _route_envelope_for_replay(
+    platform: str,
+    chat_id: Any,
+    thread_id: Any,
+    route_envelope_json: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Decode and validate durable recipient provenance before replay."""
+    if platform == "telegram":
+        if not route_envelope_json:
+            raise ValueError("ambiguous_route_envelope")
+        from gateway.telegram_egress_policy import (
+            assert_recipient_allowed,
+            canonical_route_envelope,
+        )
+
+        route_envelope = canonical_route_envelope(
+            json.loads(route_envelope_json)
+        )
+        if (
+            route_envelope["chat_id"] != str(chat_id)
+            or route_envelope["platform"] != str(platform)
+            or route_envelope["thread_id"]
+            != (str(thread_id) if thread_id is not None else None)
+        ):
+            raise ValueError("ambiguous_route_envelope")
+        assert_recipient_allowed(chat_id)
+        return route_envelope
+    if not route_envelope_json:
+        return None
+    decoded = json.loads(route_envelope_json)
+    return decoded if isinstance(decoded, dict) else None
 
 
 def sweep_recoverable(
@@ -315,9 +457,11 @@ def sweep_recoverable(
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
 
-    Claiming atomically re-stamps the owner to THIS process and increments
-    ``attempts``, so a second gateway racing the same sweep cannot
+    Claiming atomically re-stamps the owner to THIS process and assigns an
+    exact runtime token, so a second gateway racing the same sweep cannot
     double-claim (the UPDATE is guarded on the previous owner stamp).
+    It does not increment ``attempts``: the budget is consumed by
+    :func:`begin_redelivery_attempt` immediately before the wire send.
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
@@ -339,13 +483,18 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile
+                      owner_pid, owner_started_at, adapter_profile,
+                      resume_task_id,
+                      continuation_generation, continuation_claim_owner,
+                      continuation_claim_token, route_envelope_json
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
-             adapter_profile) in rows:
+             adapter_profile, resume_task_id,
+             continuation_generation, continuation_owner,
+             continuation_token, route_envelope_json) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -367,12 +516,33 @@ def sweep_recoverable(
                 and (platform, adapter_profile) not in deliverable_targets
             ):
                 continue
+            route_envelope = None
+            try:
+                route_envelope = _route_envelope_for_replay(
+                    platform, chat_id, thread_id, route_envelope_json
+                )
+            except Exception as exc:
+                if platform == "telegram":
+                    error = str(exc) or "ambiguous_route_envelope"
+                    if "denied" not in error:
+                        error = "ambiguous_route_envelope"
+                    conn.execute(
+                        """UPDATE delivery_obligations
+                           SET state='abandoned', updated_at=?, last_error=?
+                           WHERE obligation_id=?""",
+                        (now, error, oid),
+                    )
+                    continue
+                route_envelope = None
+            runtime_claim_token = uuid.uuid4().hex
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid),
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       runtime_claim_token=?, updated_at=?
+                   WHERE obligation_id=? AND state=? AND owner_pid IS ?
+                      AND owner_started_at IS ?""",
+                (pid, started, runtime_claim_token, now, oid, state, owner_pid,
+                 owner_started_at),
             )
             if cursor.rowcount:
                 claimed.append({
@@ -386,9 +556,37 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "profile": adapter_profile,
-                    "attempts": attempts + 1,
+                    "attempts": attempts,
+                    "runtime_claim_token": runtime_claim_token,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def begin_redelivery_attempt(obligation_id: str, claim_token: str) -> bool:
+    """Spend one attempt only when the exact runtime claim is about to send."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', attempts=attempts+1, updated_at=?
+               WHERE obligation_id=? AND runtime_claim_token=?
+                 AND owner_pid=? AND owner_started_at IS ?
+                 AND state IN ('pending','attempting','failed')
+                 AND attempts < ?""",
+            (
+                time.time(),
+                obligation_id,
+                claim_token,
+                pid,
+                started,
+                MAX_ATTEMPTS,
+            ),
+        ).rowcount)
 
 
 def sweep_failed_for_runtime(
@@ -396,12 +594,13 @@ def sweep_failed_for_runtime(
     now: Optional[float] = None,
     *,
     profile: Optional[str] = None,
+    transport_profile: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Claim this process's reconnect-retryable failed rows for one adapter.
 
-    ``profile`` scopes multiplexed gateways to the bot identity that actually
-    owned the failed send; ``None`` means the primary/default adapter. The
-    persisted adapter owner is independent of the routed session namespace.
+    ``transport_profile`` scopes Telegram replay using the immutable durable
+    route envelope. ``profile`` remains the compatibility selector for older
+    callers and non-Telegram rows whose adapter owner is stored separately.
 
     Startup recovery intentionally ignores rows owned by a live gateway. That
     protects concurrent processes, but it also means a final response rejected
@@ -418,6 +617,11 @@ def sweep_failed_for_runtime(
     marker because the failed send's acknowledgement is not safe to infer.
     """
     now = now if now is not None else time.time()
+    expected_transport = (
+        str(transport_profile).strip()
+        if transport_profile is not None
+        else None
+    )
     pid, started = _owner_stamp()
     if started is None:
         # PID equality alone cannot distinguish this process from a stale row
@@ -429,11 +633,15 @@ def sweep_failed_for_runtime(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile
+                      content, state, attempts, created_at, owner_pid,
+                      owner_started_at, last_error, adapter_profile,
+                      resume_task_id, continuation_generation,
+                      continuation_claim_owner, continuation_claim_token,
+                      route_envelope_json
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""",
-            (platform,),
+               WHERE state IN ('failed','attempting') AND platform=?
+               ORDER BY created_at, obligation_id""",
+            (str(platform),),
         ).fetchall()
         for (
             oid,
@@ -442,40 +650,134 @@ def sweep_failed_for_runtime(
             chat_id,
             thread_id,
             content,
+            state,
             attempts,
             created_at,
             owner_pid,
             owner_started_at,
             last_error,
             adapter_profile,
+            resume_task_id,
+            continuation_generation,
+            continuation_owner,
+            continuation_token,
+            route_envelope_json,
         ) in rows:
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
             )
-            if adapter_profile != expected_profile:
+            # New Telegram reconnects are selected by immutable route
+            # provenance. Legacy callers still use adapter_profile, preserving
+            # compatibility without allowing that mutable column to override a
+            # transport stamped into the exact route envelope.
+            if expected_transport is None and adapter_profile != expected_profile:
                 continue
-            # Runtime reconnect recovery may act only on its own rows. Exact
-            # process-start matching prevents PID reuse from stealing work.
-            if owner_pid != pid or owner_started_at != started:
+            route_envelope = None
+            raw_route = None
+            if row_platform == "telegram":
+                # Route provenance is authority for a reconnect send. Validate
+                # it before *any* ownership, expiry, or claim mutation so a
+                # transport-specific sweep cannot steal/quarantine another
+                # transport's row merely by observing it.
+                try:
+                    raw_route = json.loads(route_envelope_json or "")
+                    if not isinstance(raw_route, dict):
+                        raise ValueError("ambiguous_route_envelope")
+                    from gateway.telegram_egress_policy import (
+                        canonical_route_envelope,
+                    )
+
+                    canonical_route = canonical_route_envelope(raw_route)
+                    if (
+                        canonical_route["platform"] != row_platform
+                        or canonical_route["chat_id"] != str(chat_id)
+                        or canonical_route["thread_id"]
+                        != (str(thread_id) if thread_id is not None else None)
+                    ):
+                        raise ValueError("ambiguous_route_envelope")
+                    if (
+                        expected_transport is not None
+                        and canonical_route["transport_profile"]
+                        != expected_transport
+                    ):
+                        continue
+                    route_envelope = _route_envelope_for_replay(
+                        row_platform, chat_id, thread_id, route_envelope_json
+                    )
+                except Exception as exc:
+                    raw_transport = (
+                        raw_route.get("transport_profile")
+                        if isinstance(raw_route, dict)
+                        else None
+                    )
+                    owns_route = (
+                        expected_transport is None
+                        or (
+                            isinstance(raw_transport, str)
+                            and raw_transport == expected_transport
+                            and raw_transport.strip() == raw_transport
+                        )
+                    )
+                    if owns_route:
+                        error = str(exc) or "ambiguous_route_envelope"
+                        if "denied" not in error:
+                            error = "ambiguous_route_envelope"
+                        conn.execute(
+                            """UPDATE delivery_obligations
+                               SET state='abandoned', updated_at=?, last_error=?
+                               WHERE obligation_id=? AND state=?
+                                 AND owner_pid IS ? AND owner_started_at IS ?""",
+                            (
+                                now,
+                                error,
+                                oid,
+                                state,
+                                owner_pid,
+                                owner_started_at,
+                            ),
+                        )
+                    continue
+            else:
+                route_envelope = _route_envelope_for_replay(
+                    row_platform, chat_id, thread_id, route_envelope_json
+                )
+
+            # Runtime reconnect may reclaim a transient failure owned by this
+            # exact live process, or a failed/attempting row whose former owner
+            # is provably dead. Missing ownership provenance remains fail-closed.
+            if owner_pid is None or owner_started_at is None:
                 continue
-            if str(last_error or "").strip().lower() not in _RUNTIME_RETRYABLE_ERRORS:
-                continue
-            owner_guard = (oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+            exact_current_owner = int(owner_pid or 0) == int(pid) and (
+                int(owner_started_at) == int(started)
+            )
+            if _owner_alive(owner_pid, owner_started_at):
+                if not (exact_current_owner and state == "failed"):
+                    continue
+                if (
+                    str(last_error or "").strip().lower()
+                    not in _RUNTIME_RETRYABLE_ERRORS
+                ):
+                    continue
+            if int(attempts or 0) >= MAX_ATTEMPTS or (
+                now - float(created_at or now)
+            ) > STALE_AFTER_SECONDS:
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
-                       WHERE obligation_id=? AND state='failed'
+                       WHERE obligation_id=? AND state=?
                          AND owner_pid IS ? AND owner_started_at IS ?""",
-                    (now, *owner_guard),
+                    (now, oid, state, owner_pid, owner_started_at),
                 )
                 continue
+            claim_token = uuid.uuid4().hex
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET state='attempting', attempts=attempts+1, updated_at=?
-                   WHERE obligation_id=? AND state='failed'
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       runtime_claim_token=?, updated_at=?
+                   WHERE obligation_id=? AND state=?
                      AND owner_pid IS ? AND owner_started_at IS ?""",
-                (now, *owner_guard),
+                (pid, started, claim_token, now, oid, state, owner_pid,
+                 owner_started_at),
             )
             if cursor.rowcount:
                 claimed.append({
@@ -489,9 +791,112 @@ def sweep_failed_for_runtime(
                     "marker": RECONNECTED_MARKER,
                     "profile": adapter_profile,
                     "runtime_recovery": True,
-                    "attempts": attempts + 1,
+                    "attempts": int(attempts or 0),
+                    "runtime_claim_token": claim_token,
+                    "resume_task_id": str(resume_task_id or ""),
+                    "continuation_generation": int(continuation_generation or 0),
+                    "continuation_claim_owner": str(continuation_owner or ""),
+                    "continuation_claim_token": str(continuation_token or ""),
+                    "route_envelope": route_envelope,
                 })
     return claimed
+
+
+def abandon_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    error: str = "",
+) -> bool:
+    """Abandon only the reconnect generation represented by ``claim_token``."""
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state='abandoned', runtime_claim_token='', updated_at=?,
+                   last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                time.time(),
+                str(error or "")[:500] or None,
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
+
+
+def settle_runtime_claim(
+    obligation_id: str,
+    claim_token: str,
+    *,
+    delivered: bool,
+    error: str = "",
+) -> bool:
+    """Settle only the exact reconnect claim generation."""
+    state = "delivered" if delivered else "failed"
+    with _DB_LOCK, _transaction() as conn:
+        return bool(conn.execute(
+            """UPDATE delivery_obligations
+               SET state=?, runtime_claim_token='', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND runtime_claim_token=?""",
+            (
+                state,
+                time.time(),
+                None if delivered else str(error or "")[:500],
+                obligation_id,
+                claim_token,
+            ),
+        ).rowcount)
+
+
+async def settle_with_retry(callable_, *args, **kwargs):
+    """Retry only an idempotent post-wire ledger settlement off-loop."""
+    delay = 0.01
+    for attempt in range(4):
+        try:
+            return await asyncio.to_thread(callable_, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked:
+                raise
+            if attempt == 3:
+                task = asyncio.create_task(
+                    _settle_locked_until_owned(callable_, args, kwargs)
+                )
+                _PENDING_SETTLEMENT_TASKS.add(task)
+                task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)
+                # Give the supervised owner one short handoff slice. If the
+                # lock clears on the next attempt, callers observe the settled
+                # row before returning; a persistent lock still continues in
+                # the retained background task without blocking wire delivery.
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                return False
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+_PENDING_SETTLEMENT_TASKS: set[asyncio.Task] = set()
+
+
+async def _settle_locked_until_owned(callable_, args, kwargs) -> None:
+    """Continue DB-only settlement after irreversible wire acceptance."""
+    delay = 0.08
+    while True:
+        try:
+            await asyncio.to_thread(callable_, *args, **kwargs)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                logger.error("delivery settlement failed permanently: %s", exc)
+                return
+            await asyncio.sleep(delay)
+            delay = min(2.0, delay * 2)
+        except Exception:
+            logger.exception("delivery settlement failed permanently")
+            return
 
 
 def _prune(now: Optional[float] = None) -> None:
@@ -512,11 +917,8 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered','abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )

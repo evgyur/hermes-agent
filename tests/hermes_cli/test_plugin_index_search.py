@@ -24,6 +24,9 @@ from hermes_cli.plugin_index import (
 )
 
 
+TELEGRAM_BUSINESS_UPSTREAM_REF = "e905f3bc5eeaa5a9dab9bc5155601b3ebec75757"
+
+
 def _entry(name, repo="owner/repo", **kw):
     return PluginIndexEntry(name=name, repo=repo, **kw)
 
@@ -133,6 +136,17 @@ class TestParsing:
             assert e.repo.count("/") == 1
             assert e.ref, f"seed entry {e.name} must pin a ref"
             assert len(e.ref) == 40, f"seed entry {e.name} must pin a commit SHA"
+
+    def test_dormant_telegram_business_catalog_pin_stays_on_official_upstream(self):
+        raw = json.loads(plugin_index.SEED_INDEX_PATH.read_text(encoding="utf-8"))
+        entries = _parse_entries(raw)
+        business = next(
+            entry
+            for entry in entries
+            if entry.name == "hermes-telegram-business"
+        )
+        assert business.repo == "NousResearch/hermes-telegram-business"
+        assert business.ref == TELEGRAM_BUSINESS_UPSTREAM_REF
 
 
 # ---------------------------------------------------------------------------

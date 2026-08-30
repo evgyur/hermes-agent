@@ -59,6 +59,7 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _start_ack_receipt: Any = None
 
     # --- progress threading metadata (assigned after construction, before
     #     send_progress_messages is scheduled) ----------------------------
@@ -91,16 +92,44 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    # Exact external message id stamped on the current durable user row. A
+    # startup recovery note intentionally leaves this unset because the
+    # original triggering row already owns the platform identity.
+    persist_user_message_id: Optional[str] = None
+    # One-shot sync bridge invoked only after that user dict is durably marked.
+    # It commits the active-turn origin snapshot on the gateway event loop.
+    after_user_row_commit: Optional[Callable[[], bool]] = None
+    # Gateway already committed the triggering row and active snapshot before
+    # entering any hook, enrichment, compressor, memory or agent code.
+    precommitted_authority: bool = False
+    precommitted_user_row_id: Optional[int] = None
+    # Cross-process lease acquired by the gateway and held through the turn.
+    durable_turn_authority: Optional[dict] = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
+    # Trusted marker from the synthetic gateway startup event. This must
+    # survive the async-to-executor seam; inferring it from blank text would
+    # let ordinary empty messages acquire continuation authority.
+    startup_resume: bool = False
+    # A startup turn admitted solely to reconcile an unresolved pre-restart
+    # effect. It may read back external state, but must not replay the UNKNOWN
+    # call or continue into new effects.
+    startup_resume_reconciliation_only: bool = False
+    startup_resume_effect_fence: dict = field(default_factory=dict)
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    # Legacy/manual contexts that set ``enabled=True`` expect raw delivery;
+    # the real gateway always overwrites this with off|raw|generic per turn.
+    interim_assistant_messages_mode: str = "raw"
+    start_ack_text: str = ""
+    start_ack_required: bool = False
+    start_ack_timeout_s: float = 3.0
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
@@ -131,6 +160,7 @@ class TurnContext:
     #     the sibling closures) ---------------------------------------------
     progress_callback: Optional[Callable] = None
     voice_ack_callback: Optional[Callable] = None
+    start_ack_callback: Optional[Callable] = None
     _step_callback_sync: Optional[Callable] = None
     _event_callback_sync: Optional[Callable] = None
     _status_callback_sync: Optional[Callable] = None

@@ -134,6 +134,7 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-block"
     assert "repeated_exact_failure_block" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
@@ -385,12 +386,19 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     from a crash for Open WebUI and similar clients).
     """
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
-    same_args = {"query": "same"}
     responses = [
         _mock_response(
             content="",
             finish_reason="tool_calls",
-            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+            # Vary the query so this exercises the true same-tool failure halt,
+            # not the non-terminal repeated-exact-call block.
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search",
+                    json.dumps({"query": f"q{i}"}),
+                    f"c{i}",
+                )
+            ],
         )
         for i in range(1, 10)
     ]

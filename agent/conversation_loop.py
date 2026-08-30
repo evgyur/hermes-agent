@@ -1840,6 +1840,10 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_message_id: Optional[str] = None,
+    after_user_row_commit: Optional[callable] = None,
+    precommitted_authority: bool = False,
+    precommitted_user_row_id: Optional[int] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
@@ -1917,6 +1921,10 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_message_id=persist_user_message_id,
+        after_user_row_commit=after_user_row_commit,
+        precommitted_authority=precommitted_authority,
+        precommitted_user_row_id=precommitted_user_row_id,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
@@ -1940,11 +1948,16 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _ephemeral_user_context = _ctx.ephemeral_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    agent._tool_start_ack_emitted = False
+    agent._start_ack_delivered_text = None
+    agent._start_ack_receipt = None
+    agent._latest_interim_visible_text = None
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
@@ -2018,8 +2031,31 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        if bool(getattr(agent, "start_ack_required", False)):
+            return {
+                "final_response": (
+                    "This runtime cannot safely start tools because required "
+                    "user-visible acknowledgment is unavailable."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "turn_exit_reason": "start_ack_runtime_unsupported",
+            }
+        _codex_user_message = user_message
+        if _ephemeral_user_context:
+            if not isinstance(_codex_user_message, str):
+                raise TypeError(
+                    "codex_app_server requires string input for ephemeral context"
+                )
+            _codex_user_message = (
+                f"{_codex_user_message}\n\n{_ephemeral_user_context}"
+                if _codex_user_message
+                else _ephemeral_user_context
+            )
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=_codex_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
@@ -2162,6 +2198,15 @@ def run_conversation(
                 else:
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                drained_receipts = list(
+                    getattr(agent, "_drained_steer_receipts", []) or []
+                )
+                if drained_receipts:
+                    pending_receipts = list(
+                        getattr(agent, "_pending_steer_receipts", []) or []
+                    )
+                    agent._pending_steer_receipts = drained_receipts + pending_receipts
+                    agent._drained_steer_receipts = []
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
@@ -2295,6 +2340,8 @@ def run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
+            api_msg.pop("platform_message_id", None)
+            api_msg.pop("message_id", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -2319,6 +2366,23 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # Private inbound context is deliberately added only to this
+                # structural API copy, after all replayable sidecar handling.
+                # It never mutates ``messages`` or becomes ``api_content``.
+                if _ephemeral_user_context:
+                    _wire_content = api_msg.get("content")
+                    if isinstance(_wire_content, str):
+                        api_msg["content"] = (
+                            f"{_wire_content}\n\n{_ephemeral_user_context}"
+                            if _wire_content
+                            else _ephemeral_user_context
+                        )
+                    elif isinstance(_wire_content, list):
+                        _wire_blocks = list(_wire_content)
+                        _wire_blocks.append(
+                            {"type": "text", "text": _ephemeral_user_context}
+                        )
+                        api_msg["content"] = _wire_blocks
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -3018,6 +3082,9 @@ def run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
+                        reject_provider_executed_tools=bool(
+                            getattr(agent, "start_ack_required", False)
+                        ),
                     )
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
@@ -3212,6 +3279,9 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                            reject_provider_executed_tools=bool(
+                                getattr(agent, "start_ack_required", False)
+                            ),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -3251,6 +3321,12 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _steer_request_fenced = bool(
+                    (_pre_api_steer and _injected)
+                    or getattr(agent, "_drained_steer_receipts", None)
+                )
+                if _steer_request_fenced:
+                    agent._mark_drained_steer_request_fenced()
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -3268,6 +3344,13 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                except BaseException:
+                    if _steer_request_fenced:
+                        agent._mark_fenced_steer_provider_result(accepted=False)
+                    raise
+                else:
+                    if _steer_request_fenced:
+                        agent._mark_fenced_steer_provider_result(accepted=True)
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -6434,6 +6517,14 @@ def run_conversation(
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
+                    _summary_lower = str(_final_summary).lower()
+                    _is_codex_no_byte_watchdog = (
+                        "chatgpt.com/backend-api/codex" in _summary_lower
+                        and (
+                            "codex stream produced no useful bytes" in _summary_lower
+                            or "codex stream produced no bytes" in _summary_lower
+                        )
+                    )
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
                         if classified.billing_unverified:
@@ -6458,6 +6549,16 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                             unverified=classified.billing_unverified,
+                        )
+                    elif _is_codex_no_byte_watchdog:
+                        # The TTFB watchdog already emitted a bounded reconnect
+                        # status. If all retries fail, retain the diagnostic in
+                        # logs but do not turn transport plumbing into a scary
+                        # final Telegram message.
+                        agent._vprint(
+                            f"{agent.log_prefix}   ⚠️ Codex no-byte watchdog "
+                            "exhausted retries; suppressing chat delivery.",
+                            force=True,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -6578,6 +6679,8 @@ def run_conversation(
                             _provider, _base, _model, _billing_guidance,
                             unverified=_billing_unverified,
                         )
+                    elif _is_codex_no_byte_watchdog:
+                        _final_response = ""
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -6610,7 +6713,8 @@ def run_conversation(
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": _final_summary,
+                        "error": "" if _is_codex_no_byte_watchdog else _final_summary,
+                        "suppress_delivery": bool(_is_codex_no_byte_watchdog),
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a
@@ -7459,6 +7563,35 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                _start_ack_required = bool(
+                    getattr(agent, "start_ack_required", False)
+                )
+                _start_ack_outcome = None
+                if _start_ack_required:
+                    # Strict mode settles visibility before publishing the
+                    # tool-call row. On failure, publish the assistant call and
+                    # its no-effect cancellation results atomically in the same
+                    # flush; a crash cannot leave durable replay ambiguity.
+                    _start_ack_outcome = agent._emit_tool_start_ack_if_needed(
+                        assistant_msg
+                    )
+                    if _start_ack_outcome is False:
+                        for _cancelled_tc in assistant_message.tool_calls or []:
+                            append_message(
+                                messages,
+                                {
+                                    "role": "tool",
+                                    "name": _cancelled_tc.function.name,
+                                    "tool_call_id": coalesce_tool_call_id(_cancelled_tc),
+                                    "effect_disposition": "none",
+                                    "content": (
+                                        "Tool execution cancelled before start: "
+                                        "required user-visible acknowledgment was "
+                                        "not delivered. No tool effect was attempted."
+                                    ),
+                                },
+                            )
+
                 _tool_turn_persisted = None
                 try:
                     # Persist the assistant tool-call turn before any tool
@@ -7495,9 +7628,23 @@ def run_conversation(
                     failed = True
                     break
 
+                if _start_ack_outcome is False and _start_ack_required:
+                    _turn_exit_reason = "start_ack_delivery_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
+                # A gateway may require immediate execution visibility even
+                # when the model's first tool-call turn contains no prose.
+                # This settles before the first tool side effect. Model-authored
+                # commentary rides the same receipt-bearing barrier; only an
+                # already-confirmed streamed delivery suppresses another send.
+                if not _start_ack_required:
+                    agent._emit_tool_start_ack_if_needed(assistant_msg)
+
                 if not duplicate_previous_interim:
                     agent._emit_interim_assistant_message(assistant_msg)
 

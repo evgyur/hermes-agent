@@ -24,6 +24,7 @@ import hermes_state
 import hermes_state_schema
 from hermes_state import (
     FTS_REBUILD_DEFERRAL_KEY,
+    FTS_STALE_LAYOUT_KEY,
     FTS_STALE_KEY,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
@@ -69,6 +70,46 @@ def _message_contents(db_path):
     rows = raw.execute("SELECT content FROM messages ORDER BY id").fetchall()
     raw.close()
     return [r[0] for r in rows]
+
+
+def _message_rows(db_path):
+    raw = sqlite3.connect(str(db_path))
+    rows = raw.execute("SELECT id, content FROM messages ORDER BY id").fetchall()
+    raw.close()
+    return rows
+
+
+def _database_checks(db_path):
+    raw = sqlite3.connect(str(db_path))
+    quick = raw.execute("PRAGMA quick_check").fetchone()[0]
+    foreign_keys = raw.execute("PRAGMA foreign_key_check").fetchall()
+    raw.close()
+    return quick, foreign_keys
+
+
+def _fts_schema_sql(db_path):
+    raw = sqlite3.connect(str(db_path))
+    row = raw.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'messages_fts'"
+    ).fetchone()
+    raw.close()
+    return None if row is None else row[0]
+
+
+def _fts_integrity_check(db_path, *, external_content):
+    raw = sqlite3.connect(str(db_path))
+    if external_content:
+        raw.execute(
+            "INSERT INTO messages_fts(messages_fts, rank) "
+            "VALUES('integrity-check', 1)"
+        )
+    else:
+        raw.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')"
+        )
+    raw.commit()
+    raw.close()
 
 
 def _meta_value(db_path, key):
@@ -200,14 +241,17 @@ class TestRuntimeFtsRebuild:
         for pid in (111, 222, 333):
             fd_dir = proc_root / str(pid) / "fd"
             fd_dir.mkdir(parents=True)
-        # PID 222 holds the deleted WAL sidecar
-        os.symlink(db_path_wal + " (deleted)", str(proc_root / "222" / "fd" / "3"))
-        # PID 111 (self) holds the db — should be excluded
-        os.symlink(str(db_path), str(proc_root / "111" / "fd" / "3"))
-        # PID 333 holds an unrelated file
+        # Populate fd names; readlink targets are injected below so this
+        # Linux /proc fault-test also runs on Windows without symlink rights.
+        for pid in (111, 222, 333):
+            (proc_root / str(pid) / "fd" / "3").touch()
         other = tmp_path / "other.db"
         other.touch()
-        os.symlink(str(other), str(proc_root / "333" / "fd" / "3"))
+        targets = {
+            os.fspath(proc_root / "111" / "fd" / "3"): str(db_path),
+            os.fspath(proc_root / "222" / "fd" / "3"): db_path_wal + " (deleted)",
+            os.fspath(proc_root / "333" / "fd" / "3"): str(other),
+        }
 
         monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
         monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
@@ -218,20 +262,18 @@ class TestRuntimeFtsRebuild:
                 path = path.replace("/proc", str(proc_root))
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
-        real_readlink = os.readlink
         def _readlink(path):
             path = path.replace("/proc", str(proc_root))
-            return real_readlink(path)
+            return targets[os.path.normpath(path)]
         monkeypatch.setattr(hermes_state.os, "readlink", _readlink)
 
         holders = db._foreign_state_db_holders()
         assert holders == [(222, db_path_wal + " (deleted)")]
 
-    def test_foreign_holder_uninspectable_process_cmdline_fallback(
+    def test_foreign_holder_uninspectable_process_without_exact_db_path_is_ignored(
         self, db, tmp_path, monkeypatch
     ):
-        """A process whose fd table is unreadable (different user) is still
-        flagged when /proc/<pid>/cmdline identifies it as a Hermes process."""
+        """A Hermes-looking process is not proof that it holds this state.db."""
         db_path = tmp_path / "state.db"
 
         proc_root = tmp_path / "proc"
@@ -248,6 +290,8 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(hermes_state.sys, "platform", "linux")
         real_listdir = os.listdir
         def _listdir(path):
+            if os.fspath(path) == "/proc/222/fd":
+                raise PermissionError(path)
             if isinstance(path, str):
                 path = path.replace("/proc", str(proc_root))
             return real_listdir(path)
@@ -267,13 +311,33 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(hermes_state, "_read_proc_cmdline", _fake_cmdline)
 
         holders = db._foreign_state_db_holders()
-        # Should include PID 222 with the cmdline info
-        assert len(holders) == 1
-        assert holders[0][0] == 222
-        assert "hermes_cli.main" in holders[0][1]
+        assert holders == []
 
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)
+
+    def test_sqlite_write_lock_remains_final_rebuild_barrier(
+        self, db, tmp_path
+    ):
+        """No process heuristic bypasses SQLite's own transaction authority."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "canonical before locked rebuild")
+        before = _message_rows(db_path)
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            db._conn.execute("PRAGMA busy_timeout=1")
+            assert not db._try_runtime_fts_rebuild(
+                sqlite3.DatabaseError("database disk image is malformed")
+            )
+            assert _message_rows(db_path) == before
+        finally:
+            blocker.rollback()
+            blocker.close()
 
     def test_corruption_error_classification_covers_both_sqlite_messages(self):
         """SQLite's message for a corrupt FTS index varies by version: older
@@ -414,6 +478,94 @@ class TestRuntimeFtsRebuild:
             assert results
         finally:
             reopened.close()
+
+    def test_constructor_unopenable_fts_is_quarantined_and_rebuilt(
+        self, db, tmp_path, monkeypatch
+    ):
+        """Recovery must not depend on a fresh connection constructing FTS.
+
+        NULLing the root FTS segment makes xConnect/xDestroy fail on a new
+        connection on affected SQLite builds.  The already-connected writer
+        must quarantine the derived tables while it can still destroy them,
+        preserving canonical rows for a clean rebuild on reopen.
+        """
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "constructor seed")
+        before = _message_rows(db_path)
+
+        raw = sqlite3.connect(str(db_path))
+        raw.execute("UPDATE messages_fts_data SET block = NULL WHERE id = 10")
+        raw.commit()
+        raw.close()
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: (_ for _ in ()).throw(
+                sqlite3.DatabaseError("vtable constructor failed: messages_fts")
+            ),
+        )
+
+        db.append_message("s1", "user", "canonical after constructor failure")
+        expected = before + [
+            (_message_rows(db_path)[-1][0], "canonical after constructor failure")
+        ]
+        assert _message_rows(db_path) == expected
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _meta_value(db_path, FTS_STALE_LAYOUT_KEY) is not None
+
+        db.close()
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _meta_value(db_path, FTS_STALE_LAYOUT_KEY) is None
+            assert _message_rows(db_path) == expected
+            assert reopened.search_messages("constructor failure")
+            _fts_integrity_check(db_path, external_content=True)
+            assert _database_checks(db_path) == ("ok", [])
+        finally:
+            reopened.close()
+
+    def test_quarantine_failure_rolls_back_before_trigger_only_fallback(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A failed quarantine cannot leave half-dropped derived schema."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "rollback seed")
+        before = _message_rows(db_path)
+        original_drop = db._drop_all_fts_triggers
+        calls = 0
+
+        def _fail_first_drop(cursor):
+            nonlocal calls
+            calls += 1
+            original_drop(cursor)
+            if calls == 1:
+                raise sqlite3.DatabaseError("injected quarantine interruption")
+
+        monkeypatch.setattr(db, "_drop_all_fts_triggers", _fail_first_drop)
+        assert db._enter_fts_fail_open(
+            sqlite3.DatabaseError("database disk image is malformed")
+        )
+
+        assert calls == 2
+        assert _message_rows(db_path) == before
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _meta_value(db_path, FTS_STALE_LAYOUT_KEY) is None
+        assert _base_fts_triggers(db_path) == set()
+        raw = sqlite3.connect(str(db_path))
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone() == (1,)
+        raw.close()
+        assert _database_checks(db_path) == ("ok", [])
 
     def test_failed_in_place_rebuild_fails_open(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
@@ -640,8 +792,12 @@ class TestRuntimeFtsRebuild:
         legacy = SessionDB(db_path=db_path)
         try:
             assert legacy._db_has_legacy_inline_fts(legacy._conn.cursor())
+            legacy_schema = _fts_schema_sql(db_path)
+            assert legacy_schema is not None
+            assert "content='messages'" not in legacy_schema.lower()
             legacy.create_session("s1", source="test")
             legacy.append_message("s1", "user", "legacy seed")
+            before = _message_rows(db_path)
             _corrupt_fts(db_path)
             monkeypatch.setattr(
                 legacy,
@@ -651,8 +807,12 @@ class TestRuntimeFtsRebuild:
                 ),
             )
             legacy.append_message("s1", "user", "legacy canonical survives")
-            assert _message_contents(db_path)[-1] == "legacy canonical survives"
+            expected = before + [
+                (_message_rows(db_path)[-1][0], "legacy canonical survives")
+            ]
+            assert _message_rows(db_path) == expected
             assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert _meta_value(db_path, FTS_STALE_LAYOUT_KEY) is not None
         finally:
             legacy.close()
 
@@ -660,6 +820,11 @@ class TestRuntimeFtsRebuild:
         try:
             assert recovered._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _meta_value(db_path, FTS_STALE_LAYOUT_KEY) is None
+            assert _fts_schema_sql(db_path) == legacy_schema
+            assert _message_rows(db_path) == expected
             assert recovered.search_messages("canonical survives")
+            _fts_integrity_check(db_path, external_content=False)
+            assert _database_checks(db_path) == ("ok", [])
         finally:
             recovered.close()

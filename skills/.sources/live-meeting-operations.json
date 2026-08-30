@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "name": "live-meeting-operations",
+  "source_repo": "human20team/human20-meeting-operations",
+  "source_commit": "7dc655f366800f19415a9ab7d345cd298ad09358",
+  "source_tree": "77dfe1876b4b84f63c4cdfe0ab2cbfed64452be8",
+  "version": "3.0.1",
+  "entries": [
+    {
+      "path": ".gitignore",
+      "sha256": "24dad05d46e82d9622e124b5ae65f9c78aef3f1d864b14b15f93469e8a1374a9"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "9a7e56f7c03001e6d45bba0b75f8bfff7880452c7470233c3999276bb8e299f5"
+    },
+    {
+      "path": "SKILL.md",
+      "sha256": "1aab380c233c4d8f693b999faee91e688058009fac7e7489b672f08875825bf5"
+    },
+    {
+      "path": "VERSION",
+      "sha256": "06e3fe4a7a1884d20d81cc7065ca8cfd4c394ec602c4d180ddc39bbd4f7da521"
+    },
+    {
+      "path": "references/agenda-realtime-facilitator.md",
+      "sha256": "fa59510e0c21387cc9c8dbc61ea7e75fe18dafebd5f338eaf0e4604237be0906"
+    },
+    {
+      "path": "references/api-first-room-creation.md",
+      "sha256": "9bef663956bf8cd5a43af1e3293062e928cafe57c97094d0030d19363ec14bfd"
+    },
+    {
+      "path": "references/canonical-governance-and-rollout.md",
+      "sha256": "8b7512eb0a13adfa9cab6cdaf0f2643b8f61471f667f537b5b3dc03d8e8eae77"
+    },
+    {
+      "path": "references/google-meet-live-operator.md",
+      "sha256": "b8f2eab937e7a08c2d78d876cf84555abf71c295501baab12c48a0318911b73a"
+    },
+    {
+      "path": "references/gpt-realtime-zoom-bridge.md",
+      "sha256": "c6d7dffb78621001b3f5327014785603c3d581d1936f144f06768134fd668afc"
+    },
+    {
+      "path": "references/meeting-reschedule-lifecycle.md",
+      "sha256": "9f26cc7388e8ea98ab1b65e6f413cf39bcbeec850c81a14ea9e4839b721ed0ba"
+    },
+    {
+      "path": "references/realtime-memory-owner-gate-and-cost-telemetry.md",
+      "sha256": "6fb62f6cbb7750bd88e6aa05f30dd4354a64026a4b477699c1bea0fbc47cfcc3"
+    },
+    {
+      "path": "references/strategic-live-meeting-preflight.md",
+      "sha256": "c94a8a86319babba8e3cb92c46d6f2e436d5acd876d94c0f6c791610b5c75a22"
+    },
+    {
+      "path": "references/webinar-lifecycle.md",
+      "sha256": "46ae6ce58a314492b461f9645b227519c474b453026329c3e12f8c09ff924f2b"
+    },
+    {
+      "path": "references/zoom-browser-live-operator.md",
+      "sha256": "dfb33b4439ce3996a0c2271ad44c198db2da202dde1d2b6853a59295d5f2d46d"
+    },
+    {
+      "path": "references/zoom-cloud-artifact-recovery.md",
+      "sha256": "d728441e889375b86590be80d94aedf8f2f8ea73c698de77eb9af455c79494de"
+    },
+    {
+      "path": "references/zoom-cloud-artifacts.md",
+      "sha256": "0e5791400c1ea0fa34d09ea4fa5db5af48bd3ebba3827cf5571905847c232b55"
+    },
+    {
+      "path": "references/zoom-dual-context-host-agent.md",
+      "sha256": "7257b35c4cdd1cdd1d6fd514df430ad1006824c62968b515b1cb367713f8ad4f"
+    },
+    {
+      "path": "references/zoom-virtual-mic-egress-verification.md",
+      "sha256": "fa4228751a94db0e6e7f74c7c8260449cb682f372dbc361b15b04f347b9d95d7"
+    },
+    {
+      "path": "scripts/create_meeting.py",
+      "sha256": "d5d0a25ca8a2fd43a5f86cb59953a75fde6dc9a8bbd3a9cae8875055a3c15663"
+    },
+    {
+      "path": "scripts/meeting_state.py",
+      "sha256": "10390f2b445fbce2d7c5506757a15f3bf32f4a2f9985f1d022edbd3363da34ce"
+    },
+    {
+      "path": "scripts/setup_google_meeting_oauth.py",
+      "sha256": "891f45f44bd6d3262f099f90a9bf214ae6c8a6adf82d73e0d6afced69e447a93"
+    },
+    {
+      "path": "scripts/test_contract_negative.py",
+      "sha256": "0f462c7f1071f437b59a1fbef8302d2060c537a5d4f0deb359267ba27b204e7a"
+    },
+    {
+      "path": "scripts/update_zoom_meeting.py",
+      "sha256": "d3fdeaea12f611fe6e81a3bdfbc627641efac5c7fc413e8cb4e4477888372b22"
+    },
+    {
+      "path": "scripts/validate_contract.py",
+      "sha256": "bc3cc44815073ad64a042cf1df64ab7175afeffdafe6c40610f78f699d119ad5"
+    },
+    {
+      "path": "scripts/zoom_cloud_artifacts.py",
+      "sha256": "b2d094d1ecf86dd3760b616a998bb8d877f63e2f0beb183595478ce01cfe4d0a"
+    },
+    {
+      "path": "templates/sigurd-gpt-meet@.service",
+      "sha256": "fabcf90419f2aa88ac3c1e28b05a5f2cfb43f11fcf13cf7da2730f95dd6f47c4"
+    },
+    {
+      "path": "templates/sigurd-gpt-voice@.service",
+      "sha256": "6bb750f2949899d2fd34857c744749aca925dcc8dd73b3de5109cb245712520b"
+    },
+    {
+      "path": "tests/test_zoom_cloud_artifacts.py",
+      "sha256": "0115d1f3459ef508fea7f55f691b803a068f0adea59c418fd07fc239f162b3e8"
+    }
+  ]
+}

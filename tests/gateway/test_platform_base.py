@@ -118,6 +118,17 @@ class TestMessageEventGetCommandArgs:
         event = MessageEvent(text="/new session id 123")
         assert event.get_command_args() == "session id 123"
 
+    def test_normalizes_smart_dashes_for_user_commands(self):
+        event = MessageEvent(text="/new —flag –value")
+        assert event.get_command_args() == "--flag -value"
+
+    def test_preserves_verbatim_args_for_trusted_adapter_command(self):
+        event = MessageEvent(
+            text="/telegram-chip 04/20 — canary",
+            metadata={"preserve_command_args": True},
+        )
+        assert event.get_command_args() == "04/20 — canary"
+
 
 # ---------------------------------------------------------------------------
 # extract_images
@@ -772,7 +783,10 @@ class TestMediaDeliveryDefaultMode:
         workdir = fake_home / "work"
         workdir.mkdir()
         link = workdir / "innocent.pdf"
-        link.symlink_to(key)
+        try:
+            link.symlink_to(key)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",

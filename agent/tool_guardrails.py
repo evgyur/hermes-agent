@@ -24,6 +24,8 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        "skills_list",
+        "skill_view",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -267,7 +269,13 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        # ``block`` refuses only the repeated call. It must not terminate the
+        # whole turn: the model still needs a chance to change arguments, use a
+        # different tool, or continue from the last successful result.
+        return self.action == "halt" or self.code in {
+            "loop_web_search_cap",
+            "loop_subagent_cap",
+        }
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -402,7 +410,6 @@ class ToolCallGuardrailController:
                 count=exact_count,
                 signature=signature,
             )
-            self._halt_decision = decision
             return decision
 
         if self._is_idempotent(tool_name):
@@ -422,7 +429,6 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
                     return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -491,6 +497,19 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+
+        # A landed write/patch changes the execution environment for commands
+        # that may consume the edited file.  The terminal arguments can remain
+        # byte-identical (for example, ``python repair.py``) while the command
+        # itself is no longer the same attempt.  Discard only terminal failure
+        # history; all other guardrail state and thresholds remain intact.
+        if file_mutation_result_landed(tool_name, result):
+            self._exact_failure_counts = {
+                observed_signature: count
+                for observed_signature, count in self._exact_failure_counts.items()
+                if observed_signature.tool_name != "terminal"
+            }
+            self._same_tool_failure_counts.pop("terminal", None)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

@@ -82,6 +82,20 @@ class TestTelegramAllowedChats:
         adapter = _make_telegram_adapter(allowed_chats=[-100, -200])
         assert adapter._telegram_allowed_chats() == {"-100", "-200"}
 
+    def test_json_string_form_preserves_exact_chat_ids(self):
+        adapter = _make_telegram_adapter(
+            allowed_chats='["617744661", "-1003971448755"]',
+            require_mention=False,
+        )
+
+        assert adapter._telegram_allowed_chats() == {
+            "617744661",
+            "-1003971448755",
+        }
+        assert adapter._should_process_message(
+            _tg_group_message(-1003971448755)
+        ) is True
+
 
     def test_mention_cannot_bypass_whitelist(self):
         """@mention in a non-allowed chat is still ignored."""
@@ -218,5 +232,4 @@ class TestMatrixAllowedRooms:
         raw = "" or ""
         allowed = {r.strip() for r in raw.split(",") if r.strip()}
         assert allowed == set()
-
 

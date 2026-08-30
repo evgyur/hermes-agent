@@ -86,6 +86,9 @@ def _safe_int(value: Any) -> int | None:
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
+_DETERMINISTIC_SUMMARY_FALLBACK: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_deterministic_summary_fallback", default=False
+)
 
 # Echo of the route the summary call consumed, for SIBLING aux calls of the
 # same attempt (lean digests). Context-local like the pin itself, so it can
@@ -115,11 +118,34 @@ def pin_summary_route(route: Optional[Dict[str, Any]]):
     no-op passthrough so callers can wire it unconditionally. Re-entrant-safe:
     restores the previous pin on exit.
     """
-    token = _SUMMARY_ROUTE_PIN.set(route if isinstance(route, dict) else None)
+    pin_token = _SUMMARY_ROUTE_PIN.set(route if isinstance(route, dict) else None)
+    consumed_token = _SUMMARY_ROUTE_CONSUMED.set(None)
     try:
         yield
     finally:
-        _SUMMARY_ROUTE_PIN.reset(token)
+        _SUMMARY_ROUTE_CONSUMED.reset(consumed_token)
+        _SUMMARY_ROUTE_PIN.reset(pin_token)
+
+
+@contextlib.contextmanager
+def force_deterministic_summary_fallback():
+    """Skip the summary LLM for one compression attempt.
+
+    The host uses this only after every bounded summary route stalled.  A
+    ContextVar is required because the timed-out workers remain detached and
+    share the compressor instance; an instance attribute could leak the local
+    fallback into one of those workers or an unrelated session.
+    """
+    token = _DETERMINISTIC_SUMMARY_FALLBACK.set(True)
+    try:
+        yield
+    finally:
+        _DETERMINISTIC_SUMMARY_FALLBACK.reset(token)
+
+
+def deterministic_summary_fallback_forced() -> bool:
+    """Return whether this worker must use the bounded local handoff path."""
+    return bool(_DETERMINISTIC_SUMMARY_FALLBACK.get())
 
 
 def take_pinned_summary_route() -> Optional[Dict[str, Any]]:
@@ -289,6 +315,7 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
+PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY = "_proactive_prune_retry_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -310,6 +337,22 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+_STARTUP_RECOVERY_MARKER = (
+    "[Internal continuation marker: startup recovery turn.]"
+)
+_STARTUP_RECOVERY_NOTE_PREFIX = (
+    "[System note: The previous turn was interrupted by a gateway "
+)
+
+
+def _is_startup_recovery_user_turn(message: Any) -> bool:
+    """Recognize one-turn gateway recovery scaffolding after persistence."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    text = _content_text_for_contains(message.get("content")).strip()
+    return text == _STARTUP_RECOVERY_MARKER or text.startswith(
+        _STARTUP_RECOVERY_NOTE_PREFIX
+    )
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -516,7 +559,10 @@ def _salvage_reduce_todo_snapshot(out: List[Dict[str, Any]]) -> None:
         msg = out[i]
         if not isinstance(msg, dict):
             continue
-        if msg.get("_todo_snapshot_synthetic") and msg.get("role") == "user":
+        if msg.get("_todo_snapshot_synthetic") and msg.get("role") in {
+            "user",
+            "system",
+        }:
             content = msg.get("content")
             notice_idx = (
                 content.find(_PRUNED_SKILL_RELOAD_NOTICE_HEADER)
@@ -2319,6 +2365,9 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
+        self._turn_lease_holder = None
+        self._turn_lease_ttl_seconds = 300.0
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -2624,11 +2673,14 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
         self._session_id = session_id or ""
+        self._turn_lease_holder = None
+        self._turn_lease_ttl_seconds = 300.0
         self._summary_failure_cooldown_until = 0.0
         self._cooldown_persist_failed = False
         self._last_summary_error = None
@@ -2639,10 +2691,32 @@ class ContextCompressor(ContextEngine):
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_retry_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_proactive_prune_rearm_tokens()
+        self._load_proactive_prune_retry_tokens()
+
+    def bind_turn_lease(
+        self,
+        holder: Optional[str],
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> None:
+        """Bind one holder-qualified transcript rewrite capability."""
+        if holder is not None and (
+            type(holder) is not str or not holder.strip() or holder != holder.strip()
+        ):
+            raise ValueError("turn lease holder must be an exact non-empty string")
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("turn lease ttl must be positive") from exc
+        if ttl <= 0:
+            raise ValueError("turn lease ttl must be positive")
+        self._turn_lease_holder = holder
+        self._turn_lease_ttl_seconds = ttl
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -2734,6 +2808,49 @@ class ContextCompressor(ContextEngine):
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
+
+    def _load_proactive_prune_retry_tokens(self) -> None:
+        """Restore a lease-raced prune obligation for post-turn execution."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(session_id, PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY, 0)
+            self._proactive_prune_retry_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("proactive prune retry lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "proactive prune retry lookup failed (non-sqlite): %s", exc
+            )
+
+    def _persist_proactive_prune_retry_tokens(self, tokens: int) -> bool:
+        """Persist one retry obligation without rewriting transcript rows."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return False
+        value = max(0, int(tokens or 0))
+        try:
+            patcher(
+                session_id,
+                {
+                    PROACTIVE_PRUNE_RETRY_MODEL_CONFIG_KEY: (
+                        value if value > 0 else None
+                    )
+                },
+            )
+        except Exception as exc:
+            logger.warning("proactive prune retry persist failed: %s", exc)
+            return False
+        self._proactive_prune_retry_tokens = value
+        return True
 
     def _clear_durable_proactive_prune_rearm(self) -> None:
         """Remove the persisted runway key without touching the transcript.
@@ -3405,6 +3522,9 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        # Durable obligation armed only when the original prune candidate was
+        # fenced by a released turn lease; consumed after that boundary.
+        self._proactive_prune_retry_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -3756,8 +3876,9 @@ class ContextCompressor(ContextEngine):
         * ``"cooldown:<seconds>"`` — the summary LLM is recovering from a
           recent 429/transient failure; compression is deferred to avoid the
           freeze loop described in #11529.
-        * ``"ineffective"`` — anti-thrashing has backed off because the last
-          two compressions each saved <10%.
+        * ``"ineffective"`` / ``"degraded_summary"`` — anti-thrashing has
+          backed off after low-savings attempts or repeated deterministic
+          fallback summaries.
 
         When ``reason`` is non-``None`` the session is over its compression
         threshold yet cannot shrink — callers should surface a warning so the
@@ -3788,8 +3909,11 @@ class ContextCompressor(ContextEngine):
           eligible inside the protection window (#93022); retries are
           deferred transiently and compaction resumes when the backoff
           lapses or the transcript outgrows the window.
-        * ``"ineffective"`` — anti-thrashing has backed off (the last two
-          compressions each saved <10%, or the fallback streak tripped).
+        * ``"ineffective"`` — anti-thrashing has backed off after two
+          low-savings verdicts.
+        * ``"degraded_summary"`` — two completed deterministic fallback
+          summaries tripped the bounded degraded-summary breaker.
+        * ``"ineffective+degraded_summary"`` — both breakers are active.
         * ``None`` — no block active.
         """
         _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
@@ -3802,9 +3926,13 @@ class ContextCompressor(ContextEngine):
             return f"structural_backoff:{_structural_remaining:.0f}"
         if (
             self._ineffective_compression_count >= 2
-            or self._fallback_compression_streak >= 2
+            and self._fallback_compression_streak >= 2
         ):
+            return "ineffective+degraded_summary"
+        if self._ineffective_compression_count >= 2:
             return "ineffective"
+        if self._fallback_compression_streak >= 2:
+            return "degraded_summary"
         return None
 
     def _refresh_durable_guards(self) -> None:
@@ -4341,14 +4469,29 @@ class ContextCompressor(ContextEngine):
         if session_db and session_id:
             # The capability gate above guarantees archive_and_compact exists.
             try:
+                turn_lease_kwargs = {}
+                if self._turn_lease_holder is not None:
+                    turn_lease_kwargs = {
+                        "turn_lease_holder": self._turn_lease_holder,
+                        "turn_lease_ttl_seconds": self._turn_lease_ttl_seconds,
+                    }
                 session_db.archive_and_compact(
                     session_id,
                     pruned_msgs,
                     model_config_patch={
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                     },
+                    **turn_lease_kwargs,
                 )
             except Exception as exc:
+                if type(exc).__name__ == "SessionTurnLeaseLostError":
+                    # The prune crossed the active-turn boundary after making
+                    # its deterministic candidate. Persist one obligation in
+                    # the session row; run_agent executes it only after the
+                    # holder-qualified lease release, never with force semantics.
+                    retry_tokens = max(int(current_tokens or 0), before)
+                    self._proactive_prune_retry_tokens = retry_tokens
+                    self._persist_proactive_prune_retry_tokens(retry_tokens)
                 logger.warning(
                     "Proactive tool-result prune DB commit failed; keeping the "
                     "original transcript: %s",
@@ -4359,6 +4502,8 @@ class ContextCompressor(ContextEngine):
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         self._proactive_prune_rearm_tokens = next_rearm_tokens
+        if self._proactive_prune_retry_tokens:
+            self._persist_proactive_prune_retry_tokens(0)
         return pruned_msgs, pruned_count
 
     # ------------------------------------------------------------------
@@ -4807,7 +4952,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary += _redact_compaction_text(
                 _build_anchor_index(turns_to_summarize)
             )
-        if _LEAN_DIGESTS_HEADING not in summary:
+        if (
+            _LEAN_DIGESTS_HEADING not in summary
+            and not deterministic_summary_fallback_forced()
+        ):
             summary += _redact_compaction_text(
                 self._build_chunk_digests(turns_to_summarize)
             )
@@ -5633,7 +5781,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
+        if (
+            message.get("observed") is True
+            or message.get("internal") is True
+            or str(message.get("display_kind") or "").casefold()
+            in {"internal_notification", "hidden"}
+        ):
+            return True
         if cls._has_compressed_summary_metadata(message):
+            return True
+        if _is_startup_recovery_user_turn(message):
             return True
         content = message.get("content")
         if cls._is_context_summary_content(content):
@@ -7340,7 +7497,17 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            turn_lease_kwargs = {}
+            if self._turn_lease_holder is not None:
+                turn_lease_kwargs = {
+                    "turn_lease_holder": self._turn_lease_holder,
+                    "turn_lease_ttl_seconds": self._turn_lease_ttl_seconds,
+                }
+            session_db.archive_and_compact(
+                session_id,
+                compacted_messages,
+                **turn_lease_kwargs,
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
@@ -7848,7 +8015,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        deterministic_stall_fallback = deterministic_summary_fallback_forced()
+        if (
+            not deterministic_stall_fallback
+            and not force
+            and self._ineffective_compression_count >= 1
+        ):
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -7875,7 +8047,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        if feasibility_skip:
+        if deterministic_stall_fallback:
+            # Every configured summary route already exhausted its bounded
+            # host timeout.  Do not call another model: Phase 4 builds the
+            # existing bounded local handoff and preserves the protected tail.
+            summary = None
+        elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
@@ -7915,11 +8092,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         # rotating into a child session with a placeholder summary degrades the
         # conversation for zero benefit. Preserve it unchanged until access or
         # provider health is restored (#29559, #25585, #94448).
-        if not summary and not feasibility_skip and (
-            self.abort_on_summary_failure
-            or self._last_summary_auth_failure
-            or self._last_summary_network_failure
-            or self._last_summary_empty_content_failure
+        if (
+            not summary
+            and not feasibility_skip
+            and not deterministic_stall_fallback
+            and (
+                self.abort_on_summary_failure
+                or self._last_summary_auth_failure
+                or self._last_summary_network_failure
+                or self._last_summary_empty_content_failure
+            )
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -8007,7 +8189,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # content-free "N messages were removed" marker.
         if not summary:
             if not self.quiet_mode:
-                if feasibility_skip:
+                if deterministic_stall_fallback:
+                    logger.warning(
+                        "All summary routes stalled — inserting deterministic "
+                        "fallback context summary"
+                    )
+                elif feasibility_skip:
                     logger.info("Feasibility skip — inserting deterministic fallback context summary")
                 else:
                     logger.warning("Summary generation failed — inserting deterministic fallback context summary")
@@ -8015,18 +8202,28 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
-            if feasibility_skip:
+            if deterministic_stall_fallback:
+                telemetry["failure_class"] = (
+                    telemetry.get("failure_class")
+                    or "deterministic_stall_fallback"
+                )
+            elif feasibility_skip:
                 # Deliberate optimization, not a summary failure — keep the
                 # telemetry class distinct so dashboards don't count skips
                 # as aux-model breakage.
                 telemetry["failure_class"] = telemetry.get("failure_class") or "feasibility_skip"
             else:
                 telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
+            fallback_reason = self._last_summary_error
+            if feasibility_skip:
+                fallback_reason = None
+            elif deterministic_stall_fallback:
+                fallback_reason = "all configured summary routes stalled"
             summary = self._build_static_fallback_summary(
                 turns_to_summarize,
                 # A stale error from an earlier real failure must not be
                 # embedded into a deliberate feasibility skip's fallback.
-                reason=None if feasibility_skip else self._last_summary_error,
+                reason=fallback_reason,
             )
 
         tail_messages: List[Dict[str, Any]] = []

@@ -20,9 +20,11 @@ import concurrent.futures
 import inspect
 import logging
 import queue
+import re
 import secrets
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -270,6 +272,11 @@ class GatewayStreamConsumer:
         self._turn_id = str(uuid.uuid4())
 
         self._queue: queue.Queue = queue.Queue()
+        # A send exception can mean the platform accepted the message but the
+        # receipt was lost. Strict pre-effect barriers must never interpret
+        # later queue cleanup as proof that a duplicate fallback is safe.
+        self._delivery_ambiguous = False
+        self._consumer_terminal = False
         self._accumulated = ""
         # Full segment text mirror of ``_accumulated`` that is NOT truncated
         # when overflow splits seal head chunks.  Used to record a reconciliable
@@ -300,6 +307,10 @@ class GatewayStreamConsumer:
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
         self._last_edit_overflowed = False
+        # Exact commentary delivery receipts.  Text-only bookkeeping is not
+        # enough for cleanup: when an interim is also the final response the
+        # gateway must protect the precise native message from deletion.
+        self._delivered_commentary_receipts: list[tuple[str, Optional[str]]] = []
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # True when fallback is sending only the missing tail after a partial
@@ -333,6 +344,9 @@ class GatewayStreamConsumer:
         # replies after an early/partial multi-message delivery.
         self._turn_split_delivery = False
         self._delivered_commentary_texts: list[str] = []
+        self._settled_message_order: list[str] = []
+        self._settled_messages: dict[str, tuple[str, Optional[str]]] = {}
+        self._logical_delivery_receipts: dict[str, tuple[str, ...]] = {}
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
         # clears ``_last_sent_text``. Without this, a segment break (triggered
@@ -669,6 +683,8 @@ class GatewayStreamConsumer:
         target = self._clean_for_display(text or "").strip()
         if not target:
             return False
+        if self.delivered_message_ids_for_text(text) is not None:
+            return True
         visible_prefix = self._visible_prefix().strip()
         if visible_prefix == target:
             return True
@@ -676,6 +692,87 @@ class GatewayStreamConsumer:
             sent.strip() == target
             for sent in (*self._delivered_commentary_texts, *self._delivered_segment_texts)
         )
+
+    def delivered_message_id_for_text(self, text: str) -> Optional[str]:
+        """Return the newest native message id for an exactly delivered text."""
+        ids = self.delivered_message_ids_for_text(text)
+        if ids:
+            return ids[-1]
+        target = self._clean_for_display(text or "").strip()
+        if not target:
+            return None
+        for delivered_text, message_id in reversed(
+            self._delivered_commentary_receipts
+        ):
+            if delivered_text.strip() == target and message_id is not None:
+                return str(message_id)
+        visible_prefix = self._visible_prefix().strip()
+        if visible_prefix == target and self._message_id not in (None, "__no_edit__"):
+            return str(self._message_id)
+        return None
+
+    def _record_settled_message(
+        self,
+        text: str,
+        message_id: Optional[Any],
+        *,
+        token: Optional[str] = None,
+    ) -> None:
+        visible = self._clean_for_display(text or "")
+        if not visible:
+            return
+        native_id = (
+            str(message_id)
+            if message_id not in (None, "__no_edit__")
+            else None
+        )
+        key = token or (
+            f"id:{native_id}" if native_id else f"anon:{uuid.uuid4().hex}"
+        )
+        if key not in self._settled_messages:
+            self._settled_message_order.append(key)
+        self._settled_messages[key] = (visible, native_id)
+
+    def delivered_message_ids_for_text(
+        self, text: str
+    ) -> Optional[tuple[str, ...]]:
+        """Resolve all ids whose contiguous settled payload exactly matches."""
+        target = self._clean_for_display(text or "")
+        if not target:
+            return None
+        logical_ids = self._logical_delivery_receipts.get(target)
+        if logical_ids:
+            return logical_ids
+        entries = [
+            self._settled_messages[key]
+            for key in self._settled_message_order
+            if key in self._settled_messages
+        ]
+        for start in range(len(entries)):
+            combined = ""
+            ids: list[str] = []
+            for visible, native_id in entries[start:]:
+                combined += visible
+                if native_id is not None:
+                    ids.append(native_id)
+                if combined == target:
+                    return tuple(ids)
+                if len(combined) >= len(target) or not target.startswith(combined):
+                    break
+        return None
+
+    def _bind_logical_delivery(self, text: str, message_ids: Any) -> None:
+        """Bind an undecorated logical payload to all authoritative wire IDs."""
+        target = self._clean_for_display(text or "")
+        ordered: list[str] = []
+        for message_id in message_ids or ():
+            if message_id in (None, "", "__no_edit__"):
+                continue
+            value = str(message_id)
+            if value not in ordered:
+                ordered.append(value)
+        if target and ordered:
+            self._logical_delivery_receipts[target] = tuple(ordered)
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -779,12 +876,19 @@ class GatewayStreamConsumer:
         agent-thread-blocking path — races ahead of buffered prose that is still
         sitting in this queue, so the question lands ABOVE its own explanation.
         """
+        if self._consumer_terminal or self._delivery_ambiguous:
+            return False
         evt = threading.Event()
         try:
             self._queue.put((_FLUSH, evt))
         except Exception:
             return False
-        return evt.wait(timeout=max(0.0, float(timeout)))
+        settled = evt.wait(timeout=max(0.0, float(timeout)))
+        return bool(
+            settled
+            and not self._consumer_terminal
+            and not self._delivery_ambiguous
+        )
 
     def request_reopen_seed(self) -> None:
         """Request an EAGER native re-seed after a clarify-reopen boundary.
@@ -1526,6 +1630,11 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and (self._accumulated or (self._use_native_streaming and self._tool_progress_active)):
+                    # Redact the complete logical buffer before any platform
+                    # chunking. Per-chunk filtering can split one credential
+                    # into two harmless-looking messages that reassemble.
+                    self._accumulated = self._clean_for_display(self._accumulated)
+                    self._stream_ledger = self._clean_for_display(self._stream_ledger)
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     # Native streaming bypasses this entirely — the adapter's
@@ -1537,6 +1646,10 @@ class GatewayStreamConsumer:
                         and _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is None
                     ):
+                        _logical_split_text = self._clean_for_display(
+                            self._accumulated
+                        )
+                        _split_receipt_start = len(self._settled_message_order)
                         # No existing message to edit (first message or after a
                         # segment break).  Seal only the overflowing head chunks
                         # as fixed messages, then keep the trailing chunk in
@@ -1616,7 +1729,17 @@ class GatewayStreamConsumer:
                                 # still reconcile against final_response
                                 # (#71643, #78541).
                                 self._turn_split_delivery = True
-                                self._record_turn_final_payload(self._accumulated)
+                                _split_ids = [
+                                    self._settled_messages[key][1]
+                                    for key in self._settled_message_order[
+                                        _split_receipt_start:
+                                    ]
+                                    if key in self._settled_messages
+                                ]
+                                self._bind_logical_delivery(
+                                    _logical_split_text, _split_ids
+                                )
+                                self._record_turn_final_payload(_logical_split_text)
                             return
                         if got_segment_break:
                             self._message_id = None
@@ -1624,6 +1747,31 @@ class GatewayStreamConsumer:
                             self._fallback_prefix = ""
                             if not self._accumulated:
                                 continue
+
+                        if got_flush and chunks_delivered:
+                            # A synchronous ACK flush is a delivery boundary,
+                            # not merely a queue-drained signal.  Settle the
+                            # active tail too, then bind the original logical
+                            # payload to every head/tail wire id.  Otherwise
+                            # the callback sees only decorated heads and sends
+                            # the full ACK again.
+                            tail_delivered = True
+                            if self._accumulated:
+                                tail_delivered = await self._send_or_edit(
+                                    self._accumulated,
+                                    finalize=False,
+                                )
+                            if tail_delivered:
+                                _split_ids = [
+                                    self._settled_messages[key][1]
+                                    for key in self._settled_message_order[
+                                        _split_receipt_start:
+                                    ]
+                                    if key in self._settled_messages
+                                ]
+                                self._bind_logical_delivery(
+                                    _logical_split_text, _split_ids
+                                )
 
                         # This iteration consumed a _FLUSH barrier and delivered
                         # the buffered prose via the chunk loop above, then takes
@@ -1960,6 +2108,7 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            self._delivery_ambiguous = True
             # Best-effort final edit on cancellation.  finalize=True so
             # REQUIRES_EDIT_FINALIZE platforms (Telegram) apply final
             # formatting — a plain edit here would leave the entire reply
@@ -1997,8 +2146,10 @@ class GatewayStreamConsumer:
                 self._final_content_delivered = True
                 self._record_turn_final_payload(self._accumulated)
         except Exception as e:
+            self._delivery_ambiguous = True
             logger.error("Stream consumer error: %s", e)
         finally:
+            self._consumer_terminal = True
             # Safety net: if run() exits (normal return, cancellation, or
             # exception) while a _FLUSH barrier is still queued or was consumed
             # but not yet signaled, wake any waiters now. Without this a caller
@@ -2038,7 +2189,22 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        cleaned = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        try:
+            from agent.redact import redact_sensitive_text
+
+            cleaned = redact_sensitive_text(cleaned, force=True)
+        except Exception:
+            pass
+        # Fail closed even when the shared redactor faults. Mask dangling
+        # provider-token prefixes too: their body may arrive in the next model
+        # delta or after a tool boundary.
+        return re.sub(
+            r"(?i)(?:sk-(?:proj-)?(?:[A-Za-z0-9_-]{20,64}|[A-Za-z0-9_-]{0,64}$)|"
+            r"gh[pousr]_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})",
+            "[REDACTED]",
+            cleaned,
+        )
 
     async def _send_new_chunk(
         self,
@@ -2069,6 +2235,7 @@ class GatewayStreamConsumer:
                 self._track_preview_ids_from_result(result)
                 self._already_sent = True
                 self._last_sent_text = text
+                self._record_settled_message(text, result.message_id)
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
@@ -2610,6 +2777,11 @@ class GatewayStreamConsumer:
             return False
         # Frame delivered.  Track text for parity with edit-based no-op skip.
         self._last_sent_text = text
+        self._record_settled_message(
+            text,
+            getattr(result, "message_id", None),
+            token=f"draft:{self._draft_id}",
+        )
         return True
 
     async def _abandon_native_stream(self) -> None:
@@ -2733,8 +2905,18 @@ class GatewayStreamConsumer:
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
                 self._delivered_commentary_texts.append(text)
+                message_id = getattr(result, "message_id", None)
+                self._delivered_commentary_receipts.append(
+                    (text, str(message_id) if message_id is not None else None)
+                )
+                self._record_settled_message(text, message_id)
+                message_ids = self._message_ids_from_result(result)
+                self._bind_logical_delivery(text, message_ids)
+                for settled_id in message_ids:
+                    self._track_preview_id(settled_id)
             return result.success
         except Exception as e:
+            self._delivery_ambiguous = True
             logger.error("Commentary send error: %s", e)
             return False
 
@@ -2808,6 +2990,25 @@ class GatewayStreamConsumer:
         if isinstance(raw, dict):
             for mid in (raw.get("message_ids") or ()):
                 self._track_preview_id(mid)
+
+    @staticmethod
+    def _message_ids_from_result(result: Any) -> tuple[str, ...]:
+        """Extract every ordered native ID from one transport receipt."""
+        ordered: list[str] = []
+        raw = getattr(result, "raw_response", None) or {}
+        sources = [
+            (raw.get("message_ids") or ()) if isinstance(raw, dict) else (),
+            getattr(result, "continuation_message_ids", ()) or (),
+            (getattr(result, "message_id", None),),
+        ]
+        for source in sources:
+            for message_id in source:
+                if message_id in (None, "", "__no_edit__"):
+                    continue
+                value = str(message_id)
+                if value not in ordered:
+                    ordered.append(value)
+        return tuple(ordered)
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Return True when the adapter would rather finalize a streamed reply
@@ -3261,6 +3462,7 @@ class GatewayStreamConsumer:
         try:
             if self._message_id is not None:
                 if self._edit_supported:
+                    _edited_original_message_id = self._message_id
                     # Skip if text is identical to what we last sent.
                     # Exception: adapters that require an explicit finalize
                     # call (REQUIRES_EDIT_FINALIZE) must still receive the
@@ -3332,6 +3534,7 @@ class GatewayStreamConsumer:
                         finalize=finalize,
                     )
                     if result.success:
+                        _result_message_id = getattr(result, "message_id", None)
                         self._already_sent = True
                         # Record any continuation fragments an oversized edit
                         # split off, so fresh-final can clean them all up.
@@ -3350,19 +3553,31 @@ class GatewayStreamConsumer:
                         _continuation_ids = getattr(result, "continuation_message_ids", ()) or ()
                         if (
                             _continuation_ids
-                            and result.message_id
-                            and result.message_id != self._message_id
+                            and _result_message_id
+                            and _result_message_id != self._message_id
                         ):
                             self._last_edit_overflowed = True
                             # Adapter adopted continuation messages — this
                             # turn is a multi-message delivery (#71643).
                             self._turn_split_delivery = True
-                            self._message_id = str(result.message_id)
+                            self._message_id = str(_result_message_id)
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
+                        self._record_settled_message(
+                            text,
+                            _result_message_id or self._message_id,
+                        )
+                        _continuation_ids = tuple(
+                            getattr(result, "continuation_message_ids", ()) or ()
+                        )
+                        if _continuation_ids:
+                            self._bind_logical_delivery(
+                                text,
+                                (_edited_original_message_id, *_continuation_ids),
+                            )
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
@@ -3511,6 +3726,7 @@ class GatewayStreamConsumer:
                         self._edit_supported = False
                     self._already_sent = True
                     self._last_sent_text = text
+                    self._record_settled_message(text, result.message_id)
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True

@@ -14,6 +14,7 @@ from hermes_state import SessionDB
 
 
 _REARM_KEY = "_proactive_prune_rearm_tokens"
+_RETRY_KEY = "_proactive_prune_retry_tokens"
 
 
 def _assistant_call(call_id: str) -> dict:
@@ -184,6 +185,36 @@ def test_prune_persistence_failure_is_a_noop(tmp_path: Path) -> None:
     assert [message["content"] for message in messages] == original_contents
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == original_contents
     assert _REARM_KEY not in _model_config(db, session_id)
+
+
+def test_turn_lease_refusal_persists_retry_obligation(tmp_path: Path) -> None:
+    from hermes_state import SessionTurnLeaseLostError
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PRUNE_TURN_LEASE_RETRY"
+    db.create_session(session_id, source="telegram")
+    db.append_messages_batch(session_id, _history())
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+    compressor = agent.context_compressor
+    messages = db.get_messages_as_conversation(session_id)
+
+    with patch.object(
+        db,
+        "archive_and_compact",
+        side_effect=SessionTurnLeaseLostError("stale-holder"),
+    ):
+        result, count = compressor.prune_tool_results_only(
+            messages, current_tokens=120_000,
+        )
+
+    assert result is messages
+    assert count == 0
+    assert compressor._proactive_prune_retry_tokens == 120_000
+    assert _model_config(db, session_id)[_RETRY_KEY] == 120_000
+
+    resumed = _build_agent(db, session_id)
+    assert resumed.context_compressor._proactive_prune_retry_tokens == 120_000
 
 
 def test_archive_model_config_patch_rolls_back_with_transcript(tmp_path: Path) -> None:

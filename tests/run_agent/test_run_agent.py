@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -2980,6 +2983,44 @@ class TestRunConversation:
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
+
+    def test_codex_ttfb_watchdog_final_failure_is_chat_silent(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.5"
+        agent.api_mode = "codex_responses"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        statuses = []
+
+        def fail_codex_watchdog(_api_kwargs):
+            raise TimeoutError(
+                "Codex stream produced no bytes within 12s "
+                "(TTFB threshold: 12s). Codex backend appears to be silently "
+                "rejecting 'gpt-5.5' on chatgpt.com/backend-api/codex"
+            )
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=fail_codex_watchdog,
+            ),
+            patch.object(agent, "_emit_status", side_effect=statuses.append),
+            patch.object(agent, "_try_activate_fallback", return_value=False),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.conversation_loop.time.sleep"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["suppress_delivery"] is True
+        assert result["final_response"] == ""
+        assert result["error"] == ""
+        assert not any("API failed after" in status for status in statuses)
 
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(

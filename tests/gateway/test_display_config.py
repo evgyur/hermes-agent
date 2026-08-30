@@ -34,6 +34,175 @@ class TestResolveDisplaySetting:
         }
         assert resolve_display_setting(config, "telegram", "tool_progress") == "new"
 
+    def test_start_ack_text_is_empty_by_default_and_overrideable_per_platform(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "start_ack_text") == ""
+        assert (
+            resolve_display_setting({}, "telegram", "start_ack_mode")
+            == "best_effort"
+        )
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_text": "↳ Принял. Начинаю проверку."
+                    }
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(config, "telegram", "start_ack_text")
+            == "↳ Принял. Начинаю проверку."
+        )
+
+    def test_required_start_ack_rejects_blank_global_text(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
+
+        with pytest.raises(ValueError, match="must be non-empty"):
+            validate_start_ack_configuration(
+                {"display": {"start_ack_mode": "required", "start_ack_text": " "}}
+            )
+
+    def test_required_start_ack_rejects_blank_platform_text(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
+
+        with pytest.raises(ValueError, match="platforms.telegram"):
+            validate_start_ack_configuration(
+                {
+                    "display": {
+                        "platforms": {
+                            "telegram": {
+                                "start_ack_mode": "required",
+                                "start_ack_text": "",
+                            }
+                        }
+                    }
+                }
+            )
+
+    def test_start_ack_rejects_unknown_mode(self):
+        import pytest
+        from gateway.display_config import validate_start_ack_configuration
+
+        with pytest.raises(ValueError, match="best_effort.*required"):
+            validate_start_ack_configuration(
+                {"display": {"start_ack_mode": "sometimes"}}
+            )
+
+    def test_platform_required_mode_can_inherit_global_text(self):
+        from gateway.display_config import validate_start_ack_configuration
+
+        validate_start_ack_configuration(
+            {
+                "display": {
+                    "start_ack_text": "configured",
+                    "platforms": {
+                        "telegram": {"start_ack_mode": "required"}
+                    },
+                }
+            }
+        )
+
+    def test_gateway_startup_rejects_invalid_required_policy(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        invalid = {
+            "display": {"start_ack_mode": "required", "start_ack_text": ""}
+        }
+        with (
+            patch(
+                "gateway.run.load_gateway_config_for_runner",
+                return_value=GatewayConfig(),
+            ),
+            patch("hermes_cli.config.load_config", return_value=invalid),
+            pytest.raises(ValueError, match="must be non-empty"),
+        ):
+            GatewayRunner()
+
+    def test_explicit_gateway_config_cannot_bypass_ack_validation(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig()
+        invalid = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": " ",
+                    }
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=invalid),
+            pytest.raises(ValueError, match="platforms.telegram"),
+        ):
+            GatewayRunner(injected)
+
+    def test_valid_explicit_gateway_config_keeps_transport_precedence(self):
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig()
+        valid = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": "configured",
+                    }
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=valid):
+            runner = GatewayRunner(injected)
+
+        assert runner.config is injected
+
+    def test_required_unsupported_runtime_fails_before_runner_readiness(self):
+        import pytest
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        injected = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")
+            }
+        )
+        strict = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "start_ack_mode": "required",
+                        "start_ack_text": "ack",
+                    }
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict),
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={
+                    "api_mode": "codex_app_server",
+                    "provider": "openai-codex",
+                },
+            ),
+            pytest.raises(ValueError, match="codex_app_server"),
+        ):
+            GatewayRunner(injected)
+
 
     def test_platform_override_only_affects_that_platform(self):
         """Other platforms are unaffected by a specific platform override."""
@@ -325,5 +494,3 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
-

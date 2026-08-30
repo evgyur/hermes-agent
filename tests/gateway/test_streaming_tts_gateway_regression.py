@@ -17,6 +17,7 @@ import asyncio
 import sys
 import threading
 import types
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -42,12 +43,17 @@ class _NoopAgent:
     def run_conversation(self, user_message, conversation_history=None,
                          task_id=None, persist_user_message=None,
                          persist_user_timestamp=None):
+        self.captured_message = user_message
+        _CAPTURED_MESSAGES.append(user_message)
         return {
             "final_response": "Hello from the agent.",
             "messages": [],
             "api_calls": 1,
             "completed": True,
         }
+
+
+_CAPTURED_MESSAGES = []
 
 
 def _install_fake_agent(monkeypatch):
@@ -155,3 +161,50 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+def test_interactive_startup_resume_marker_reaches_model_note(monkeypatch, tmp_path):
+    """Trusted startup continuation must not degrade into interactive ask/skip."""
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    _CAPTURED_MESSAGES.clear()
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:12345"
+    runner.session_store._entries = {
+        session_key: SimpleNamespace(
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=datetime.now(),
+        )
+    }
+    class _InteractiveNoStreamAdapter:
+        interactive_resume = True
+
+        def __bool__(self):
+            return False
+
+        def get_pending_message(self, _session_key):
+            return None
+
+    adapter = _InteractiveNoStreamAdapter()
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_adapter_for_source",
+        lambda self, source: adapter,
+    )
+
+    async def _run():
+        return await runner._run_agent(
+            message="",
+            context_prompt="",
+            history=[],
+            source=_make_voice_source(),
+            session_id="session-1",
+            session_key=session_key,
+            startup_resume=True,
+        )
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+    assert result["final_response"] == "Hello from the agent."
+    assert len(_CAPTURED_MESSAGES) == 1
+    model_message = _CAPTURED_MESSAGES[0]
+    assert "synthetic startup continuation" in model_message
+    assert "ask what they would like to do next" not in model_message
+    assert "skip any unfinished work" not in model_message
