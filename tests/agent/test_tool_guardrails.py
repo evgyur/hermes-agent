@@ -105,6 +105,8 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.action == "block"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+    assert blocked.should_halt is False
+    assert controller.halt_decision is None
 
 
 def test_landed_file_mutation_invalidates_terminal_failure_history():

@@ -267,7 +267,13 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        # ``block`` refuses only the repeated call. It must not terminate the
+        # whole turn: the model still needs a chance to change arguments, use a
+        # different tool, or continue from the last successful result.
+        return self.action == "halt" or self.code in {
+            "loop_web_search_cap",
+            "loop_subagent_cap",
+        }
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -402,7 +408,6 @@ class ToolCallGuardrailController:
                 count=exact_count,
                 signature=signature,
             )
-            self._halt_decision = decision
             return decision
 
         if self._is_idempotent(tool_name):
@@ -422,7 +427,6 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
                     return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
