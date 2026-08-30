@@ -2,6 +2,14 @@
 
 All notable changes to the canonical Human20 meeting skill are recorded here.
 
+## 4.1.0 — 2026-08-30
+
+- Added a receipt-backed Telegram source resolver for plain URLs, UTF-16-safe `MessageEntityTextUrl` values, inline URL buttons, and validated redirect chains.
+- Added durable live-capture receipts that bind source message/type/final domain to provider media readiness, file growth, and ffprobe metadata without storing tokens.
+- Added two-phase idempotent finalization: recording integrity is proven before synthesis locking; lock contention becomes `FINALIZATION_DEFERRED` and is retried by a no-agent gate.
+- Added canonical private meeting packages with checksummed manifests, speaker transcripts, summaries/decisions/ideas/source links, and separate event/capture/package/replay dates.
+- Added regression tests for hidden Telegram URLs, private redirect blocking, safe receipts, deferred resume, missing-recording classification, and package integrity.
+
 ## 4.0.2 — 2026-08-30
 
 - Fixed the restricted SSH stream gate to accept the canonical `PULSE_SERVER=… exec parec|paplay …` transport emitted by the runtime.

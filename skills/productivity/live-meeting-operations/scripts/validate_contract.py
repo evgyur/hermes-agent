@@ -14,8 +14,12 @@ REQUIRED_FILES = {
     "CHANGELOG.md",
     "references/canonical-governance-and-rollout.md",
     "references/webinar-lifecycle.md",
+    "references/telegram-webinar-capture-and-packaging.md",
     "references/zoom-cloud-artifacts.md",
     "scripts/zoom_cloud_artifacts.py",
+    "scripts/telegram_source_resolver.py",
+    "scripts/webinar_pipeline.py",
+    "scripts/webinar_finalizer_gate.py",
 }
 REQUIRED_NEEDLES = {
     "single canonical meeting root": "single canonical meeting root",
@@ -29,6 +33,9 @@ REQUIRED_NEEDLES = {
     "kanban handoff": "Team20 cards",
     "independent egress": "independent egress receipt",
     "recording proof": "Recording-active state",
+    "telegram source resolver": "telegram_source_resolver.py",
+    "deferred finalization": "FINALIZATION_DEFERRED",
+    "canonical package": "canonical private packaging",
 }
 FORBIDDEN_SUFFIXES = {".m4a", ".mp3", ".mp4", ".wav", ".vtt", ".srt", ".cookie", ".sqlite"}
 FORBIDDEN_TEXT = [
@@ -40,11 +47,12 @@ TRIGGER_CASES = {
     "зайди в Google Meet и отвечай голосом": True,
     "вытащи последнюю транскрибацию Zoom и ответственных": True,
     "проведи вебинар, модерируй вопросы и сделай протокол": True,
+    "запиши эфир из этого Telegram-поста и сделай расшифровку": True,
     "создай карточку в Kanban по готовому ТЗ": False,
     "расшифруй загруженный mp3": False,
 }
 TRIGGER_RE = re.compile(
-    r"(?i)\b(zoom|google\s*meet|meet\.google|вебинар\w*|созвон\w*|конференц\w*|meeting\w*|"
+    r"(?i)\b(zoom|google\s*meet|meet\.google|вебинар\w*|эфир\w*|созвон\w*|конференц\w*|meeting\w*|"
     r"облачн\w*\s+запис\w*|транскрибац\w*\s+(?:zoom|meet)|говор\w*\s+голос\w*\s+(?:в|на)\s+(?:zoom|meet))\b"
 )
 

@@ -72,5 +72,11 @@ A local playback exit code, visible tab, or enabled setting is not rehearsal pro
 - `CREATED_NOT_REHEARSED` — valid object/link, no full rehearsal evidence.
 - `REHEARSED_WITH_GAPS` — exact failed lanes listed.
 - `LIVE_ACTIVE` — in-room state plus verified ingress/egress/recording/context.
-- `ARTIFACTS_PROCESSING` — event ended; provider files not complete.
-- `POST_EVENT_COMPLETE` — requested artifacts delivered and requested Team20 handoff verified.
+- `CAPTURE_ACTIVE_VERIFIED` — Telegram/provider source is receipt-backed, provider media is ready, and detached output growth plus ffprobe are proven.
+- `RECORDING_VERIFIED` — media exists, first/middle/last decode, and checksum receipt is durable.
+- `ARTIFACTS_PROCESSING` — event ended; provider files or ASR/derived artifacts are not complete.
+- `FINALIZATION_DEFERRED` — recording remains verified but synthesis lease/run-lock is busy; deterministic retry remains active.
+- `PACKAGE_COMPLETE` — the private package manifest covers every requested artifact and semantic date.
+- `POST_EVENT_COMPLETE` — requested artifacts were delivered and requested Team20 handoff was verified.
+
+For Telegram-sourced third-party rooms and local detached capture, follow [`telegram-webinar-capture-and-packaging.md`](telegram-webinar-capture-and-packaging.md). `RECORDING_MISSING` may be emitted only by the deterministic integrity phase, never inferred from `run_lock`, ASR delay, or missing summaries.
