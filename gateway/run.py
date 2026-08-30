@@ -25461,14 +25461,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
             _hyg_total_ceiling_seconds = 600.0
-            # Max wall-clock the user's TURN is held waiting on hygiene
-            # compression before the gateway stops waiting and proceeds on the
-            # uncompressed transcript (#TKT-0029). The compressor keeps running
-            # detached; its commit is fenced (revoke_commit_admission) so a
-            # stale result can never clobber turns appended after the wait was
-            # abandoned. Capped well below typical transport idle-timeouts
-            # (Telegram ~30s) so the wire never goes silent long enough to sever.
-            _hyg_max_turn_hold_seconds = 10.0
+            # Optional wall-clock cap for holding the current turn while
+            # hygiene compression streams. When omitted, the configured total
+            # ceiling is authoritative; silently replacing an operator's
+            # 120s/600s inactivity/ceiling contract with a hidden 10s cap made
+            # every healthy long summary get cancelled before it could commit.
+            _hyg_max_turn_hold_seconds = None
             _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
             _hyg_provider = None
@@ -25544,6 +25542,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_max_turn_hold_seconds = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        if _hyg_max_turn_hold_seconds is None:
+                            _hyg_max_turn_hold_seconds = _hyg_total_ceiling_seconds
+                        else:
+                            _hyg_max_turn_hold_seconds = min(
+                                _hyg_max_turn_hold_seconds,
+                                _hyg_total_ceiling_seconds,
+                            )
                         _raw_cooldown = _comp_cfg.get("hygiene_failure_cooldown_seconds")
                         if _raw_cooldown is not None:
                             try:
@@ -25611,6 +25616,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
             except Exception:
                 pass
+
+            if _hyg_max_turn_hold_seconds is None:
+                _hyg_max_turn_hold_seconds = _hyg_total_ceiling_seconds
 
             if _hyg_compression_enabled:
                 _hyg_context_length = await get_model_context_length_async(

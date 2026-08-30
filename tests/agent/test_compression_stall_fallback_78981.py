@@ -441,8 +441,15 @@ def test_second_fallback_reaches_real_summary_call_with_its_route():
         llm_calls.append(kwargs)
         return _ok_response()
 
+    # The compressor owns a module-level call_llm alias, while auxiliary
+    # route resolution may re-enter through the defining module from the
+    # propagated worker thread.  Patch both names with the same spy: the
+    # test must never probe a developer's real Codex OAuth state, and either
+    # supported import path must still prove the exact pinned route kwargs.
     with _patch_chain([CHAIN_ENTRY, second]), patch(
         "agent.context_compressor.call_llm", side_effect=_call_llm
+    ), patch(
+        "agent.auxiliary_client.call_llm", side_effect=_call_llm
     ):
         result = _retry_compression_on_fallback_chain(
             worker=_worker,

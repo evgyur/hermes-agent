@@ -710,9 +710,24 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     SlowCompressAgent.last_instance.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "budget_config",
+    [
+        (
+            "  hygiene_timeout_seconds: 60\n"
+            "  hygiene_total_ceiling_seconds: 600\n"
+            "  hygiene_max_turn_hold_seconds: 0.3\n"
+        ),
+        (
+            "  hygiene_timeout_seconds: 0.3\n"
+            "  hygiene_total_ceiling_seconds: 0.3\n"
+        ),
+    ],
+    ids=["explicit-turn-hold", "ceiling-default-no-hidden-cap"],
+)
 @pytest.mark.asyncio
 async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, budget_config
 ):
     """A compression that still streams progress must not hold the turn hostage.
 
@@ -721,8 +736,9 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     timeout NEVER fires — without a turn-hold budget the gateway would extend
     the wait up to the total ceiling (default 600s) while zero bytes hit the
     wire, severing the transport. The turn must instead be abandoned once it
-    exceeds ``hygiene_max_turn_hold_seconds``, proceed on the uncompressed
-    transcript, and fence the stale commit.
+    exceeds the explicit ``hygiene_max_turn_hold_seconds`` or, when that
+    optional cap is omitted, the configured total ceiling. A hidden 10-second
+    default must never override the operator's timeout/ceiling contract.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -781,12 +797,8 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     cfg_path.write_text(
         "compression:\n"
         "  enabled: true\n"
-        # Inactivity budget is huge, so the slice timeout can never fire on
-        # its own; the turn-hold budget is the ONLY thing that abandons.
-        "  hygiene_timeout_seconds: 60\n"
-        "  hygiene_total_ceiling_seconds: 600\n"
-        "  hygiene_max_turn_hold_seconds: 0.3\n"
-        "  hygiene_failure_cooldown_seconds: 120\n"
+        + budget_config
+        + "  hygiene_failure_cooldown_seconds: 120\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
@@ -848,13 +860,14 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     )
 
     started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+    result = await asyncio.wait_for(runner._handle_message(event), timeout=3)
     elapsed = time.monotonic() - started
 
-    # The turn proceeded on the uncompressed transcript well under the 600s
-    # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
+    # The turn proceeded on the uncompressed transcript at the configured
+    # ~0.3s budget. The omitted-cap case proves no hidden 10s default replaces
+    # the operator's total-ceiling contract.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
+    assert elapsed < 2.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
     # The stale commit must be fenced: the late worker never mutates the session.

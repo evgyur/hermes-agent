@@ -222,13 +222,23 @@ def test_install_receipt_records_release_component_pins(tmp_path: Path):
         str(home),
     )
 
-    receipt = Path(
-        next(
-            line.removeprefix("receipt=")
-            for line in result.stdout.splitlines()
-            if line.startswith("receipt=")
-        )
+    receipt_text = next(
+        line.removeprefix("receipt=")
+        for line in result.stdout.splitlines()
+        if line.startswith("receipt=")
     )
+    # The installer deliberately prints its normalized shell path.  Under
+    # Git Bash that is an MSYS ``/tmp/...`` path, which native pathlib would
+    # otherwise misread as ``C:\\tmp\\...`` instead of the Windows temp
+    # directory where the receipt was actually written.
+    if os.name == "nt" and receipt_text.startswith("/"):
+        bash = shutil.which("bash")
+        assert bash
+        receipt_text = subprocess.check_output(
+            [bash, "-lc", 'cygpath -w "$1"', "--", receipt_text],
+            text=True,
+        ).strip()
+    receipt = Path(receipt_text)
     payload = json.loads(receipt.read_text(encoding="utf-8"))
     assert payload["component_pins"] == {"example": pin}
 
