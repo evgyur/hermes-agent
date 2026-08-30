@@ -36,6 +36,14 @@ EXTENSIONS = {
     "shared_screen_with_gallery_view": ".mp4",
     "active_speaker": ".mp4",
 }
+SAFE_EXT = {
+    "TRANSCRIPT": ".vtt",
+    "SUMMARY": ".json",
+    "TIMELINE": ".json",
+    "CHAT": ".txt",
+    "M4A": ".m4a",
+    "MP4": ".mp4",
+}
 
 
 def load_env(path: Path) -> None:
@@ -119,7 +127,34 @@ def canonical_share(url: str) -> str:
     return url.split("?", 1)[0].rstrip("/")
 
 
-def select_meeting(meetings: list[dict[str, Any]], share_url: str | None, topic: str | None) -> dict[str, Any]:
+def select_meeting(
+    meetings: list[dict[str, Any]],
+    share_url: str | None = None,
+    topic: str | None = None,
+    *,
+    latest: bool | None = None,
+) -> dict[str, Any]:
+    """Select a recording without silently substituting another meeting.
+
+    `latest is None` is the canonical share-URL/topic API. Supplying `latest`
+    activates the legacy exact-meeting-id contract retained for older bots.
+    """
+    if latest is not None:
+        meeting_id = re.sub(r"\D+", "", share_url or "")
+        candidates = meetings
+        if meeting_id:
+            candidates = [
+                item
+                for item in meetings
+                if re.sub(r"\D+", "", str(item.get("id") or "")) == meeting_id
+            ]
+        if not candidates:
+            raise RuntimeError("no matching finalized Zoom cloud recording found")
+        candidates = sorted(candidates, key=lambda item: item.get("start_time") or "", reverse=True)
+        if not latest and not meeting_id and len(candidates) > 1:
+            raise RuntimeError("multiple recordings found; pass an exact meeting id or latest=True")
+        return candidates[0]
+
     selected = meetings
     if share_url:
         wanted = canonical_share(share_url)
@@ -136,6 +171,15 @@ def select_meeting(meetings: list[dict[str, Any]], share_url: str | None, topic:
     return selected[0]
 
 
+def safe_filename(index: int, item: dict[str, Any]) -> str:
+    """Build a deterministic artifact filename without provider URLs or secrets."""
+    file_type = str(item.get("file_type") or "FILE").upper()
+    recording_type = re.sub(
+        r"[^a-z0-9]+", "-", str(item.get("recording_type") or "artifact").lower()
+    ).strip("-")
+    return f"{index:02d}-{recording_type}-{file_type.lower()}{SAFE_EXT.get(file_type, '.bin')}"
+
+
 def private_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     path.chmod(stat.S_IRWXU)
@@ -150,10 +194,14 @@ def download(token: str, url: str, target: Path) -> dict[str, Any]:
     return {"path": str(target), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def vtt_to_txt(source: Path, target: Path, meeting: dict[str, Any]) -> dict[str, Any]:
+def vtt_to_txt(
+    source: Path,
+    target: Path,
+    meeting: dict[str, Any] | None = None,
+) -> dict[str, Any] | int:
     text = source.read_text(errors="replace")
     blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n"))
-    cues: list[str] = []
+    cues: list[tuple[str, str]] = []
     for block in blocks:
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if not lines or lines[0] == "WEBVTT":
@@ -166,11 +214,24 @@ def vtt_to_txt(source: Path, target: Path, meeting: dict[str, Any]) -> dict[str,
         if not body:
             continue
         start = timing.split("-->", 1)[0].strip().split(".", 1)[0]
+        cues.append((start, body))
+
+    if meeting is None:
+        # Compatibility ABI used by already-shipped Human20Bot tests/callers.
+        target.write_text(
+            "\n".join(f"[{start}] {body}" for start, body in cues) + "\n",
+            encoding="utf-8",
+        )
+        target.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        return len(cues)
+
+    formatted: list[str] = []
+    for start, body in cues:
         match = re.match(r"([^:]{1,80}):\s*(.*)", body)
         if match:
-            cues.append(f"[{start}] {match.group(1).strip()}:\n{match.group(2).strip()}")
+            formatted.append(f"[{start}] {match.group(1).strip()}:\n{match.group(2).strip()}")
         else:
-            cues.append(f"[{start}]\n{body}")
+            formatted.append(f"[{start}]\n{body}")
     header = (
         "Автоматическая транскрипция Zoom\n"
         f"Тема: {meeting.get('topic') or ''}\n"
@@ -178,10 +239,10 @@ def vtt_to_txt(source: Path, target: Path, meeting: dict[str, Any]) -> dict[str,
         f"Длительность: {meeting.get('duration') or ''} минут\n"
         "Источник: Zoom audio_transcript; распознавание может содержать ошибки.\n\n"
     )
-    target.write_text(header + "\n\n".join(cues) + "\n", encoding="utf-8")
+    target.write_text(header + "\n\n".join(formatted) + "\n", encoding="utf-8")
     target.chmod(stat.S_IRUSR | stat.S_IWUSR)
     data = target.read_bytes()
-    return {"path": str(target), "cues": len(cues), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    return {"path": str(target), "cues": len(formatted), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def main() -> None:

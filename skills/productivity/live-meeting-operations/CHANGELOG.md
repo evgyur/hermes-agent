@@ -2,6 +2,12 @@
 
 All notable changes to the canonical Human20 meeting skill are recorded here.
 
+## 3.0.1 — 2026-08-30
+
+- Preserved the deployed Human20Bot Zoom helper ABI while keeping the newer share-URL/topic API.
+- Restored exact-meeting-id fail-closed selection, deterministic safe filenames, and legacy VTT conversion compatibility.
+- Added the compatibility recovery reference and exact regression-guard markers used by Human20Bot.
+
 ## 3.0.0 — 2026-08-30
 
 - Established `human20team/human20-meeting-operations` as the canonical exact-commit source for all Human20 meeting agents and bots.

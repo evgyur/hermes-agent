@@ -2,9 +2,9 @@
   "schema": 1,
   "name": "live-meeting-operations",
   "source_repo": "human20team/human20-meeting-operations",
-  "source_commit": "478d1afa3c92b5fe0882375b4611e2c33302e915",
-  "source_tree": "cb277fcf050ff837658ff4d80d3a373e3f42e92d",
-  "version": "3.0.0",
+  "source_commit": "7dc655f366800f19415a9ab7d345cd298ad09358",
+  "source_tree": "77dfe1876b4b84f63c4cdfe0ab2cbfed64452be8",
+  "version": "3.0.1",
   "entries": [
     {
       "path": ".gitignore",
@@ -12,15 +12,15 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "195c9a0316c2a394ac9969f7f35a481e7f2a8703eb605b9d1c07a98ad56aea3c"
+      "sha256": "9a7e56f7c03001e6d45bba0b75f8bfff7880452c7470233c3999276bb8e299f5"
     },
     {
       "path": "SKILL.md",
-      "sha256": "a42288d4413601df39f45cb91d966d465394e5fb6e2816597dc8c2db84552cdf"
+      "sha256": "1aab380c233c4d8f693b999faee91e688058009fac7e7489b672f08875825bf5"
     },
     {
       "path": "VERSION",
-      "sha256": "2985be8b28d3ade858e8d8fb4bc22f565b1bf6020dff982dce141f7721b9999c"
+      "sha256": "06e3fe4a7a1884d20d81cc7065ca8cfd4c394ec602c4d180ddc39bbd4f7da521"
     },
     {
       "path": "references/agenda-realtime-facilitator.md",
@@ -63,6 +63,10 @@
       "sha256": "dfb33b4439ce3996a0c2271ad44c198db2da202dde1d2b6853a59295d5f2d46d"
     },
     {
+      "path": "references/zoom-cloud-artifact-recovery.md",
+      "sha256": "d728441e889375b86590be80d94aedf8f2f8ea73c698de77eb9af455c79494de"
+    },
+    {
       "path": "references/zoom-cloud-artifacts.md",
       "sha256": "0e5791400c1ea0fa34d09ea4fa5db5af48bd3ebba3827cf5571905847c232b55"
     },
@@ -100,7 +104,7 @@
     },
     {
       "path": "scripts/zoom_cloud_artifacts.py",
-      "sha256": "beee51971a60d5eee216cf8c0e707e402ed4fd6181ac896c91b194a024606c35"
+      "sha256": "b2d094d1ecf86dd3760b616a998bb8d877f63e2f0beb183595478ce01cfe4d0a"
     },
     {
       "path": "templates/sigurd-gpt-meet@.service",
@@ -109,6 +113,10 @@
     {
       "path": "templates/sigurd-gpt-voice@.service",
       "sha256": "6bb750f2949899d2fd34857c744749aca925dcc8dd73b3de5109cb245712520b"
+    },
+    {
+      "path": "tests/test_zoom_cloud_artifacts.py",
+      "sha256": "0115d1f3459ef508fea7f55f691b803a068f0adea59c418fd07fc239f162b3e8"
     }
   ]
 }

@@ -1,7 +1,7 @@
 ---
 name: live-meeting-operations
 description: "Use for every Zoom or Google Meet call/webinar lifecycle: plan, create, join, host, speak, facilitate, record, retrieve, transcribe, summarize, assign owners, and hand off to Kanban. This is the single canonical meeting root for all Human20 agents and bots; related meeting skills are subordinate adapters, never parallel lifecycles."
-version: 3.0.0
+version: 3.0.1
 author: Human20Team
 license: Proprietary
 metadata:
@@ -21,7 +21,7 @@ Use when any Human20 agent or bot must plan, create, join, host, facilitate, rec
 
 ## Canonical Human20 governance
 
-This repository is the **single source of truth** for meeting behavior across Human20 Hermes agents and bots. Load this root first for every meeting/webinar request. Provider plugins and specialist skills may supply adapters, but they never own a second lifecycle or a conflicting completion state.
+This repository contains the **single canonical Human20 skill** for meeting behavior across Human20 Hermes agents and bots. Load this root first for every meeting/webinar request. Provider plugins and specialist skills may supply adapters, but they never own a second lifecycle or a conflicting completion state.
 
 1. Canonical source: `human20team/human20-meeting-operations`, branch `main`, exact commit SHA.
 2. Consumers install an exact canonical archive and persist a source receipt containing repository, commit, tree SHA, and per-file hashes. Floating/manual copies are non-compliant.
@@ -111,7 +111,9 @@ This is the single canonical Zoom root. It owns the whole lifecycle:
 4. deliver transcript, summary, decisions, owners, and deadlines;
 5. hand approved tasks to Team20 Kanban with duplicate search and readback.
 
-Do not route a post-call request to a browser password form before checking configured Zoom Server-to-Server OAuth. Do not stop after downloading a file when the user asked for synthesis or Kanban actions. For the exact API workflow and deterministic helper, load [`references/zoom-cloud-artifacts.md`](references/zoom-cloud-artifacts.md).
+#### Zoom cloud artifact recovery gate
+
+Do not route a post-call request to a browser password form before checking configured Zoom Server-to-Server OAuth. Do not stop after downloading a file when the user asked for synthesis or Kanban actions. The legacy reference name [`references/zoom-cloud-artifact-recovery.md`](references/zoom-cloud-artifact-recovery.md) is a compatibility pointer; the canonical workflow is [`references/zoom-cloud-artifacts.md`](references/zoom-cloud-artifacts.md).
 
 ## Workflow
 
