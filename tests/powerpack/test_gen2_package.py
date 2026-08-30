@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.5"
+    assert manifest["version"] == "2.3.6"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [

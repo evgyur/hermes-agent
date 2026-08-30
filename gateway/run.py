@@ -21578,7 +21578,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             drain_command = event.get_command()
             if drain_command == "restart":
                 return "⏳ Gateway restart is already in progress."
-            if drain_command not in {"status", "context", "help", "whoami"}:
+            if drain_command not in {
+                "status",
+                "context",
+                "help",
+                "whoami",
+                "stop",
+            }:
                 return await self._admit_planned_restart_event(
                     event,
                     self._session_key_for_source(source),

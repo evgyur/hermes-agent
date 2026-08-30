@@ -136,6 +136,45 @@ async def test_authorized_telegram_input_is_committed_during_external_planned_re
 
 
 @pytest.mark.asyncio
+async def test_stop_bypasses_planned_drain_inbox_after_active_turn_clears(
+    monkeypatch, tmp_path
+):
+    """A late /stop remains control traffic after the busy owner disappears."""
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    db = SessionDB(tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    runner._draining = True
+    runner._restart_requested = True
+    runner._handle_stop_command = AsyncMock(return_value="No active task to stop.")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="12345",
+        user_id="42",
+        message_id="702",
+        profile="main",
+        transport_profile="default",
+    )
+    event = MessageEvent(
+        text="/stop@hermes_test_bot",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(message_id=702),
+        message_id="702",
+    )
+    try:
+        response = await runner._handle_message(event)
+
+        assert response == "No active task to stop."
+        runner._handle_stop_command.assert_awaited_once_with(event)
+        assert await runner._session_db.list_gateway_drain_inbox_ready() == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_planned_quiesce_waits_for_handler_created_batch():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test"))
     order = []
