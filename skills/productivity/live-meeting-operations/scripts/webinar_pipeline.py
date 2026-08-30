@@ -356,7 +356,7 @@ def finalize(args: argparse.Namespace) -> int:
     state = _load_json(state_path)
     media = Path((state.get("capture") or {}).get("media_path") or "")
     package_dir = Path(args.package_dir)
-    package_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    package_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     recording_receipt = package_dir.parent / f".{package_dir.name}.recording-receipt.json"
 
     # Phase 1 intentionally precedes the synthesis lease.

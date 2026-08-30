@@ -91,6 +91,7 @@ class WebinarPipelineTests(unittest.TestCase):
             self.assertEqual(state["phases"]["recording_integrity"], "VERIFIED")
             self.assertNotEqual(state["status"], "RECORDING_MISSING")
             self.assertTrue(Path(state["recording"]["receipt_path"]).is_file())
+            self.assertFalse(Path(args.package_dir).exists())
 
     def test_resume_builds_complete_private_package_with_semantic_dates(self):
         with tempfile.TemporaryDirectory() as tmp:

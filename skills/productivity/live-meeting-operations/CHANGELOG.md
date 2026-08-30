@@ -2,6 +2,10 @@
 
 All notable changes to the canonical Human20 meeting skill are recorded here.
 
+## 4.1.2 — 2026-08-30
+
+- Kept the canonical package path absent while finalization is deferred; only the recording receipt and durable state exist until package completion.
+
 ## 4.1.1 — 2026-08-30
 
 - Included the preflight/live capture receipt in the canonical private package whenever the state machine has one.
