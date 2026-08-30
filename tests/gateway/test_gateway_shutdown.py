@@ -149,6 +149,85 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_drains_deferred_compression_before_session_db_close():
+    """A detached compressor must finish before shutdown closes SessionDB."""
+    runner, adapter = make_restart_runner()
+    order: list[str] = []
+    adapter.disconnect = AsyncMock()
+
+    async def _drain_deferred():
+        order.append("deferred-drain")
+        return True
+
+    runner._drain_deferred_agent_cleanup_tasks = AsyncMock(
+        side_effect=_drain_deferred
+    )
+
+    session_db = MagicMock()
+    session_db.close.side_effect = lambda: order.append("session-db-close")
+    runner._session_db = MagicMock()
+    runner._session_db._db = session_db
+    runner.session_store._db = None
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    runner._drain_deferred_agent_cleanup_tasks.assert_awaited_once()
+    assert order.index("deferred-drain") < order.index("session-db-close"), order
+
+
+@pytest.mark.asyncio
+async def test_deferred_compression_drain_waits_for_worker_completion():
+    """The lifecycle helper consumes a late worker before reporting safe close."""
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    released = asyncio.Event()
+    finished: list[str] = []
+
+    async def _worker():
+        await released.wait()
+        finished.append("write-complete")
+
+    task = asyncio.create_task(_worker())
+    runner._deferred_agent_cleanup_tasks = {task}
+    released.set()
+
+    drained = await runner._drain_deferred_agent_cleanup_tasks()
+
+    assert drained is True
+    assert task.done()
+    assert finished == ["write-complete"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_keeps_clients_and_db_open_when_deferred_worker_is_live():
+    """A bounded drain miss must not invalidate resources under a live worker."""
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._drain_deferred_agent_cleanup_tasks = AsyncMock(return_value=False)
+
+    session_db = MagicMock()
+    store_db = MagicMock()
+    runner._session_db = MagicMock()
+    runner._session_db._db = session_db
+    runner.session_store._db = store_db
+    runner.session_store.close_all_db_handles = MagicMock()
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients") as close_clients,
+    ):
+        await runner.stop()
+
+    close_clients.assert_not_called()
+    session_db.close.assert_not_called()
+    store_db.close.assert_not_called()
+    runner.session_store.close_all_db_handles.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
@@ -363,4 +442,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-

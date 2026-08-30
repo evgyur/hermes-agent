@@ -12950,6 +12950,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    async def _drain_deferred_agent_cleanup_tasks(self) -> bool:
+        """Wait for detached agent workers before SessionDB handles close."""
+        tasks = {
+            task
+            for task in getattr(self, "_deferred_agent_cleanup_tasks", set())
+            if not task.done()
+        }
+        if not tasks:
+            return True
+
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(float(getattr(self, "_CLEANUP_TIMEOUT_S", 30.0)), 0.0),
+        )
+        for task in done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("Deferred agent cleanup finished with an error: %s", exc)
+        if pending:
+            logger.warning(
+                "Shutdown left %d deferred agent worker(s) pending; "
+                "SessionDB handles will remain open until process exit",
+                len(pending),
+            )
+            return False
+        return True
+
     # Bounded budget for one finalize_session() dispatch (plugin
     # on_session_finalize hooks + core Relay conversation close). Generous
     # enough for a normal trace-export flush, small enough that a wedged
@@ -18864,6 +18894,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            # A timed-out compressor may still be finishing in its executor
+            # thread. Join its strongly-held cleanup task before invalidating
+            # clients or SQLite handles underneath it.
+            _deferred_cleanup_drained = True
+            _drain_deferred = getattr(
+                self, "_drain_deferred_agent_cleanup_tasks", None
+            )
+            if callable(_drain_deferred):
+                _deferred_cleanup_drained = await _drain_deferred()
+
             # Reap the process-global auxiliary-client cache once at the very
             # end of teardown.  Per-turn cleanup runs in _cleanup_agent_resources
             # for each active agent, but clients bound to worker-thread loops
@@ -18871,11 +18911,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # get swept here.  Without this, long-running gateways accumulate
             # async httpx transports until they hit EMFILE on macOS's default
             # RLIMIT_NOFILE=256.  See #14210.
-            try:
-                from agent.auxiliary_client import shutdown_cached_clients
-                shutdown_cached_clients()
-            except Exception as _e:
-                logger.debug("shutdown_cached_clients error: %s", _e)
+            if _deferred_cleanup_drained:
+                try:
+                    from agent.auxiliary_client import shutdown_cached_clients
+                    shutdown_cached_clients()
+                except Exception as _e:
+                    logger.debug("shutdown_cached_clients error: %s", _e)
+            else:
+                logger.warning(
+                    "Skipping auxiliary-client and SessionDB teardown while "
+                    "deferred agent workers are still live"
+                )
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -18886,7 +18932,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
             _self_db = getattr(self, "_session_db", None)
             _self_db = getattr(_self_db, "_db", _self_db)
+            if not _deferred_cleanup_drained:
+                _self_db = None
             for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
+                if not _deferred_cleanup_drained:
+                    break
                 if _db is None or not hasattr(_db, "close"):
                     continue
                 try:
@@ -18898,8 +18948,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # for the shutdown task's own (root) scope. Sweep the rest so
             # secondary profiles' WAL locks are released before --replace
             # brings a new gateway up on the same files.
-            _sweep = getattr(
-                getattr(self, "session_store", None), "close_all_db_handles", None
+            _sweep = (
+                getattr(
+                    getattr(self, "session_store", None),
+                    "close_all_db_handles",
+                    None,
+                )
+                if _deferred_cleanup_drained
+                else None
             )
             if _sweep is not None:
                 try:
@@ -18908,10 +18964,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("SessionDB handle sweep error: %s", _e)
             # Same sweep for the runner's own per-profile session_search
             # handles (slash commands resolve them under profile scopes).
-            try:
-                GatewayRunner.close_all_session_db_handles(self)
-            except Exception as _e:
-                logger.debug("Runner SessionDB handle sweep error: %s", _e)
+            if _deferred_cleanup_drained:
+                try:
+                    GatewayRunner.close_all_session_db_handles(self)
+                except Exception as _e:
+                    logger.debug("Runner SessionDB handle sweep error: %s", _e)
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
