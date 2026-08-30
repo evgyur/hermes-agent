@@ -58,11 +58,11 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.34` is based on upstream
+Powerpack `0.21.35` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.34` enters the durable restart path immediately instead of
+Release `0.21.35` enters the durable restart path immediately instead of
 waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
 turns are checkpointed before interruption; cron work retains its bounded
 30-second drain. The installer now arms and verifies the lossless Telegram
@@ -71,6 +71,9 @@ starting the replacement process. `/stop` remains an immediate control-plane
 command during drain and is never replayed as post-restart work. Powerpack
 Doctor now rejects a live service whose inherited `PYTHONPATH` loads Hermes
 from a different checkout, while keeping environment values out of evidence.
+It also requires the gateway's `VIRTUAL_ENV` and first `PATH` entry to identify
+the same candidate venv, so child tool commands cannot fall back to an older or
+system Python after a runtime cutover.
 The release also pins the HEL1 `hermesdev` exact-topic checkpoint, scoped H20
 Keys Groq STT transport, and no-repeat Jyotish rectification intake to one
 verified server-doctor commit. The installer records these pins in its receipt

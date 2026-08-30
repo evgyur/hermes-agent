@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.7"
+    assert manifest["version"] == "2.3.8"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
@@ -189,6 +189,16 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
             "values_exposed": False,
         },
     )
+    monkeypatch.setattr(
+        doctor,
+        "_process_runtime_env_report",
+        lambda *_args, **_kwargs: {
+            "status": "PASS",
+            "virtual_env_exact": True,
+            "venv_bin_first": True,
+            "values_exposed": False,
+        },
+    )
 
     report = doctor.run_doctor(
         root=PACKAGE_ROOT,
@@ -212,6 +222,7 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
     assert checks["host_deleted_state_handles"]["status"] == "PASS"
     assert checks["host_operational_config"]["status"] == "PASS"
     assert checks["host_pythonpath_identity"]["status"] == "PASS"
+    assert checks["host_runtime_env_identity"]["status"] == "PASS"
 
 
 def test_service_failure_policy_requires_upstream_restart_contract():
@@ -272,6 +283,36 @@ def test_pythonpath_identity_accepts_empty_or_candidate_scoped_value(tmp_path):
     assert empty["status"] == "PASS"
     assert scoped["status"] == "PASS"
     assert scoped["outside_candidate_count"] == 0
+
+
+def test_runtime_env_identity_requires_exact_candidate_venv_first_on_path(tmp_path):
+    del tmp_path
+    venv = Path("/srv/hermes-candidate/venv")
+
+    stale = doctor._runtime_env_identity_report(
+        b"VIRTUAL_ENV=/srv/hermes-old/venv\0PATH=/usr/bin:/bin\0",
+        expected_venv=venv,
+        path_separator=":",
+    )
+    exact = doctor._runtime_env_identity_report(
+        f"VIRTUAL_ENV={venv}\0PATH={venv / 'bin'}:/usr/bin:/bin\0".encode(),
+        expected_venv=venv,
+        path_separator=":",
+    )
+
+    assert stale == {
+        "status": "FAIL",
+        "virtual_env_exact": False,
+        "venv_bin_first": False,
+        "values_exposed": False,
+    }
+    assert exact == {
+        "status": "PASS",
+        "virtual_env_exact": True,
+        "venv_bin_first": True,
+        "values_exposed": False,
+    }
+    assert "/srv/hermes-old" not in json.dumps(stale)
 
 
 def test_gen2_credentials_require_perplexity_only_when_selected(monkeypatch):

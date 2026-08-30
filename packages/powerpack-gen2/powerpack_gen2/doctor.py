@@ -354,6 +354,64 @@ def _process_pythonpath_report(
     )
 
 
+def _runtime_env_identity_report(
+    raw_environment: bytes,
+    *,
+    expected_venv: Path,
+    path_separator: str = os.pathsep,
+) -> dict[str, Any]:
+    """Prove child tool processes inherit the same venv as the gateway.
+
+    Only booleans are returned: service environments can contain secrets and
+    must never be copied into doctor receipts.
+    """
+
+    values: dict[bytes, bytes] = {}
+    for row in raw_environment.split(b"\0"):
+        if b"=" not in row:
+            continue
+        key, value = row.split(b"=", 1)
+        if key in {b"VIRTUAL_ENV", b"PATH"}:
+            values[key] = value
+
+    expected_venv = expected_venv.resolve()
+    expected_bin = (expected_venv / "bin").resolve()
+    try:
+        configured_venv = Path(os.fsdecode(values.get(b"VIRTUAL_ENV", b""))).resolve()
+    except OSError:
+        configured_venv = Path()
+    path_entries = [
+        Path(item).resolve()
+        for item in os.fsdecode(values.get(b"PATH", b"")).split(path_separator)
+        if item
+    ]
+    virtual_env_exact = configured_venv == expected_venv
+    venv_bin_first = bool(path_entries) and path_entries[0] == expected_bin
+    return {
+        "status": "PASS" if virtual_env_exact and venv_bin_first else "FAIL",
+        "virtual_env_exact": virtual_env_exact,
+        "venv_bin_first": venv_bin_first,
+        "values_exposed": False,
+    }
+
+
+def _process_runtime_env_report(pid: int, *, expected_venv: Path) -> dict[str, Any]:
+    try:
+        raw_environment = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {
+            "status": "FAIL",
+            "virtual_env_exact": False,
+            "venv_bin_first": False,
+            "values_exposed": False,
+            "readable": False,
+        }
+    return _runtime_env_identity_report(
+        raw_environment,
+        expected_venv=expected_venv,
+    )
+
+
 def _exit_status_contains(raw: str, expected: int) -> bool:
     tokens = {part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()}
     return str(expected) in tokens
@@ -655,6 +713,10 @@ def run_doctor(
             repository=repository,
             process_cwd=Path(process_cwd) if isinstance(process_cwd, str) else repository,
         )
+        runtime_env_identity = _process_runtime_env_report(
+            int(process.get("pid") or 0),
+            expected_venv=venv,
+        )
         process_identity_ok = process_identity["status"] == "PASS"
         host_report = {
             "repository": git_report,
@@ -674,6 +736,7 @@ def run_doctor(
             "process_identity_ok": process_identity_ok,
             "process_identity": process_identity,
             "pythonpath_identity": pythonpath_identity,
+            "runtime_env_identity": runtime_env_identity,
         }
         _check(checks, "host_repository_clean", git_report["clean"], required=mode == "gen2_only", evidence=git_report)
         _check(
@@ -702,6 +765,13 @@ def run_doctor(
             pythonpath_identity["status"] == "PASS",
             required=mode == "gen2_only",
             evidence=pythonpath_identity,
+        )
+        _check(
+            checks,
+            "host_runtime_env_identity",
+            runtime_env_identity["status"] == "PASS",
+            required=mode == "gen2_only",
+            evidence=runtime_env_identity,
         )
         _check(checks, "host_venv_ownership", venv_owner == expected_uid, evidence=host_report["venv"])
         _check(
