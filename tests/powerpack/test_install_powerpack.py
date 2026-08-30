@@ -6,12 +6,27 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tomllib
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install-powerpack.sh"
+
+
+def test_project_version_matches_locked_root_package():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    root_packages = [
+        package
+        for package in lock["package"]
+        if package["name"] == project["project"]["name"]
+        and package.get("source") == {"editable": "."}
+    ]
+
+    assert len(root_packages) == 1
+    assert root_packages[0]["version"] == project["project"]["version"]
 
 
 def test_locked_sync_preserves_the_configured_messaging_runtime():
