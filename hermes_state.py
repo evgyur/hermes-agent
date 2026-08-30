@@ -13686,6 +13686,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_gateway_user_authority_by_platform_id(
+        self,
+        session_id: str,
+        platform_message_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one indexed durable user authority row for transport dedupe.
+
+        The caller needs the sealed raw semantic envelope and whether the
+        original turn already wrote any downstream row.  Keeping this lookup
+        here avoids loading a long transcript merely to classify one Telegram
+        redelivery after reconnect.
+        """
+        if not session_id:
+            raise ValueError("session_id is required")
+        if (
+            type(platform_message_id) is not str
+            or not platform_message_id.strip()
+            or platform_message_id != platform_message_id.strip()
+        ):
+            raise ValueError("platform_message_id must be an exact non-empty string")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, display_kind, display_metadata, "
+                "platform_message_id FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "AND platform_message_id = ? ORDER BY id",
+                (session_id, platform_message_id),
+            ).fetchall()
+            if len(rows) > 1:
+                raise RuntimeError(
+                    "duplicate durable gateway authority rows are ambiguous"
+                )
+            if not rows:
+                return None
+            row = rows[0]
+            downstream = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 "
+                "AND id > ? LIMIT 1",
+                (session_id, int(row["id"])),
+            ).fetchone()
+            return {
+                "id": int(row["id"]),
+                "content": self._decode_content(row["content"]),
+                "display_kind": row["display_kind"],
+                "display_metadata": self._decode_display_metadata(
+                    row["display_metadata"]
+                ),
+                "platform_message_id": str(row["platform_message_id"]),
+                "has_downstream": downstream is not None,
+            }
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

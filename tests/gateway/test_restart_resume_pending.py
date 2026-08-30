@@ -3287,6 +3287,75 @@ async def test_terminal_telegram_redelivery_is_dropped_from_startup_queue():
     assert runner._startup_restore_queue == []
 
 
+@pytest.mark.asyncio
+async def test_completed_telegram_redelivery_after_startup_drops_when_reply_quote_is_missing():
+    """Live 24113 shape: Telegram may omit the hydrated quote after reconnect."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="-1003770669948",
+        chat_type="group",
+        thread_id="5585",
+        message_id="24113",
+    )
+    entry = SessionEntry(
+        session_key=runner._session_key_for_source(source),
+        session_id="20260816_130737_834c6ee7",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    durable_quote = "The publisher cannot replace media."
+    runner._session_db = MagicMock()
+    runner._session_db.get_gateway_user_authority_by_platform_id = AsyncMock(
+        return_value={
+            "id": 326301,
+            "platform_message_id": "24113",
+            "content": (
+                f'[Replying to: "{durable_quote}"]\n\n'
+                "through telegram=chip everything is possible"
+            ),
+            "display_kind": None,
+            "display_metadata": {
+                "gateway_raw_semantic_v1": {
+                    "version": 1,
+                    "message_type": "text",
+                    "reply": {
+                        "message_id": "24112",
+                        "is_own": False,
+                        "quote": durable_quote,
+                    },
+                    "media": [],
+                }
+            },
+            "has_downstream": True,
+        }
+    )
+    redelivery = MessageEvent(
+        text="through telegram=chip everything is possible",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="24113",
+        reply_to_message_id="24112",
+        reply_to_text=None,
+        reply_to_is_own_message=False,
+    )
+
+    assert await runner._is_completed_durable_telegram_redelivery(
+        redelivery,
+        entry,
+        "24113",
+    ) is True
+
+    altered = replace(redelivery, text="different edited content")
+    assert await runner._is_completed_durable_telegram_redelivery(
+        altered,
+        entry,
+        "24113",
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

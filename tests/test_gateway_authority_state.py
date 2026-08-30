@@ -82,6 +82,63 @@ def test_gateway_authority_user_row_reuses_only_exact_unfinished_tail(tmp_path):
         db.close()
 
 
+def test_gateway_authority_lookup_returns_completed_transport_row(tmp_path):
+    """The indexed lookup exposes one completed row without scanning history."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "completed-transport-redelivery"
+        holder = "pid=1:completed-transport-redelivery"
+        raw_semantics = {
+            "gateway_raw_semantic_v1": {
+                "version": 1,
+                "message_type": "text",
+                "reply": {
+                    "message_id": "24112",
+                    "is_own": False,
+                    "quote": "Original assistant reply",
+                },
+                "media": [],
+            }
+        }
+        db.create_session(session_id, source="telegram")
+        assert db.acquire_session_turn_lease(session_id, holder, wait_seconds=0.1)
+        inserted = db.append_or_reuse_gateway_user_authority(
+            session_id,
+            content="through telegram=chip everything is possible",
+            platform_message_id="24113",
+            display_metadata=raw_semantics,
+            turn_lease_holder=holder,
+        )
+        db.enrich_gateway_user_authority(
+            session_id,
+            inserted.row_id,
+            content=(
+                '[Replying to: "Original assistant reply"]\n\n'
+                "through telegram=chip everything is possible"
+            ),
+            platform_message_id="24113",
+            turn_lease_holder=holder,
+        )
+        db.append_message(
+            session_id,
+            "assistant",
+            "done",
+            turn_lease_holder=holder,
+        )
+
+        row = db.get_gateway_user_authority_by_platform_id(
+            session_id,
+            "24113",
+        )
+
+        assert row is not None
+        assert row["platform_message_id"] == "24113"
+        assert row["has_downstream"] is True
+        assert row["display_metadata"] == raw_semantics
+    finally:
+        db.close()
+
+
 def test_internal_gateway_authority_survives_compaction_without_platform_id(
     tmp_path,
 ):

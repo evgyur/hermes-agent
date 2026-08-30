@@ -15149,11 +15149,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             incoming_envelope = cls._gateway_raw_semantic_envelope(event)
         except (TypeError, ValueError):
             return False
-        if durable_envelope != incoming_envelope:
+        if any(
+            durable_envelope.get(key) != incoming_envelope.get(key)
+            for key in ("version", "message_type", "media")
+        ):
             return False
 
+        durable_reply = durable_envelope.get("reply")
+        incoming_reply = incoming_envelope.get("reply")
+        if durable_reply != incoming_reply:
+            # Telegram can redeliver an already processed direct reply after a
+            # reconnect without hydrating reply_to_message.text.  The current
+            # message id/body are still immutable; accept only the same sealed
+            # reply target.  A different target or edited body remains RED.
+            if not isinstance(durable_reply, dict):
+                return False
+            durable_reply_id = durable_reply.get("message_id")
+            if isinstance(incoming_reply, dict):
+                incoming_reply_id = incoming_reply.get("message_id")
+            else:
+                if getattr(event, "reply_to_text", None) not in (None, ""):
+                    return False
+                incoming_reply_id = getattr(event, "reply_to_message_id", None)
+            if (
+                type(durable_reply_id) is not str
+                or incoming_reply_id != durable_reply_id
+            ):
+                return False
+
         expected_content = event.text
-        reply = durable_envelope.get("reply")
+        reply = durable_reply
         if isinstance(reply, dict):
             label = (
                 "Replying to your previous message"
@@ -15174,6 +15199,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and media
             and expected_content
             and durable_content.endswith(f"\n\n{expected_content}")
+        )
+
+    async def _is_completed_durable_telegram_redelivery(
+        self,
+        event: "MessageEvent",
+        session_entry: SessionEntry,
+        platform_message_id: str,
+    ) -> bool:
+        """Drop one completed Telegram transport retry before turn admission."""
+        source = getattr(event, "source", None)
+        if (
+            getattr(source, "platform", None) != Platform.TELEGRAM
+            or bool(getattr(event, "internal", False))
+            or bool(getattr(event, "startup_resume", False))
+        ):
+            return False
+        try:
+            row = await self._await_db_call(
+                self._session_db,
+                "get_gateway_user_authority_by_platform_id",
+                session_entry.session_id,
+                platform_message_id,
+            )
+        except Exception:
+            logger.warning(
+                "Completed Telegram redelivery lookup failed for %s",
+                session_entry.session_key,
+                exc_info=True,
+            )
+            return False
+        return bool(
+            isinstance(row, dict)
+            and row.get("platform_message_id") == platform_message_id
+            and row.get("has_downstream") is True
+            and self._startup_redelivery_matches_durable_row(event, row)
         )
 
     @staticmethod
@@ -25300,6 +25360,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "Refusing external turn %s without a platform message id",
                 session_entry.session_key,
+            )
+            return
+        if (
+            triggering_platform_message_id is not None
+            and await self._is_completed_durable_telegram_redelivery(
+                event,
+                session_entry,
+                triggering_platform_message_id,
+            )
+        ):
+            logger.info(
+                "Dropping completed Telegram transport redelivery: "
+                "session=%s message_id=%s",
+                session_entry.session_key,
+                triggering_platform_message_id,
             )
             return
         if not await self._mark_durable_active_turn(
