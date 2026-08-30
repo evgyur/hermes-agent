@@ -3368,6 +3368,61 @@ async def test_completed_telegram_redelivery_after_startup_drops_when_reply_quot
     ) is False
 
 
+@pytest.mark.asyncio
+async def test_completed_legacy_plain_dm_redelivery_without_semantic_metadata_drops():
+    """Live 8117 shape predates raw-envelope persistence but is unambiguous."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="242077174",
+        chat_type="private",
+        thread_id=None,
+        message_id="8117",
+    )
+    entry = SessionEntry(
+        session_key=runner._session_key_for_source(source),
+        session_id="20260830_131151_649c0e04",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+    )
+    runner._session_db = MagicMock()
+    runner._session_db.get_gateway_user_authority_by_platform_id = AsyncMock(
+        return_value={
+            "id": 325631,
+            "platform_message_id": "8117",
+            "content": "Are you there?",
+            "display_kind": None,
+            "display_metadata": None,
+            "has_downstream": True,
+        }
+    )
+    redelivery = MessageEvent(
+        text="Are you there?",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="8117",
+    )
+
+    assert await runner._is_completed_durable_telegram_redelivery(
+        redelivery,
+        entry,
+        "8117",
+    ) is True
+
+    assert await runner._is_completed_durable_telegram_redelivery(
+        replace(redelivery, text="edited text"),
+        entry,
+        "8117",
+    ) is False
+    assert await runner._is_completed_durable_telegram_redelivery(
+        replace(redelivery, reply_to_message_id="8116"),
+        entry,
+        "8117",
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

@@ -15141,7 +15141,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         metadata = row.get("display_metadata")
         if not isinstance(metadata, dict):
-            return False
+            # Pre-envelope Powerpack rows exist in long-lived sessions.  Only
+            # the narrow legacy plain-text shape is recoverable without
+            # semantic metadata: exact completed route/message/body, no reply,
+            # no media, and no special display provenance.  Anything richer
+            # remains fail-closed.
+            return bool(
+                metadata is None
+                and row.get("display_kind") is None
+                and getattr(event, "message_type", None) == MessageType.TEXT
+                and row.get("content") == event.text
+                and getattr(event, "reply_to_message_id", None) is None
+                and getattr(event, "reply_to_text", None) in (None, "")
+                and not (getattr(event, "media_urls", None) or [])
+                and not (getattr(event, "media_types", None) or [])
+            )
         durable_envelope = metadata.get(_GATEWAY_RAW_SEMANTIC_ENVELOPE_KEY)
         if not isinstance(durable_envelope, dict):
             return False

@@ -58,11 +58,11 @@ configured in Hermes, installing Powerpack does not replace or re-authorize it.
 
 ## Release identity
 
-Powerpack `0.21.28` is based on upstream
+Powerpack `0.21.29` is based on upstream
 `c30ac90a92097058ddd6f9db3fa2e3182a7bfdcc`. The exact release commit is shown
 by the installer's dry-run and pinned in the resulting receipt.
 
-Release `0.21.28` enters the durable restart path immediately instead of
+Release `0.21.29` enters the durable restart path immediately instead of
 waiting up to 30 minutes for an autonomous turn to finish. Active Telegram/API
 turns are checkpointed before interruption; cron work retains its bounded
 30-second drain. The installer now arms and verifies the lossless Telegram
@@ -99,6 +99,11 @@ The same dedupe also accepts the already-rendered durable reply prefix when a
 post-start queue replays it without Telegram's original reply object. This is
 still bounded to a completed row with the exact route and platform message ID;
 an explicit different reply target remains rejected.
+
+Long-lived sessions may contain pre-envelope user rows. A completed legacy
+plain-text Telegram DM can now be deduplicated by exact route, message ID, and
+body when it has no reply, media, or special provenance. Rich legacy rows stay
+fail-closed because their missing semantics cannot be reconstructed safely.
 
 Telegram redelivery during startup now matches the durable raw reply/media
 envelope before the later prompt-only reply prefix is applied. The original
