@@ -1,0 +1,10 @@
+[Unit]
+Description=Ensure Sigurd meeting virtual audio topology
+After=default.target
+
+[Service]
+Type=oneshot
+Environment=PULSE_SERVER=unix:/run/user/@REMOTE_UID@/pulse/native
+ExecStart=@REMOTE_HOME@/.local/lib/sigurd-meeting/ensure_audio_topology.sh
+NoNewPrivileges=true
+PrivateTmp=true

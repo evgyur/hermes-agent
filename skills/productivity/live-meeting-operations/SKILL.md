@@ -1,7 +1,7 @@
 ---
 name: live-meeting-operations
 description: "Use for every Zoom or Google Meet call/webinar lifecycle: plan, create, join, host, speak, facilitate, record, retrieve, transcribe, summarize, assign owners, and hand off to Kanban. This is the single canonical meeting root for all Human20 agents and bots; related meeting skills are subordinate adapters, never parallel lifecycles."
-version: 3.0.1
+version: 4.0.2
 author: Human20Team
 license: Proprietary
 metadata:
@@ -62,6 +62,10 @@ Context is capability-scoped, not "everything the process can read." Shared Huma
 
 Use one durable GPT Realtime speech-to-speech service behind provider adapters. Zoom is the current default transport; Google Meet must satisfy the same contract before it may be called ready. Do not restore the old chunked Groq STT → Hermes → ElevenLabs response loop for either platform.
 
+Materialize the runtime for each bot/service account with `scripts/install_voice_runtime.py`; render the templates for that account's home, managed Python interpreter, mode-`0600` H20 Keys environment file, meeting transport host, and dedicated SSH identity. Never copy the raw templates directly while `@...@` placeholders remain.
+
+The canonical bridge connects only through H20 Keys. Load `H20_KEYS_REALTIME_URL` and `H20_KEYS_API_KEY` from the server-side `%h/.config/sigurd-meeting/h20-keys.env`; never read Codex/OpenAI auth files and never fall back to a direct upstream WebSocket. A missing/invalid H20 Keys route is a startup blocker, not permission to bypass the gateway.
+
 ```bash
 ~/.local/bin/sigurd-voice start zoom <zoom-meeting-id>
 ~/.local/bin/sigurd-voice status zoom <zoom-meeting-id>
@@ -74,7 +78,10 @@ Use one durable GPT Realtime speech-to-speech service behind provider adapters. 
 Runtime contract:
 
 - `gpt-realtime-2.1` speech-to-speech over one persistent WebSocket;
+- the WebSocket target is the exact `H20_KEYS_REALTIME_URL`, authenticated with `Authorization: Bearer <H20_KEYS_API_KEY>`; direct upstream URLs are rejected;
+- all SSH lanes use one optional `MEETING_SSH_IDENTITY`; when configured it must be a regular file and every owner-state, capture, playback, preflight, and cleanup invocation adds `-i <path> -o IdentitiesOnly=yes`;
 - Zoom ingress `meet_output.monitor`; egress `agent_mic` / `agent_mic_source`;
+- the meeting browser host must keep PulseAudio persistent (`--exit-idle-time=-1`) and materialize the three virtual devices with `scripts/ensure_audio_topology.sh`; the timer is a repair guard, not a replacement for a persistent audio daemon;
 - server VAD interrupts output; verify a `barge_in` event;
 - `gpt-live-transcribe` writes compact mode-`0600` JSONL; raw audio is never persisted;
 - service preflight proves in-meeting state and unmutes the virtual microphone; recording preflight must separately verify an active recording control/API state rather than trusting an `ensure-recording` click or feature-enabled text;
@@ -96,6 +103,7 @@ Detailed implementation and verification pattern: [`references/realtime-memory-o
 
 Durable artifacts:
 
+- `~/.config/sigurd-meeting/h20-keys.env` (mode `0600`; H20 Keys route/key and optional `MEETING_SSH_IDENTITY`)
 - `~/.config/systemd/user/sigurd-gpt-voice@.service` (Zoom)
 - `~/.config/systemd/user/sigurd-gpt-meet@.service` (Google Meet)
 - `~/.local/lib/sigurd-meeting/zoom_gpt_voice.py` (provider-neutral Realtime bridge; legacy filename)

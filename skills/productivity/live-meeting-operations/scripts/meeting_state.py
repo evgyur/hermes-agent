@@ -40,7 +40,7 @@ ZOOM_STATE = r"""(()=>{
   const participantsAria=labels.find(x=>/participants list pane/i.test(x))||'';
   const countMatch=participantsAria.match(/([0-9]+)[ ]+partic/i);
   return {
-    provider:'zoom', inMeeting:labels.some(x=>x.toLowerCase()==='leave'),
+    provider:'zoom', inMeeting:labels.some(x=>/^(leave|end)$/i.test(x)) || labels.some(x=>/mute my microphone|unmute my microphone/i.test(x)),
     mic:labels.find(x=>/mute my microphone|unmute my microphone/i.test(x))||'',
     recording:body.toLowerCase().includes('recording') || labels.some(x=>/pause recording|stop recording/i.test(x)),
     participantCount:countMatch?Number(countMatch[1]):0,

@@ -1,4 +1,4 @@
-# GPT Realtime ↔ Zoom browser bridge
+# H20 Keys Realtime ↔ Zoom browser bridge
 
 Use this reference when a browser participant must behave as a real low-latency voice participant: hear the room continuously, answer in-room, allow interruption, keep a live transcript, and stop cleanly when the room ends.
 
@@ -22,7 +22,8 @@ Zoom speaker output
   → meet_output null sink
   → meet_output.monitor
   → PCM16 24 kHz mono capture
-  → persistent OpenAI Realtime WebSocket
+  → persistent H20 Keys Realtime WebSocket
+  → managed upstream Realtime route (server-side only)
   → streamed PCM16 24 kHz mono output
   → agent_mic null sink
   → agent_mic_source
@@ -31,13 +32,14 @@ Zoom speaker output
 
 Keep ingress and egress on different sinks to avoid self-barge. Do not persist raw audio. A compact mode-`0600` text/receipt log is enough for transcript and verification.
 
-For a remote browser host, it is valid to keep the Realtime process on the authenticated control host and stream Pulse PCM over one long-lived SSH capture connection plus one output connection per response. This avoids copying long-lived credentials to the browser host. The Realtime credential should stay in process memory and should not be exported to Pulse/SSH child environments.
+For a remote browser host, keep the Realtime process on the authenticated control host and stream Pulse PCM over one long-lived SSH capture connection plus one output connection per response. This avoids copying credentials to the browser host. Load `H20_KEYS_REALTIME_URL` and `H20_KEYS_API_KEY` from the server-side `%h/.config/sigurd-meeting/h20-keys.env`; keep the key in process memory and never export it to Pulse/SSH child environments. The bridge must not read Codex/OpenAI auth files or fall back to a direct upstream WebSocket.
 
 ## Realtime session shape
 
-Check current official OpenAI docs before changing event names or model versions. The verified GA pattern used:
+Check the H20 Keys gateway contract and current upstream event documentation before changing event names or model versions. The verified pattern used:
 
-- WebSocket: `/v1/realtime?model=gpt-realtime-2.1`
+- WebSocket: exact `H20_KEYS_REALTIME_URL`, authenticated with `Authorization: Bearer <H20_KEYS_API_KEY>`
+- direct upstream provider hosts are rejected by the bridge
 - input/output: PCM16, 24 kHz, mono
 - `server_vad` with `create_response=true` and `interrupt_response=true`
 - input transcription: `gpt-live-transcribe`
@@ -139,13 +141,15 @@ Body text containing `recording`, a visible `Record` button/menu, or “Meeting 
 
 A durable meeting voice service should:
 
-- preflight exact room, identity, Pulse routes, and Realtime authorization;
+- preflight exact room, identity, Pulse routes, H20 Keys URL/key, and Realtime authorization;
 - start the audio WebSocket only while the target room is active;
 - keep the Zoom virtual microphone unmuted only when the service owns a silent virtual source;
-- reconnect with a bounded policy and refresh credentials from the authorized control plane;
+- reconnect with a bounded policy through H20 Keys only; missing gateway configuration fails closed;
 - watch the exact room state and exit cleanly when it ends;
 - terminate capture/player subprocesses and remute Zoom in cleanup;
 - avoid running continuously against silence outside meetings, which wastes metered audio and expands privacy exposure.
+
+When the meeting browser host requires a dedicated key, set `MEETING_SSH_IDENTITY` in the same server-side environment file. The bridge validates that it exists and is a regular file, then appends `-i <path> -o IdentitiesOnly=yes` to owner-state, audio-capture, audio-playback, service preflight, and cleanup SSH invocations. Never silently fall back to another SSH identity when this variable is configured.
 
 ## Minimum verification packet
 

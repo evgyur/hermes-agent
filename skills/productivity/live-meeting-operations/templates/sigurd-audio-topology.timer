@@ -1,0 +1,12 @@
+[Unit]
+Description=Continuously ensure Sigurd meeting virtual audio topology
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=sigurd-audio-topology.service
+
+[Install]
+WantedBy=timers.target

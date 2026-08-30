@@ -2,9 +2,9 @@
   "schema": 1,
   "name": "live-meeting-operations",
   "source_repo": "human20team/human20-meeting-operations",
-  "source_commit": "7dc655f366800f19415a9ab7d345cd298ad09358",
-  "source_tree": "77dfe1876b4b84f63c4cdfe0ab2cbfed64452be8",
-  "version": "3.0.1",
+  "source_commit": "23c3b8cdcfce3421ab51944dff5f8c7a9187a9ed",
+  "source_tree": "09bfb9813d6c0de0d89960a6ba49f463470ac3d0",
+  "version": "4.0.2",
   "entries": [
     {
       "path": ".gitignore",
@@ -12,15 +12,15 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "9a7e56f7c03001e6d45bba0b75f8bfff7880452c7470233c3999276bb8e299f5"
+      "sha256": "37b6dbcdd665dc82a4ee4290822257628a64d37c10666967539820d8a663f0ed"
     },
     {
       "path": "SKILL.md",
-      "sha256": "1aab380c233c4d8f693b999faee91e688058009fac7e7489b672f08875825bf5"
+      "sha256": "5940fa3c203f6499c45348127eb82af1ba97b81a10e6f4553d370467aecccfd0"
     },
     {
       "path": "VERSION",
-      "sha256": "06e3fe4a7a1884d20d81cc7065ca8cfd4c394ec602c4d180ddc39bbd4f7da521"
+      "sha256": "c6d3fb057b198f1d0563d4218d4e36b48df752251aabffe78ea60aac5a72c7a2"
     },
     {
       "path": "references/agenda-realtime-facilitator.md",
@@ -40,7 +40,7 @@
     },
     {
       "path": "references/gpt-realtime-zoom-bridge.md",
-      "sha256": "c6d7dffb78621001b3f5327014785603c3d581d1936f144f06768134fd668afc"
+      "sha256": "57d3ff7b2e4992738d392b7801608c470ef56d7c14eb6d67b5864747ab7e279c"
     },
     {
       "path": "references/meeting-reschedule-lifecycle.md",
@@ -83,12 +83,28 @@
       "sha256": "d5d0a25ca8a2fd43a5f86cb59953a75fde6dc9a8bbd3a9cae8875055a3c15663"
     },
     {
+      "path": "scripts/ensure_audio_topology.sh",
+      "sha256": "9b7a4198fe79e70204389bea96e34b3af37137ffd2d32682a493b62dd47c5b4a"
+    },
+    {
+      "path": "scripts/h20_voice_ssh_gate.py",
+      "sha256": "defaecc59153d60d729fafe8f86b6a3a778777299ed44349223151be8a335dbd"
+    },
+    {
+      "path": "scripts/install_voice_runtime.py",
+      "sha256": "f83f48bdc812b3192e8bede5e7a3597e6940c2bdf182537c526b1c47da263853"
+    },
+    {
       "path": "scripts/meeting_state.py",
-      "sha256": "10390f2b445fbce2d7c5506757a15f3bf32f4a2f9985f1d022edbd3363da34ce"
+      "sha256": "1675d3254696b8bdffda3812e19a52f7d89e57f1cd38e14a12f9b06dccc183e5"
     },
     {
       "path": "scripts/setup_google_meeting_oauth.py",
       "sha256": "891f45f44bd6d3262f099f90a9bf214ae6c8a6adf82d73e0d6afced69e447a93"
+    },
+    {
+      "path": "scripts/sigurd_voice.py",
+      "sha256": "8dde369670dc7d49d76b5601ad9a78af3fadab46233160a43e9d832d81511f5b"
     },
     {
       "path": "scripts/test_contract_negative.py",
@@ -107,16 +123,36 @@
       "sha256": "b2d094d1ecf86dd3760b616a998bb8d877f63e2f0beb183595478ce01cfe4d0a"
     },
     {
+      "path": "scripts/zoom_gpt_voice.py",
+      "sha256": "be5e518eb8da5094e1d2380e5cf317f0e8dbf044f65f89ebd5b0348b6beeee42"
+    },
+    {
+      "path": "templates/pulseaudio-meeting-voice.conf",
+      "sha256": "5f70fdd2c80db0ab8ed4bab19659cde0d254b59a2ba05db4a8a023d7d7175949"
+    },
+    {
+      "path": "templates/sigurd-audio-topology.service",
+      "sha256": "589f2ed5dfa2b3b08951bb67ffd8fc31eb516a7bf6034d3a80e47a1e9572d0dc"
+    },
+    {
+      "path": "templates/sigurd-audio-topology.timer",
+      "sha256": "e0ee4ada51a036e077881f626afaafcc99d1ace0e75e662012f5e1eba7d93e2e"
+    },
+    {
       "path": "templates/sigurd-gpt-meet@.service",
-      "sha256": "fabcf90419f2aa88ac3c1e28b05a5f2cfb43f11fcf13cf7da2730f95dd6f47c4"
+      "sha256": "c6c4286733db1be8c54973a5a14189863c2aff207a5b15fb14d8d51cb4ca01b3"
     },
     {
       "path": "templates/sigurd-gpt-voice@.service",
-      "sha256": "6bb750f2949899d2fd34857c744749aca925dcc8dd73b3de5109cb245712520b"
+      "sha256": "005d43bdcc0d751512bdab237970ce7d0c68fecefafc5cd5bea1eb2252c632eb"
     },
     {
       "path": "tests/test_zoom_cloud_artifacts.py",
       "sha256": "0115d1f3459ef508fea7f55f691b803a068f0adea59c418fd07fc239f162b3e8"
+    },
+    {
+      "path": "tests/test_zoom_gpt_voice.py",
+      "sha256": "e71d163aead35445436043bf2d6c141c906864cbee7f8477824b3ecd5576b759"
     }
   ]
 }
