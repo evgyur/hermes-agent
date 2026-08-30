@@ -456,6 +456,44 @@ def test_second_shutdown_does_not_roll_new_human_turn_over_claimed_resume(tmp_pa
     assert row["generation"] == 1
 
 
+def test_shutdown_replaces_unsealed_legacy_resume_hint_with_active_turn(tmp_path):
+    """A legacy hint without exact identity cannot block a real active turn."""
+    store = _make_store(tmp_path)
+    original = replace(
+        _make_source(chat_id="legacy-resume-hint", user_id="owner"),
+        chat_type="group",
+        thread_id="5413",
+        message_id="24097",
+    )
+    entry = store.get_or_create_session(original)
+    with store._lock:
+        entry.resume_pending = True
+        entry.resume_reason = "shutdown_timeout"
+        entry.resume_task_id = ""
+        entry.continuation_generation = 0
+        entry.continuation_claim_owner = ""
+        entry.continuation_claim_token = ""
+        entry.resume_origin_snapshot = None
+        store._save()
+
+    newer_human = replace(original, message_id="24101")
+    active_task = store.mark_turn_active(entry.session_key, newer_human)
+    assert active_task
+
+    result = store.mark_resume_pending_with_outcome(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+
+    assert result["outcome"] == "marked_exact"
+    assert result["receipt"]["resume_task_id"] == active_task
+    assert result["receipt"]["continuation_generation"] == 1
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == active_task
+    assert json.loads(row["origin_json"])["message_id"] == "24101"
+
+
 def test_startup_reconciles_orphaned_claim_before_next_restart_generation(tmp_path):
     """A reset/new task must not inherit a claimed obligation from an old boot."""
     store = _make_store(tmp_path)

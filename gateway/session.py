@@ -3846,7 +3846,12 @@ class SessionStore:
             active_task_id = str(entry.active_turn_token or "")
             already_owned = False
             rollover_identity: Optional[Dict[str, Any]] = None
-            if entry.resume_pending:
+            exact_pending_identity = bool(
+                entry.resume_task_id
+                and int(entry.continuation_generation or 0) > 0
+                and resume_origin_from_snapshot(entry) is not None
+            )
+            if entry.resume_pending and exact_pending_identity:
                 if active_task_id and active_task_id == entry.resume_task_id:
                     already_owned = True
                     expected_generation = int(entry.continuation_generation) - 1
@@ -3882,6 +3887,13 @@ class SessionStore:
                     candidate.resume_reason = reason
                     candidate.last_resume_marked_at = _now()
             else:
+                # Older Powerpack releases could persist ``resume_pending``
+                # without the immutable task/generation/origin identity.  It
+                # is a routing hint, not a claim, and must not prevent the
+                # currently active, authority-bound turn from being protected
+                # during shutdown.  The DB admission below remains fail-closed:
+                # any real PENDING/CLAIMED obligation still wins and makes the
+                # final identity comparison reject this replacement.
                 if not active_task_id:
                     fail("failed_missing_active_origin")
                     return None
