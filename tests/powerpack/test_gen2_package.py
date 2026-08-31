@@ -71,15 +71,23 @@ def _reload_package():
 
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
+    metadata = doctor.load_manifest(PACKAGE_ROOT)
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.9"
-    assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
+    assert metadata["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
         "disabled",
         "compatibility",
         "gen2_only",
     ]
+
+
+def test_status_reports_powerpack_and_hermes_versions_separately():
+    powerpack_version = doctor.load_manifest(PACKAGE_ROOT)["version"]
+    text = cli.slash_status(PACKAGE_ROOT, "employee", "gen2_only", "")
+
+    assert f"Powerpack Gen2 v{powerpack_version}" in text
+    assert f"Hermes v{cli.hermes_version()}" in text
 
 
 def test_private_descendant_keeps_supported_upstream_ancestry(tmp_path):
@@ -204,7 +212,7 @@ def test_gen2_host_accepts_clean_private_descendant(monkeypatch, tmp_path):
         root=PACKAGE_ROOT,
         variant="employee",
         mode="gen2_only",
-        upstream_sha="4209d371aa1bb8840ce8447555bdd863a1a96c38",
+        upstream_sha=cli.PIN,
         ci=True,
         host=True,
         repo_root=repo,
@@ -465,7 +473,12 @@ def test_operational_config_accepts_managed_stt_and_cross_profile_cron(tmp_path)
 
 
 def test_default_doctor_pin_matches_certified_fresh_upstream():
-    assert cli.PIN == "4209d371aa1bb8840ce8447555bdd863a1a96c38"
+    release = json.loads(
+        (PACKAGE_ROOT.parents[1] / "powerpack" / "release.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert cli.PIN == release["upstream_base"]
     assert cli.PIN in doctor.load_manifest(PACKAGE_ROOT)["supported_upstream_shas"]
 
 

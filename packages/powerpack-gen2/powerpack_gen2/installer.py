@@ -158,11 +158,17 @@ def install(source_root: Path, hermes_home: Path, *, variant: str, mode: str) ->
         shutil.rmtree(backup)
 
     manifest = doctor.load_manifest(target)
+    try:
+        from hermes_cli import __version__ as hermes_version
+    except Exception:
+        hermes_version = "unknown"
     receipt = {
         "schema_version": 1,
         "status": "installed",
         "plugin": PLUGIN_NAME,
         "version": manifest["version"],
+        "powerpack_version": manifest["version"],
+        "hermes_version": str(hermes_version),
         "variant": variant,
         "mode": mode,
         "package_sha256": doctor._inventory_report(target)["aggregate_sha256"],

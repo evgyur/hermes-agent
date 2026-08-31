@@ -41,6 +41,8 @@ def test_installer_atomically_materializes_and_activates_boxed_plugin(monkeypatc
 
     assert receipt["status"] == "installed"
     assert receipt["plugin"] == "human20-powerpack-gen2"
+    assert receipt["powerpack_version"] == receipt["version"]
+    assert receipt["hermes_version"]
     assert receipt["secrets_persisted"] is False
     assert doctor._inventory_report(target)["status"] == "PASS"
     assert config["plugins"]["enabled"] == ["google_meet", "human20-powerpack-gen2"]

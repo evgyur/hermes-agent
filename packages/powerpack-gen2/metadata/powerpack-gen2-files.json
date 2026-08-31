@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "8ff90e2d25fce338b563335808cb9874d1486db52cb6f1dbdfa298f49d984c75",
+  "aggregate_sha256": "f5d529b97c2b7d916250b81bd0f78bcc6d277eb9a0491e2f1f487dca7e32e59d",
   "file_count": 17,
   "files": [
     {
@@ -13,9 +13,9 @@
       "sha256": "2f5a5f4591b88864c8ab7941aecf0d0724c92a26e051e6ee9a83687314f9deb3"
     },
     {
-      "bytes": 4286,
+      "bytes": 4334,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "5255f605dcd2690dde38e00075b2d547b5ac56b70343d0cbed8ed6526121786a"
+      "sha256": "9cd6874cfaa22337b2ed2757692f1a753981486dfbef4d3539dfac0b569d52b8"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 753,
       "path": "plugin.yaml",
-      "sha256": "3fbcfb3968e30df85764711f982f99cf20f70865bc6734b511d2a7a7867ae494"
+      "sha256": "612015a7a0797200655b03247b40fd90949330289dae1cbe57dcdf0bd71b3a1e"
     },
     {
       "bytes": 6557,
@@ -38,19 +38,19 @@
       "sha256": "6cbcaa6798dab4f0b54b3fb0db5f8cfb0463106305abe2dbe0f8afbd6be039fb"
     },
     {
-      "bytes": 6220,
+      "bytes": 6780,
       "path": "powerpack_gen2/cli.py",
-      "sha256": "9958e0476e73fa99848afa3718240d5b135ccf94003f261c6b1d3f20e8ccd26e"
+      "sha256": "1d7e8f1f619fceaa86e868b4176662f74670d88806dd95c3b95c6fe9807a460f"
     },
     {
-      "bytes": 30672,
+      "bytes": 30896,
       "path": "powerpack_gen2/doctor.py",
-      "sha256": "67dfba4e091cf84f9e206850124bf9aaa4e0205f3ed505de756f24ee42a34bed"
+      "sha256": "d8c0216d3d31ac0f74a84a8ca759091a6623e6844d50c6401981ea47b225ad17"
     },
     {
-      "bytes": 7139,
+      "bytes": 7363,
       "path": "powerpack_gen2/installer.py",
-      "sha256": "46c480a13710a2fb57ac6790d9b97824fe9b0843c0b5401b4f4200efcf9b098d"
+      "sha256": "039c3eaf96723d1b6f8bf40270e23041dfa5020f3920e848a1890353b22d5280"
     },
     {
       "bytes": 8955,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.3.9"
+  "version": "2.4.0"
 }

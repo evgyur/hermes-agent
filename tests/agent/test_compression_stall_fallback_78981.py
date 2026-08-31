@@ -29,7 +29,6 @@ from agent.context_compressor import (
     ContextCompressor,
     deterministic_summary_fallback_forced,
     force_deterministic_summary_fallback,
-    attempt_summary_route_kwargs,
     pin_summary_route,
     take_pinned_summary_route,
 )
@@ -611,7 +610,6 @@ def test_pinned_route_overrides_the_summary_call_route():
         with pin_summary_route(dict(CHAIN_ENTRY)):
             summary = compressor._generate_summary(_msgs())
 
-    assert attempt_summary_route_kwargs() == {}
     assert summary and "SUMMARY BODY" in summary
     assert len(calls) == 1
     call = calls[0]

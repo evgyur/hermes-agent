@@ -10,8 +10,18 @@ from pathlib import Path
 from .doctor import run_doctor
 
 
-PIN = "4209d371aa1bb8840ce8447555bdd863a1a96c38"
+PIN = "1cf36398135f4848a1d04b2167ffb564b7881d35"
 MANAGED_STT_PROVIDER = "human20-keys-groq"
+
+
+def hermes_version() -> str:
+    """Return the independently versioned Hermes core release."""
+    try:
+        from hermes_cli import __version__
+
+        return str(__version__)
+    except Exception:
+        return "unknown"
 
 
 def _configure_managed_stt() -> None:
@@ -67,6 +77,8 @@ def _write_receipt(root: Path, variant: str, mode: str, package_sha256: str) -> 
                 "schema_version": 1,
                 "plugin": "human20-powerpack-gen2",
                 "version": doctor_version(root),
+                "powerpack_version": doctor_version(root),
+                "hermes_version": hermes_version(),
                 "variant": variant,
                 "mode": mode,
                 "package_sha256": package_sha256,
@@ -102,7 +114,14 @@ def handle_cli(args, root: Path, variant: str, mode: str, *, ctx=None) -> int:
         print(json.dumps({"ok": True, "variant": target, "mode": target_mode, "receipt": str(receipt), "restart_required": target != variant or target_mode != mode}, sort_keys=True))
         return 0
     if command == "status":
-        print(json.dumps({"plugin": "human20-powerpack-gen2", "version": doctor_version(root), "variant": variant, "mode": mode}, sort_keys=True))
+        print(json.dumps({
+            "plugin": "human20-powerpack-gen2",
+            "version": doctor_version(root),
+            "powerpack_version": doctor_version(root),
+            "hermes_version": hermes_version(),
+            "variant": variant,
+            "mode": mode,
+        }, sort_keys=True))
         return 0
     if command == "doctor":
         host = bool(getattr(args, "host", False))
@@ -129,7 +148,10 @@ def slash_status(root: Path, variant: str, mode: str, raw: str) -> str:
     if raw.strip() == "doctor":
         report = run_doctor(root=root, variant=variant, mode=mode, upstream_sha=PIN, ci=True)
         return json.dumps(report, ensure_ascii=False, sort_keys=True)
-    return f"Powerpack Gen2 v{doctor_version(root)}; mode={mode}; variant={variant}; use /powerpack-gen2 doctor for offline diagnostics."
+    return (
+        f"Powerpack Gen2 v{doctor_version(root)} · Hermes v{hermes_version()}; "
+        f"mode={mode}; variant={variant}; use /powerpack-gen2 doctor for offline diagnostics."
+    )
 
 
 def doctor_version(root: Path) -> str:

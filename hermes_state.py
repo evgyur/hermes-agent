@@ -7504,10 +7504,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # Merge-max with any longer live deadline so a later shorter
+            # write cannot reopen the thrash window (#96775). The error
+            # column always takes the latest diagnostic.
             conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                "WHEN compression_failure_cooldown_until IS NOT NULL "
+                " AND compression_failure_cooldown_until > ? "
+                "THEN compression_failure_cooldown_until ELSE ? END, "
                 "compression_failure_error = ? WHERE id = ?",
-                (cooldown_until, error, session_id),
+                (cooldown_until, cooldown_until, error, session_id),
             )
 
         try:
@@ -15599,15 +15605,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def fail_handoff(self, session_id: str, error: str) -> None:
-        """Mark a handoff as failed and record the reason."""
+    def fail_handoff(
+        self,
+        session_id: str,
+        error: str,
+        *,
+        only_states: Optional[Tuple[str, ...]] = None,
+    ) -> bool:
+        """Mark a handoff as failed and record the reason.
+
+        ``only_states`` makes the write a compare-and-swap: the row is only
+        failed when its current ``handoff_state`` is in the given tuple.
+        Waiters that give up (CLI 60s poll, Desktop bounded poll) MUST pass
+        ``only_states=("pending",)`` — once the gateway watcher has claimed
+        the row (``running``) it owns the terminal state, and a waiter-side
+        unconditional fail races the dispatch: the gateway later overwrites
+        ``failed`` → ``completed`` while the user was already told the
+        gateway is down (split-brain — the handoff actually delivered and
+        ``switch_session`` re-pointed the session).
+
+        The gateway watcher itself fails its OWN claimed row unconditionally
+        (no ``only_states``) — it is the owner while the row is ``running``.
+
+        Returns True when a row was transitioned to ``failed``.
+        """
         def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
-                (error[:500], session_id),
-            )
-        self._execute_write(_do)
+            if only_states:
+                placeholders = ", ".join("?" for _ in only_states)
+                cur = conn.execute(
+                    "UPDATE sessions SET handoff_state = 'failed', "
+                    f"handoff_error = ? WHERE id = ? AND handoff_state IN ({placeholders})",
+                    (error[:500], session_id, *only_states),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE sessions SET handoff_state = 'failed', "
+                    "handoff_error = ? WHERE id = ?",
+                    (error[:500], session_id),
+                )
+            return cur.rowcount > 0
+        return bool(self._execute_write(_do))
 
     # ── Gateway continuation and busy-input authority ─────────────────────
 

@@ -96,6 +96,16 @@ project_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p'
 [[ -n "$init_version" && "$init_version" == "$project_version" ]] \
     || die "candidate version metadata is missing or inconsistent"
 
+release_manifest="$SOURCE_DIR/powerpack/release.json"
+powerpack_version="$(grep -Eo '"powerpack_version"[[:space:]]*:[[:space:]]*"[^"]+"' "$release_manifest" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' | tr -d '\r')"
+manifest_hermes_version="$(grep -Eo '"hermes_version"[[:space:]]*:[[:space:]]*"[^"]+"' "$release_manifest" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' | tr -d '\r')"
+plugin_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' "$SOURCE_DIR/packages/powerpack-gen2/plugin.yaml" | head -n1 | tr -d '\r')"
+metadata_version="$(grep -Eo '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$SOURCE_DIR/packages/powerpack-gen2/metadata/powerpack-gen2.json" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' | tr -d '\r')"
+[[ -n "$powerpack_version" && "$powerpack_version" == "$plugin_version" && "$powerpack_version" == "$metadata_version" ]] \
+    || die "Powerpack version metadata is missing or inconsistent"
+[[ "$manifest_hermes_version" == "$init_version" ]] \
+    || die "Hermes version metadata is missing or inconsistent"
+
 if [[ -z "$POWERPACK_REPO_URL" ]]; then
     POWERPACK_REPO_URL="$(git_at "$SOURCE_DIR" remote get-url origin 2>/dev/null || true)"
 fi
@@ -118,7 +128,6 @@ if [[ -e "$INSTALL_DIR" ]]; then
        && git_at "$SOURCE_DIR" merge-base --is-ancestor "$current_sha" "$candidate_sha"; then
         ancestry_ok=true
     fi
-    release_manifest="$SOURCE_DIR/powerpack/release.json"
     predecessor_ok=false
     if [[ -f "$release_manifest" ]] \
        && grep -Eo '[0-9a-f]{40}' "$release_manifest" | grep -Fqx "$current_sha"; then
@@ -169,7 +178,8 @@ check_upgrade_permissions() {
 # gateway, including during --dry-run.
 check_upgrade_permissions
 
-printf 'powerpack_version=%s\n' "$init_version"
+printf 'powerpack_version=%s\n' "$powerpack_version"
+printf 'hermes_version=%s\n' "$init_version"
 printf 'candidate_sha=%s\n' "$candidate_sha"
 printf 'action=%s\n' "$action"
 printf 'install_dir=%s\n' "$INSTALL_DIR"
@@ -414,7 +424,7 @@ fi
 
 receipt_dir="$HERMES_HOME/runtime/receipts"
 mkdir -p "$receipt_dir"
-receipt="$receipt_dir/powerpack-install-$init_version-$candidate_sha.json"
+receipt="$receipt_dir/powerpack-install-$powerpack_version-$candidate_sha.json"
 if [[ -x "$INSTALL_DIR/venv/bin/python" ]]; then
     receipt_python="$INSTALL_DIR/venv/bin/python"
 elif command -v python >/dev/null 2>&1; then
@@ -423,7 +433,8 @@ else
     receipt_python="$(command -v python3 2>/dev/null || true)"
 fi
 [[ -n "$receipt_python" ]] || die "Python is required to write the install receipt"
-POWERPACK_RECEIPT="$receipt" POWERPACK_VERSION="$init_version" \
+POWERPACK_RECEIPT="$receipt" POWERPACK_VERSION="$powerpack_version" \
+POWERPACK_HERMES_VERSION="$init_version" \
 POWERPACK_SHA="$candidate_sha" POWERPACK_PREVIOUS_SHA="$current_sha" \
 POWERPACK_BACKUP_REF="$backup_ref" POWERPACK_INSTALL_DIR="$INSTALL_DIR" \
 POWERPACK_HERMES_HOME="$HERMES_HOME" \
@@ -442,9 +453,11 @@ if manifest_path.is_file():
         component_pins = raw_pins
 
 payload = {
-    "format": "hermes-powerpack-install-v1",
+    "format": "hermes-powerpack-install-v2",
     "result": "PASS",
     "version": os.environ["POWERPACK_VERSION"],
+    "powerpack_version": os.environ["POWERPACK_VERSION"],
+    "hermes_version": os.environ["POWERPACK_HERMES_VERSION"],
     "candidate_sha": os.environ["POWERPACK_SHA"],
     "previous_sha": os.environ.get("POWERPACK_PREVIOUS_SHA") or None,
     "backup_ref": os.environ.get("POWERPACK_BACKUP_REF") or None,

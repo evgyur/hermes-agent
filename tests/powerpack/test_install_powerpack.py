@@ -37,7 +37,8 @@ def test_release_version_matches_project_and_cli():
         (ROOT / "powerpack" / "release.json").read_text(encoding="utf-8")
     )
 
-    assert cli_version == project["project"]["version"] == release["version"]
+    assert cli_version == project["project"]["version"] == release["hermes_version"]
+    assert release["powerpack_version"] != ""
 
 
 def test_locked_sync_preserves_the_configured_messaging_runtime():
@@ -86,7 +87,11 @@ def _git(repo: Path, *args: str) -> str:
     ).strip()
 
 
-def _write_source_contract(repo: Path, version: str = "0.21.0") -> None:
+def _write_source_contract(
+    repo: Path,
+    version: str = "0.21.0",
+    powerpack_version: str = "2.4.0",
+) -> None:
     (repo / ".gitattributes").write_text("* text eol=lf\n", encoding="utf-8")
     (repo / "hermes_cli").mkdir(exist_ok=True)
     (repo / "hermes_cli" / "__init__.py").write_text(
@@ -97,6 +102,31 @@ def _write_source_contract(repo: Path, version: str = "0.21.0") -> None:
         encoding="utf-8",
     )
     (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    release = repo / "powerpack" / "release.json"
+    release.parent.mkdir(parents=True, exist_ok=True)
+    release.write_text(
+        json.dumps(
+            {
+                "format": "hermes-powerpack-release-v2",
+                "hermes_version": version,
+                "powerpack_version": powerpack_version,
+                "accepted_predecessors": [],
+                "component_pins": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    package = repo / "packages" / "powerpack-gen2"
+    (package / "metadata").mkdir(parents=True, exist_ok=True)
+    (package / "plugin.yaml").write_text(
+        f"name: human20-powerpack-gen2\nversion: {powerpack_version}\n",
+        encoding="utf-8",
+    )
+    (package / "metadata" / "powerpack-gen2.json").write_text(
+        json.dumps({"version": powerpack_version}) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
@@ -294,9 +324,10 @@ def test_install_receipt_records_release_component_pins(tmp_path: Path):
         "deployment": "preserve_profile_use_pinned_component",
     }
     manifest = source / "powerpack" / "release.json"
-    manifest.parent.mkdir()
+    release = json.loads(manifest.read_text(encoding="utf-8"))
+    release["component_pins"] = {"example": pin}
     manifest.write_text(
-        json.dumps({"component_pins": {"example": pin}}) + "\n",
+        json.dumps(release) + "\n",
         encoding="utf-8",
     )
     _git(source, "add", "powerpack/release.json")
@@ -372,9 +403,10 @@ def test_registered_powerpack_predecessor_can_upgrade(tmp_path: Path):
     predecessor = _git(install, "rev-parse", "HEAD")
 
     manifest = source / "powerpack" / "release.json"
-    manifest.parent.mkdir()
+    release = json.loads(manifest.read_text(encoding="utf-8"))
+    release["accepted_predecessors"] = [predecessor]
     manifest.write_text(
-        json.dumps({"accepted_predecessors": [predecessor]}) + "\n",
+        json.dumps(release) + "\n",
         encoding="utf-8",
     )
     _git(source, "add", "powerpack/release.json")

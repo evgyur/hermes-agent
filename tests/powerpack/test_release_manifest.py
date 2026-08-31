@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import hermes_cli
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,7 +16,21 @@ def test_release_manifest_matches_package_and_pins_valid_components():
         (ROOT / "powerpack" / "release.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["version"] == hermes_cli.__version__
+    plugin = yaml.safe_load(
+        (ROOT / "packages" / "powerpack-gen2" / "plugin.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    package = json.loads(
+        (ROOT / "packages" / "powerpack-gen2" / "metadata" / "powerpack-gen2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["format"] == "hermes-powerpack-release-v2"
+    assert manifest["hermes_version"] == hermes_cli.__version__
+    assert manifest["powerpack_version"] == plugin["version"] == package["version"]
+    assert manifest["upstream_base"] in package["supported_upstream_shas"]
     assert manifest["data_policy"]["profiles"] == "preserve"
     pins = manifest.get("component_pins")
     assert isinstance(pins, dict) and pins

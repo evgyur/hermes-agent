@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "human20-powerpack-gen2",
-  "version": "2.3.9",
+  "version": "2.4.0",
   "plugin_kind": "standalone",
   "source_repository": "human20team/hermes-agent-powerpack",
   "source_base_sha": "90bb41551f98edf847ca2c86f9b1a86c7422cb8d",
@@ -34,7 +34,8 @@
     "ddbd928ee4e881f0c7b3536a00355647c6559fe2",
     "057dcdf236f8a6a26721c10fcc6ccb72726e272a",
     "d5632392c73f9418b2a4a90f4b351c8c21d152ff",
-    "4209d371aa1bb8840ce8447555bdd863a1a96c38"
+    "4209d371aa1bb8840ce8447555bdd863a1a96c38",
+    "1cf36398135f4848a1d04b2167ffb564b7881d35"
   ],
   "variants": {
     "rentals": {

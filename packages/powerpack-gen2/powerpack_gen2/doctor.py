@@ -790,9 +790,15 @@ def run_doctor(
         _check(checks, "host_credentials_present", credentials["status"] == "PASS", required=mode == "gen2_only", evidence=credentials)
 
     required_failures = [item["name"] for item in checks if item["required"] and item["status"] != "PASS"]
+    try:
+        from hermes_cli import __version__ as hermes_version
+    except Exception:
+        hermes_version = "unknown"
     return {
         "schema_version": 2,
         "version": manifest["version"],
+        "powerpack_version": manifest["version"],
+        "hermes_version": str(hermes_version),
         "ok": not required_failures,
         "status": "PASS" if not required_failures else "FAIL",
         "mode": mode,
