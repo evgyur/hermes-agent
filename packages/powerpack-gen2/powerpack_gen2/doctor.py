@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -556,6 +557,126 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _quick_command_requirements_report(hermes_home: Path) -> dict[str, Any]:
+    """Validate declared skill requirements in the interpreter that runs them.
+
+    Quick commands may deliberately use a Python environment other than the
+    gateway runtime.  ``pip check`` cannot see a standalone skill's
+    ``requirements.txt``, so resolve the active command targets and query the
+    distributions installed in each exact interpreter.
+    """
+    config = _load_mapping(hermes_home / "config.yaml")
+    commands = config.get("quick_commands")
+    if not isinstance(commands, dict):
+        gateway = config.get("gateway")
+        commands = gateway.get("quick_commands") if isinstance(gateway, dict) else {}
+    if not isinstance(commands, dict):
+        commands = {}
+
+    skills_root = (hermes_home / "skills").resolve()
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    missing_scripts: list[str] = []
+    skipped = 0
+    for name, spec in sorted(commands.items()):
+        if not isinstance(spec, dict) or spec.get("type", "exec") != "exec":
+            skipped += 1
+            continue
+        try:
+            parts = shlex.split(str(spec.get("command") or ""), posix=os.name != "nt")
+        except ValueError:
+            missing_scripts.append(str(name))
+            continue
+        if len(parts) < 2 or not parts[1].endswith(".py"):
+            skipped += 1
+            continue
+        # Preserve a virtualenv shim instead of resolving it to the base
+        # interpreter; invoking the resolved target would drop that venv's
+        # site-packages and produce a false missing-dependency report.
+        interpreter = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(parts[0]))))
+        target = Path(os.path.expandvars(os.path.expanduser(parts[1]))).resolve()
+        if not interpreter.is_file() or not target.is_file():
+            missing_scripts.append(str(name))
+            continue
+        try:
+            target.relative_to(skills_root)
+        except ValueError:
+            skipped += 1
+            continue
+        requirements: Path | None = None
+        for parent in (target.parent, *target.parents):
+            if parent == skills_root.parent:
+                break
+            candidate = parent / "requirements.txt"
+            if candidate.is_file():
+                requirements = candidate
+                break
+            if parent == skills_root:
+                break
+        if requirements is None:
+            continue
+        key = (str(interpreter), str(requirements))
+        row = groups.setdefault(key, {"commands": [], "requirements": []})
+        row["commands"].append(str(name))
+
+    failures: list[dict[str, Any]] = []
+    checked: list[dict[str, Any]] = []
+    for (interpreter, requirements_path), row in sorted(groups.items()):
+        requirements = Path(requirements_path)
+        names: list[str] = []
+        for raw in requirements.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith(("-", "http:", "https:", "git+")):
+                continue
+            match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+            if match:
+                names.append(match.group(1))
+        probe = _run(
+            [
+                interpreter,
+                "-c",
+                (
+                    "import importlib.metadata as m, json, sys\n"
+                    "out = {}\n"
+                    "for name in sys.argv[1:]:\n"
+                    "    try:\n"
+                    "        out[name] = m.version(name)\n"
+                    "    except m.PackageNotFoundError:\n"
+                    "        out[name] = None\n"
+                    "print(json.dumps(out))\n"
+                ),
+                *names,
+            ],
+            timeout=15,
+        )
+        versions: dict[str, str | None] = {}
+        if probe.returncode == 0:
+            try:
+                value = json.loads(probe.stdout)
+                if isinstance(value, dict):
+                    versions = {str(key): (str(item) if item is not None else None) for key, item in value.items()}
+            except ValueError:
+                versions = {}
+        missing = sorted(name for name in names if not versions.get(name))
+        evidence = {
+            "interpreter": interpreter,
+            "requirements": requirements_path,
+            "commands": sorted(row["commands"]),
+            "declared_count": len(names),
+            "missing": missing,
+            "probe_ok": probe.returncode == 0,
+        }
+        checked.append(evidence)
+        if missing or probe.returncode != 0:
+            failures.append(evidence)
+    return {
+        "status": "PASS" if not missing_scripts and not failures else "FAIL",
+        "checked_groups": checked,
+        "missing_command_targets": missing_scripts,
+        "failure_count": len(failures) + len(missing_scripts),
+        "skipped_command_count": skipped,
+    }
+
+
 def _stt_is_managed(config: dict[str, Any]) -> bool:
     stt = config.get("stt")
     if not isinstance(stt, dict) or stt.get("enabled") is not True:
@@ -730,6 +851,7 @@ def run_doctor(
         sqlite_runtime = _sqlite_runtime_report(process_exe if isinstance(process_exe, str) else None)
         state_handles = _state_handle_report(int(process.get("pid") or 0))
         operational_config = _operational_config_report(configured_home)
+        quick_command_requirements = _quick_command_requirements_report(configured_home)
         process_identity = _process_identity_report(
             repository=repository,
             venv=venv,
@@ -754,6 +876,7 @@ def run_doctor(
             "sqlite_runtime": sqlite_runtime,
             "deleted_state_handles": state_handles,
             "operational_config": operational_config,
+            "quick_command_requirements": quick_command_requirements,
             "active_plugin_manifest": {
                 "path": str(active_root / "plugin.yaml"),
                 "sha256": _sha256(active_root / "plugin.yaml") if (active_root / "plugin.yaml").is_file() else None,
@@ -786,6 +909,13 @@ def run_doctor(
         _check(checks, "host_sqlite_runtime", sqlite_runtime["status"] == "PASS", required=mode == "gen2_only", evidence=sqlite_runtime)
         _check(checks, "host_deleted_state_handles", state_handles["status"] == "PASS", required=mode == "gen2_only", evidence=state_handles)
         _check(checks, "host_operational_config", operational_config["status"] == "PASS", required=mode == "gen2_only", evidence=operational_config)
+        _check(
+            checks,
+            "host_quick_command_requirements",
+            quick_command_requirements["status"] == "PASS",
+            required=mode == "gen2_only",
+            evidence=quick_command_requirements,
+        )
         _check(checks, "host_process_loaded_identity", process_identity_ok, evidence={"cwd": process_cwd, "exe": process_exe})
         _check(
             checks,

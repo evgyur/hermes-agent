@@ -122,6 +122,71 @@ def test_status_reports_powerpack_and_hermes_versions_separately():
     assert f"Hermes v{cli.hermes_version()}" in text
 
 
+def test_quick_command_requirements_detect_missing_skill_distribution(tmp_path):
+    home = tmp_path / ".hermes"
+    skill = home / "skills" / "demo"
+    scripts = skill / "scripts"
+    scripts.mkdir(parents=True)
+    target = scripts / "quick.py"
+    target.write_text("print('ok')\n", encoding="utf-8")
+    (skill / "requirements.txt").write_text(
+        "definitely-missing-powerpack-test-package>=1\n", encoding="utf-8"
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "quick_commands": {
+                    "demo": {
+                        "type": "exec",
+                        "command": f"{sys.executable} {target}",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = doctor._quick_command_requirements_report(home)
+
+    assert report["status"] == "FAIL"
+    assert report["failure_count"] == 1
+    assert report["checked_groups"][0]["commands"] == ["demo"]
+    assert report["checked_groups"][0]["missing"] == [
+        "definitely-missing-powerpack-test-package"
+    ]
+
+
+def test_quick_command_requirements_accept_installed_distribution(tmp_path):
+    home = tmp_path / ".hermes"
+    skill = home / "skills" / "demo"
+    scripts = skill / "scripts"
+    scripts.mkdir(parents=True)
+    target = scripts / "quick.py"
+    target.write_text("print('ok')\n", encoding="utf-8")
+    (skill / "requirements.txt").write_text("pytest>=1\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "quick_commands": {
+                    "demo": {
+                        "type": "exec",
+                        "command": f"{sys.executable} {target}",
+                    },
+                    "model_only": {"type": "model", "model": "example/model"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = doctor._quick_command_requirements_report(home)
+
+    assert report["status"] == "PASS"
+    assert report["failure_count"] == 0
+    assert report["checked_groups"][0]["missing"] == []
+    assert report["skipped_command_count"] == 1
+
+
 def test_private_descendant_keeps_supported_upstream_ancestry(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
