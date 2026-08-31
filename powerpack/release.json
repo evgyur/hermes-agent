@@ -2,7 +2,7 @@
   "format": "hermes-powerpack-release-v2",
   "hermes_version": "0.20.6",
   "powerpack_version": "2.5.0",
-  "upstream_base": "b8d3c8aa07301eeacad06cde25e460a189c9d6d6",
+  "upstream_base": "db88b6c97c7000c6bf4a320bfc676dda09eba3eb",
   "accepted_predecessors": [
     "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
     "63a56fb8ab29352ddd40d67aeaf37d3e355ee096",

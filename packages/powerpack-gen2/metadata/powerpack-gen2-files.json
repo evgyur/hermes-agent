@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "cdae545ca324390474624c2c69f0011c451dd44a40106353b280876deabd3b0e",
+  "aggregate_sha256": "732ca19570f757eeddfcdda4e8387f496bf107a273ca4b516cc3690695096e93",
   "file_count": 17,
   "files": [
     {
@@ -13,9 +13,9 @@
       "sha256": "2f5a5f4591b88864c8ab7941aecf0d0724c92a26e051e6ee9a83687314f9deb3"
     },
     {
-      "bytes": 4678,
+      "bytes": 4726,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "ac03d6a426a354a79cd6ce4627f6c16dbfef887d9283b7508046e29527d04063"
+      "sha256": "d5e3c98737e5a3bca959d99c41f23d278d87dd27163d689cc6473a9ab4130c2c"
     },
     {
       "bytes": 171,
@@ -40,7 +40,7 @@
     {
       "bytes": 6789,
       "path": "powerpack_gen2/cli.py",
-      "sha256": "6079f18c43bb9073165a430d4da56214079ce5150d31f10534b35635da021359"
+      "sha256": "94085310db07468950e7f1253ccbf78f2433039afbef1db6b5323426bb882988"
     },
     {
       "bytes": 31664,

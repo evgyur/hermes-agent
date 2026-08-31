@@ -10,7 +10,7 @@ from pathlib import Path
 from .doctor import run_doctor
 
 
-PIN = "b8d3c8aa07301eeacad06cde25e460a189c9d6d6"
+PIN = "db88b6c97c7000c6bf4a320bfc676dda09eba3eb"
 MANAGED_STT_PROVIDER = "human20-keys-groq"
 
 
