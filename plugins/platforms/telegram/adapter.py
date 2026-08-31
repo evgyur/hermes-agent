@@ -12050,15 +12050,32 @@ class TelegramAdapter(BasePlatformAdapter):
         }
         try:
             normalized_paths: List[str] = []
-            for path in paths:
+            normalized_types: List[str] = []
+            original_types = list(event.media_types or [])
+            for index, path in enumerate(paths):
                 if path not in transient_media:
                     normalized_paths.append(path)
+                    normalized_types.append(
+                        original_types[index]
+                        if index < len(original_types)
+                        else ""
+                    )
                     continue
                 normalized_path = self._normalize_telegram_chip_media_for_stt(path)
                 transient_media.remove(path)
                 transient_media.add(normalized_path)
                 normalized_paths.append(normalized_path)
+                normalized_types.append("audio/mp4")
             paths = normalized_paths
+            # Core validates that every plugin-consumed path still belongs to
+            # the inbound event.  Normalization is an owned in-event
+            # replacement, so publish the replacement before returning the
+            # consumed set instead of leaving the now-deleted source path.
+            event.media_urls = list(normalized_paths)
+            event.media_types = normalized_types
+            event.metadata["telegram_chip_transient_media"] = sorted(
+                transient_media
+            )
 
             for path in paths:
                 result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")

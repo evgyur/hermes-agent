@@ -491,5 +491,7 @@ async def test_transcribe_route_normalizes_recovered_video_before_stt(
     assert transcode_calls == [(str(recovered_video), str(owned_parent))]
     assert transcribe_calls == [str(normalized)]
     assert consumed == {str(normalized)}
+    assert event.media_urls == [str(normalized)]
+    assert event.media_types == ["audio/mp4"]
     assert not recovered_video.exists()
     assert not owned_parent.exists()
