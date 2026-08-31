@@ -69,6 +69,35 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+def _installed_powerpack_version() -> Optional[str]:
+    """Return the installed Powerpack version from its durable receipt.
+
+    Hermes and Powerpack have independent release lines.  The gateway must not
+    infer the overlay version from the Hermes package version or from model
+    text, so ``/status`` reads the installer-owned receipt and fails closed
+    when it is absent or malformed.
+    """
+    import json
+
+    home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    receipt = (
+        home
+        / "powerpack"
+        / "receipts"
+        / "human20-powerpack-gen2-install.json"
+    )
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "installed":
+        return None
+    version = _clean_str(payload.get("powerpack_version") or payload.get("version"))
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,39}", version):
+        return None
+    return version
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -596,6 +625,7 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.fallback_config import get_fallback_chain
 
         source = event.source
+        powerpack_version = _installed_powerpack_version()
         session_entry = await self.async_session_store.get_or_create_session(source)
 
         connected_platforms = [p.value for p in self.adapters.keys()]
@@ -878,6 +908,11 @@ class GatewaySlashCommandsMixin:
 
         lines = [
             f"🪽 **Hermes {hermes_version} ({_status_git_revision()})**",
+            *(
+                [f"⚡ Powerpack: **{powerpack_version}**"]
+                if powerpack_version
+                else []
+            ),
             f"⏱️ Uptime: gateway {gateway_uptime} · system {system_uptime}",
             f"🧠 Model: {model_display} · 🔑 {auth_label}",
             f"🔄 Fallbacks: {_gateway_status_fallbacks(fallback_chain)}",

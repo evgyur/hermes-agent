@@ -133,6 +133,42 @@ async def test_status_command_preserves_operator_grade_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_status_command_reports_installed_powerpack_version(
+    tmp_path, monkeypatch
+):
+    """Powerpack installs must expose their version separately from Hermes."""
+    home = tmp_path / ".hermes"
+    receipt = (
+        home
+        / "powerpack"
+        / "receipts"
+        / "human20-powerpack-gen2-install.json"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(
+        '{"status":"installed","hermes_version":"0.20.6",'
+        '"powerpack_version":"2.4.1"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-powerpack-version",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert result.startswith("🪽 **Hermes ")
+    assert "⚡ Powerpack: **2.4.1**" in result
+
+
+@pytest.mark.asyncio
 async def test_status_resolves_provider_context_when_compressor_limit_is_zero(
     monkeypatch,
 ):
