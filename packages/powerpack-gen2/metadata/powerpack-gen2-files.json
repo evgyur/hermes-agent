@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "067f4a61220a1d88fd1b70eeb11f49bfe33cc51b3058a031259346c6f10dfca6",
+  "aggregate_sha256": "a8a0574d53df11d97d4dfe47d9fc33dfff6aa81593a6f4e8a4c4ced7adbff671",
   "file_count": 17,
   "files": [
     {
@@ -15,7 +15,7 @@
     {
       "bytes": 4334,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "3915b7f24773456e3f884caf5fa03db68695c4b543a673cd18d7b0fe63c1c8f6"
+      "sha256": "807df6edb662ea4b2a4479facafca919f72c7763a26f1c2c1a6ded3c5b65eede"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 753,
       "path": "plugin.yaml",
-      "sha256": "a2532143ce6577bcee08749280d5a3ba98f9104cda386e71fc4f2b54eb45e1a8"
+      "sha256": "3c351cbbaa95006216b70db7b03ef3445f5c5bb7867980ebfcb19562d1db131c"
     },
     {
       "bytes": 6557,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.4.4"
+  "version": "2.4.5"
 }

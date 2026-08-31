@@ -1814,6 +1814,47 @@ async def test_startup_scheduler_is_admission_only_and_never_reads_transcript(
     assert event.metadata["startup_resume_effect_fence"] == {}
 
 
+@pytest.mark.parametrize("terminal_state", ["CANCELLED", "TERMINAL"])
+def test_startup_scheduler_rejects_terminal_root_obligation(
+    monkeypatch,
+    terminal_state,
+):
+    """A stale profile hint cannot resurrect a root-settled continuation."""
+    from gateway import restart_loop_guard
+
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", lambda *a, **k: False)
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(message_id="restart-message-settled")
+    entry = bind_restart_origin_snapshot(
+        SessionEntry(
+            session_key=runner._session_key_for_source(source),
+            session_id="sid-settled-root-obligation",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=datetime.now(),
+            resume_task_id="task-settled-root-obligation",
+        )
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    settled = runner.session_store._coordination_db.get_gateway_resume_obligation(
+        entry.session_key
+    )
+    settled["state"] = terminal_state
+    runner.session_store._coordination_db.get_gateway_resume_obligation.side_effect = None
+    runner.session_store._coordination_db.get_gateway_resume_obligation.return_value = (
+        settled
+    )
+    runner._run_startup_resume_event = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    runner._run_startup_resume_event.assert_not_awaited()
+
+
 def test_startup_scheduler_defers_to_claimed_delivery_obligation(monkeypatch):
     """Boot redelivery owns the exact session until delivery is settled."""
     from gateway import restart_loop_guard

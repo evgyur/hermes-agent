@@ -16081,6 +16081,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     entry.session_key,
                 )
                 continue
+            try:
+                coordination_db = getattr(
+                    self.session_store, "_coordination_db", None
+                )
+                get_obligation = getattr(
+                    coordination_db, "get_gateway_resume_obligation", None
+                )
+                obligation = (
+                    get_obligation(entry.session_key)
+                    if callable(get_obligation)
+                    else None
+                )
+            except Exception:
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: durable "
+                    "coordination obligation lookup failed",
+                    entry.session_key,
+                    exc_info=True,
+                )
+                continue
+            snapshot = getattr(entry, "resume_origin_snapshot", None) or {}
+            obligation_state = (
+                str(obligation.get("state") or "")
+                if isinstance(obligation, dict)
+                else ""
+            )
+            obligation_exact = bool(
+                isinstance(obligation, dict)
+                and obligation_state in {"PENDING", "CLAIMED"}
+                and str(obligation.get("resume_task_id") or "")
+                == str(getattr(entry, "resume_task_id", "") or "")
+                and int(obligation.get("generation") or 0)
+                == int(getattr(entry, "continuation_generation", 0) or 0)
+                and str(obligation.get("origin_sha256") or "")
+                == str(snapshot.get("source_sha256") or "")
+                and (
+                    obligation_state == "PENDING"
+                    or (
+                        str(obligation.get("claim_owner") or "")
+                        == str(
+                            getattr(entry, "continuation_claim_owner", "") or ""
+                        )
+                        and str(obligation.get("claim_token") or "")
+                        == str(
+                            getattr(entry, "continuation_claim_token", "") or ""
+                        )
+                    )
+                )
+            )
+            if not obligation_exact:
+                logger.warning(
+                    "Quarantining startup auto-resume for %s: profile "
+                    "recovery hint has no matching live root obligation "
+                    "(state=%s)",
+                    entry.session_key,
+                    obligation_state or "ABSENT",
+                )
+                continue
             if platform is not None and source.platform != platform:
                 continue
             if source.platform == Platform.TELEGRAM and source.chat_type == "dm":

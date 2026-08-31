@@ -187,6 +187,25 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+
+    def _exact_pending_obligation(session_key):
+        entry = runner.session_store._entries.get(session_key)
+        if entry is None:
+            return None
+        snapshot = entry.resume_origin_snapshot or {}
+        return {
+            "session_key": session_key,
+            "resume_task_id": entry.resume_task_id,
+            "generation": entry.continuation_generation,
+            "state": "PENDING",
+            "origin_sha256": snapshot.get("source_sha256"),
+            "claim_owner": None,
+            "claim_token": None,
+        }
+
+    runner.session_store._coordination_db.get_gateway_resume_obligation.side_effect = (
+        _exact_pending_obligation
+    )
     # Startup continuation is authorized only after a readable durable
     # frontier.  The generic fixture models a safe user-only transcript;
     # risk-specific tests replace this with tool-call rows.
