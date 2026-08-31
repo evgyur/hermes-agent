@@ -3088,6 +3088,26 @@ class TestOptimizeFts:
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
+    def test_post_commit_fts_system_error_does_not_fail_durable_write(
+        self, db, monkeypatch, caplog
+    ):
+        """Best-effort FTS maintenance cannot negate an admitted user write."""
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+
+        def _broken_merge(*, max_pages):
+            raise SystemError(
+                "TrackedConnection returned NULL without setting an exception"
+            )
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _broken_merge)
+
+        db.create_session(session_id="fts-maintenance-fault", source="cli")
+
+        row = db.get_session("fts-maintenance-fault")
+        assert row is not None
+        assert row["id"] == "fts-maintenance-fault"
+        assert "FTS incremental merge failed" in caplog.text
+
 
 
 class TestAutoMaintenance:

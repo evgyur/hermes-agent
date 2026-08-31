@@ -21764,6 +21764,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
+            and is_internal
+            and not bool(getattr(event, "startup_resume", False))
+            and not getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            # Completion/watch events are new synthetic turns, not part of
+            # the startup-resume turn itself.  Starting one while the boot
+            # continuation owns this session can replace its exact active
+            # marker with an identity-free internal source.  Queue it behind
+            # startup restore so one session always has one durable owner.
+            self._queue_startup_restore_event(event)
+            return None
+
+        if (
+            getattr(self, "_startup_restore_in_progress", False)
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):

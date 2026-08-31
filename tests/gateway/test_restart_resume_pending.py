@@ -3245,6 +3245,37 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 @pytest.mark.asyncio
+async def test_startup_restore_queues_internal_completion_behind_resume():
+    """A completion wake cannot start a second owner beside boot resume."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._handle_message_with_agent = AsyncMock(return_value=None)
+    adapter.handle_message = AsyncMock(return_value=None)
+
+    source = make_restart_source(
+        chat_id="-1003971448755",
+        chat_type="group",
+        thread_id="26452",
+    )
+    completion = MessageEvent(
+        text="[Background delegation completed]",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+    )
+
+    assert await runner._handle_message(completion) is None
+
+    assert runner._startup_restore_queue == [completion]
+    runner._handle_message_with_agent.assert_not_awaited()
+
+    assert await runner._drain_startup_restore_queue() == 1
+    adapter.handle_message.assert_awaited_once_with(completion)
+
+
+@pytest.mark.asyncio
 async def test_exact_telegram_redelivery_before_startup_resume_is_not_new_human():
     """A reply-context prefix must not disguise the interrupted redelivery."""
     runner, adapter = make_restart_runner()

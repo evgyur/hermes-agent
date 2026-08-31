@@ -88,10 +88,15 @@ class SessionSearchMixin:
             self._merge_fts_incrementally(
                 max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
             )
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, SystemError) as exc:
             # Routine maintenance is best effort, but unexpected SQLite errors
             # must remain visible instead of being silently mistaken for an
-            # optional missing index.
+            # optional missing index.  CPython's sqlite wrapper can surface a
+            # contended FTS virtual-table probe as ``SystemError: returned NULL
+            # without setting an exception``.  The caller's durable write has
+            # already committed before this maintenance pass starts, so that
+            # engine-level wrapper failure must not turn an admitted message
+            # into an apparent ingress failure.
             logger.warning("FTS incremental merge failed: %s", exc)
 
     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
