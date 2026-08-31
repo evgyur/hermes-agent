@@ -104,6 +104,10 @@ def install(source_root: Path, hermes_home: Path, *, variant: str, mode: str) ->
     errors = doctor.validate_settings({"variant": variant, "mode": mode})
     if errors:
         raise ValueError("; ".join(errors))
+    if variant == "owner" and not doctor.owner_mcp_runtime_report()["available"]:
+        raise RuntimeError(
+            "owner variant requires the Hermes MCP extra with streamable HTTP support"
+        )
     inventory = doctor._inventory_report(source_root)
     if inventory.get("status") != "PASS":
         raise RuntimeError("Powerpack source inventory verification failed")

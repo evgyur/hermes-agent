@@ -22,6 +22,9 @@ common memory/provider surface, `employee` additionally exposes the isolated
 employee Telegram bridge, and `owner` selects every Powerpack surface while
 allowing the host to bind its separately managed full-memory and account
 credentials. The package never copies or persists secrets itself.
+The `owner` contour also requires the Hermes `mcp` extra in the managed
+interpreter; both the installer and doctor fail closed when streamable HTTP MCP
+support is absent.
 
 ## Boxed install over an existing Hermes profile
 

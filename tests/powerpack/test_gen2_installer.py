@@ -103,6 +103,24 @@ def test_installer_persists_owner_variant_without_secrets(monkeypatch, tmp_path)
     }
 
 
+def test_installer_rejects_owner_without_streamable_http_mcp(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        doctor,
+        "owner_mcp_runtime_report",
+        lambda: {"available": False, "mcp_version": None},
+    )
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    original = b"plugins:\n  enabled: []\n"
+    (home / "config.yaml").write_bytes(original)
+
+    with pytest.raises(RuntimeError, match="streamable HTTP"):
+        installer.install(PACKAGE_ROOT, home, variant="owner", mode="gen2_only")
+
+    assert (home / "config.yaml").read_bytes() == original
+    assert not (home / "plugins" / "human20-powerpack-gen2").exists()
+
+
 def test_installer_rejects_tampered_source_without_mutating_profile(tmp_path):
     source = tmp_path / "source"
     shutil.copytree(PACKAGE_ROOT, source, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))

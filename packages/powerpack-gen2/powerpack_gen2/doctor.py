@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 import re
@@ -634,6 +636,19 @@ def _check(checks: list[dict[str, Any]], name: str, passed: bool, *, required: b
     checks.append({"name": name, "status": "PASS" if passed else "FAIL", "required": required, "evidence": evidence})
 
 
+def owner_mcp_runtime_report() -> dict[str, Any]:
+    """Report whether this exact interpreter can open streamable HTTP MCPs."""
+    try:
+        available = importlib.util.find_spec("mcp.client.streamable_http") is not None
+    except (ImportError, ModuleNotFoundError):
+        available = False
+    try:
+        version = importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    return {"available": available, "mcp_version": version}
+
+
 def run_doctor(
     *,
     root: Path,
@@ -653,6 +668,13 @@ def run_doctor(
     checks: list[dict[str, Any]] = []
     settings_errors = validate_settings({"variant": variant, "mode": mode})
     _check(checks, "settings", not settings_errors, evidence=settings_errors)
+    owner_mcp = owner_mcp_runtime_report()
+    _check(
+        checks,
+        "owner_streamable_http_mcp",
+        variant != "owner" or owner_mcp["available"],
+        evidence=owner_mcp,
+    )
     _check(checks, "manifest_kind", manifest.get("plugin_kind") == "standalone", evidence=manifest.get("plugin_kind"))
     _check(
         checks,

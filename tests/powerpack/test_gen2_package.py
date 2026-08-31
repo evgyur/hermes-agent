@@ -556,6 +556,25 @@ def test_owner_variant_keeps_all_powerpack_surfaces():
     }
 
 
+def test_owner_doctor_fails_closed_without_streamable_http_mcp(monkeypatch):
+    monkeypatch.setattr(
+        doctor,
+        "owner_mcp_runtime_report",
+        lambda: {"available": False, "mcp_version": None},
+    )
+
+    report = doctor.run_doctor(
+        root=PACKAGE_ROOT,
+        variant="owner",
+        mode="gen2_only",
+        upstream_sha=cli.PIN,
+        ci=True,
+    )
+
+    assert report["ok"] is False
+    assert "owner_streamable_http_mcp" in report["required_failures"]
+
+
 def test_collision_fails_closed():
     package = _reload_package()
     ctx = FakeContext(mode="gen2_only", reject="tool:continuum_host")
