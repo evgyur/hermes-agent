@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,6 +115,10 @@ def handle_continuum(args: dict[str, Any], **_: Any) -> str:
 
 
 _CHIPMANAGER_BASE = "http://127.0.0.1:18083"
+_CHIPMANAGER_PREVIEW_RECEIPT_TTL_SECONDS = 10 * 60
+_CHIPMANAGER_PREVIEW_RECEIPT_MAX_KEYS = 256
+_chipmanager_preview_receipt_lock = threading.Lock()
+_chipmanager_preview_receipts: dict[tuple[str, str, str], list[tuple[float, int]]] = {}
 
 
 def _chipmanager_base() -> str:
@@ -124,6 +130,80 @@ def _unwrap(payload: dict[str, Any]) -> Any:
     if isinstance(value, str) and value.startswith(("{", "[")):
         return json.loads(value)
     return value
+
+
+def _record_chipmanager_preview_receipt(
+    *,
+    session_key: str,
+    turn_id: str,
+    chat_id: str,
+    message_id: int,
+    created_at: float | None = None,
+) -> bool:
+    """Record one exact-readback receipt for the current live turn.
+
+    This is intentionally process-local. A restart loses the receipt and
+    fails closed instead of granting stale publication authority.
+    """
+    session_key = str(session_key or "").strip()
+    turn_id = str(turn_id or "").strip()
+    chat_id = str(chat_id or "").strip()
+    if not session_key or not turn_id or not chat_id or type(message_id) is not int:
+        return False
+    key = (session_key, turn_id, chat_id)
+    stamp = time.monotonic() if created_at is None else float(created_at)
+    with _chipmanager_preview_receipt_lock:
+        for stale_key, stale_receipts in list(
+            _chipmanager_preview_receipts.items()
+        ):
+            if not any(
+                stamp - receipt_stamp
+                <= _CHIPMANAGER_PREVIEW_RECEIPT_TTL_SECONDS
+                for receipt_stamp, _ in stale_receipts
+            ):
+                _chipmanager_preview_receipts.pop(stale_key, None)
+        if (
+            key not in _chipmanager_preview_receipts
+            and len(_chipmanager_preview_receipts)
+            >= _CHIPMANAGER_PREVIEW_RECEIPT_MAX_KEYS
+        ):
+            oldest_key = min(
+                _chipmanager_preview_receipts,
+                key=lambda candidate: min(
+                    receipt_stamp
+                    for receipt_stamp, _ in _chipmanager_preview_receipts[candidate]
+                ),
+            )
+            _chipmanager_preview_receipts.pop(oldest_key, None)
+        receipts = _chipmanager_preview_receipts.setdefault(key, [])
+        if not any(existing_id == message_id for _, existing_id in receipts):
+            receipts.append((stamp, message_id))
+    return True
+
+
+def consume_chipmanager_preview_receipts(
+    *,
+    session_key: str,
+    turn_id: str,
+    chat_id: str,
+    now: float | None = None,
+) -> tuple[int, ...]:
+    """Consume fresh receipts for one exact Hermes turn and Telegram chat."""
+    key = (
+        str(session_key or "").strip(),
+        str(turn_id or "").strip(),
+        str(chat_id or "").strip(),
+    )
+    if not all(key):
+        return ()
+    current = time.monotonic() if now is None else float(now)
+    with _chipmanager_preview_receipt_lock:
+        receipts = _chipmanager_preview_receipts.pop(key, [])
+    return tuple(
+        message_id
+        for created_at, message_id in receipts
+        if current - created_at <= _CHIPMANAGER_PREVIEW_RECEIPT_TTL_SECONDS
+    )
 
 
 def handle_chipmanager(args: dict[str, Any], **_: Any) -> str:
@@ -160,7 +240,26 @@ def handle_chipmanager(args: dict[str, Any], **_: Any) -> str:
         readback = _unwrap(fetched)
         if not fetched.get("success") or not isinstance(readback, dict) or readback.get("text") != message:
             raise RuntimeError("chipmanager exact message readback failed")
-        return _json({"ok": True, "message_id": message_id, "readback": "exact"})
+        from tools.approval import (
+            get_current_observability_context,
+            get_current_session_key,
+        )
+
+        correlation = get_current_observability_context()
+        receipt_recorded = _record_chipmanager_preview_receipt(
+            session_key=get_current_session_key(default=""),
+            turn_id=correlation.get("turn_id", ""),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        return _json(
+            {
+                "ok": True,
+                "message_id": message_id,
+                "readback": "exact",
+                "receipt_recorded": receipt_recorded,
+            }
+        )
     except (urllib.error.URLError, OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         return _json({"ok": False, "fail_closed": True, "error": str(exc)})
 

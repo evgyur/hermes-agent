@@ -19,6 +19,33 @@ if str(PACKAGE_ROOT) not in sys.path:
 from powerpack_gen2 import cli, doctor  # noqa: E402
 
 
+def _preview_guard_adapter():
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from unittest.mock import AsyncMock, MagicMock
+    from types import SimpleNamespace
+
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="fake-token",
+            extra={
+                "inline_preview_guard": {
+                    "enabled": True,
+                    "chats": ["-1003712304136"],
+                }
+            },
+        )
+    )
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=8174)
+    )
+    adapter._bot.send_chat_action = AsyncMock()
+    adapter._rich_messages_enabled = False
+    return adapter
+
+
 class FakeContext:
     def __init__(self, *, mode: str, variant: str = "employee", reject: str | None = None):
         self.settings = {"mode": mode, "variant": variant}
@@ -580,6 +607,185 @@ def test_current_plugin_context_registers_exact_gen2_owners(monkeypatch, tmp_pat
     assert web_search_registry.get_provider("human20-perplexity") is not None
     assert image_gen_registry.get_provider("human20-keys-openai-codex") is not None
     assert transcription_registry.get_provider("human20-keys-groq") is not None
+
+
+@pytest.mark.asyncio
+async def test_chipmanager_exact_readback_receipt_replaces_agent_final_once(monkeypatch):
+    """Incident 8174: a proven external send gets one deterministic ack."""
+    package = _reload_package()
+    sent_message = "Published through the trusted preview route."
+
+    def fake_http(method, url, payload=None, timeout=15):
+        if url.endswith("/me"):
+            return {"data": {"username": "chipmanager"}}
+        if url.endswith("/messages/send"):
+            assert method == "POST"
+            assert payload == {
+                "chat_id": "-1003712304136",
+                "message": sent_message,
+            }
+            return {"success": True, "data": "Message ID: 8172"}
+        if url.endswith("/messages/8172"):
+            return {"success": True, "data": {"text": sent_message}}
+        raise AssertionError((method, url, payload, timeout))
+
+    monkeypatch.setattr(package.tools, "_http_json", fake_http)
+    from tools.approval import (
+        reset_current_observability_context,
+        reset_current_session_key,
+        set_current_observability_context,
+        set_current_session_key,
+    )
+
+    session_token = set_current_session_key(
+        "agent:serverdoctor:telegram:group:-1003712304136"
+    )
+    observability_tokens = set_current_observability_context(
+        turn_id="turn-8174",
+        tool_call_id="tool-preview-1",
+        session_id="session-8174",
+    )
+    try:
+        tool_result = json.loads(
+            package.tools.handle_chipmanager(
+                {
+                    "action": "send",
+                    "chat_id": "-1003712304136",
+                    "message": sent_message,
+                    "authority": "explicit-user-request",
+                }
+            )
+        )
+    finally:
+        reset_current_observability_context(observability_tokens)
+        reset_current_session_key(session_token)
+
+    assert tool_result == {
+        "message_id": 8172,
+        "ok": True,
+        "readback": "exact",
+        "receipt_recorded": True,
+    }
+
+    adapter = _preview_guard_adapter()
+    metadata = {
+        "notify": True,
+        "_hermes_session_key": "agent:serverdoctor:telegram:group:-1003712304136",
+        "_hermes_turn_id": "turn-8174",
+    }
+    first = await adapter.send(
+        "-1003712304136",
+        "Arbitrary model-authored final must not be forwarded.",
+        metadata=metadata,
+    )
+    assert first.success is True
+    first_text = adapter._bot.send_message.await_args.kwargs["text"]
+    assert "8172" in first_text
+    assert "отправлено" in first_text.lower()
+    assert "Arbitrary model-authored" not in first_text
+    assert "превью заблокировано" not in first_text
+
+    adapter._bot.send_message.reset_mock()
+    second = await adapter.send(
+        "-1003712304136",
+        "A replay in the same turn must fail closed.",
+        metadata=metadata,
+    )
+    assert second.success is True
+    second_text = adapter._bot.send_message.await_args.kwargs["text"]
+    assert "превью заблокировано" in second_text
+
+
+@pytest.mark.asyncio
+async def test_chipmanager_receipt_is_exact_route_and_turn_scoped():
+    package = _reload_package()
+    package.tools._record_chipmanager_preview_receipt(
+        session_key="session-route-a",
+        turn_id="turn-a",
+        chat_id="-1003712304136",
+        message_id=8172,
+    )
+    adapter = _preview_guard_adapter()
+
+    await adapter.send(
+        "-1003712304136",
+        "Wrong turn",
+        metadata={
+            "notify": True,
+            "_hermes_session_key": "session-route-a",
+            "_hermes_turn_id": "turn-b",
+        },
+    )
+    assert "превью заблокировано" in adapter._bot.send_message.await_args.kwargs["text"]
+
+    adapter._bot.send_message.reset_mock()
+    await adapter.send(
+        "-1003712304136",
+        "Right turn",
+        metadata={
+            "notify": True,
+            "_hermes_session_key": "session-route-a",
+            "_hermes_turn_id": "turn-a",
+        },
+    )
+    assert "8172" in adapter._bot.send_message.await_args.kwargs["text"]
+    assert "Right turn" not in adapter._bot.send_message.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_chipmanager_failed_readback_records_no_preview_receipt(monkeypatch):
+    package = _reload_package()
+
+    def fake_http(method, url, payload=None, timeout=15):
+        if url.endswith("/me"):
+            return {"data": {"username": "chipmanager"}}
+        if url.endswith("/messages/send"):
+            return {"success": True, "data": "Message ID: 8172"}
+        if url.endswith("/messages/8172"):
+            return {"success": True, "data": {"text": "different content"}}
+        raise AssertionError((method, url, payload, timeout))
+
+    monkeypatch.setattr(package.tools, "_http_json", fake_http)
+    from tools.approval import (
+        reset_current_observability_context,
+        reset_current_session_key,
+        set_current_observability_context,
+        set_current_session_key,
+    )
+
+    session_token = set_current_session_key("session-failed-readback")
+    observability_tokens = set_current_observability_context(
+        turn_id="turn-failed-readback",
+        tool_call_id="tool-preview-failed",
+        session_id="session-failed-readback",
+    )
+    try:
+        result = json.loads(
+            package.tools.handle_chipmanager(
+                {
+                    "action": "send",
+                    "chat_id": "-1003712304136",
+                    "message": "expected content",
+                    "authority": "explicit-user-request",
+                }
+            )
+        )
+    finally:
+        reset_current_observability_context(observability_tokens)
+        reset_current_session_key(session_token)
+    assert result["ok"] is False
+
+    adapter = _preview_guard_adapter()
+    await adapter.send(
+        "-1003712304136",
+        "Should remain blocked",
+        metadata={
+            "notify": True,
+            "_hermes_session_key": "session-failed-readback",
+            "_hermes_turn_id": "turn-failed-readback",
+        },
+    )
+    assert "превью заблокировано" in adapter._bot.send_message.await_args.kwargs["text"]
 
 
 def test_current_plugin_context_accepts_legacy_root_settings(monkeypatch, tmp_path):

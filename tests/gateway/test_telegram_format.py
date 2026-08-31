@@ -203,6 +203,51 @@ async def test_inline_preview_guard_still_blocks_agent_final():
     assert "превью заблокировано" in sent_text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_text",
+    [
+        "Готово, публикация отправлена.",
+        "➊ Публикация завершена\n\nТекст без строки источника.",
+        "Отправил пост напрямую, всё успешно.",
+    ],
+)
+async def test_inline_preview_guard_never_trusts_agent_text_shape(agent_text):
+    """No model-authored wording may stand in for a delivery receipt."""
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={
+            "inline_preview_guard": {
+                "enabled": True,
+                "chats": ["-1003712304136"],
+            }
+        },
+    )
+    guarded = TelegramAdapter(config)
+    guarded._bot = MagicMock()
+    guarded._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=8066)
+    )
+    guarded._bot.send_chat_action = AsyncMock()
+    guarded._rich_messages_enabled = False
+
+    result = await guarded.send(
+        "-1003712304136",
+        agent_text,
+        metadata={
+            "notify": True,
+            # Model/tool output cannot manufacture authority by adding a
+            # receipt-looking metadata field.
+            "preview_receipt": {"message_id": 8172, "readback": "exact"},
+        },
+    )
+
+    assert result.success is True
+    sent_text = guarded._bot.send_message.await_args.kwargs["text"]
+    assert "превью заблокировано" in sent_text
+
+
 # =========================================================================
 # format_message - bold and italic
 # =========================================================================

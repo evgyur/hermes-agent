@@ -7799,6 +7799,15 @@ class TurnRunner:
                     history_offset=len(agent_history),
                 )
 
+        if isinstance(ctx._status_thread_metadata, dict):
+            _receipt_turn_id = str(
+                getattr(agent, "_current_turn_id", "") or ""
+            )
+            if _receipt_turn_id:
+                ctx._status_thread_metadata["_hermes_turn_id"] = (
+                    _receipt_turn_id
+                )
+
         ctx.result_holder[0] = result
         _delivery_control = normalize_delivery_control(result, logger=logger)
 
@@ -36876,6 +36885,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+
+        # Gateway-authored correlation for trusted effect receipts. The turn
+        # id is added after run_conversation creates it; this dict remains the
+        # same object held by the stream consumer, so the later stamp is visible
+        # to both streaming and non-streaming final delivery.
+        if source.platform == Platform.TELEGRAM:
+            if _status_thread_metadata is None:
+                _status_thread_metadata = {}
+            else:
+                _status_thread_metadata = dict(_status_thread_metadata)
+            _status_thread_metadata["_hermes_session_key"] = session_key or ""
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the

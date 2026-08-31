@@ -224,6 +224,20 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_observability_context() -> dict[str, str]:
+    """Return correlation IDs for the currently executing tool.
+
+    Effectful plugin tools use this public accessor to bind trusted receipts
+    to the exact Hermes turn without importing approval internals or accepting
+    model-authored correlation fields.
+    """
+    return {
+        "turn_id": _approval_turn_id.get(),
+        "tool_call_id": _approval_tool_call_id.get(),
+        "session_id": _approval_session_id.get(),
+    }
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

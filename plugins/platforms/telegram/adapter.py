@@ -6436,10 +6436,36 @@ class TelegramAdapter(BasePlatformAdapter):
             and bool((metadata or {}).get("notify"))
             and not str((metadata or {}).get("gateway_command") or "").strip()
         ):
-            content = (
-                "⚠️ превью заблокировано: готовая публикация должна пройти "
-                "через настроенный внешний preview-маршрут."
-            )
+            receipt_message_ids: tuple[int, ...] = ()
+            try:
+                from powerpack_gen2.tools import (
+                    consume_chipmanager_preview_receipts,
+                )
+
+                receipt_message_ids = consume_chipmanager_preview_receipts(
+                    session_key=str(
+                        (metadata or {}).get("_hermes_session_key") or ""
+                    ),
+                    turn_id=str((metadata or {}).get("_hermes_turn_id") or ""),
+                    chat_id=str(chat_id),
+                )
+            except Exception:
+                # Missing/disabled Powerpack, absent correlation, or any
+                # receipt error keeps the publication lane fail-closed.
+                receipt_message_ids = ()
+            if receipt_message_ids:
+                joined_ids = ", ".join(str(value) for value in receipt_message_ids)
+                # Never forward model-authored text through the guarded lane.
+                # The only permitted final is this deterministic receipt ack.
+                content = (
+                    "✅ Превью отправлено и проверено — "
+                    f"message_id {joined_ids}."
+                )
+            else:
+                content = (
+                    "⚠️ превью заблокировано: готовая публикация должна пройти "
+                    "через настроенный внешний preview-маршрут."
+                )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
