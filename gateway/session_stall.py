@@ -99,6 +99,8 @@ def resolve_session_idle_seconds_from_activity(
         return None
 
     elapsed = activity.get("seconds_since_activity")
+    if isinstance(elapsed, bool):
+        elapsed = None
     if elapsed is not None:
         try:
             idle = float(elapsed)
@@ -115,6 +117,8 @@ def resolve_session_idle_seconds_from_activity(
     if ts is None:
         ts = activity.get("last_activity_ts")
     if ts is None:
+        return None
+    if isinstance(ts, bool):
         return None
     try:
         when = float(ts)

@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "b8167324aedf2f1efed43c9d38d5af8de3fc6db3a718fdee7fa10b0fc7009459",
+  "aggregate_sha256": "a4b79f8b96ef2833424f4e13fb3db6f292da38881ff5eb06dd59caa5550ab9b3",
   "file_count": 17,
   "files": [
     {
@@ -13,9 +13,9 @@
       "sha256": "2f5a5f4591b88864c8ab7941aecf0d0724c92a26e051e6ee9a83687314f9deb3"
     },
     {
-      "bytes": 4726,
+      "bytes": 4774,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "61bbbcdb6deb494d6c90cfe397f82786a1aece6fc59b72d3a3b994c4531ab7ad"
+      "sha256": "0b5150a52ee9dbcd174d5df25a16b548d22cb5cb4282d3ecc430746ab6a7bd96"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 801,
       "path": "plugin.yaml",
-      "sha256": "a517674197a846e401d11895176215676c819d49468633f2d4c639794f54a001"
+      "sha256": "6f7c3e8766d64d8140027dccf4dd070060ee4033ee8e4acbe10fe839e6bb4826"
     },
     {
       "bytes": 6577,
@@ -40,7 +40,7 @@
     {
       "bytes": 6789,
       "path": "powerpack_gen2/cli.py",
-      "sha256": "94085310db07468950e7f1253ccbf78f2433039afbef1db6b5323426bb882988"
+      "sha256": "48e0a8bf828bea701f4d3b4daa873f0683b92f16f729c204f00dfb701b676f32"
     },
     {
       "bytes": 31664,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.5.4"
+  "version": "2.6.0"
 }
