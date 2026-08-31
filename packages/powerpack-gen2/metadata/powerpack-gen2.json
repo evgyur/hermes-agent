@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "human20-powerpack-gen2",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "plugin_kind": "standalone",
   "source_repository": "human20team/hermes-agent-powerpack",
   "source_base_sha": "90bb41551f98edf847ca2c86f9b1a86c7422cb8d",

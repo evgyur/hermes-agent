@@ -49,6 +49,7 @@ def _preview_guard_adapter():
 class FakeContext:
     def __init__(self, *, mode: str, variant: str = "employee", reject: str | None = None):
         self.settings = {"mode": mode, "variant": variant}
+        self.profile_name = "default"
         self.reject = reject
         self.calls: list[tuple[str, str]] = []
 
@@ -87,6 +88,10 @@ class FakeContext:
 
     def register_transcription_provider(self, provider):
         return self._record("stt", provider.name)
+
+    def on_unload(self, callback):
+        assert callable(callback)
+        return self._record("unload", getattr(callback, "__name__", "callback"))
 
 
 def _reload_package():
@@ -640,6 +645,79 @@ def test_current_plugin_context_registers_exact_gen2_owners(monkeypatch, tmp_pat
     assert web_search_registry.get_provider("human20-perplexity") is not None
     assert image_gen_registry.get_provider("human20-keys-openai-codex") is not None
     assert transcription_registry.get_provider("human20-keys-groq") is not None
+
+
+def test_root_powerpack_stt_provider_follows_multiplex_profile_scope(monkeypatch, tmp_path):
+    """A root install must expose stateless STT without borrowing root secrets."""
+    from agent import image_gen_registry, transcription_registry, web_search_registry
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    import tools.registry as tool_registry_module
+
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "sigurdtranscribe"
+    root_home.mkdir()
+    profile_home.mkdir(parents=True)
+    (root_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "entries": {
+                        "human20-powerpack-gen2": {
+                            "settings": {
+                                "mode": "gen2_only",
+                                "variant": "employee",
+                            },
+                            "allow_tool_override": True,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "stt:\n  provider: human20-keys-groq\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "H20_KEYS_BASE_URL=http://profile-keys.example.invalid/v1\n"
+        "H20_KEYS_STT_API_KEY=profile-only-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root_home))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+    clean_registry = tool_registry_module.ToolRegistry()
+    monkeypatch.setattr(tool_registry_module, "registry", clean_registry)
+    image_gen_registry._reset_for_tests()
+    transcription_registry._reset_for_tests()
+    web_search_registry._reset_for_tests()
+
+    package = _reload_package()
+    manager = PluginManager()
+    ctx = PluginContext(
+        PluginManifest(
+            name="human20-powerpack-gen2",
+            key="human20-powerpack-gen2",
+            source="user",
+        ),
+        manager,
+    )
+    package.register(ctx)
+    root_provider = transcription_registry.get_provider("human20-keys-groq")
+    assert root_provider is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    profile_provider = transcription_registry.get_provider("human20-keys-groq")
+    assert profile_provider is root_provider
+    transcription_module = importlib.import_module(
+        "powerpack_gen2.vendors.human20_keys.transcription"
+    )
+    assert transcription_module._stt_credential() == "profile-only-secret"
+
+    manager.unload()
+    assert transcription_registry.get_provider("human20-keys-groq") is None
 
 
 @pytest.mark.asyncio

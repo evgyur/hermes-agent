@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "2bbb46128291187ec8892c32c22c589173da927d3fe2f042d57c5ddfa959d1a5",
+  "aggregate_sha256": "bb0078ec98adcbd1662e3152fa33a6b4013d9fd14d6cbd2c59983c2cb91bcbc1",
   "file_count": 17,
   "files": [
     {
@@ -15,7 +15,7 @@
     {
       "bytes": 4726,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "8b00edb0669163aea721fc1bac45a5ba0d68b02b7067f8fdf02a0bced4271b12"
+      "sha256": "19c314f894bc8242badaa0f063d0b446a8b6a6593c61b05a64aec92fc0454d8d"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 801,
       "path": "plugin.yaml",
-      "sha256": "638d936389daf3c939e27eaf42935407a455f58a84525d1bfe5530810b37fa18"
+      "sha256": "ce3676128619b1e29d7bc65d0d14372a8e4e992115e2037ec3422ed30e802218"
     },
     {
       "bytes": 6577,
@@ -63,9 +63,9 @@
       "sha256": "038c4515fb8964623ac5e65c783dd1387e60b8fa9f1adf36d2c96d55968c88a6"
     },
     {
-      "bytes": 38562,
+      "bytes": 40521,
       "path": "powerpack_gen2/vendors/human20_keys/__init__.py",
-      "sha256": "f91bf0ddc5478363ec0f4bc915f0097735c81a2d0f89358abc756a2466f12a32"
+      "sha256": "25ae74f4a3df70fdf614bef058d34122d4e1242e67c8bb0de85c85117d1f2077"
     },
     {
       "bytes": 6036,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.5.1"
+  "version": "2.5.2"
 }

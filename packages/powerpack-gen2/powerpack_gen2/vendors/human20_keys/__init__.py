@@ -1030,9 +1030,53 @@ def register(ctx, *, required: bool = False) -> None:
     image_handle = ctx.register_image_gen_provider(image)
     transcription_handle = ctx.register_transcription_provider(transcription)
     from agent.image_gen_registry import get_provider as get_image_provider
-    from agent.transcription_registry import get_provider as get_transcription_provider
+    from agent.transcription_registry import (
+        get_provider as get_transcription_provider,
+        register_provider as register_transcription_provider,
+        restore_registration as restore_transcription_registration,
+        snapshot_registration as snapshot_transcription_registration,
+    )
+
+    # A multiplex gateway switches HERMES_HOME to the active profile before
+    # STT dispatch.  Hermes consequently selects that profile's plugin
+    # manager/registry scope, even though the process-level Powerpack is
+    # installed at the default home.  This backend is intentionally safe to
+    # inherit: it is stateless and resolves H20 credentials at call time
+    # through the active profile secret scope.  Publish it process-wide only
+    # from the default profile; profile-local Powerpack installs remain local.
+    global_transcription_handle = None
+    if getattr(ctx, "profile_name", "default") == "default":
+        global_previous = snapshot_transcription_registration(
+            transcription.name, scope=None
+        )
+        register_transcription_provider(transcription, scope=None)
+        if (
+            snapshot_transcription_registration(transcription.name, scope=None)
+            is transcription
+        ):
+            global_transcription_handle = ctx.on_unload(
+                lambda: restore_transcription_registration(
+                    transcription.name,
+                    transcription,
+                    global_previous,
+                    scope=None,
+                )
+            )
+            if global_transcription_handle is None:
+                restore_transcription_registration(
+                    transcription.name,
+                    transcription,
+                    global_previous,
+                    scope=None,
+                )
 
     if required and image_handle is None and get_image_provider(image.name) is not image:
         raise RuntimeError("Powerpack Gen2 provider registration collided: human20-keys-openai-codex")
     if required and transcription_handle is None and get_transcription_provider(transcription.name) is not transcription:
         raise RuntimeError("Powerpack Gen2 provider registration collided: human20-keys-groq")
+    if (
+        required
+        and getattr(ctx, "profile_name", "default") == "default"
+        and global_transcription_handle is None
+    ):
+        raise RuntimeError("Powerpack Gen2 global STT registration failed: human20-keys-groq")
