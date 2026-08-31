@@ -612,14 +612,20 @@ def _operational_config_report(hermes_home: Path) -> dict[str, Any]:
 
 
 def _credential_report(mode: str, *, require_perplexity: bool = True) -> dict[str, Any]:
-    names = ("H20_KEYS_BASE_URL", "H20_KEYS_STT_API_KEY", "H20_KEYS_API_KEY", "PERPLEXITY_API_KEY", "PPLX_API_KEY")
+    names = ("H20_KEYS_BASE_URL", "H20_KEYS_STT_API_KEY", "H20_KEYS_API_KEY")
     present = {name: bool(os.environ.get(name)) for name in names}
-    h20 = present["H20_KEYS_BASE_URL"] and (present["H20_KEYS_STT_API_KEY"] or present["H20_KEYS_API_KEY"])
-    perplexity = present["PERPLEXITY_API_KEY"] or present["PPLX_API_KEY"]
+    h20_stt = present["H20_KEYS_BASE_URL"] and (
+        present["H20_KEYS_STT_API_KEY"] or present["H20_KEYS_API_KEY"]
+    )
+    h20_perplexity = present["H20_KEYS_BASE_URL"] and present["H20_KEYS_API_KEY"]
     return {
-        "status": "PASS" if mode != "gen2_only" or (h20 and (perplexity or not require_perplexity)) else "FAIL",
+        "status": "PASS"
+        if mode != "gen2_only"
+        or (h20_stt and (h20_perplexity or not require_perplexity))
+        else "FAIL",
         "present": present,
         "perplexity_required": require_perplexity,
+        "perplexity_via_h20_keys": h20_perplexity,
         "values_exposed": False,
     }
 

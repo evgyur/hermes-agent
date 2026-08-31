@@ -38,7 +38,7 @@ def _activate_config(
     variant: str,
     mode: str,
     *,
-    perplexity_available: bool,
+    h20_keys_available: bool,
 ) -> None:
     plugins = config.setdefault("plugins", {})
     if not isinstance(plugins, dict):
@@ -70,7 +70,7 @@ def _activate_config(
     image_gen = config.setdefault("image_gen", {})
     if not all(isinstance(section, dict) for section in (web, stt, image_gen)):
         raise RuntimeError("web, stt, and image_gen config sections must be mappings")
-    if perplexity_available:
+    if h20_keys_available:
         web["search_backend"] = "human20-perplexity"
     elif web.get("search_backend") == "human20-perplexity":
         web.pop("search_backend", None)
@@ -114,8 +114,10 @@ def install(source_root: Path, hermes_home: Path, *, variant: str, mode: str) ->
     config_path = hermes_home / "config.yaml"
     original_config = config_path.read_bytes() if config_path.exists() else None
     config = _load_config(config_path)
-    perplexity_available = bool(os.environ.get("PERPLEXITY_API_KEY") or os.environ.get("PPLX_API_KEY"))
-    _activate_config(config, variant, mode, perplexity_available=perplexity_available)
+    h20_keys_available = bool(
+        os.environ.get("H20_KEYS_BASE_URL") and os.environ.get("H20_KEYS_API_KEY")
+    )
+    _activate_config(config, variant, mode, h20_keys_available=h20_keys_available)
 
     stage = Path(tempfile.mkdtemp(prefix=f".{PLUGIN_NAME}.stage-", dir=plugins_root))
     backup = plugins_root / f".{PLUGIN_NAME}.backup-{os.getpid()}"

@@ -72,7 +72,7 @@ def _reload_package():
 def test_manifest_is_supported_standalone_plugin():
     manifest = yaml.safe_load((PACKAGE_ROOT / "plugin.yaml").read_text())
     assert manifest["kind"] == "standalone"
-    assert manifest["version"] == "2.3.8"
+    assert manifest["version"] == "2.3.9"
     assert doctor.load_manifest(PACKAGE_ROOT)["version"] == manifest["version"]
     assert manifest["config_schema"]["mode"]["default"] == "disabled"
     assert manifest["config_schema"]["mode"]["choices"] == [
@@ -315,17 +315,30 @@ def test_runtime_env_identity_requires_exact_candidate_venv_first_on_path(tmp_pa
     assert "/srv/hermes-old" not in json.dumps(stale)
 
 
-def test_gen2_credentials_require_perplexity_only_when_selected(monkeypatch):
+def test_gen2_credentials_route_perplexity_through_h20_keys(monkeypatch):
     monkeypatch.setenv("H20_KEYS_BASE_URL", "https://keys.example.invalid/v1")
     monkeypatch.setenv("H20_KEYS_API_KEY", "test-key")
-    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
-    monkeypatch.delenv("PPLX_API_KEY", raising=False)
 
     fallback = doctor._credential_report("gen2_only", require_perplexity=False)
     selected = doctor._credential_report("gen2_only", require_perplexity=True)
 
     assert fallback["status"] == "PASS"
+    assert selected["status"] == "PASS"
+    assert selected["perplexity_via_h20_keys"] is True
+    assert "PERPLEXITY_API_KEY" not in selected["present"]
+    assert "PPLX_API_KEY" not in selected["present"]
+
+
+def test_direct_perplexity_key_does_not_satisfy_gen2_credentials(monkeypatch):
+    monkeypatch.delenv("H20_KEYS_BASE_URL", raising=False)
+    monkeypatch.delenv("H20_KEYS_API_KEY", raising=False)
+    monkeypatch.delenv("H20_KEYS_STT_API_KEY", raising=False)
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "direct-key-must-not-be-used")
+
+    selected = doctor._credential_report("gen2_only", require_perplexity=True)
+
     assert selected["status"] == "FAIL"
+    assert selected["perplexity_via_h20_keys"] is False
 
 
 def test_sqlite_runtime_floor_rejects_wal_reset_vulnerable_version():

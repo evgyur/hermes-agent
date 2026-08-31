@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "c172080d64d3434dc2b0c87fbd37703d46ea17f97909ff5da3d2c17eaf15debf",
+  "aggregate_sha256": "81b9880915cb1a57295756896b367112395b716e4c8693cf628a2ab07eade9f9",
   "file_count": 17,
   "files": [
     {
@@ -15,7 +15,7 @@
     {
       "bytes": 4286,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "8b2607276075b49d19ff19e1ded6aaa46468627fd93d21474a5d56144298392e"
+      "sha256": "5255f605dcd2690dde38e00075b2d547b5ac56b70343d0cbed8ed6526121786a"
     },
     {
       "bytes": 171,
@@ -30,7 +30,7 @@
     {
       "bytes": 753,
       "path": "plugin.yaml",
-      "sha256": "729730f5be9ee63b0ef04722d657e931705521ae8372e79fab25bc579d8fbb8c"
+      "sha256": "3fbcfb3968e30df85764711f982f99cf20f70865bc6734b511d2a7a7867ae494"
     },
     {
       "bytes": 6557,
@@ -43,14 +43,14 @@
       "sha256": "9958e0476e73fa99848afa3718240d5b135ccf94003f261c6b1d3f20e8ccd26e"
     },
     {
-      "bytes": 30601,
+      "bytes": 30672,
       "path": "powerpack_gen2/doctor.py",
-      "sha256": "c01c3c795b6609d841057a00ad082063b6db9daa461c89765a4c1a5926ceba91"
+      "sha256": "67dfba4e091cf84f9e206850124bf9aaa4e0205f3ed505de756f24ee42a34bed"
     },
     {
-      "bytes": 7131,
+      "bytes": 7139,
       "path": "powerpack_gen2/installer.py",
-      "sha256": "22ac0bee827399c9daf81ed2cf7e557b54bed0bd6f8a4202e664dac72d0afb0a"
+      "sha256": "46c480a13710a2fb57ac6790d9b97824fe9b0843c0b5401b4f4200efcf9b098d"
     },
     {
       "bytes": 8955,
@@ -78,9 +78,9 @@
       "sha256": "eaddd05636587668e8fb2030a92e4037fb1e84008838f52e9c61ee71b5510153"
     },
     {
-      "bytes": 10321,
+      "bytes": 5549,
       "path": "powerpack_gen2/vendors/perplexity/provider.py",
-      "sha256": "5c607787638db611e985b3a6e2c6e1f21f649d64d56cdc1e13cd107be37c55c2"
+      "sha256": "9970baef3ae07f2c1882f57e181d5526b9de28cf834adab4445cc80c73a9c575"
     },
     {
       "bytes": 794,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.3.8"
+  "version": "2.3.9"
 }

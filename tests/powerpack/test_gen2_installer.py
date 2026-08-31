@@ -17,7 +17,8 @@ from powerpack_gen2 import doctor, installer  # noqa: E402
 
 
 def test_installer_atomically_materializes_and_activates_boxed_plugin(monkeypatch, tmp_path):
-    monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+    monkeypatch.setenv("H20_KEYS_BASE_URL", "http://keys.example.invalid")
+    monkeypatch.setenv("H20_KEYS_API_KEY", "test-key")
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -59,9 +60,9 @@ def test_installer_atomically_materializes_and_activates_boxed_plugin(monkeypatc
     assert persisted["package_sha256"] == receipt["package_sha256"]
 
 
-def test_installer_preserves_default_web_provider_without_perplexity_credentials(monkeypatch, tmp_path):
-    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
-    monkeypatch.delenv("PPLX_API_KEY", raising=False)
+def test_installer_preserves_default_web_provider_without_h20_credentials(monkeypatch, tmp_path):
+    monkeypatch.delenv("H20_KEYS_BASE_URL", raising=False)
+    monkeypatch.delenv("H20_KEYS_API_KEY", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
