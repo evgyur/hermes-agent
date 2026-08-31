@@ -331,6 +331,63 @@ def test_write_under_profile_scope_lands_in_profile_store(multiplex_homes):
     assert _session_ids(root / "state.db") == set()
 
 
+def test_profile_reset_settles_root_resume_and_publishes_new_route(
+    multiplex_homes,
+):
+    """A routed /new must not leave a restart zombie in the root store.
+
+    Drain/startup coordination runs outside a profile scope, so its routing
+    projection and resume obligation are rooted in the gateway's coordination
+    DB.  The explicit reset itself runs inside the routed profile scope.  The
+    reset must still cancel the exact old obligation and publish the new
+    session id back to the root projection; otherwise the next gateway boot
+    reloads the ended predecessor and can resurrect the old task.
+    """
+    root, profile = multiplex_homes
+    store = _make_store(root)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003971448755",
+        user_id="617744661",
+        chat_type="group",
+        thread_id="51141",
+        profile="fitness",
+    )
+    token = set_hermes_home_override(str(profile))
+    try:
+        entry = store.get_or_create_session(source)
+    finally:
+        reset_hermes_home_override(token)
+    old_session_id = entry.session_id
+    # Planned drain is process-global and therefore runs after the routed
+    # profile scope has unwound.
+    assert store.mark_turn_active(entry.session_key, source)
+    assert store.mark_resume_pending(entry.session_key) is True
+
+    root_db = store._db
+    root_row = root_db.get_gateway_resume_obligation(entry.session_key)
+    assert root_row is not None and root_row["state"] == "PENDING"
+
+    token = set_hermes_home_override(str(profile))
+    try:
+        new_entry = store.reset_session(entry.session_key)
+        profile_db = store._db
+    finally:
+        reset_hermes_home_override(token)
+
+    assert new_entry is not None
+    assert new_entry.session_id != old_session_id
+    assert root_db.get_gateway_resume_obligation(entry.session_key)["state"] == "CANCELLED"
+
+    root_route = root_db.load_gateway_routing_entries(
+        scope=str((root / "sessions").resolve())
+    )[entry.session_key]
+    assert __import__("json").loads(root_route)["session_id"] == new_entry.session_id
+    assert entry.session_key not in profile_db.load_gateway_routing_entries(
+        scope=str((root / "sessions").resolve())
+    )
+
+
 def test_handles_are_cached_per_path(multiplex_homes):
     """One handle per profile: no reopen per message, no sharing across profiles."""
     root, profile = multiplex_homes

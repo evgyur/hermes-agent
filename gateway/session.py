@@ -1768,6 +1768,14 @@ class SessionStore:
             handles=self._db_handles,
             lock=self._db_handles_lock,
         )
+        # Routing and restart-continuation ownership are gateway-global even
+        # when transcripts are profile-scoped.  Capture the process-root DB at
+        # construction time, before any multiplex profile context can redirect
+        # ``_db``.  Otherwise a routed /new writes the new route to the profile
+        # DB while startup keeps reading the old route from the root DB.
+        from hermes_state import _default_db_path
+
+        self._coordination_db_path = Path(_default_db_path()).resolve()
         self._open_session_db_for_active_scope()
 
     def _open_session_db_for_active_scope(self):
@@ -1842,6 +1850,28 @@ class SessionStore:
     @_db.setter
     def _db(self, value) -> None:
         self._db_pinned = value
+
+    @property
+    def _coordination_db(self):
+        """Root DB owning routing and restart-continuation CAS state.
+
+        Session rows and transcripts follow the active multiplex profile via
+        ``_db``.  Routing projections and resume obligations must not: startup
+        runs outside every profile scope and reads them from the process root.
+        Keep those two halves in one store so reset/resume cannot strand an
+        old root owner while publishing a new profile-local route.
+        """
+        if self._db_pinned is not _DB_UNPINNED:
+            return self._db_pinned
+
+        path = Path(self._coordination_db_path)
+
+        def _open():
+            from hermes_state import SessionDB
+
+            return SessionDB(db_path=path)
+
+        return self._db_handle_cache.get(path, _open)
 
     def close_all_db_handles(self) -> None:
         """Close every SessionDB handle this store opened, one per resolved path.
@@ -1924,7 +1954,7 @@ class SessionStore:
         # _prune_stale_sessions_locked).
         db_had_entries = False
         db_load_succeeded = False
-        _db = getattr(self, "_db", None)
+        _db = getattr(self, "_coordination_db", None)
         if _db:
             loader = getattr(_db, "load_gateway_routing_entries", None)
             if callable(loader):
@@ -2132,7 +2162,7 @@ class SessionStore:
         if getattr(self, "_routing_db_loaded", False) or baseline is None:
             return
 
-        db = getattr(self, "_db", None)
+        db = getattr(self, "_coordination_db", None)
         loader = getattr(db, "load_gateway_routing_entries", None) if db else None
         if not callable(loader):
             return
@@ -2197,7 +2227,7 @@ class SessionStore:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
-            _db = getattr(self, "_db", None)
+            _db = getattr(self, "_coordination_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
@@ -2355,7 +2385,7 @@ class SessionStore:
         if captured is None:
             return
         entry_json, revision, candidate_entry = captured
-        _db = getattr(self, "_db", None)
+        _db = getattr(self, "_coordination_db", None)
         saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
         if callable(saver):
             save_lock = getattr(self, "_save_lock", None)
@@ -3920,7 +3950,7 @@ class SessionStore:
                 separators=(",", ":"),
             )
 
-            db = self._db
+            db = self._coordination_db
             admit = getattr(db, "admit_gateway_resume_obligation", None) if db else None
             rollover = (
                 getattr(db, "rollover_claimed_gateway_resume_obligation", None)
@@ -4136,7 +4166,7 @@ class SessionStore:
                 )
             if current != expected:
                 return False
-            db = self._db
+            db = self._coordination_db
             get_obligation = (
                 getattr(db, "get_gateway_resume_obligation", None) if db else None
             )
@@ -4227,7 +4257,7 @@ class SessionStore:
             )
             if current != expected:
                 return False
-            db = self._db
+            db = self._coordination_db
             abandon = (
                 getattr(db, "abandon_gateway_resume_obligation", None)
                 if db
@@ -4271,7 +4301,7 @@ class SessionStore:
         that no longer has an exact, fresh mirror cannot be replayed, but it
         must also not block the next independently authorized task generation.
         """
-        db = self._db
+        db = self._coordination_db
         list_rows = (
             getattr(db, "list_gateway_resume_obligations", None)
             if db
@@ -4684,6 +4714,75 @@ class SessionStore:
                 self._save()
         return count
 
+    def _settle_resume_obligation_for_reset_locked(
+        self, entry: SessionEntry
+    ) -> None:
+        """Terminate the exact old restart owner before publishing /new.
+
+        The caller holds ``self._lock``.  A reset is an explicit conversation
+        boundary, but it is not permission to cancel an unrelated generation:
+        only the immutable identity mirrored by ``entry`` may be settled.
+        """
+        if not entry.resume_pending:
+            return
+        task_id = str(entry.resume_task_id or "")
+        generation = int(entry.continuation_generation or 0)
+        if not task_id or generation <= 0:
+            # Legacy marker without a DB-backed owner. Replacing the route is
+            # sufficient; there is no executable obligation to settle.
+            return
+
+        db = self._coordination_db
+        getter = getattr(db, "get_gateway_resume_obligation", None) if db else None
+        if not callable(getter):
+            raise RuntimeError("resume coordination store unavailable during reset")
+        row = getter(entry.session_key)
+        if row is None or str(row.get("state") or "") in {"TERMINAL", "CANCELLED"}:
+            return
+        if (
+            str(row.get("resume_task_id") or "") != task_id
+            or int(row.get("generation") or 0) != generation
+        ):
+            raise RuntimeError("resume obligation identity changed during reset")
+
+        state = str(row.get("state") or "")
+        settled = False
+        if state == "PENDING":
+            cancel = getattr(db, "cancel_gateway_resume_obligation", None)
+            settled = bool(
+                callable(cancel)
+                and cancel(
+                    session_key=entry.session_key,
+                    resume_task_id=task_id,
+                    expected_generation=generation,
+                    reason="session_reset",
+                )
+            )
+        elif state == "CLAIMED":
+            owner = str(entry.continuation_claim_owner or "")
+            token = str(entry.continuation_claim_token or "")
+            if (
+                not owner
+                or not token
+                or str(row.get("claim_owner") or "") != owner
+                or str(row.get("claim_token") or "") != token
+            ):
+                raise RuntimeError("resume claim identity changed during reset")
+            abandon = getattr(db, "abandon_gateway_resume_obligation", None)
+            settled = bool(
+                callable(abandon)
+                and abandon(
+                    session_key=entry.session_key,
+                    resume_task_id=task_id,
+                    expected_generation=generation,
+                    claim_owner=owner,
+                    claim_token=token,
+                    reason="session_reset",
+                )
+            )
+        if not settled:
+            raise RuntimeError("could not settle resume obligation during reset")
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
@@ -4697,6 +4796,7 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+            self._settle_resume_obligation_for_reset_locked(old_entry)
             db_end_session_id = old_entry.session_id
 
             now = _now()
