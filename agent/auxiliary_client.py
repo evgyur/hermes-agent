@@ -8407,6 +8407,13 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
+    if client is not None and _aux_probe_active():
+        # Probe clients may be wrapped (for example a CodexAuxiliaryClient
+        # around _AuxProbeClientStub), so checking only the outer type at the
+        # cache write cannot reliably identify them.  Probe resolution is
+        # deliberately ephemeral: return the result without touching the
+        # runtime cache.
+        return client, model or default_model
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.

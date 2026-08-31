@@ -34,6 +34,38 @@ class TestAuxProbeMode:
         with aux._client_cache_lock:
             assert key not in aux._client_cache
 
+    def test_probe_client_wrapped_for_codex_is_not_reused_at_runtime(self):
+        import agent.auxiliary_client as aux
+
+        wrapped_probe = aux.CodexAuxiliaryClient(aux._AuxProbeClientStub(), "m")
+        runtime_client = object()
+        resolver_probe_states = []
+
+        def fake_resolver(*args, **kwargs):
+            is_probe = aux._aux_probe_active()
+            resolver_probe_states.append(is_probe)
+            if is_probe:
+                return wrapped_probe, "m"
+            return runtime_client, "m"
+
+        cache_key = aux._client_cache_key(
+            "openai-codex", async_mode=False, model="m"
+        )
+        with aux._client_cache_lock:
+            aux._client_cache.pop(cache_key, None)
+        try:
+            with patch.object(aux, "resolve_provider_client", fake_resolver):
+                with aux.aux_probe_mode():
+                    probed, _ = aux._get_cached_client("openai-codex", "m")
+                actual, _ = aux._get_cached_client("openai-codex", "m")
+
+            assert probed is wrapped_probe
+            assert actual is runtime_client
+            assert resolver_probe_states == [True, False]
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(cache_key, None)
+
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux
 
