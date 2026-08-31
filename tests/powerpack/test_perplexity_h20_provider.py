@@ -27,7 +27,7 @@ class _Response:
 
 def test_provider_uses_only_h20_keys_proxy(monkeypatch):
     values = {
-        "H20_KEYS_BASE_URL": "http://127.0.0.1:18750/",
+        "H20_KEYS_BASE_URL": "http://127.0.0.1:18750/v1/",
         "H20_KEYS_API_KEY": "customer-key",
     }
     monkeypatch.setattr(provider, "_env_value", lambda name: values.get(name, ""))

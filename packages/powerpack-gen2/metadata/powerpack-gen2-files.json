@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "81b9880915cb1a57295756896b367112395b716e4c8693cf628a2ab07eade9f9",
+  "aggregate_sha256": "8ff90e2d25fce338b563335808cb9874d1486db52cb6f1dbdfa298f49d984c75",
   "file_count": 17,
   "files": [
     {
@@ -78,9 +78,9 @@
       "sha256": "eaddd05636587668e8fb2030a92e4037fb1e84008838f52e9c61ee71b5510153"
     },
     {
-      "bytes": 5549,
+      "bytes": 5615,
       "path": "powerpack_gen2/vendors/perplexity/provider.py",
-      "sha256": "9970baef3ae07f2c1882f57e181d5526b9de28cf834adab4445cc80c73a9c575"
+      "sha256": "02825b2330cac5b3fcd70632dbfc97e2f91d2b1ad37027ed81b1cb3796701319"
     },
     {
       "bytes": 794,

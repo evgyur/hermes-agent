@@ -35,6 +35,8 @@ def _api_key() -> str:
 
 def _api_url() -> str:
     base_url = _env_value("H20_KEYS_BASE_URL").rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
     return f"{base_url}{_PROXY_PATH}" if base_url else ""
 
 
