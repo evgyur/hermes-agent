@@ -11,7 +11,7 @@ from . import cli, doctor, installer, tools
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = frozenset({"disabled", "compatibility", "gen2_only"})
-VARIANTS = frozenset({"rentals", "employee"})
+VARIANTS = frozenset({"rentals", "employee", "owner"})
 
 
 def _load_vendor(package_name: str, directory: Path):
@@ -127,7 +127,7 @@ def _register_effectful_surfaces(ctx: Any, variant: str) -> int:
     ):
         _register_tool_required(ctx, name, schema, handler)
         count += 1
-    if variant == "employee":
+    if variant in {"employee", "owner"}:
         _register_tool_required(
             ctx,
             "chipmanager_telegram",

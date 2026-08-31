@@ -542,6 +542,20 @@ def test_gen2_only_registers_unique_effectful_surfaces():
     assert not ({name for _, name in ctx.calls} & doctor.BUILTIN_COLLISION_NAMES)
 
 
+def test_owner_variant_keeps_all_powerpack_surfaces():
+    package = _reload_package()
+    ctx = FakeContext(mode="gen2_only", variant="owner")
+
+    result = package.register(ctx)
+
+    assert result == {"mode": "gen2_only", "variant": "owner", "skills": 2, "tools": 3}
+    assert {name for kind, name in ctx.calls if kind == "tool"} == {
+        "mem0g",
+        "continuum_host",
+        "chipmanager_telegram",
+    }
+
+
 def test_collision_fails_closed():
     package = _reload_package()
     ctx = FakeContext(mode="gen2_only", reject="tool:continuum_host")

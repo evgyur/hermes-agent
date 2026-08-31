@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "human20-powerpack-gen2",
-  "version": "2.4.7",
+  "version": "2.4.8",
   "plugin_kind": "standalone",
   "source_repository": "human20team/hermes-agent-powerpack",
   "source_base_sha": "90bb41551f98edf847ca2c86f9b1a86c7422cb8d",
@@ -46,6 +46,13 @@
       "inherits": "rentals",
       "telegram_account_access": "chipmanager-only",
       "components": ["telegram-chip"]
+    },
+    "owner": {
+      "inherits": "employee",
+      "telegram_account_access": "host-provisioned-owner",
+      "memory_access": "host-provisioned-full",
+      "account_access": "host-provisioned-full",
+      "components": ["telegram-chip", "human20-memory-stack", "owner-account-bindings"]
     }
   },
   "state_quota_bytes": 0,

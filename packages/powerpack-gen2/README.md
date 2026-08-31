@@ -17,6 +17,12 @@ Canonical runtime package for Human20 capabilities on Hermes Agent.
 
 The default is `disabled`. Activation is explicit and transaction-owned in production.
 
+Variants are intentionally separate from credentials. `rentals` provides the
+common memory/provider surface, `employee` additionally exposes the isolated
+employee Telegram bridge, and `owner` selects every Powerpack surface while
+allowing the host to bind its separately managed full-memory and account
+credentials. The package never copies or persists secrets itself.
+
 ## Boxed install over an existing Hermes profile
 
 Run this with the same managed Python and `HERMES_HOME` used by the target
@@ -26,7 +32,7 @@ gateway:
 PYTHONPATH=/path/to/packages/powerpack-gen2 python -m powerpack_gen2.installer \
   --source-root /path/to/packages/powerpack-gen2 \
   --hermes-home "$HERMES_HOME" \
-  --variant employee --mode gen2_only
+  --variant owner --mode gen2_only
 ```
 
 The installer verifies the complete package inventory before changing the

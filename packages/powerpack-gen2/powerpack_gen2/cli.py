@@ -47,7 +47,7 @@ def _persist_plugin_setting(ctx, key: str, value: str) -> None:
 def setup_parser(parser, root: Path, variant: str, mode: str) -> None:
     sub = parser.add_subparsers(dest="power_command")
     install = sub.add_parser("install", help="Select and validate a Powerpack variant")
-    install.add_argument("variant", choices=["rentals", "employee"])
+    install.add_argument("variant", choices=["rentals", "employee", "owner"])
     install.add_argument("--mode", choices=["disabled", "compatibility", "gen2_only"], default="compatibility")
     install.set_defaults(power_root=str(root), power_variant=variant, power_mode=mode)
     status = sub.add_parser("status", help="Show package status")

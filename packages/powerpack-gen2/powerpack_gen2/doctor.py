@@ -19,7 +19,7 @@ SECRET_PATTERNS = (
     re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{30,}\b"),
 )
 VALID_MODES = frozenset({"disabled", "compatibility", "gen2_only"})
-VALID_VARIANTS = frozenset({"rentals", "employee"})
+VALID_VARIANTS = frozenset({"rentals", "employee", "owner"})
 MINIMUM_SQLITE_VERSION = (3, 53, 1)
 MANAGED_STT_PROVIDER = "human20-keys-groq"
 MANAGED_STT_MODEL = "whisper-large-v3"
@@ -76,7 +76,7 @@ def validate_settings(settings: dict[str, Any]) -> list[str]:
     if len(encoded) > SETTINGS_QUOTA_BYTES:
         errors.append(f"settings exceed {SETTINGS_QUOTA_BYTES} bytes")
     if settings.get("variant", "rentals") not in VALID_VARIANTS:
-        errors.append("variant must be rentals or employee")
+        errors.append("variant must be rentals, employee, or owner")
     if settings.get("mode", "disabled") not in VALID_MODES:
         errors.append("mode must be disabled, compatibility, or gen2_only")
     return errors
@@ -104,7 +104,7 @@ def skill_entries(root: Path, variant: str) -> list[dict[str, Any]]:
             name = f"{row['slug']}-{name}"
         used.add(name)
         entries.append({"name": name, "path": row["path"]})
-    if variant == "employee":
+    if variant in {"employee", "owner"}:
         entries.append(
             {
                 "name": "telegram-chip",

@@ -1,5 +1,5 @@
 name: human20-powerpack-gen2
-version: 2.4.7
+version: 2.4.8
 description: "Human20 skills, governed host bridges, and operator diagnostics."
 author: Human20
 kind: standalone
@@ -23,4 +23,5 @@ config_schema:
   variant:
     type: str
     default: rentals
-    description: "Install contour: rentals or employee."
+    choices: [rentals, employee, owner]
+    description: "Install contour: rentals, employee, or owner."

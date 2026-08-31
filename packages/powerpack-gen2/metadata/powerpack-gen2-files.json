@@ -1,11 +1,11 @@
 {
-  "aggregate_sha256": "22acbf592ee208c8c40656a0918c8569641e8de2b7eaf1addcce6948f919a8fe",
+  "aggregate_sha256": "3c7507a5e9c5c8c57376100004c43cf2f7f1b9ea96bccf08ed2de56a145e42ca",
   "file_count": 17,
   "files": [
     {
-      "bytes": 1963,
+      "bytes": 2330,
       "path": "README.md",
-      "sha256": "9fb4d4ae13d539d03bca094e5cd495545c31556d602f565c7eea04fcbb6befa5"
+      "sha256": "d2d04552051bb9b99a440de996bc833c283acc2e50ed87d47a4372ec98fd9f26"
     },
     {
       "bytes": 332,
@@ -13,9 +13,9 @@
       "sha256": "2f5a5f4591b88864c8ab7941aecf0d0724c92a26e051e6ee9a83687314f9deb3"
     },
     {
-      "bytes": 4334,
+      "bytes": 4630,
       "path": "metadata/powerpack-gen2.json",
-      "sha256": "a0131c5ee6b5f71d4183b3e68650286e5f21b5133ee68d645cdaac3f4f845c79"
+      "sha256": "08f5afbcff4b7818ae1a1987cb35bff5d12e620f916011c86cec95df216090de"
     },
     {
       "bytes": 171,
@@ -28,24 +28,24 @@
       "sha256": "34e890d9605d7f174861cc3236b5f56d15fd3fed254eca1cb92caefe9bb103bc"
     },
     {
-      "bytes": 753,
+      "bytes": 801,
       "path": "plugin.yaml",
-      "sha256": "c6312d0c9e1d7726929c334e30f1728b67eaf9b388a7f4df6bdc5edc2dd02765"
+      "sha256": "382f824a7cb45893f379f63a2f72b551b139e7152758ede2dcb97454acb7d6b8"
     },
     {
-      "bytes": 6557,
+      "bytes": 6577,
       "path": "powerpack_gen2/__init__.py",
-      "sha256": "6cbcaa6798dab4f0b54b3fb0db5f8cfb0463106305abe2dbe0f8afbd6be039fb"
+      "sha256": "c9e69a9c6add22f048ec5f2da7b32ceb0165bb2f7fe36e3f73b096e30493159e"
     },
     {
-      "bytes": 6780,
+      "bytes": 6789,
       "path": "powerpack_gen2/cli.py",
-      "sha256": "1d7e8f1f619fceaa86e868b4176662f74670d88806dd95c3b95c6fe9807a460f"
+      "sha256": "09ae3efca2e8fe6bc2058e2578fe45727ca2bdbf1e2d820b396c01bdf2d62824"
     },
     {
-      "bytes": 30896,
+      "bytes": 30924,
       "path": "powerpack_gen2/doctor.py",
-      "sha256": "d8c0216d3d31ac0f74a84a8ca759091a6623e6844d50c6401981ea47b225ad17"
+      "sha256": "d6d530196ac7146c615e4fb191b762043cb6ee4204537271f8b9ab1260fe7827"
     },
     {
       "bytes": 7363,
@@ -95,5 +95,5 @@
   ],
   "package": "human20-powerpack-gen2",
   "schema_version": 2,
-  "version": "2.4.7"
+  "version": "2.4.8"
 }

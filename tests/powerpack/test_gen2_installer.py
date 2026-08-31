@@ -85,6 +85,24 @@ def test_installer_preserves_default_web_provider_without_h20_credentials(monkey
     assert config["web"]["extract_backend"] == "parallel"
 
 
+def test_installer_persists_owner_variant_without_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("H20_KEYS_BASE_URL", "http://keys.example.invalid")
+    monkeypatch.setenv("H20_KEYS_API_KEY", "test-key")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+
+    receipt = installer.install(PACKAGE_ROOT, home, variant="owner", mode="gen2_only")
+    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+
+    assert receipt["variant"] == "owner"
+    assert receipt["secrets_persisted"] is False
+    assert config["plugins"]["entries"]["human20-powerpack-gen2"]["settings"] == {
+        "mode": "gen2_only",
+        "variant": "owner",
+    }
+
+
 def test_installer_rejects_tampered_source_without_mutating_profile(tmp_path):
     source = tmp_path / "source"
     shutil.copytree(PACKAGE_ROOT, source, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
