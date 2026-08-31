@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 import urllib.parse
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -270,6 +270,18 @@ def test_telegram_chip_cleanup_removes_its_owned_temp_parent(tmp_path):
     assert not owned_parent.exists()
 
 
+def test_telegram_chip_cleanup_removes_owned_suffixed_media_parent(tmp_path):
+    adapter = _adapter()
+    owned_parent = tmp_path / "hermes-telegram-chip-media-suffixed"
+    owned_parent.mkdir()
+    owned_path = owned_parent / "media-stt.m4a"
+    owned_path.write_bytes(b"audio")
+
+    adapter._cleanup_telegram_chip_media_path(str(owned_path))
+
+    assert not owned_parent.exists()
+
+
 def test_telegram_chip_never_accepts_or_deletes_an_unowned_media_path(
     monkeypatch, tmp_path
 ):
@@ -427,3 +439,57 @@ async def test_transcribe_multilink_recovery_is_atomic_and_ordered(tmp_path):
     assert event.media_urls == []
     assert event.message_type is MessageType.TEXT
     assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_route_normalizes_recovered_video_before_stt(
+    monkeypatch, tmp_path
+):
+    """The 583 MiB incident MP4 must reach the 25 MiB STT rail as compact m4a."""
+    adapter = _adapter()
+    adapter.config.extra["transcribe_routes"] = [
+        {
+            "enabled": True,
+            "profile": PROFILE,
+            "chat_id": CHAT_ID,
+            "thread_id": THREAD_ID,
+        }
+    ]
+    event = _event("Transcribe recovered media")
+    event.message_type = MessageType.VOICE
+    owned_parent = tmp_path / "hermes-telegram-chip-media-incident"
+    owned_parent.mkdir()
+    recovered_video = owned_parent / "media.ogg"
+    recovered_video.write_bytes(b"production-shaped mp4 bytes")
+    event.media_urls = [str(recovered_video)]
+    event.media_types = ["audio/mpeg"]
+    event.metadata["telegram_chip_transient_media"] = [str(recovered_video)]
+
+    normalized = owned_parent / "media-stt.m4a"
+    transcode_calls = []
+
+    def _transcode(path, work_dir):
+        transcode_calls.append((path, work_dir))
+        normalized.write_bytes(b"compact m4a")
+        return str(normalized), None
+
+    transcribe_calls = []
+
+    def _transcribe(path, _model, _source):
+        transcribe_calls.append(path)
+        return {"success": True, "transcript": "incident transcript"}
+
+    monkeypatch.setattr(
+        "tools.transcription_tools._transcode_audio_for_stt", _transcode
+    )
+    monkeypatch.setattr("tools.transcription_tools.transcribe_audio", _transcribe)
+    adapter.send_document = AsyncMock(return_value=MagicMock(success=True))
+
+    text, consumed = await adapter.prepare_inbound_message_text(event, "")
+
+    assert text == "incident transcript"
+    assert transcode_calls == [(str(recovered_video), str(owned_parent))]
+    assert transcribe_calls == [str(normalized)]
+    assert consumed == {str(normalized)}
+    assert not recovered_video.exists()
+    assert not owned_parent.exists()

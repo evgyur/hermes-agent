@@ -11793,7 +11793,8 @@ class TelegramAdapter(BasePlatformAdapter):
         parent = os.path.dirname(path)
         try:
             if (
-                os.path.basename(path) == "media"
+                os.path.basename(path)
+                in {"media", "media.ogg", "media.mp3", "media-stt.m4a"}
                 and os.path.basename(parent).startswith("hermes-telegram-chip-media-")
                 and not os.path.islink(parent)
                 and (
@@ -11804,6 +11805,59 @@ class TelegramAdapter(BasePlatformAdapter):
                 os.rmdir(parent)
         except OSError:
             pass
+
+    @classmethod
+    def _normalize_telegram_chip_media_for_stt(cls, path: str) -> str:
+        """Turn a sidecar-recovered container into compact STT-safe m4a.
+
+        The operator bridge can return long Telegram videos while its owned
+        output path retains the historical ``media.ogg`` voice-note suffix.
+        The managed Human20/Groq provider has a 25 MiB upload rail, so passing
+        the original container both lies about its MIME type and rejects large
+        videos.  Reuse Hermes' upstream 16 kHz mono / 32 kbps encoder before
+        provider dispatch; a 76-minute incident video becomes a normal m4a
+        below the provider limit without widening any filesystem authority.
+        """
+        parent = os.path.dirname(path)
+        if (
+            os.path.basename(path) not in {"media", "media.ogg", "media.mp3"}
+            or not os.path.basename(parent).startswith(
+                "hermes-telegram-chip-media-"
+            )
+            or os.path.islink(path)
+            or os.path.islink(parent)
+            or not os.path.isfile(path)
+        ):
+            raise ValueError("telegram-chip STT input is not an owned media path")
+
+        from tools.transcription_tools import _transcode_audio_for_stt
+
+        converted_path, error = _transcode_audio_for_stt(path, parent)
+        expected_path = os.path.join(parent, "media-stt.m4a")
+        if (
+            not converted_path
+            or os.path.realpath(converted_path) != os.path.realpath(expected_path)
+            or os.path.islink(converted_path)
+            or not os.path.isfile(converted_path)
+            or os.path.getsize(converted_path) <= 0
+        ):
+            try:
+                if os.path.realpath(converted_path or "") == os.path.realpath(
+                    expected_path
+                ):
+                    os.unlink(expected_path)
+            except OSError:
+                pass
+            raise RuntimeError(error or "telegram-chip media normalization failed")
+
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            cls._cleanup_telegram_chip_media_path(converted_path)
+            raise RuntimeError(
+                "telegram-chip source cleanup failed after STT normalization"
+            ) from exc
+        return converted_path
 
     async def _resolve_telegram_chip_context(self, event: MessageEvent) -> bool:
         """Resolve private-link/reply context before the model sees the turn.
@@ -11995,6 +12049,17 @@ class TelegramAdapter(BasePlatformAdapter):
             for path in event.metadata.get("telegram_chip_transient_media", [])
         }
         try:
+            normalized_paths: List[str] = []
+            for path in paths:
+                if path not in transient_media:
+                    normalized_paths.append(path)
+                    continue
+                normalized_path = self._normalize_telegram_chip_media_for_stt(path)
+                transient_media.remove(path)
+                transient_media.add(normalized_path)
+                normalized_paths.append(normalized_path)
+            paths = normalized_paths
+
             for path in paths:
                 result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
                 transcript = (
