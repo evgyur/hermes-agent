@@ -47,6 +47,8 @@ def _redact_telegram_error_text(error: object) -> str:
 
 _DEFAULT_TELEGRAM_CHIP_URLOPEN = urllib.request.urlopen
 _TELEGRAM_CHIP_MAX_JSON_BYTES = 1024 * 1024
+_TELEGRAM_CHIP_MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024
+_TELEGRAM_CHIP_MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 600.0
 
 
 def _scoped_gate_env(name: str, default: str = "") -> str:
@@ -11681,7 +11683,7 @@ class TelegramAdapter(BasePlatformAdapter):
             f"?{query}"
         )
         request = urllib.request.Request(url, headers={"Accept": "application/json"})
-        max_bytes = 64 * 1024 * 1024
+        max_bytes = _TELEGRAM_CHIP_MAX_MEDIA_BYTES
         opener = urllib.request.build_opener(_NoRedirect())
         temp_path = ""
         keep_owned_path = False
@@ -11694,7 +11696,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     stderr=subprocess.PIPE,
                     timeout=5.0,
                 )
-            with opener.open(request, timeout=20.0) as response:
+            with opener.open(
+                request,
+                timeout=_TELEGRAM_CHIP_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+            ) as response:
                 declared = response.headers.get("Content-Length")
                 content_type = str(response.headers.get_content_type() or "")
                 if content_type == "application/json":

@@ -191,6 +191,62 @@ def test_telegram_chip_decodes_the_deployed_media_path_envelope(
     Path(returned).parent.rmdir()
 
 
+def test_telegram_chip_waits_for_and_accepts_a_large_operator_media_file(
+    monkeypatch,
+):
+    """A long Telegram video must not inherit the 20 s / 64 MiB Bot API rail."""
+    adapter = _adapter()
+    observed_timeouts = []
+    incident_size = 583_224_973
+
+    class _Headers(dict):
+        def get_content_type(self):
+            return "application/json"
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+            self.headers = _Headers({"Content-Length": str(len(body))})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, _limit):
+            return self._body
+
+    class _Opener:
+        def open(self, request, *, timeout):
+            observed_timeouts.append(timeout)
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(request.full_url).query
+            )
+            media_path = Path(query["output_path"][0])
+            with media_path.open("wb") as large_media:
+                large_media.truncate(incident_size)
+            body = json.dumps(
+                {
+                    "success": True,
+                    "data": json.dumps(
+                        {"success": True, "path": str(media_path), "error": None}
+                    ),
+                    "error": None,
+                }
+            ).encode()
+            return _Response(body)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_a: _Opener())
+
+    returned = Path(adapter._telegram_chip_media_download_sync(CHAT_ID, 47266))
+
+    assert observed_timeouts == [600.0]
+    assert returned.stat().st_size == incident_size
+    returned.unlink()
+    returned.parent.rmdir()
+
+
 def test_telegram_chip_cleanup_never_removes_a_generic_temp_parent(tmp_path):
     adapter = _adapter()
     generic_path = tmp_path / "fallback.mp3"
@@ -269,6 +325,12 @@ def test_telegram_chip_cleans_only_its_owned_target_on_media_failure(
     monkeypatch, tmp_path, case
 ):
     adapter = _adapter()
+    if case == "oversize":
+        monkeypatch.setitem(
+            adapter._telegram_chip_media_download_sync.__globals__,
+            "_TELEGRAM_CHIP_MAX_MEDIA_BYTES",
+            64 * 1024 * 1024,
+        )
     requested_paths = []
     symlink_target = tmp_path / "symlink-target.ogg"
     symlink_target.write_bytes(b"must survive")
