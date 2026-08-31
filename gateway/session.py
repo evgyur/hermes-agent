@@ -3957,19 +3957,41 @@ class SessionStore:
                 if db
                 else None
             )
+            rollover_pending = (
+                getattr(db, "rollover_pending_gateway_resume_obligation", None)
+                if db
+                else None
+            )
             if rollover_identity is not None:
-                if not callable(rollover):
+                if not callable(rollover) and not callable(rollover_pending):
                     fail("failed_db")
                     return None
-                committed = rollover(
-                    session_key=session_key,
-                    **rollover_identity,
-                    resume_task_id=candidate.resume_task_id,
-                    origin_json=source_json,
-                    origin_sha256=source_digest,
-                    reason=reason,
-                    marked_at=candidate.last_resume_marked_at.timestamp(),
-                )
+                committed = None
+                if callable(rollover):
+                    committed = rollover(
+                        session_key=session_key,
+                        **rollover_identity,
+                        resume_task_id=candidate.resume_task_id,
+                        origin_json=source_json,
+                        origin_sha256=source_digest,
+                        reason=reason,
+                        marked_at=candidate.last_resume_marked_at.timestamp(),
+                    )
+                if committed is None and callable(rollover_pending):
+                    committed = rollover_pending(
+                        session_key=session_key,
+                        previous_resume_task_id=rollover_identity[
+                            "previous_resume_task_id"
+                        ],
+                        previous_generation=rollover_identity[
+                            "previous_generation"
+                        ],
+                        resume_task_id=candidate.resume_task_id,
+                        origin_json=source_json,
+                        origin_sha256=source_digest,
+                        reason=reason,
+                        marked_at=candidate.last_resume_marked_at.timestamp(),
+                    )
             elif not callable(admit):
                 fail("failed_db")
                 return None

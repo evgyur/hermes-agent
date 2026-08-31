@@ -415,6 +415,75 @@ def test_second_shutdown_rolls_exact_running_resume_into_next_generation(tmp_pat
     assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
 
 
+def test_second_shutdown_rolls_pending_startup_before_claim(tmp_path):
+    """A second stop must protect startup work even before its claim lands."""
+    store = _make_store(tmp_path)
+    source = replace(
+        _make_source(chat_id="pending-restart-race", user_id="owner"),
+        chat_type="group",
+        thread_id="51141",
+        message_id="51660",
+    )
+    entry = store.get_or_create_session(source)
+    first_task = store.mark_turn_active(entry.session_key, source)
+    first = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert first and first["resume_task_id"] == first_task
+    assert store._db.get_gateway_resume_obligation(entry.session_key)["state"] == "PENDING"
+
+    resumed_task = store.mark_turn_active(entry.session_key, source)
+    assert resumed_task and resumed_task != first_task
+    second = store.mark_resume_pending_with_outcome(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+
+    assert second["outcome"] == "marked_exact"
+    assert second["receipt"]["resume_task_id"] == resumed_task
+    assert second["receipt"]["continuation_generation"] == 2
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == resumed_task
+    assert row["generation"] == 2
+    assert json.loads(row["origin_json"])["message_id"] == "51660"
+
+
+def test_pending_rollover_rejects_new_human_message(tmp_path):
+    """The PENDING race repair cannot replace a different human command."""
+    store = _make_store(tmp_path)
+    original = replace(
+        _make_source(chat_id="pending-restart-isolation", user_id="owner"),
+        chat_type="group",
+        thread_id="51141",
+        message_id="51660",
+    )
+    entry = store.get_or_create_session(original)
+    first_task = store.mark_turn_active(entry.session_key, original)
+    first = store.mark_resume_pending_with_receipt(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+    assert first and first["resume_task_id"] == first_task
+
+    newer_human = replace(original, message_id="51757")
+    assert store.mark_turn_active(entry.session_key, newer_human)
+    second = store.mark_resume_pending_with_outcome(
+        entry.session_key,
+        "shutdown_timeout",
+    )
+
+    assert second == {
+        "outcome": "failed_nonterminal_previous_generation",
+        "receipt": None,
+    }
+    row = store._db.get_gateway_resume_obligation(entry.session_key)
+    assert row["state"] == "PENDING"
+    assert row["resume_task_id"] == first_task
+    assert row["generation"] == 1
+
+
 def test_second_shutdown_does_not_roll_new_human_turn_over_claimed_resume(tmp_path):
     """A different Telegram message cannot supersede an in-flight claim."""
     store = _make_store(tmp_path)

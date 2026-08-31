@@ -16545,6 +16545,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def rollover_pending_gateway_resume_obligation(
+        self, *, session_key: str, previous_resume_task_id: str,
+        previous_generation: int, resume_task_id: str, origin_json: str,
+        origin_sha256: str, reason: str, marked_at: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Re-arm an exact startup turn before its PENDING claim lands.
+
+        A fast second shutdown can observe the synthetic turn's new active
+        marker before the handler claims the previous generation.  The sealed
+        origin must remain byte-for-byte identical; a newer human message can
+        therefore never use this transition to replace older authorization.
+        """
+        key = str(session_key)
+        previous_task = str(previous_resume_task_id)
+        task = str(resume_task_id)
+        generation = int(previous_generation)
+        if (
+            not key
+            or not previous_task
+            or generation <= 0
+            or not task
+            or task == previous_task
+            or not origin_json
+            or not origin_sha256
+        ):
+            raise ValueError("invalid pending gateway resume rollover identity")
+        next_generation = generation + 1
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE gateway_resume_obligations
+                      SET resume_task_id=?, generation=?, state='PENDING',
+                          reason=?, marked_at=?, claim_owner=NULL,
+                          claim_token=NULL, updated_at=?
+                    WHERE session_key=? AND resume_task_id=? AND generation=?
+                      AND state='PENDING'
+                      AND origin_json=? AND origin_sha256=?""",
+                (
+                    task,
+                    next_generation,
+                    str(reason),
+                    float(marked_at),
+                    now,
+                    key,
+                    previous_task,
+                    generation,
+                    origin_json,
+                    origin_sha256,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM gateway_resume_obligations WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+            if cursor.rowcount == 1:
+                return dict(row)
+            if row is None:
+                return None
+            existing = dict(row)
+            if (
+                existing["state"] == "PENDING"
+                and existing["resume_task_id"] == task
+                and int(existing["generation"]) == next_generation
+                and existing["origin_json"] == origin_json
+                and existing["origin_sha256"] == origin_sha256
+            ):
+                return existing
+            return None
+
+        return self._execute_write(_do)
+
     def claim_gateway_resume_obligation(
         self, *, session_key: str, resume_task_id: str,
         expected_generation: int, claim_owner: str, claim_token: str,
