@@ -56,7 +56,19 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -68,6 +80,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_RAW_SELECT,
     _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL,
+    is_automatic_end_reason,
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
@@ -3938,7 +3951,7 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
 def is_zeroed_state_db(
     path: Path, *, probe_bytes: int = 100, force: bool = False
 ) -> bool:
-    """Detect the #68474 zeroed state.db signature (size>0, NUL header).
+    """Detect the #68474/#97568 zeroed state.db signature (0-byte or NUL header).
 
     Byte-level probe, so it is only safe BEFORE any connection to *path*
     exists in this process: ``close()`` cancels every POSIX advisory lock the
@@ -3959,29 +3972,35 @@ def is_zeroed_state_db(
     except Exception:
         pass
     try:
+        if not path.is_file():
+            # Special files (FIFO, device, socket) are never "zeroed", and
+            # probing a FIFO would block until a writer appears.
+            return False
         size = path.stat().st_size
     except OSError:
         return False
-    if size <= 0:
+    if size < 0:
         return False
-    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+    from hermes_cli.sqlite_safe_read import has_live_connection, read_header_bytes_preopen
+
+    if not force and has_live_connection(path):
+        return False
 
     head = read_header_bytes_preopen(
         path, length=max(16, probe_bytes), force=force
     )
-    if not head or head.startswith(b"SQLite format 3"):
+    if head is None:
+        return False
+    if len(head) == 0:
+        return True
+    if head.startswith(b"SQLite format 3"):
         return False
     return all(byte == 0 for byte in head)
 
 
-def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
-    """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
-
-    Uses a cross-process lock (``#68805``) so two concurrent startups cannot
-    race: the first process moves the zeroed file and the second re-checks
-    under the lock, finding the file already gone (or a fresh DB in its place)
-    instead of clobbering the quarantine.
-    """
+@contextlib.contextmanager
+def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
+    """Acquire the cross-process lock for path.quarantine.lock."""
     import platform
 
     lock_path = path.with_name(path.name + ".quarantine.lock")
@@ -3989,9 +4008,10 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
     handle = lock_path.open("a+b")
     acquired = False
     try:
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + timeout
         if platform.system() == "Windows":
             import msvcrt
+
             while True:
                 try:
                     handle.seek(0)
@@ -4004,6 +4024,7 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
                     time.sleep(0.020)
         else:
             import fcntl
+
             while True:
                 try:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4013,21 +4034,36 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
                     if time.monotonic() >= deadline:
                         break
                     time.sleep(0.020)
-        if not acquired:
-            # Fail closed: do NOT proceed without the lock. A slow or paused
-            # startup that still owns the lock can overlap this fallback and
-            # the two processes can act on the same live file (#68805 review).
-            logger.error(
-                "quarantine lock for %s not acquired within 5s — refusing to "
-                "quarantine without the cross-process lock. The zeroed file "
-                "is left in place. If sessions fail to load, restore from "
-                "state-snapshots via `hermes snapshot list` / "
-                "`hermes snapshot restore <id>`.",
-                path,
-            )
-            return None
-        # Re-check under the lock: another process may have already quarantined
-        # the file, leaving a fresh DB (or no file at all) in its place.
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if platform.system() == "Windows":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            handle.close()
+
+
+def quarantine_zeroed_state_db(
+    path: Path, *, already_locked: bool = False
+) -> Optional[Path]:
+    """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
+
+    Uses a cross-process lock (``#68805``) so two concurrent startups cannot
+    race: the first process moves the zeroed file and the second re-checks
+    under the lock, finding the file already gone (or a fresh DB in its place)
+    instead of clobbering the quarantine.
+    """
+    def _do_quarantine():
         if not path.exists():
             logger.info(
                 "quarantine_zeroed_state_db: %s already moved by another process",
@@ -4046,12 +4082,9 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             ts = time.strftime("%Y%m%d-%H%M%S")
         except Exception:
             ts = "unknown"
-        # Unique destination with PID suffix to avoid collision across
-        # concurrent startups that somehow both enter the lock.
         dest = path.with_name(
             f"{path.name}.zeroed-{ts}-{os.getpid()}.bak"
         )
-        # Non-clobbering: if dest somehow exists, append a counter.
         n = 0
         while dest.exists():
             n += 1
@@ -4063,7 +4096,6 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
         except OSError as exc:
             logger.error("Failed to quarantine zeroed %s: %s", path, exc)
             return None
-        # Also move empty WAL/SHM if present so a fresh open is clean
         for suffix in ("-wal", "-shm"):
             side = Path(str(path) + suffix)
             if side.exists():
@@ -4072,20 +4104,22 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
                 except OSError:
                     pass
         return dest
-    finally:
-        try:
-            if acquired:
-                if platform.system() == "Windows":
-                    import msvcrt
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (OSError, AttributeError):
-            pass
-        finally:
-            handle.close()
+
+    if already_locked:
+        return _do_quarantine()
+
+    with quarantine_cross_process_lock(path) as acquired:
+        if not acquired:
+            logger.error(
+                "quarantine lock for %s not acquired within 5s — refusing to "
+                "quarantine without the cross-process lock. The zeroed file "
+                "is left in place. If sessions fail to load, restore from "
+                "state-snapshots via `hermes snapshot list` / "
+                "`hermes snapshot restore <id>`.",
+                path,
+            )
+            return None
+        return _do_quarantine()
 
 
 # ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
@@ -4675,34 +4709,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not read_only:
                 preflight_db_writability(self.db_path, db_label="state.db")
 
-            # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
-            # generic "file is not a database" with no recovery path. Quarantine
-            # the bytes (do not delete) and continue so a fresh DB can open;
-            # point the operator at pre-update snapshots.
-            if (
+            # #68474 / #97568: Serialize startup across zero-byte check, quarantine,
+            # connect, and schema commit so concurrent openers don't race on an
+            # absent-path -> connect -> schema-commit window.
+            needs_startup_guard = (
                 not read_only
-                and self.db_path.exists()
-                and is_zeroed_state_db(self.db_path)
-            ):
-                try:
-                    zsize = self.db_path.stat().st_size
-                except OSError:
-                    zsize = -1
-                qpath = quarantine_zeroed_state_db(self.db_path)
-                snaps = self.db_path.parent / "state-snapshots"
-                msg = (
-                    f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
-                    f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
-                    f"Restore from {snaps} via `hermes snapshot list` / "
-                    f"`hermes snapshot restore <id>` if available. "
-                    "Opening a fresh empty database so the agent can start."
+                and (
+                    not self.db_path.exists()
+                    or is_zeroed_state_db(self.db_path)
                 )
-                logger.error(msg)
-                _set_last_init_error(msg)
-                # If quarantine failed, do not open the zeroed file (would fail
-                # opaquely or risk further damage). Raise with the clear message.
-                if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
-                    raise sqlite3.DatabaseError(msg)
+            )
+
+            def _handle_quarantine_if_zeroed(already_locked: bool = False):
+                if (
+                    self.db_path.exists()
+                    and is_zeroed_state_db(self.db_path)
+                ):
+                    try:
+                        zsize = self.db_path.stat().st_size
+                    except OSError:
+                        zsize = -1
+                    qpath = quarantine_zeroed_state_db(
+                        self.db_path, already_locked=already_locked
+                    )
+                    snaps = self.db_path.parent / "state-snapshots"
+                    msg = (
+                        f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
+                        f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
+                        f"Restore from {snaps} via `hermes snapshot list` / "
+                        f"`hermes snapshot restore <id>` if available. "
+                        "Opening a fresh empty database so the agent can start."
+                    )
+                    logger.error(msg)
+                    _set_last_init_error(msg)
+                    # If quarantine failed, do not open the zeroed file (would fail
+                    # opaquely or risk further damage). Raise with the clear message.
+                    if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
+                        raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -4764,8 +4807,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                         )
 
+            def _open_with_optional_startup_guard():
+                if needs_startup_guard:
+                    with quarantine_cross_process_lock(self.db_path) as lock_acquired:
+                        if not lock_acquired:
+                            logger.warning(
+                                "startup quarantine lock for %s not acquired within 5s; proceeding",
+                                self.db_path,
+                            )
+                        _handle_quarantine_if_zeroed(already_locked=lock_acquired)
+                        _connect_and_init_with_lock_patience()
+                else:
+                    _handle_quarantine_if_zeroed(already_locked=False)
+                    _connect_and_init_with_lock_patience()
+
             try:
-                _connect_and_init_with_lock_patience()
+                _open_with_optional_startup_guard()
             except sqlite3.DatabaseError as exc:
                 # The malformed-schema class (e.g. a duplicate sqlite_master
                 # row for messages_fts) fails on the very first statement —
@@ -4975,7 +5032,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return self._get_read_conn()
 
     @contextmanager
-    def _read_ctx(self):
+    def _read_ctx(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements.
 
         WAL: a read-only connection borrowed from a bounded pool with NO
@@ -5018,7 +5075,82 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._close_read_conn(conn)
             return
         with self._lock:
-            yield self._conn
+            if self._conn is None:
+                # close() ran while a reader was still unwinding (#94736
+                # class) — reopen instead of yielding None to a .execute.
+                self._reopen_after_close_locked(context="read")
+            yield cast(sqlite3.Connection, self._conn)
+
+    def _reopen_after_close_locked(self, context: str = "write") -> None:
+        """Reopen the writer connection after ``close()`` raced a live caller.
+
+        The #94736 failure shape: a teardown owner (cron ``run_job``'s
+        ``finally``, a delegate timeout owner abandoning its worker, agent
+        ``close()``) calls ``SessionDB.close()`` — which sets ``_conn = None``
+        — while a still-unwinding worker thread has one more transcript flush
+        to land. The next ``_execute_write`` then died on
+        ``'NoneType' object has no attribute 'execute'``, the conversation
+        loop force-ended the turn as ``session_persistence_failed``, and the
+        in-flight tail of the subagent/cron session was silently dropped
+        (delivered as ``last_status: ok``).
+
+        The transcript append is THE critical write — losing it destroys the
+        turn — so at this shared persistence boundary we self-heal: reopen a
+        connection to the same database file and let the write land. The
+        reopen is loud (WARNING names the race) and bounded (only fires when
+        ``_conn`` is ``None``, i.e. after an explicit ``close()`` — the
+        constructor never leaves a live instance with a ``None`` handle).
+        ``__del__`` delegates to ``close()``, so the reopened connection is
+        still released at GC/exit time.
+
+        Caller must hold ``self._lock``. Raises ``sqlite3.OperationalError``
+        with an explicit cause when the reopen itself fails, so the surfaced
+        persistence error names the teardown race instead of the opaque
+        ``NoneType`` attribute error.
+        """
+        if self.read_only:
+            raise sqlite3.ProgrammingError(
+                f"SessionDB for {self.db_path} was closed (read-only handle); "
+                f"cannot serve a {context} after close()"
+            )
+        logger.warning(
+            "state.db connection for %s was closed while a %s was still in "
+            "flight — reopening (teardown/worker race, #94736)",
+            self.db_path,
+            context,
+        )
+        try:
+            conn = _connect_tracked_db(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+        except Exception as exc:
+            raise sqlite3.OperationalError(
+                f"state.db connection was closed while a {context} was still "
+                f"in flight (a session-teardown path called close() before "
+                f"this worker finished — #94736) and the automatic reopen "
+                f"failed: {exc}"
+            ) from exc
+        try:
+            conn.row_factory = sqlite3.Row
+            self._wal_active = (
+                apply_wal_with_fallback(conn, db_label="state.db") == "wal"
+            )
+            apply_database_pragmas(conn, db_label="state.db")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+        except Exception as exc:
+            self._close_connection_quietly(conn)
+            raise sqlite3.OperationalError(
+                f"state.db reopen after close() succeeded but connection "
+                f"setup failed: {exc}"
+            ) from exc
+        # Schema was initialised by this instance's original open; the file
+        # cannot have lost it, so no _init_schema here (no DDL races with
+        # sibling processes during teardown).
+        self._conn = conn
 
     # ── Core write helper ──
 
@@ -5129,41 +5261,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
               and leave the stale breadcrumb (#self-heal). The table itself
               stays for a later capable open to rebuild.
         """
-        cjk_present = bool(cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'messages_fts_cjk'"
-        ).fetchone())
+        try:
+            cjk_present = bool(cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'messages_fts_cjk'"
+            ).fetchone())
 
-        if not self._fts_cjk_loaded:
-            if cjk_present:
-                live = [
-                    r[0] for r in cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchall()
-                ]
-                if live:
-                    # Self-heal: this process cannot tokenize, so every
-                    # message INSERT would die inside the cjk trigger.
-                    # Breadcrumb FIRST (crash between the two statements is
-                    # merely conservative), then drop.
-                    logger.warning(
-                        "messages_fts_cjk triggers present but the "
-                        "cjk_unicode61 tokenizer is unavailable (%s) — "
-                        "dropping the cjk triggers so message writes keep "
-                        "working. CJK search falls back to trigram/LIKE; "
-                        "run `hermes sessions optimize-storage` on a host "
-                        "with the extension to rebuild.",
-                        fts5_cjk_so_path(),
-                    )
-                    cursor.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                        (FTS_CJK_STALE_KEY,),
-                    )
-                    for trig in live:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            if not self._fts_cjk_loaded:
+                if cjk_present:
+                    live = [
+                        r[0] for r in cursor.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                            f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                            _FTS_CJK_TRIGGERS,
+                        ).fetchall()
+                    ]
+                    if live:
+                        # Self-heal: this process cannot tokenize, so every
+                        # message INSERT would die inside the cjk trigger.
+                        # Breadcrumb FIRST (crash between the two statements is
+                        # merely conservative), then drop.
+                        logger.warning(
+                            "messages_fts_cjk triggers present but the "
+                            "cjk_unicode61 tokenizer is unavailable (%s) — "
+                            "dropping the cjk triggers so message writes keep "
+                            "working. CJK search falls back to trigram/LIKE; "
+                            "run `hermes sessions optimize-storage` on a host "
+                            "with the extension to rebuild.",
+                            fts5_cjk_so_path(),
+                        )
+                        cursor.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                        for trig in live:
+                            cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                self._fts_cjk_available = False
+                return
+        except sqlite3.OperationalError:
+            # Mirror the tokenizer-loaded except below: the presence check
+            # and self-heal above run before the loaded/not-loaded branch is
+            # even known to be safe, so they need the same never-raises
+            # guarantee the docstring promises for the rest of the method.
+            logger.warning(
+                "messages_fts_cjk presence check failed; CJK search stays on "
+                "trigram/LIKE", exc_info=True,
+            )
             self._fts_cjk_available = False
             return
 
@@ -5308,6 +5452,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
+                    if self._conn is None:
+                        # close() ran while this writer was still unwinding
+                        # (#94736) — reopen instead of dying on None.execute.
+                        self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -5981,6 +6129,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Session lifecycle
     # =========================================================================
 
+    _PROFILE_DIR_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+    def _own_profile_name(self) -> Optional[str]:
+        """The profile that owns THIS store, derived from ``db_path`` alone.
+
+        Every profile-tree ``state.db`` belongs to exactly one profile
+        (``<root>/state.db`` → ``default``,
+        ``<root>/profiles/<name>/state.db`` → ``<name>``), so the derivation
+        is a single match, never a guess — the same contract
+        :meth:`backfill_null_session_profiles` and the web listing's
+        ``row_profile`` stamp rely on. Path-based (not
+        ``get_active_profile_name()``) on purpose: a gateway serving a
+        NON-launch profile opens that profile's store directly, and the row
+        must be stamped with the store's owner, not the serving process's
+        launch profile. Returns ``None`` for stores outside the profile tree
+        (explicit ``db_path`` in tests, ad-hoc copies) — those rows keep the
+        legacy NULL rather than a fabricated owner.
+        """
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            root = get_default_hermes_root().resolve()
+            parent = Path(self.db_path).resolve().parent
+            if parent == root:
+                return "default"
+            if parent.parent == root / "profiles" and self._PROFILE_DIR_RE.match(
+                parent.name
+            ):
+                return parent.name
+        except Exception:
+            logger.debug("own-profile derivation failed", exc_info=True)
+        return None
+
     def _insert_session_row(
         self,
         session_id: str,
@@ -5995,7 +6176,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         thread_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
-        profile_name: str = None,
+        profile_name: Optional[str] = None,
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
@@ -6034,7 +6215,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
+
+        When the caller passes no ``profile_name`` at all, the row is stamped
+        with THIS store's own profile (:meth:`_own_profile_name`) instead of
+        NULL. Every ``state.db`` belongs to exactly one profile — the same
+        single-match contract :meth:`backfill_null_session_profiles` relies
+        on — so the stamp is derivation, not a guess. Rows minted NULL after
+        that one-shot #94724 backfill ran stayed NULL forever, and
+        profile-keyed consumers (desktop sidebar scope matching,
+        ``@session:<profile>/<id>`` deep links, the fail-closed owner ladder)
+        treat NULL as unowned: the session vanishes from the sidebar even
+        though its transcript is intact (#99222). Stores outside the profile
+        tree (explicit ``db_path`` in tests, ad-hoc copies) derive nothing
+        and keep NULL — never guess.
         """
+        if not (profile_name or "").strip():
+            profile_name = self._own_profile_name()
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
@@ -6282,9 +6479,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         """INSERT INTO sessions (
                                id, source, user_id, session_key, chat_id,
                                chat_type, thread_id, display_name, origin_json,
-                               started_at
+                               profile_name, started_at
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(id) DO UPDATE SET
                                session_key = COALESCE(sessions.session_key, excluded.session_key),
                                chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
@@ -6302,6 +6499,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             thread_id,
                             display_name,
                             origin_json,
+                            # Same ownership stamp as _insert_session_row: a
+                            # self-healed row is a first creation too, and an
+                            # unowned (NULL) row vanishes from profile-keyed
+                            # consumers (#99222).
+                            self._own_profile_name(),
                             time.time(),
                         ),
                     )
@@ -7111,6 +7313,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        require_lease_refresh: bool = False,
+        lease_ttl_seconds: float = 300.0,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
     ) -> None:
@@ -7135,8 +7339,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *require_lease_refresh* is True and *compression_lock_holder* is
+        set, the lease is refreshed inside the same transaction before the
+        expiry check. This gives a refresher
+        that stopped due to transient DB failures one final chance to extend
+        the lease, preventing wasted compression work. The refresh uses the
+        same ``conn`` as the publication, so there is no TOCTOU window.
         """
         def _do(conn):
+            if require_lease_refresh and compression_lock_holder:
+                conn.execute(
+                    "UPDATE compression_locks SET expires_at = ? "
+                    "WHERE session_id = ? AND holder = ?",
+                    (time.time() + lease_ttl_seconds, parent_session_id,
+                     compression_lock_holder),
+                )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -7151,7 +7369,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -7160,7 +7378,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if parent is None:
                 raise RuntimeError(f"Compression parent not found: {parent_session_id}")
             if parent["ended_at"] is not None:
-                raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
+                # A parent stamped ended by AUTOMATIC cleanup (tui_shutdown,
+                # ws_disconnect, orphan reap, idle/LRU evict) while a live
+                # agent is publishing its rotation is stale by construction —
+                # this writer holds the compression lease and is actively
+                # continuing the conversation the stamp claims is over.
+                # Left in place it wedges rotation forever: every attempt
+                # aborts here, nothing clears the stamp, and each attempt's
+                # pre-publish flush re-grows the parent until the provider
+                # rejects the request (#88197: 303 unique messages → 2,611
+                # rows → HTTP 400). Clear it in this same transaction and
+                # proceed; the closure UPDATE below re-stamps the parent with
+                # its true boundary (end_reason='compression'). Deliberate
+                # boundaries (compression, session_reset, explicit close)
+                # still fail closed — those mean another path owns lineage.
+                if is_automatic_end_reason(parent["end_reason"]):
+                    conn.execute(
+                        "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                        "WHERE id = ?",
+                        (parent_session_id,),
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Compression parent already ended: {parent_session_id}"
+                    )
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -7187,8 +7428,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # compression-fork backfill (#59527 / cross-profile jump
                     # fix): the child stays on the parent's profile and keeps
                     # the gateway routing/origin columns so peer recovery
-                    # still works after a crash at the boundary.
-                    profile_name or parent["profile_name"],
+                    # still works after a crash at the boundary. When neither
+                    # names an owner (legacy NULL parent), stamp this store's
+                    # own profile so the rotated child doesn't extend the
+                    # unowned lineage (#99222).
+                    profile_name
+                    or parent["profile_name"]
+                    or self._own_profile_name(),
                     parent["user_id"],
                     parent["session_key"],
                     parent["chat_id"],
@@ -8190,11 +8436,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, now),
+            ).fetchone()
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
@@ -8268,11 +8515,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
@@ -12101,6 +12349,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        tail_count: int = 0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -12139,6 +12388,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         held by that holder and unexpired — a compression whose lease was
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
+
+        *tail_count* (default 0) names how many of the LAST rows of
+        *compacted_messages* are the verbatim carried-forward tail the
+        compressor protected rather than summarized (#86366). Those rows'
+        ORIGINALS — which this call archives as a side effect of the blanket
+        soft-archive — are superseded byte-identical duplicates, not
+        "summarized away" content, so they are stamped rewind-style
+        (``active=0, compacted=0``, hidden from search_messages) instead of
+        ``compacted=1``. Without this the tail originals satisfy the recall
+        filter alongside their live clones and session_search returns every
+        carried-forward message once per compaction. Callers that cannot know
+        their tail shape keep the historical archive-everything behavior.
 
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
@@ -12210,13 +12471,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # rewind/undo's active=0+compacted=0, which means "user took it
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them. Tail originals are
-            # archived too — their clones (below) carry the live copy.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
+            # loads (active=1 only) still exclude them. Tail originals whose
+            # verbatim clones ride inside *compacted_messages* (tail_count)
+            # are superseded duplicates instead (#86366): they get the
+            # rewind-style flags so they stop matching the recall filter.
+            # Rewind-target ids: the originals of the carried-forward tail
+            # rows (tail_count), captured BEFORE any flag flips. Named apart
+            # from the watermark `tail_ids` below on purpose — the two are
+            # different sets (#86366): rewind targets sit AT/BELOW the
+            # watermark (the compressor only saw rows up to it), while
+            # `tail_ids` are concurrent appends ABOVE it. Without the bound,
+            # a concurrent append would steal a LIMIT slot and leave a real
+            # carried-forward original stamped compacted=1.
+            rewind_tail_ids: Optional[list[int]] = None
+            if tail_count > 0:
+                if watermark is not None:
+                    tail_rows = conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 AND id <= ? "
+                        "ORDER BY id DESC LIMIT ?",
+                        (session_id, int(watermark), int(tail_count)),
+                    ).fetchall()
+                else:
+                    tail_rows = conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
+                        (session_id, int(tail_count)),
+                    ).fetchall()
+                rewind_tail_ids = [int(row["id"]) for row in tail_rows]
+
+            # The watermark clone below re-inserts `tail_ids` rows byte-exact
+            # as live rows — their originals are the SAME superseded-duplicate
+            # class as the carried-forward tail (#86366), so they take the
+            # rewind flags too instead of double-matching the recall filter.
+            rewind_ids = [*(rewind_tail_ids or []), *tail_ids]
+
+            if rewind_ids:
+                placeholders = ",".join("?" for _ in rewind_ids)
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 0 "
+                    f"WHERE session_id = ? AND id IN ({placeholders})",
+                    [session_id, *rewind_ids],
+                )
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1 "
+                    f"AND id NOT IN ({placeholders})",
+                    [session_id, *rewind_ids],
+                )
+            else:
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )
@@ -13882,7 +14190,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if not exists:
                 return []
-            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+            # Use the borrowed read connection, never self._conn: handing the
+            # shared writer connection to a helper here executes on it without
+            # self._lock — the same unsynchronized-read class as #99349/#90734.
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
         return [session_id, *sorted(delegate_ids)]
 
     def delete_session(
@@ -15550,12 +15861,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         no handoff record.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT handoff_state, handoff_platform, handoff_error "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
             if not row:
                 return None
             return {
@@ -15572,15 +15883,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Used by the gateway's handoff watcher.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
-            )
-            return [self._session_row_dict(r) for r in cur.fetchall()]
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT s.*, "
+                    "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                    "FROM sessions s "
+                    "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                    "WHERE s.handoff_state = 'pending' "
+                    "ORDER BY s.started_at ASC"
+                ).fetchall()
+            return [self._session_row_dict(r) for r in rows]
         except Exception:
             return []
 

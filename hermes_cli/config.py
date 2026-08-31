@@ -2498,9 +2498,12 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     try:
         from toolsets import validate_toolset
         from hermes_cli.toolset_validation import validate_platform_toolsets
+        from hermes_cli.toolset_scope import toolset_allowed_for_platform
 
         ts_warnings = validate_platform_toolsets(
-            read_raw_config().get("platform_toolsets"), validate_toolset
+            read_raw_config().get("platform_toolsets"),
+            validate_toolset,
+            toolset_allowed_for_platform,
         )
         for w in ts_warnings:
             results["warnings"].append(w)
@@ -4387,8 +4390,12 @@ def _env_line_defines_key(
     assigned_key, separator, _value = stripped.partition("=")
     if not separator:
         return False
+    # load_env() strips whitespace around the parsed name, so `KEY = value`
+    # IS a live assignment. The writers must match the same shape, or a
+    # hand-edited spaced line is invisible to save (duplicate appended) and
+    # remove (line survives -> value resurrects on next load). #67488.
     return _env_var_policy_name(
-        assigned_key,
+        assigned_key.strip(),
         is_windows=is_windows,
     ) == _env_var_policy_name(key, is_windows=is_windows)
 

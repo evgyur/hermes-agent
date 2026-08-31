@@ -1,8 +1,8 @@
 {
   "format": "hermes-powerpack-release-v2",
   "hermes_version": "0.20.6",
-  "powerpack_version": "2.4.10",
-  "upstream_base": "1cf36398135f4848a1d04b2167ffb564b7881d35",
+  "powerpack_version": "2.5.0",
+  "upstream_base": "b8d3c8aa07301eeacad06cde25e460a189c9d6d6",
   "accepted_predecessors": [
     "c002cac77941c8faebde8659ab8f8c06ccc50c4f",
     "63a56fb8ab29352ddd40d67aeaf37d3e355ee096",
@@ -15,7 +15,9 @@
     "8b57d51b6e36cab711cd0fca37b13d30cf791696",
     "289c02eebebb06f0d6f01403511f1ab5b8b16334",
     "89a48845855884a90d20c36d2bd54d7d22c5b40b",
-    "2e4935546fa0611b782f8281b2e9dcf4700678ba"
+    "2e4935546fa0611b782f8281b2e9dcf4700678ba",
+    "bb20257ea60e1fcb2d5be41b71cc255d89765e4c",
+    "1b70deaeeaf5e6ff794c8da4d0a8ffff836c4bde"
   ],
   "component_pins": {
     "hermesdev_exact_topic_checkpoint": {
