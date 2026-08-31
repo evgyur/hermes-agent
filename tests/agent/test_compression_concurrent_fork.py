@@ -262,6 +262,39 @@ def test_failed_in_place_split_does_not_announce_compaction_complete(tmp_path: P
     assert db.get_compression_lock_holder(session_id) is None
 
 
+def test_in_place_compression_passes_gateway_turn_lease_once(tmp_path: Path) -> None:
+    """A gateway-owned compaction must not duplicate lease keyword arguments."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "IN_PLACE_GATEWAY_LEASE_TEST"
+    holder = "gateway-turn-holder"
+    db.create_session(session_id, source="telegram")
+    assert db.try_acquire_session_turn_lease(
+        session_id,
+        holder,
+        ttl_seconds=60.0,
+    )
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._active_session_turn_lease_holder = holder
+    agent._active_session_turn_lease_ttl_seconds = 60.0
+    archive = MagicMock(wraps=db.archive_and_compact)
+    db.archive_and_compact = archive
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    compressed, _system_prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+        force=True,
+    )
+
+    assert compressed is not messages
+    archive.assert_called_once()
+    assert archive.call_args.kwargs["turn_lease_holder"] == holder
+    assert archive.call_args.kwargs["turn_lease_ttl_seconds"] == 60.0
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Path) -> None:
     """Exception paths must stop the heartbeat and release the compression lock."""
     db = SessionDB(db_path=tmp_path / "state.db")

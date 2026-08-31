@@ -90,6 +90,7 @@ def test_context_compressor_propagates_bound_turn_holder_to_rewrite_commit():
     db.archive_and_compact.assert_called_once_with(
         "bound-session",
         compacted,
+        tail_count=0,
         turn_lease_holder="holder-H",
         turn_lease_ttl_seconds=17.0,
     )

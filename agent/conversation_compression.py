@@ -4832,7 +4832,6 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
-                        **_turn_lease_kwargs,
                         tail_count=_tail_count,
                         **_turn_lease_kwargs,
                     )
